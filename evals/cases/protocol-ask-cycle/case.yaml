@@ -1,0 +1,10 @@
+id: protocol-ask-cycle
+kind: replay
+subject_capability: answer-questions
+expect:
+  state:
+    - id: t_1
+      state: completed
+  output:
+    must_mention: ["NDJSON", "spec/RFA-0.1.md"]
+  protocol: [citations_present, atomic_claims, no_gone_quiet, reply_by_honored, evidence_gate_respected]

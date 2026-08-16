@@ -9,3 +9,4 @@ dogfood/state/
 dogfood/ROOM.md
 agents/*/knowledge/
 agents/*/state/
+agents/*/evals/cases/
