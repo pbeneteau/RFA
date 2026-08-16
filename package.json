@@ -16,23 +16,26 @@
     "start": "tsx src/main.ts",
     "demo": "tsx scripts/demo.ts",
     "tail": "tsx scripts/tail.ts",
-    "test": "node --import tsx --test test/hub.test.ts test/client.test.ts test/moderation.test.ts test/memory.test.ts test/otel.test.ts",
+    "test": "node --import tsx --test test/hub.test.ts test/client.test.ts test/moderation.test.ts test/memory.test.ts test/otel.test.ts test/agentdef.test.ts",
     "demo:push": "tsx scripts/demo-push.ts",
     "keygen": "tsx scripts/keygen.ts",
     "sign-card": "tsx scripts/sign-card.ts",
     "e2e": "tsx scripts/e2e.ts",
     "e2e:full": "tsx scripts/e2e.ts --full",
-    "pm-agent": "tsx dogfood/pm-agent.ts"
+    "pm-agent": "tsx src/resident.ts --agent pm-agent",
+    "supervisor": "tsx src/supervisor.ts"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.233",
     "@modelcontextprotocol/client": "^2.0.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@modelcontextprotocol/server": "^2.0.0",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/sdk-trace-base": "^2.10.0",
+    "yaml": "^2.9.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

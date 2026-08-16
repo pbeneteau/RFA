@@ -45,7 +45,7 @@ agents/<name>/
 Rules:
 - The definition is **inert data** validated by one zod schema (`src/agentdef.ts`) shared by runner and console. Definitions MUST NOT execute code on load (R sect. 4).
 - Skills load through the SDK's plugin mechanism (`plugins: [{type: "local", path: "agents/<name>"}]`); residents keep `cwd` at the repo root with `settingSources: ["project"]` (R 3.1, the skills-loading bridge).
-- Versioning is git. Full-snapshot edits, no partial merges. The runner stamps the definition content hash into presence metadata; the capability card and digest are DERIVED from `{name, description, skills, rooms[].serve}`, so a definition edit rotates the digest and is visible in every roster (R 3.1).
+- Versioning is git. Full-snapshot edits, no partial merges. The runner stamps the definition content hash into the card; the capability card and digest are DERIVED from `{name, description, offers, definition hash}`, so ANY definition edit (frontmatter or prompt body) rotates the digest and is visible in every roster (R 3.1).
 
 ### 3.2 Frontmatter schema (normative fields)
 
@@ -57,7 +57,10 @@ model: sonnet                   # Claude Code semantics
 effort: medium                  # low | medium | high | xhigh | max
 tools: { allow: [...], deny: [...] }   # incl. mcp__* patterns
 mcp_servers: { ... }
-skills: [...]
+skills: [...]                   # Agent SDK skill packs (procedural)
+offers:                         # room-facing card skills (v0.4.0 delta: explicit,
+  - id: answer-product-question #   never derived from SKILL.md packs; the two
+    description: ...            #   are different things)
 knowledge: ["knowledge/**/*.md"]
 memory:
   scope: pack                   # the single root of section 5

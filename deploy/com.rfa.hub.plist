@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.rfa.hub</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>cd /Users/paulbeneteau/Dev/agent-com &amp;&amp; exec npx tsx src/main.ts --http 8790 --human-key "$(cat dogfood/state/human-key.txt)" --otel</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>Crashed</key><true/><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/Users/paulbeneteau/Dev/agent-com/dogfood/state/hub.log</string>
+  <key>StandardErrorPath</key><string>/Users/paulbeneteau/Dev/agent-com/dogfood/state/hub.log</string>
+</dict>
+</plist>

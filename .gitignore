@@ -7,4 +7,5 @@ research/**/papers/*.pdf
 .DS_Store
 dogfood/state/
 dogfood/ROOM.md
-dogfood/knowledge/
+agents/*/knowledge/
+agents/*/state/

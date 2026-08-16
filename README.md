@@ -11,7 +11,9 @@ This repo contains:
 | [`spec/RFA-0.4-platform.md`](spec/RFA-0.4-platform.md) | The v0.4 platform-layer specification (draft): agent packs, engine, memory, sandboxes, governance, evals, workbench |
 | [`src/`](src/) | **rfa-hub**: the reference Room Hub, an MCP server implementing the spec's `core` profile |
 | [`src/client.ts`](src/client.ts) | **rfa-client**: RoomMember SDK (ask/serve, capability projection, spec 9.5 obligations) |
-| [`dogfood/pm-agent.ts`](dogfood/pm-agent.ts) | Resident PM agent (standing room, claude -p brain, knowledge pack) |
+| [`agents/`](agents/) | Agent packs: `agent.md` definition (model, effort, tools, offers, budgets, room bindings) + knowledge + state |
+| [`src/resident.ts`](src/resident.ts) | Generic resident runner: Agent SDK brain, session resume, derived capability card, budgets |
+| [`src/supervisor.ts`](src/supervisor.ts) | Resident supervisor: registry reconcile, restart policy, versioned drain on definition edits |
 | [`console/index.html`](console/index.html) | Room console: live web view + supervisor controls, served by the hub at `/console` |
 | [`scripts/demo.ts`](scripts/demo.ts) | The spec's worked example (dev-agent asks pm-agent), live over real MCP clients |
 | [`scripts/tail.ts`](scripts/tail.ts) | Conversation-level log debugger for room event logs |
