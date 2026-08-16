@@ -53,11 +53,12 @@ const policiesSchema = z
   .object({
     join: z.enum(["open", "invite"]).optional(),
     attention: z.enum(["mentions", "all"]).optional(),
+    mode: z.enum(["open", "sequential", "moderator"]).optional(),
     history_visibility: z.enum(["member", "joined_after"]).optional(),
     max_members: z.number().int().min(2).max(256).optional(),
   })
   .optional()
-  .describe("Room policies; defaults: join=invite, attention=mentions");
+  .describe("Room policies; defaults: join=invite, attention=mentions, mode=open");
 
 const DECLARED = z.enum(["ready", "busy", "away"]);
 
@@ -110,6 +111,7 @@ export function createHubServer(hub: RoomHub): McpServer {
         name: NAME,
         card: cardSchema,
         policies: policiesSchema,
+        human_key: z.string().optional().describe("Provisioned human-principal key; grants origin=human"),
       },
     },
     async (args) =>
@@ -131,7 +133,14 @@ export function createHubServer(hub: RoomHub): McpServer {
         join_secret: z.string().optional(),
         name: NAME,
         card: cardSchema,
-        role: z.enum(["participant", "observer"]).optional(),
+        role: z
+          .enum(["participant", "observer", "supervisor"])
+          .optional()
+          .describe("supervisor requires human_key; agents are promoted via room_admin set_role"),
+        human_key: z
+          .string()
+          .optional()
+          .describe("Provisioned human-principal key (hub --human-key); grants origin=human"),
         history_limit: z.number().int().min(0).max(500).optional(),
       },
     },
@@ -178,6 +187,10 @@ export function createHubServer(hub: RoomHub): McpServer {
           })
           .optional(),
         presence: DECLARED.optional().describe("Piggyback a presence change with this send"),
+        yield_floor: z
+          .boolean()
+          .optional()
+          .describe("Floor-controlled rooms: release the floor after this message (holder only)"),
         _meta: z.record(z.string(), z.unknown()).optional().describe("traceparent/tracestate/baggage pass through"),
         ext: z.record(z.string(), z.unknown()).optional(),
       },
@@ -294,6 +307,47 @@ export function createHubServer(hub: RoomHub): McpServer {
       },
     },
     async (args) => run(() => hub.task(args as Parameters<typeof hub.task>[0])),
+  );
+
+  server.registerTool(
+    "room_admin",
+    {
+      title: "Moderation verbs (moderation profile)",
+      description:
+        "Supervisor/host interventions (spec section 12); every verb lands in the log as an auditable intervention " +
+        "event. Verbs: hold_member/release_member (pause and resume a member; release_member on an evicted identity " +
+        "lifts quarantine, human-origin only), interrupt (signal a member to abandon its turn), evict (revoke " +
+        "membership), quarantine (evict + refuse that identity's re-join), inject (speak as the supervisor: " +
+        "params.text, optional params.mentions/kind/conversation_id/in_reply_to), cancel_task (target = task id), " +
+        "approve/reject (target = approval request_id; approve requires a human-origin principal), set_policy " +
+        "(params.policies: mode/moderator/attention/max_members), set_role (host only; params.role), grant_floor " +
+        "(assign the floor; also allowed for the designated moderator). Targets are member refs unless noted.",
+      inputSchema: {
+        room: z.string(),
+        membership_token: TOKEN,
+        verb: z.enum([
+          "hold_member",
+          "release_member",
+          "interrupt",
+          "evict",
+          "quarantine",
+          "inject",
+          "cancel_task",
+          "approve",
+          "reject",
+          "set_policy",
+          "set_role",
+          "grant_floor",
+        ]),
+        target: z.string().optional().describe("Member ref, task id, or approval request_id depending on verb"),
+        reason: z.string().max(500).optional().describe("Audited in the intervention event"),
+        params: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe("Verb-specific: inject {text, mentions?, kind?}, set_policy {policies}, set_role {role}"),
+      },
+    },
+    async (args) => run(() => hub.admin(args as Parameters<typeof hub.admin>[0])),
   );
 
   server.registerTool(

@@ -79,14 +79,17 @@ npm run tail -- data/rooms/r_XXXX.ndjson --follow
 
 - **Tasks (spec 10.2)**: `room_task` gives rooms a shared task board: atomic claims (one winner), dependencies with auto-unblock, `input_required` question round-trips, `reply_by` deadlines with one-shot overdue notices, and the evidence gate: evidence-required tasks stay `working` until a member OTHER than the owner verifies the submitted evidence (accept completes, reject sends back for rework). Task events reach owner/creator/verifier under the `mentions` filter.
 
+- **Moderation (spec 12)**: `room_admin` gives hosts and supervisors auditable intervention verbs: hold/release, interrupt, evict, quarantine (identity blocked by name AND card digest until a human lifts it), inject (a supervisor's only voice: supervisors are read-only on `room_send`), cancel_task, approve/reject (approval requests via `ext["dev.agentcom/approval"]`; ONLY a human-origin principal can approve), set_policy, set_role (host only), grant_floor. Human principals are minted by provisioned keys (`--human-key`); agents can never claim `origin: human` or self-assign supervisor. Floor control: `policies.mode: sequential` (queue + auto-advance) or `moderator` (designated member assigns turns), with `not_your_turn` refusals that enqueue, `floor_granted` notices, grace/renewal/cap timers, and `yield_floor` on `room_send`. Every intervention lands in the log.
+
 ## Deviations and deferrals (v0.1 reference)
 
 - **Dual-era MCP serving (v2 SDK)**: the hub is built on `@modelcontextprotocol/server` 2.0 and serves BOTH protocol eras on every transport: modern 2026-07-28 (`server/discover`, per-request `_meta`, `Mcp-Method`/`Mcp-Name` header routing, stateless HTTP) and legacy 2025-era (`initialize` handshake) on the same endpoint. The demos deliberately run on the legacy 1.30 client SDK as a standing compatibility proof.
 - The spec's native push binding (`subscriptions/listen` + the `dev.agentcom/rooms` extension filter) remains blocked upstream: the v2 SDK's `SubscriptionFilterSchema` is a closed set (the four core types) with no extension-filter hook yet, so `room_watch` (spec 11.2b) stays the push binding.
 - Replay compaction is reported as a `compacted` count in the listen result rather than an in-log system marker.
 - (fixed in 0.1.3: the `signing` profile is implemented; see below)
-- `moderation` (floor control, `room_admin`, observer/supervisor verbs) is the one profile not yet implemented.
+- (fixed in 0.1.5: the `moderation` profile is implemented; see below)
 - The per-room event log is kept fully in memory as well as on disk; fine for reference scale.
+- The pre-delivery policy gate (spec 12.2, a SHOULD outside the moderation conformance profile) is not implemented; `policies.join: "approve"` and `message_ttl_s` are also still unimplemented policy fields.
 
 ## Security posture (spec section 14)
 

@@ -15,6 +15,7 @@ import { TERMINAL_TASK_STATES } from "./model.js";
 import type {
   AgentCard,
   EventInput,
+  FloorInfo,
   RfaTask,
   TaskEvidence,
   TaskState,
@@ -24,6 +25,7 @@ import type {
   JoinContract,
   ListenResult,
   MessageKind,
+  Origin,
   Part,
   PresenceRecord,
   RecipientDisposition,
@@ -53,6 +55,11 @@ export interface HubConfig {
   trustedKeys: Record<string, Jwk>;
   allowEmbeddedJwk: boolean;
   requireSignedCards: boolean;
+  /** Provisioned bearer keys whose presenters join as human principals (spec 12.1/14.1). */
+  humanKeys: string[];
+  floorGraceS: number;
+  floorRenewS: number;
+  floorCapS: number;
   now: () => number;
 }
 
@@ -75,6 +82,10 @@ export const DEFAULT_CONFIG: HubConfig = {
   trustedKeys: {},
   allowEmbeddedJwk: true,
   requireSignedCards: false,
+  humanKeys: [],
+  floorGraceS: 150,
+  floorRenewS: 300,
+  floorCapS: 600,
   now: () => Date.now(),
 };
 
@@ -82,6 +93,8 @@ interface Member {
   id: string;
   name: string;
   role: Role;
+  origin: Origin;
+  held: boolean;
   isHost: boolean;
   card: AgentCard;
   digest: string;
@@ -158,7 +171,46 @@ interface Room {
   tasks: Map<string, RfaTask>;
   taskSeq: number;
   taskOverdueNotified: Set<string>;
+  quarantinedNames: Set<string>;
+  quarantinedDigests: Set<string>;
+  approvals: Map<string, Approval>;
+  floor: Floor;
 }
+
+/** Approval-flow record (spec 12.1): satisfied only by a human-origin approve. */
+interface Approval {
+  requestId: string;
+  messageId: string;
+  requester: string;
+  action: string;
+  status: "pending" | "approved" | "rejected";
+  decidedBy: string | null;
+}
+
+/** Floor-control state (spec 12.3). Transient: resets on hub restart. */
+interface Floor {
+  holder: string | null;
+  grantedAt: number | null;
+  turnStartedAt: number | null;
+  expiresAt: number | null;
+  queue: string[];
+}
+
+const ADMIN_VERBS = [
+  "hold_member",
+  "release_member",
+  "interrupt",
+  "evict",
+  "quarantine",
+  "inject",
+  "cancel_task",
+  "approve",
+  "reject",
+  "set_policy",
+  "set_role",
+  "grant_floor",
+] as const;
+export type AdminVerb = (typeof ADMIN_VERBS)[number];
 
 type Filter =
   | { kind: "all" }
@@ -257,11 +309,13 @@ export class RoomHub {
     name: string;
     card: AgentCard;
     policies?: Partial<RoomPolicies>;
+    human_key?: string;
   }): { room: string; join_secret: string | null; contract: JoinContract } {
     const policies: RoomPolicies = {
       join: "invite",
       attention: "mentions",
       mode: "open",
+      moderator: null,
       history_visibility: "member",
       max_members: 32,
       ...(args.policies ?? {}),
@@ -287,12 +341,17 @@ export class RoomHub {
       tasks: new Map(),
       taskSeq: 0,
       taskOverdueNotified: new Set(),
+      quarantinedNames: new Set(),
+      quarantinedDigests: new Set(),
+      approvals: new Map(),
+      floor: { holder: null, grantedAt: null, turnStartedAt: null, expiresAt: null, queue: [] },
     };
     this.rooms.set(room.handle, room);
     const contract = this.doJoin(room, {
       name: args.name,
       card: args.card,
       role: "participant",
+      origin: this.resolveOrigin(args.human_key),
       historyLimit: 0,
       isHost: true,
     });
@@ -306,12 +365,24 @@ export class RoomHub {
     name: string;
     card: AgentCard;
     role?: Role;
+    human_key?: string;
     history_limit?: number;
   }): JoinContract {
     const room = this.getRoom(args.room);
     if (room.ended) throw new RfaError("room_ended", `room ${room.handle} has ended`);
     if (room.policies.join === "invite" && args.join_secret !== room.joinSecret) {
       throw new RfaError("join_denied", "this room requires a valid join_secret");
+    }
+    // Quarantined identities (name or capability digest) stay out pending human action (spec 12.1).
+    if (room.quarantinedNames.has(args.name) || room.quarantinedDigests.has(digestCard(args.card))) {
+      throw new RfaError("join_denied", "this identity is quarantined pending human review (room_admin release_member)");
+    }
+    const origin = this.resolveOrigin(args.human_key);
+    const role = args.role ?? "participant";
+    // Agents can never self-assign supervisor authority (spec 5.2/14): join as
+    // supervisor needs a provisioned human key; agents get promoted via set_role.
+    if (role === "supervisor" && origin !== "human") {
+      throw new RfaError("join_denied", "joining as supervisor requires a provisioned human key; agents are promoted by the host via room_admin set_role");
     }
     const presentCount = [...room.members.values()].filter((m) => m.present).length;
     if (presentCount >= room.policies.max_members) {
@@ -320,7 +391,8 @@ export class RoomHub {
     const contract = this.doJoin(room, {
       name: args.name,
       card: args.card,
-      role: args.role ?? "participant",
+      role,
+      origin,
       historyLimit: args.history_limit ?? this.cfg.historyDefault,
       isHost: false,
     });
@@ -328,9 +400,18 @@ export class RoomHub {
     return contract;
   }
 
+  /** A provisioned human key is the only path to a human principal; a wrong key fails loudly, never downgrades. */
+  private resolveOrigin(humanKey: string | undefined): Origin {
+    if (humanKey === undefined) return "agent";
+    if (!this.cfg.humanKeys.includes(humanKey)) {
+      throw new RfaError("join_denied", "invalid human_key");
+    }
+    return "human";
+  }
+
   private doJoin(
     room: Room,
-    args: { name: string; card: AgentCard; role: Role; historyLimit: number; isHost: boolean },
+    args: { name: string; card: AgentCard; role: Role; origin: Origin; historyLimit: number; isHost: boolean },
   ): JoinContract {
     if (!NAME_RE.test(args.name) || args.name.length > 64) {
       throw new RfaError("bad_request", "name must match the RFA name grammar (section 4.1)");
@@ -357,6 +438,8 @@ export class RoomHub {
       id: rid("m"),
       name,
       role: args.role,
+      origin: args.origin,
+      held: false,
       isHost: args.isHost,
       card: args.card,
       digest: digestCard(args.card),
@@ -418,6 +501,7 @@ export class RoomHub {
         id: member.id,
         name,
         role: member.role,
+        origin: member.origin,
         membership_token: member.token,
         requested_name_adjusted: adjusted,
       },
@@ -430,6 +514,13 @@ export class RoomHub {
 
   leave(args: { room: string; membership_token: string }): { ok: true } {
     const { room, member } = this.auth(args.room, args.membership_token, { allowEnded: true });
+    this.removeMembership(room, member, "leave");
+    this.writeMeta(room);
+    return { ok: true };
+  }
+
+  /** Shared removal core for leave and evict: token revocation is immediate (spec 14.8). */
+  private removeMembership(room: Room, member: Member, reason: "leave" | "evict"): void {
     member.present = false;
     member.leftAt = this.cfg.now();
     this.tokens.delete(member.token);
@@ -440,16 +531,31 @@ export class RoomHub {
       hist.push(member.id);
       room.nameHistory.set(member.name, hist);
     }
+    // No post-removal delivery: parked waiters resolve now, watchers drop.
+    for (const w of [...room.waiters].filter((w) => w.memberId === member.id)) this.resolveWaiter(room, w);
+    room.watchers = room.watchers.filter((w) => w.memberId !== member.id);
+    // Floor hygiene: a departing holder frees the floor; queued departures are pruned.
+    room.floor.queue = room.floor.queue.filter((id) => id !== member.id);
+    if (room.floor.holder === member.id) this.releaseFloor(room);
     room.epoch += 1;
     this.appendEvent(room, {
       type: "roster",
-      reason: "leave",
+      reason,
       epoch: room.epoch,
       actor: member.id,
       members: this.rosterSnapshot(room),
     });
-    this.writeMeta(room);
-    return { ok: true };
+    // Anyone owed a reply by the departed member learns immediately (same contract as offline inference).
+    const owedTo = room.pendingReplies
+      .filter((p) => this.findMessage(room, p.messageId)?.mentions.includes(member.id))
+      .map((p) => p.fromId);
+    if (owedTo.length > 0) {
+      this.appendEvent(room, {
+        type: "system",
+        event: "gone_quiet",
+        refs: { member: member.id, name: member.name, askers: [...new Set(owedTo)] },
+      });
+    }
   }
 
   end(args: { room: string; membership_token: string; summary?: string }): { ok: true } {
@@ -546,12 +652,20 @@ export class RoomHub {
     chunk?: { index: number; final: boolean };
     refusal?: Refusal;
     presence?: DeclaredState;
+    yield_floor?: boolean;
     _meta?: Record<string, unknown>;
     ext?: Record<string, unknown>;
   }): SendResult {
     const { room, member } = this.auth(args.room, args.membership_token);
     if (room.ended) throw new RfaError("room_ended", `room ${room.handle} has ended`);
-    if (member.role === "observer") throw new RfaError("unauthorized", "observers cannot send messages");
+    // Observers and supervisors are read-only on the message plane (spec 5.2);
+    // supervisors speak through the auditable room_admin inject verb.
+    if (member.role !== "participant") {
+      throw new RfaError("unauthorized", `${member.role}s cannot send messages${member.role === "supervisor" ? "; use room_admin verb=inject" : ""}`);
+    }
+    if (member.held) {
+      throw new RfaError("held", "a supervisor holds you; keep listening for the release_member intervention, do not retry");
+    }
 
     const kind: MessageKind = args.kind ?? "chat";
     if (kind === "system") throw new RfaError("bad_request", "clients cannot send system events");
@@ -564,6 +678,28 @@ export class RoomHub {
     const dedupeKey = `${member.id}:${args.message_id}`;
     const cached = room.dedupe.get(dedupeKey);
     if (cached) return cached;
+
+    // Approval-flow capture (spec 12.1): validated before append, registered
+    // after; only a human-origin room_admin approve can ever satisfy it.
+    let pendingApproval: Approval | null = null;
+    const approvalExt = (args.ext ?? {})["dev.agentcom/approval"];
+    if (approvalExt !== undefined) {
+      const a = approvalExt as { request_id?: unknown; action?: unknown };
+      if (typeof a !== "object" || a === null || typeof a.request_id !== "string" || a.request_id.length < 4) {
+        throw new RfaError("bad_request", "ext['dev.agentcom/approval'] requires a request_id string (>= 4 chars)");
+      }
+      if (room.approvals.has(a.request_id)) {
+        throw new RfaError("task_conflict", `approval request_id ${a.request_id} already exists`);
+      }
+      pendingApproval = {
+        requestId: a.request_id,
+        messageId: args.message_id,
+        requester: member.id,
+        action: typeof a.action === "string" ? a.action : "",
+        status: "pending",
+        decidedBy: null,
+      };
+    }
 
     if (JSON.stringify(args.body).length > this.cfg.maxInlineBytes) {
       throw new RfaError("payload_too_large", `inline body exceeds ${this.cfg.maxInlineBytes} bytes`);
@@ -595,6 +731,14 @@ export class RoomHub {
       replyBy = iso(t);
     }
 
+    // Floor control (spec 12.3): turn-starting messages need the floor in
+    // sequential/moderator rooms. Runs after every other validation so a grant
+    // or renewal can only happen for a message that will actually append. A
+    // denial enqueues the sender (that is how the queue forms) and instructs it
+    // to listen for floor_granted.
+    const turnStarting = (kind === "chat" || kind === "request") && !args.in_reply_to;
+    if (room.policies.mode !== "open") this.floorGate(room, member, kind, turnStarting);
+
     // Presence piggyback before the message so observers see the state first.
     if (args.presence) this.setPresence(room, member, args.presence);
     member.leaseExpires = Math.max(member.leaseExpires, now + member.ttlS * 1000);
@@ -606,7 +750,7 @@ export class RoomHub {
       seq: 0, // assigned by appendEvent
       ts: "",
       room: room.handle,
-      from: { id: member.id, name: member.name, origin: "agent" },
+      from: { id: member.id, name: member.name, origin: member.origin },
       kind,
       to,
       mentions,
@@ -642,6 +786,16 @@ export class RoomHub {
       room.pendingReplies = room.pendingReplies.filter((p) => p.messageId !== args.in_reply_to);
     }
 
+    if (pendingApproval) {
+      room.approvals.set(pendingApproval.requestId, pendingApproval);
+      this.writeMeta(room);
+    }
+
+    // The holder may yield with its final message; the queue advances immediately.
+    if (args.yield_floor && room.policies.mode !== "open" && room.floor.holder === member.id) {
+      this.releaseFloor(room);
+    }
+
     // Delivery dispositions: live if a parked waiter or a standing watcher for that member matched this event.
     const wokenMembers = this.wakeWaiters(room, [event]);
     for (const id of this.notifyWatchers(room, [event])) wokenMembers.add(id);
@@ -665,6 +819,337 @@ export class RoomHub {
     room.dedupe.set(dedupeKey, result);
     if (room.dedupe.size > 2000) room.dedupe.delete(room.dedupe.keys().next().value as string);
     return result;
+  }
+
+  // ---------------------------------------------------------------- floor control (spec 12.3)
+
+  /** The designated moderator: policy override, else the host. */
+  private moderatorOf(room: Room): string | null {
+    return room.policies.moderator ?? [...room.members.values()].find((m) => m.isHost)?.id ?? null;
+  }
+
+  private floorGate(room: Room, member: Member, kind: MessageKind, turnStarting: boolean): void {
+    const f = room.floor;
+    const now = this.cfg.now();
+    if (f.holder === member.id) {
+      if (kind === "status") {
+        // Renewal: a status message extends the turn, capped hard per turn.
+        const anchor = f.turnStartedAt ?? f.grantedAt ?? now;
+        f.expiresAt = Math.min(now + this.cfg.floorRenewS * 1000, anchor + this.cfg.floorCapS * 1000);
+      } else if (turnStarting && f.turnStartedAt === null) {
+        // Granted from the queue; the first message starts the turn clock.
+        f.turnStartedAt = now;
+        f.expiresAt = Math.min(now + this.cfg.floorRenewS * 1000, now + this.cfg.floorCapS * 1000);
+      }
+      return;
+    }
+    if (!turnStarting) return; // responses, refusals, and status flow freely for everyone
+    if (f.holder === null) {
+      // sequential: a free floor goes to the first speaker; moderator: only the
+      // designated moderator may start a turn unassigned.
+      if (room.policies.mode === "sequential" || this.moderatorOf(room) === member.id) {
+        this.grantFloor(room, member.id, { starting: true });
+        return;
+      }
+    }
+    if (!f.queue.includes(member.id)) f.queue.push(member.id);
+    const holder = f.holder ? room.members.get(f.holder) : null;
+    throw new RfaError(
+      "not_your_turn",
+      `the floor is ${holder ? `held by ${holder.name}` : "assigned by the moderator"}; you are queued at position ${f.queue.indexOf(member.id) + 1}. Listen for the floor_granted system event, do not retry.`,
+      null,
+      { holder: f.holder, position: f.queue.indexOf(member.id) + 1, mode: room.policies.mode },
+    );
+  }
+
+  /** Grant the floor. Queue grants get a grace window to start speaking and a floor_granted notice. */
+  private grantFloor(room: Room, memberId: string, opts: { starting?: boolean } = {}): void {
+    const now = this.cfg.now();
+    const f = room.floor;
+    f.holder = memberId;
+    f.grantedAt = now;
+    f.queue = f.queue.filter((id) => id !== memberId);
+    if (opts.starting) {
+      f.turnStartedAt = now;
+      f.expiresAt = now + Math.min(this.cfg.floorRenewS, this.cfg.floorCapS) * 1000;
+    } else {
+      f.turnStartedAt = null;
+      f.expiresAt = now + this.cfg.floorGraceS * 1000;
+      this.appendEvent(room, {
+        type: "system",
+        event: "floor_granted",
+        refs: { member: memberId, mode: room.policies.mode },
+      });
+    }
+  }
+
+  /** Free the floor; sequential rooms advance the queue, moderator rooms wait for a grant. */
+  private releaseFloor(room: Room): void {
+    const f = room.floor;
+    f.holder = null;
+    f.grantedAt = null;
+    f.turnStartedAt = null;
+    f.expiresAt = null;
+    if (room.policies.mode === "sequential") this.advanceFloor(room);
+  }
+
+  private advanceFloor(room: Room): void {
+    while (room.floor.queue.length > 0) {
+      const next = room.floor.queue[0];
+      const m = room.members.get(next);
+      if (!m || !m.present || m.state === "offline" || m.held || m.role !== "participant") {
+        room.floor.queue.shift();
+        continue;
+      }
+      this.grantFloor(room, next);
+      return;
+    }
+  }
+
+  private floorInfo(room: Room): FloorInfo {
+    return { mode: room.policies.mode, holder: room.floor.holder, queue: [...room.floor.queue] };
+  }
+
+  // ---------------------------------------------------------------- moderation (spec section 12)
+
+  admin(args: {
+    room: string;
+    membership_token: string;
+    verb: AdminVerb;
+    target?: string;
+    reason?: string;
+    params?: Record<string, unknown>;
+  }): Record<string, unknown> {
+    const { room, member } = this.auth(args.room, args.membership_token);
+    const isModerator = this.moderatorOf(room) === member.id;
+    const authorized = member.isHost || member.role === "supervisor" || (args.verb === "grant_floor" && isModerator);
+    if (!authorized) {
+      throw new RfaError(
+        "unauthorized",
+        "room_admin requires the host or a supervisor (grant_floor also accepts the designated moderator)",
+      );
+    }
+    const params = args.params ?? {};
+    const intervene = (target: string | null, refs: Record<string, unknown> = {}): void => {
+      this.appendEvent(room, {
+        type: "intervention",
+        verb: args.verb,
+        actor: member.id,
+        target,
+        reason: args.reason ?? null,
+        refs,
+      });
+    };
+    const targetMember = (): Member => {
+      if (!args.target) throw new RfaError("bad_request", `verb ${args.verb} requires a target member`);
+      return this.resolveRef(room, null, args.target);
+    };
+    const done = (extra: Record<string, unknown> = {}): Record<string, unknown> => {
+      this.writeMeta(room);
+      return { ok: true, epoch: room.epoch, ...extra };
+    };
+
+    switch (args.verb) {
+      case "hold_member": {
+        const m = targetMember();
+        if (m.isHost) throw new RfaError("unauthorized", "the host cannot be held");
+        m.held = true;
+        room.floor.queue = room.floor.queue.filter((id) => id !== m.id);
+        if (room.floor.holder === m.id) this.releaseFloor(room);
+        intervene(m.id);
+        return done();
+      }
+      case "release_member": {
+        // Dual use: unhold a present member, or (human-origin only) lift a
+        // former member's quarantine so the identity may join again.
+        if (!args.target) throw new RfaError("bad_request", "release_member requires a target member");
+        const m = this.resolveRef(room, null, args.target, { allowLeft: true });
+        if (m.present) {
+          m.held = false;
+          intervene(m.id);
+          return done();
+        }
+        if (!room.quarantinedNames.has(m.name) && !room.quarantinedDigests.has(m.digest)) {
+          throw new RfaError("bad_request", `${m.name} is neither present (unhold) nor quarantined (release)`);
+        }
+        if (member.origin !== "human") {
+          throw new RfaError("unauthorized", "lifting a quarantine is the pending human action; it requires a human-origin principal");
+        }
+        room.quarantinedNames.delete(m.name);
+        room.quarantinedDigests.delete(m.digest);
+        intervene(m.id, { unquarantined: true });
+        return done();
+      }
+      case "interrupt": {
+        const m = targetMember();
+        intervene(m.id);
+        return done();
+      }
+      case "evict":
+      case "quarantine": {
+        const m = targetMember();
+        if (m.isHost) throw new RfaError("unauthorized", "the host cannot be evicted");
+        if (args.verb === "quarantine") {
+          room.quarantinedNames.add(m.name);
+          room.quarantinedDigests.add(m.digest);
+        }
+        intervene(m.id, args.verb === "quarantine" ? { name: m.name, digest: m.digest } : {});
+        this.removeMembership(room, m, "evict");
+        return done();
+      }
+      case "inject": {
+        const text = params.text;
+        if (typeof text !== "string" || text.length === 0) {
+          throw new RfaError("bad_request", "inject requires params.text");
+        }
+        const mentions = (Array.isArray(params.mentions) ? (params.mentions as string[]) : []).map(
+          (ref) => this.resolveRef(room, member, ref).id,
+        );
+        const kind = params.kind === "status" ? "status" : "chat";
+        const envelope: Envelope = {
+          rfa: "0.1",
+          message_id: rid("inj", 6),
+          seq: 0,
+          ts: "",
+          room: room.handle,
+          from: { id: member.id, name: member.name, origin: member.origin },
+          kind,
+          to: mentions,
+          mentions,
+          conversation_id: typeof params.conversation_id === "string" ? params.conversation_id : null,
+          in_reply_to: typeof params.in_reply_to === "string" ? params.in_reply_to : null,
+          reply_by: null,
+          task: null,
+          body: [{ type: "text", text }],
+          chunk: null,
+          refusal: null,
+          _meta: {},
+          ext: { "dev.agentcom/injected": true },
+        };
+        intervene(null, { message_id: envelope.message_id });
+        const event = this.appendEvent(room, { type: "message", envelope });
+        envelope.seq = event.seq;
+        envelope.ts = event.ts;
+        member.sentIds.add(envelope.message_id);
+        this.wakeWaiters(room, [event]);
+        this.notifyWatchers(room, [event]);
+        return done({ seq: event.seq, message_id: envelope.message_id });
+      }
+      case "cancel_task": {
+        if (!args.target) throw new RfaError("bad_request", "cancel_task requires a target task id");
+        const task = room.tasks.get(args.target);
+        if (!task) throw new RfaError("unknown_member", `no task ${args.target}`, null, { what: "task" });
+        if (TERMINAL_TASK_STATES.has(task.state)) {
+          throw new RfaError("task_conflict", `task ${task.id} is terminal (${task.state})`);
+        }
+        task.state = "cancelled";
+        task.updated_at = iso(this.cfg.now());
+        intervene(task.owner ?? task.created_by, { task_id: task.id });
+        this.appendEvent(room, { type: "task", action: "cancel", actor: member.id, task: { ...task } });
+        return done();
+      }
+      case "approve":
+      case "reject": {
+        if (!args.target) throw new RfaError("bad_request", `${args.verb} requires a target request_id`);
+        const approval = room.approvals.get(args.target);
+        if (!approval) throw new RfaError("bad_request", `no approval request ${args.target}`);
+        if (approval.status !== "pending") {
+          throw new RfaError("task_conflict", `approval ${approval.requestId} is already ${approval.status}`);
+        }
+        if (args.verb === "approve" && member.origin !== "human") {
+          throw new RfaError(
+            "unauthorized",
+            "approve requires a human-origin principal; an agent claiming approval is void by construction (spec 12.1)",
+          );
+        }
+        approval.status = args.verb === "approve" ? "approved" : "rejected";
+        approval.decidedBy = member.id;
+        intervene(approval.requester, {
+          request_id: approval.requestId,
+          action: approval.action,
+          verdict: approval.status,
+        });
+        return done({ request_id: approval.requestId, status: approval.status });
+      }
+      case "set_policy": {
+        const patch = (params.policies ?? {}) as Partial<RoomPolicies> & { moderator?: string | null };
+        const changes: Record<string, unknown> = {};
+        if (patch.mode !== undefined) {
+          if (!["open", "sequential", "moderator"].includes(patch.mode)) {
+            throw new RfaError("bad_request", `unknown mode "${patch.mode}"`);
+          }
+          room.policies.mode = patch.mode;
+          changes.mode = patch.mode;
+          // Mode changes reset the floor; open needs none, others start free.
+          room.floor = { holder: null, grantedAt: null, turnStartedAt: null, expiresAt: null, queue: [] };
+        }
+        if (patch.moderator !== undefined) {
+          room.policies.moderator = patch.moderator === null ? null : this.resolveRef(room, null, patch.moderator).id;
+          changes.moderator = room.policies.moderator;
+        }
+        if (patch.attention !== undefined) {
+          if (!["mentions", "all"].includes(patch.attention)) {
+            throw new RfaError("bad_request", `unknown attention "${patch.attention}"`);
+          }
+          room.policies.attention = patch.attention;
+          changes.attention = patch.attention;
+        }
+        if (patch.max_members !== undefined) {
+          const n = Number(patch.max_members);
+          if (!Number.isInteger(n) || n < 2 || n > 256) throw new RfaError("bad_request", "max_members must be 2..256");
+          room.policies.max_members = n;
+          changes.max_members = n;
+        }
+        if (Object.keys(changes).length === 0) {
+          throw new RfaError("bad_request", "set_policy accepts params.policies with mode, moderator, attention, max_members");
+        }
+        intervene(null, { changes });
+        return done({ policies: room.policies });
+      }
+      case "set_role": {
+        if (!member.isHost) throw new RfaError("unauthorized", "roles are assigned by the host (spec 5.2)");
+        const m = targetMember();
+        if (m.isHost) throw new RfaError("unauthorized", "the host's role cannot be changed");
+        const role = params.role;
+        if (role !== "participant" && role !== "observer" && role !== "supervisor") {
+          throw new RfaError("bad_request", "set_role requires params.role: participant | observer | supervisor");
+        }
+        if (role === m.role) throw new RfaError("bad_request", `${m.name} already has role ${role}`);
+        if (role === "participant" && !(m.card.skills ?? []).some((s) => s.id && s.description)) {
+          throw new RfaError("bad_request", "promotion to participant requires a card with at least one skill");
+        }
+        m.role = role;
+        if (role !== "participant") {
+          room.floor.queue = room.floor.queue.filter((id) => id !== m.id);
+          if (room.floor.holder === m.id) this.releaseFloor(room);
+        }
+        intervene(m.id, { role });
+        room.epoch += 1;
+        this.appendEvent(room, {
+          type: "roster",
+          reason: "role",
+          epoch: room.epoch,
+          actor: m.id,
+          members: this.rosterSnapshot(room),
+        });
+        return done();
+      }
+      case "grant_floor": {
+        if (room.policies.mode === "open") {
+          throw new RfaError("bad_request", "grant_floor needs a sequential or moderator room (set_policy mode)");
+        }
+        const m = targetMember();
+        if (m.role !== "participant") throw new RfaError("bad_request", "only participants can hold the floor");
+        if (m.held) throw new RfaError("bad_request", `${m.name} is held; release_member first`);
+        if (room.floor.holder && room.floor.holder !== m.id) {
+          // Reassignment displaces the current holder; the intervention is the audit.
+          room.floor.holder = null;
+        }
+        this.grantFloor(room, m.id);
+        intervene(m.id, { mode: room.policies.mode });
+        return done({ floor: this.floorInfo(room) });
+      }
+    }
   }
 
   // ---------------------------------------------------------------- listen
@@ -758,6 +1243,9 @@ export class RoomHub {
     const { room, member } = this.auth(args.room, args.membership_token, { allowEnded: args.action === "get" || args.action === "list" });
     if (member.role === "observer" && args.action !== "get" && args.action !== "list") {
       throw new RfaError("unauthorized", "observers cannot act on tasks");
+    }
+    if (member.held && args.action !== "get" && args.action !== "list") {
+      throw new RfaError("held", "a supervisor holds you; keep listening for the release_member intervention");
     }
     const now = this.cfg.now();
 
@@ -1015,6 +1503,7 @@ export class RoomHub {
     cursor: number;
     topic: string;
     policies: RoomPolicies;
+    floor: FloorInfo;
     ended: boolean;
   } {
     const { room, member } = this.auth(args.room, args.membership_token, { allowEnded: true });
@@ -1025,6 +1514,7 @@ export class RoomHub {
       cursor: room.seq,
       topic: room.topic,
       policies: room.policies,
+      floor: this.floorInfo(room),
       ended: room.ended,
     };
   }
@@ -1058,6 +1548,8 @@ export class RoomHub {
         if (!member.present || member.state === "offline") continue;
         if (now > member.leaseExpires + this.cfg.flapWindowS * 1000) {
           this.setPresence(room, member, "offline");
+          // An offline holder frees the floor (queued members are skipped by advance).
+          if (room.floor.holder === member.id) this.releaseFloor(room);
           const owedTo = room.pendingReplies
             .filter((p) => this.findMessage(room, p.messageId)?.mentions.includes(member.id))
             .map((p) => p.fromId);
@@ -1070,6 +1562,15 @@ export class RoomHub {
             });
           }
         }
+      }
+      // Floor expiry (spec 12.3): grace/renewal/cap ran out; notify and advance.
+      if (room.floor.holder !== null && room.floor.expiresAt !== null && now > room.floor.expiresAt) {
+        this.appendEvent(room, {
+          type: "system",
+          event: "timeout",
+          refs: { member: room.floor.holder, scope: "floor" },
+        });
+        this.releaseFloor(room);
       }
       for (const task of room.tasks.values()) {
         if (
@@ -1212,6 +1713,7 @@ export class RoomHub {
       id: m.id,
       name: m.name,
       role: m.role,
+      held: m.held,
       state: m.state,
       detail: m.detail,
       waiting_for: m.waitingFor,
@@ -1279,6 +1781,8 @@ export class RoomHub {
         id: m.id,
         name: m.name,
         role: m.role,
+        origin: m.origin,
+        held: m.held,
         isHost: m.isHost,
         card: m.card,
         digest: m.digest,
@@ -1294,6 +1798,9 @@ export class RoomHub {
       tasks: [...room.tasks.values()],
       taskSeq: room.taskSeq,
       taskOverdueNotified: [...room.taskOverdueNotified],
+      quarantinedNames: [...room.quarantinedNames],
+      quarantinedDigests: [...room.quarantinedDigests],
+      approvals: [...room.approvals.values()],
     };
     const file = path.join(this.roomDir(), `${room.handle}.meta.json`);
     fs.writeFileSync(file, JSON.stringify(meta, null, 1), { encoding: "utf8", mode: 0o600 });
@@ -1308,7 +1815,7 @@ export class RoomHub {
         const room: Room = {
           handle: meta.handle,
           topic: meta.topic,
-          policies: meta.policies,
+          policies: { mode: "open", moderator: null, ...meta.policies },
           joinSecret: meta.joinSecret,
           createdAt: meta.createdAt,
           ended: meta.ended,
@@ -1326,12 +1833,20 @@ export class RoomHub {
           tasks: new Map((meta.tasks ?? []).map((t: RfaTask) => [t.id, t])),
           taskSeq: meta.taskSeq ?? 0,
           taskOverdueNotified: new Set(meta.taskOverdueNotified ?? []),
+          quarantinedNames: new Set(meta.quarantinedNames ?? []),
+          quarantinedDigests: new Set(meta.quarantinedDigests ?? []),
+          approvals: new Map(((meta.approvals ?? []) as Approval[]).map((a) => [a.requestId, a])),
+          // The floor does not survive a restart: everyone is offline anyway;
+          // turn-starting sends re-acquire it naturally.
+          floor: { holder: null, grantedAt: null, turnStartedAt: null, expiresAt: null, queue: [] },
         };
         const now = this.cfg.now();
         for (const m of meta.members) {
           const verification = this.verifyCardStatus(m.card);
           const member: Member = {
             ...m,
+            origin: m.origin ?? "agent",
+            held: m.held ?? false,
             cardVerified: verification.verified,
             cardVerification: verification.details,
             state: m.present ? "offline" : m.declaredState, // everyone is offline after a restart until they call in

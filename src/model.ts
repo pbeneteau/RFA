@@ -3,6 +3,8 @@
 export type PresenceState = "ready" | "busy" | "away" | "offline";
 export type DeclaredState = Exclude<PresenceState, "offline">;
 export type Role = "participant" | "observer" | "supervisor";
+/** Principal class, hub-derived at join (spec 14.1). Agents can never produce "human". */
+export type Origin = "human" | "agent";
 export type MessageKind = "chat" | "request" | "response" | "refuse" | "status" | "system";
 export type RefusalReason = "busy" | "ineligible" | "unauthorized" | "overloaded" | "expired" | "declined";
 
@@ -68,6 +70,7 @@ export interface PresenceRecord {
   id: string;
   name: string;
   role: Role;
+  held: boolean;
   state: PresenceState;
   detail: string | null;
   waiting_for: string | null;
@@ -130,14 +133,24 @@ export type RfaEvent =
       actor: string;
       target: string | null;
       reason: string | null;
+      refs: Record<string, unknown>;
     });
 
 export interface RoomPolicies {
   join: "open" | "invite";
   attention: "mentions" | "all";
-  mode: "open";
+  mode: "open" | "sequential" | "moderator";
+  /** Member id who assigns the floor in moderator mode; null falls back to the host. */
+  moderator: string | null;
   history_visibility: "member" | "joined_after";
   max_members: number;
+}
+
+/** Floor-control state exposed by room_roster (moderation profile, spec 12.3). */
+export interface FloorInfo {
+  mode: RoomPolicies["mode"];
+  holder: string | null;
+  queue: string[];
 }
 
 export interface RecipientDisposition {
@@ -168,7 +181,7 @@ export interface JoinContract {
   room: string;
   topic: string;
   policies: RoomPolicies;
-  you: { id: string; name: string; role: Role; membership_token: string; requested_name_adjusted: boolean };
+  you: { id: string; name: string; role: Role; origin: Origin; membership_token: string; requested_name_adjusted: boolean };
   roster: PresenceRecord[];
   epoch: number;
   history: { events: RfaEvent[]; cursor: number; truncated: boolean };

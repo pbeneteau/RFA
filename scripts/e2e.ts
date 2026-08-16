@@ -195,9 +195,10 @@ await scenario("unit suite (test/hub.test.ts)", async () => {
 });
 
 // 2. Hub boot + lockfile guard
+const E2E_HUMAN_KEY = "hk_e2e_human";
 let mainHub!: Hub;
 await scenario("hub boot + exclusive-store lockfile", async () => {
-  mainHub = await startHub();
+  mainHub = await startHub({ extraArgs: ["--human-key", E2E_HUMAN_KEY] });
   // A second hub over the SAME data dir must fail loudly.
   const port2 = await freePort();
   const clash = spawn("npx", ["-y", "tsx", "src/main.ts", "--http", String(port2), "--data", mainHub.dataDir], {
@@ -228,7 +229,7 @@ await scenario("dual-era: legacy initialize + modern server/discover", async () 
   const data = JSON.parse(text.split("\n").find((l) => l.startsWith("data: "))!.slice(6));
   assert(data.result?.protocolVersion === "2025-06-18", "legacy initialize not served");
   const tools = await modernRpc(mainHub.url, "tools/list", {});
-  assert(tools.tools.length === 11, `expected 11 tools, got ${tools.tools.length}`);
+  assert(tools.tools.length === 12, `expected 12 tools, got ${tools.tools.length}`);
   return `2026-07-28 + 2025-06-18 on one endpoint; ${tools.tools.length} tools listed`;
 });
 
@@ -343,7 +344,79 @@ await scenario("signing: verified card, tamper detection, --require-signed enfor
   return "verified=true, tampered=false, strict hub refuses unsigned";
 });
 
-// 7. Push over a real stdio transport (legacy client compat included)
+// 7. Moderation profile: supervisor semantics, floor control, approval over the wire
+await scenario("moderation: human supervisor, inject, floor control, approval, quarantine", async () => {
+  const u = mainHub.url;
+  const host = await call(u, "room_create", { topic: "e2e moderated", name: "mod-host", card: card("mod-host", "hosting") });
+  const alice = await call(u, "room_join", { room: host.room, join_secret: host.join_secret, name: "mod-alice", card: card("mod-alice", "working") });
+  const bob = await call(u, "room_join", { room: host.room, join_secret: host.join_secret, name: "mod-bob", card: card("mod-bob", "working") });
+  // Supervisor joins need the provisioned human key; agents claiming it are refused.
+  await assertRejectsCode(
+    call(u, "room_join", { room: host.room, join_secret: host.join_secret, name: "mod-eve", card: card("mod-eve", "supervising"), role: "supervisor" }),
+    "join_denied",
+  );
+  const eve = await call(u, "room_join", {
+    room: host.room, join_secret: host.join_secret, name: "mod-eve", card: card("mod-eve", "supervising"),
+    role: "supervisor", human_key: E2E_HUMAN_KEY,
+  });
+  assert(eve.you.origin === "human", "human key should mint a human principal");
+
+  // Supervisors are read-only on the message plane; inject is their voice.
+  await assertRejectsCode(
+    call(u, "room_send", { room: host.room, membership_token: eve.you.membership_token, message_id: "e2e_mod_sup1", body: [{ type: "text", text: "x" }] }),
+    "unauthorized",
+  );
+  const injected = await call(u, "room_admin", {
+    room: host.room, membership_token: eve.you.membership_token, verb: "inject",
+    params: { text: "supervisor online", mentions: [alice.you.id] },
+  });
+  assert(typeof injected.message_id === "string", "inject should return the message id");
+
+  // Sequential floor: alice takes it, bob queues, yield advances, bob is notified.
+  await call(u, "room_admin", {
+    room: host.room, membership_token: eve.you.membership_token, verb: "set_policy",
+    params: { policies: { mode: "sequential" } },
+  });
+  await call(u, "room_send", { room: host.room, membership_token: alice.you.membership_token, message_id: "e2e_mod_a1", body: [{ type: "text", text: "my turn" }] });
+  await assertRejectsCode(
+    call(u, "room_send", { room: host.room, membership_token: bob.you.membership_token, message_id: "e2e_mod_b1", body: [{ type: "text", text: "me too" }] }),
+    "not_your_turn",
+  );
+  await call(u, "room_send", { room: host.room, membership_token: alice.you.membership_token, message_id: "e2e_mod_a2", body: [{ type: "text", text: "done" }], yield_floor: true });
+  const bobView = await call(u, "room_listen", { room: host.room, membership_token: bob.you.membership_token, since: 0, timeout_ms: 0 });
+  assert(bobView.events.some((e: any) => e.type === "system" && e.event === "floor_granted" && e.refs.member === bob.you.id), "floor_granted notice missing");
+  await call(u, "room_send", { room: host.room, membership_token: bob.you.membership_token, message_id: "e2e_mod_b2", body: [{ type: "text", text: "thanks" }], yield_floor: true });
+
+  // Approval flow: registered via ext, satisfied only by the human supervisor.
+  // (Alice's request is turn-starting: it takes the now-free floor.)
+  await call(u, "room_send", {
+    room: host.room, membership_token: alice.you.membership_token, message_id: "e2e_mod_apr", kind: "request",
+    mentions: [eve.you.id], body: [{ type: "text", text: "permission to deploy?" }],
+    ext: { "dev.agentcom/approval": { request_id: "apr_e2e_1", action: "deploy" } },
+  });
+  const verdict = await call(u, "room_admin", { room: host.room, membership_token: eve.you.membership_token, verb: "approve", target: "apr_e2e_1" });
+  assert(verdict.status === "approved", "human approve should succeed");
+  const aliceView = await call(u, "room_listen", { room: host.room, membership_token: alice.you.membership_token, since: 0, timeout_ms: 0 });
+  assert(
+    aliceView.events.some((e: any) => e.type === "intervention" && e.verb === "approve" && e.refs.request_id === "apr_e2e_1"),
+    "requester did not see the approval intervention",
+  );
+
+  // Quarantine bites on the very next call and blocks the identity's re-join.
+  await call(u, "room_admin", { room: host.room, membership_token: eve.you.membership_token, verb: "quarantine", target: bob.you.id, reason: "e2e" });
+  await assertRejectsCode(
+    call(u, "room_send", { room: host.room, membership_token: bob.you.membership_token, message_id: "e2e_mod_b3", body: [{ type: "text", text: "?" }] }),
+    "not_a_member",
+  );
+  await assertRejectsCode(
+    call(u, "room_join", { room: host.room, join_secret: host.join_secret, name: "mod-bob", card: card("mod-bob", "working") }),
+    "join_denied",
+  );
+  await call(u, "room_end", { room: host.room, membership_token: host.you.membership_token });
+  return "human principal, inject, sequential floor + yield, approval, quarantine: all enforced on the wire";
+});
+
+// 8. Push over a real stdio transport (legacy client compat included)
 await scenario("push over stdio: room_watch notifications, zero polling", async () => {
   const client = new Client({ name: "e2e-push", version: "0.3.0" });
   const pushed: any[] = [];
@@ -373,11 +446,11 @@ await scenario("push over stdio: room_watch notifications, zero polling", async 
   }
 });
 
-// 8. Restart persistence: rooms, tokens, history, tasks survive
+// 9. Restart persistence: rooms, tokens, history, tasks survive
 await scenario("restart persistence: state survives SIGTERM + reboot on the same store", async () => {
   const { room, devTok } = roomRef!;
   await stopHub(mainHub);
-  mainHub = await startHub({ dataDir: mainHub.dataDir });
+  mainHub = await startHub({ dataDir: mainHub.dataDir, extraArgs: ["--human-key", E2E_HUMAN_KEY] });
   const roster = await call(mainHub.url, "room_roster", { room, membership_token: devTok });
   assert(roster.roster.length === 2, "roster lost across restart");
   const history = await call(mainHub.url, "room_listen", { room, membership_token: devTok, since: 0, timeout_ms: 0, wait_for: "all" });
@@ -388,7 +461,7 @@ await scenario("restart persistence: state survives SIGTERM + reboot on the same
   return `roster, ${history.events.length} events, ${tasks.tasks.length} tasks intact with old token`;
 });
 
-// 9. Slow: presence lease expiry -> offline + gone_quiet (only with --full)
+// 10. Slow: presence lease expiry -> offline + gone_quiet (only with --full)
 if (FULL) {
   await scenario("presence expiry (slow): ttl_s=30 lease -> offline + gone_quiet ~40s", async () => {
     const u = mainHub.url;

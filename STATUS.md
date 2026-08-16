@@ -10,10 +10,10 @@ RFA (Rooms for Agents): a communication protocol where AI agents join rooms, dis
 
 | Piece | State |
 |---|---|
-| Spec | v0.1.4: core, push (interim binding), signing, tasks profiles; changelog in Appendix E; **moderation profile specced but NOT implemented** |
-| Hub (`rfa-hub`) | v0.4.0 on MCP v2 SDK, dual-era (2026-07-28 + legacy on one endpoint), 11 tools |
-| Client SDK | [src/client.ts](src/client.ts): RoomMember (create/resume/ask/serve/projectTools/wrapForModel) |
-| Tests | `npm test` 30/30 (24 hub + 6 client, real wire) · `npm run e2e` 8/8 fast ~4s · `e2e:full` 9/9 ~46s, reports in `reports/` |
+| Spec | v0.1.5: core, push (interim binding), signing, tasks, **moderation** profiles all implemented; changelog in Appendix E |
+| Hub (`rfa-hub`) | v0.5.0 on MCP v2 SDK, dual-era (2026-07-28 + legacy on one endpoint), 12 tools (`room_admin` new) |
+| Client SDK | [src/client.ts](src/client.ts): RoomMember (create/resume/ask/serve/projectTools/wrapForModel/admin; supervisor role + humanKey options) |
+| Tests | `npm test` 42/42 (24 hub + 6 client + 12 moderation, real wire) · `npm run e2e` 9/9 fast ~4s · `e2e:full` 10/10 ~46s, reports in `reports/` |
 | Repo | github.com/pbeneteau/agent-com (PRIVATE, personal account); commits: 98260e6 init, 6d318ec SDK+dogfood, 4e8ed8b autonomy |
 | Dogfood | LIVE: resident `pm-agent` in standing room `r_9a25e48c0e`, Goodvest knowledge pack, answering in ~11s with citations |
 | Artifacts (claude.ai) | Research report + spec published; same URLs redeploy |
@@ -24,6 +24,8 @@ RFA (Rooms for Agents): a communication protocol where AI agents join rooms, dis
 npm run start -- --http 8790     # the shared hub (owns ./data via lockfile)
 npm run pm-agent                  # resident PM; RESUMES the same room from dogfood/state/pm-agent.json
 ```
+
+Human principals (0.5.0): the live hub runs with `--human-key "$(cat dogfood/state/human-key.txt)"` (gitignored, 0600). Joining with that key grants `origin: human`: required for `role: supervisor`, `room_admin` approve, and quarantine release. Hub log: `dogfood/state/hub.log`. Verified live 2026-08-16: v0.5.0 migrated the standing room in place (old meta defaults), pm-agent kept serving through the swap (11.6s round-trip), supervisor join + interrupt intervention delivered.
 
 - Claude Code MCP registration (project-local): `rfa-hub` over HTTP at `http://localhost:8790/mcp` (stdio would lock-conflict with the running hub).
 - Ask the PM: `/ask-pm <question>` (human shortcut) · sessions consult autonomously via the `consult-room` skill · SDK agents via `projectTools()`.
@@ -41,7 +43,7 @@ npm run pm-agent                  # resident PM; RESUMES the same room from dogf
 
 ## Known limitations and parked edges
 
-- **Moderation profile** (spec section 12) not implemented: observer/supervisor roles partially (observer join works; `room_admin` verbs and floor-control modes absent).
+- **Moderation implemented (0.1.5)** with three deliberate edges: the pre-delivery policy gate (spec 12.2, a SHOULD outside the conformance profile) is not implemented; `policies.join: "approve"` and `message_ttl_s` stay unimplemented; floor state is restart-transient by design. Human principals need the hub started with `--human-key <k1,k2>` (or `RFA_HUMAN_KEYS`); without one, `approve` and quarantine-release are impossible (that is the point).
 - **Native push binding blocked upstream**: MCP v2 SDK's `SubscriptionFilterSchema` is a closed set (no extension-filter hook), so `subscriptions/listen` push waits on the SDK; `room_watch` (spec 11.2b) is the binding. Watch `McpHttpHandler.notify` as the future attachment point.
 - `room_watch` needs a persistent connection (stdio); the stateless HTTP mode cannot push.
 - Watchers/waiters are process-local (single-hub HA only); per-room event log fully in memory as well as on disk.
@@ -51,8 +53,8 @@ npm run pm-agent                  # resident PM; RESUMES the same room from dogf
 
 ## What's next (in rough priority)
 
-1. **Let the dogfood week run.** Verdict questions: token economics of mention-gating; lease honesty across laptop sleep; does ask-the-PM beat reading the doc. Log oddities as errata like the last four.
-2. **Moderation profile**: `room_admin` verbs (pause/interrupt/evict/quarantine/inject/approve), floor-control modes, supervisor role semantics (spec section 12 already defines it all).
+1. **Let the dogfood week run.** Verdict questions: token economics of mention-gating; lease honesty across laptop sleep; does ask-the-PM beat reading the doc. Log oddities as errata like the last four. (One logged already: the haiku brain leaked a thinking fragment into an answer, "wait, that's not relevant", pm-agent.log 13:09; prompt-quality, not protocol.)
+2. ~~Moderation profile~~ DONE 2026-08-16 (spec 0.1.5, hub 0.5.0): `room_admin` 12 verbs, floor control (sequential/moderator, timers, yield/grant), human principals via `--human-key`, quarantine by name+digest, human-only approve. 12 unit tests + 1 e2e scenario.
 3. **Spec hygiene when sharing**: real domain for the extension id, LICENSE, decide internal vs public.
 4. **Room console** (live web view) when demos/oversight need it.
 5. **Python client** mirroring RoomMember; **v2-native push** when the SDK grows extension filters.

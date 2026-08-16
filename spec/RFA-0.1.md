@@ -1,6 +1,6 @@
 # RFA: Rooms for Agents
 
-**Protocol specification, version 0.1.4 (draft)**
+**Protocol specification, version 0.1.5 (draft)**
 Status: Draft for implementation · Date: 2026-08-16 (0.1.1 errata same day, from live multi-agent field testing; see Appendix E) · License: intended Apache-2.0
 Wire tag: `"rfa": "0.1"` · MCP extension id: `dev.agentcom/rooms` (replace with your final domain before publishing)
 
@@ -96,7 +96,7 @@ Rules that hold at every tier:
 
 - The hub MUST mint a **membership token** at join and require it on every subsequent tool call (`membership_token` argument). Tokens MUST be unguessable, MUST be revocable (revocation = eviction takes effect on the next call and the next lease expiry), and SHOULD be short-lived with refresh.
 - The hub MUST derive `origin` and `from` from the authenticated principal. A client-supplied `from` or `origin` field MUST be ignored.
-- Agent principals MUST NOT be able to produce `origin: "human"`. Human consoles authenticate as human principals; hubs stamp accordingly.
+- Agent principals MUST NOT be able to produce `origin: "human"`. Human consoles authenticate as human principals; hubs stamp accordingly. Reference binding (0.1.5): the hub is provisioned out-of-band with **human keys**; a join presenting a matching `human_key` becomes a human principal, a wrong key fails loudly with `join_denied` (never a silent downgrade), and no key means `origin: "agent"`. Possession of a provisioned key IS the principal class; message text never is.
 
 ---
 
@@ -113,6 +113,7 @@ Rules that hold at every tier:
     "join": "open | invite | approve",
     "attention": "mentions | all",
     "mode": "open | sequential | moderator",
+    "moderator": null,
     "history_visibility": "member | joined_after",
     "message_ttl_s": null,
     "max_members": 32
@@ -120,7 +121,7 @@ Rules that hold at every tier:
 }
 ```
 
-Defaults: `join: invite`, `attention: mentions`, `mode: open`, `history_visibility: member`.
+Defaults: `join: invite`, `attention: mentions`, `mode: open`, `history_visibility: member`. `moderator` names the member who assigns the floor in `moderator` mode; `null` falls back to the host (settable later via `room_admin set_policy`).
 
 ### 5.2 Roles
 
@@ -131,6 +132,8 @@ Three roles, assigned at join or by the host afterward:
 - **supervisor**: observer rights plus intervention verbs (section 12) and approval authority.
 
 The creating member is the **host** (a participant or supervisor with room-admin rights: policy changes, eviction, `room_end`).
+
+Supervisor assignment is guarded (0.1.5): joining with `role: supervisor` requires a human principal (`human_key`, section 4.2); agent members reach supervisor only through the host's `room_admin set_role`. The host itself is protected: it cannot be held, evicted, quarantined, or re-roled.
 
 ### 5.3 Epoch
 
@@ -212,6 +215,7 @@ A presence record (as it appears in rosters and presence events):
   "id": "m_7f3ka9",
   "name": "pm-agent",
   "role": "participant",
+  "held": false,
   "state": "busy",
   "detail": "drafting acceptance criteria for RFA-141",
   "waiting_for": null,
@@ -497,19 +501,36 @@ For non-MCP agents, hubs MAY mirror the tool plane at `POST /rfa/v0/{tool_name}`
 
 ### 12.1 Supervisor verbs (`room_admin`)
 
-Each verb emits an `intervention` event (auditable, visible to all members unless the room policy says otherwise):
+Authority: the **host or a supervisor** may call `room_admin` (`grant_floor` additionally accepts the designated moderator). Each verb emits an `intervention` event `{verb, actor, target, reason, refs}` (auditable, visible to all members under `wait_for: all`; the mentions filter matches interventions targeting the caller). Verbs (0.1.5 fixes the concrete semantics):
 
-`hold_member` / `release_member` (pause an agent's delivery), `interrupt` (signal a member to abandon its current turn), `evict` (remove membership; epoch bump; its token is revoked), `quarantine` (evict + mark; hub refuses re-join with same identity pending human action), `inject` (send with `origin` = the supervisor's principal class), `cancel_task`, `approve` / `reject` (correlated to an `approval_request` by `request_id`), `set_policy`, `set_role`.
+- `hold_member` / `release_member`: pause and resume a member. Held members get error `held` on `room_send` and on mutating `room_task` actions; reads (`room_listen`, `room_roster`, presence) keep working so they can hear the release. `held` is visible in the presence record. A held floor holder loses the floor.
+- `interrupt`: pure signal (intervention event targeting the member) telling it to abandon its current turn.
+- `evict`: remove membership. Token revocation takes effect on the next call (spec 14.8), the name frees (rebind-guarded), the epoch bumps with a `roster {reason: "evict"}` event, the member's parked listens resolve and watchers drop, and members owed replies by the evictee get the `gone_quiet` notice immediately.
+- `quarantine`: evict + mark the identity, keyed by **name and capability digest**; the hub refuses re-joins matching either, pending human action.
+- `inject`: speak with the supervisor's stamped principal class (`params: {text, mentions?, kind: chat|status, conversation_id?, in_reply_to?}`). The envelope carries `ext["dev.agentcom/injected"] = true` and the paired intervention event carries the `message_id`. This is a supervisor's only voice: supervisors and observers are read-only on `room_send`.
+- `cancel_task`: cancel any non-terminal task by id, overriding ownership; emits both the task event and the intervention.
+- `approve` / `reject`: decide an approval request by `request_id` (the verb's `target`). The intervention targets the **requester** and carries `refs: {request_id, action, verdict}` so the verdict reaches them under the mentions filter. Deciding twice is `task_conflict`.
+- `set_policy`: mutate `params.policies` (`mode`, `moderator`, `attention`, `max_members`). Mode changes reset the floor.
+- `set_role`: **host only** (roles are assigned by the host, 5.2); `params: {role}`. Epoch bump + `roster {reason: "role"}` event. Promotion to participant requires a card with at least one skill; the host's own role is immutable.
+- `grant_floor`: assign the floor to a participant (section 12.3), displacing the current holder if any.
 
-Approval flows: any member MAY send a `system`-adjacent `request` with `ext["dev.agentcom/approval"] = {request_id, action, params}` targeted at supervisors; only an `approve` intervention from a **human-origin** principal satisfies it. **A message from an agent claiming approval is void by construction** (origin stamping).
+`release_member` is dual-use: on a present member it lifts a hold; on an evicted, quarantined identity it lifts the quarantine, and that action is the "pending human action": it REQUIRES a human-origin principal.
+
+Approval flows: any member MAY send a `request` with `ext["dev.agentcom/approval"] = {request_id, action, params}` targeted at supervisors; the hub registers it at append time (duplicate `request_id`s are `task_conflict`). Only an `approve` intervention from a **human-origin** principal satisfies it: hubs MUST refuse `approve` from agent-origin principals even when they hold the supervisor role. **A message from an agent claiming approval is void by construction** (origin stamping).
 
 ### 12.2 Pre-delivery policy gate
 
-Hubs SHOULD offer a policy hook evaluated before delivery (not before append): outcomes `allow | alert | hold | refuse`, with the outcome recorded. This is where org-specific safety (content rules, egress rules, model-based screening) composes with the protocol without changing it.
+Hubs SHOULD offer a policy hook evaluated before delivery (not before append): outcomes `allow | alert | hold | refuse`, with the outcome recorded. This is where org-specific safety (content rules, egress rules, model-based screening) composes with the protocol without changing it. (The reference hub does not implement the gate yet; the moderation conformance profile does not require it.)
 
 ### 12.3 Floor control (optional, `"moderation"` conformance)
 
-`mode: sequential` (hub enforces one turn-starting speaker at a time, queue order) and `mode: moderator` (a designated member picks the next speaker). Defaults tuned from field data: first-response grace 150 s, renewal by `status` message 300 s, hard cap 600 s per turn; on expiry the hub emits `system {event: "timeout"}` and advances. `open` mode has no enforcement and is the default.
+`policies.mode` governs who may send **turn-starting** messages: `kind chat|request` without `in_reply_to`. Responses, refusals, and status messages always flow freely: floor control gates turns, never answers.
+
+- `open` (default): no enforcement.
+- `sequential`: the hub enforces one turn-starting speaker at a time. A free floor goes to the first turn-starting sender; anyone else is refused with `not_your_turn` (`data: {holder, position, mode}`) and **enqueued by that refusal**, then notified by a `system {event: "floor_granted", refs: {member}}` event when their turn comes (the refs.member reference makes it reach them under the mentions filter). When the floor frees, the hub auto-advances the queue, skipping absent, offline, held, and non-participant entries.
+- `moderator`: only the designated moderator (`policies.moderator`, defaulting to the host) may start a turn unassigned; everyone else waits for `grant_floor`. The floor does not auto-advance; the moderator picks each speaker.
+
+Turn lifecycle: a holder granted from the queue has a **first-response grace** (default 150 s) to send its first message; each `status` message by the holder renews the turn (default 300 s), under a **hard cap per turn** (default 600 s from the turn's first message). On expiry the hub emits `system {event: "timeout", refs: {member, scope: "floor"}}` and advances. A holder may release explicitly by setting `yield_floor: true` on any `room_send` (its last word yields the floor). Departure, eviction, offline inference, holds, and demotion all release the floor. Floor state is exposed in `room_roster` (`floor: {mode, holder, queue}`) and is transient: it resets on hub restart (everyone is offline then anyway; turn-starting sends re-acquire it).
 
 ---
 
@@ -596,6 +617,7 @@ Conventions: all schemas are draft 2020-12; `membership_token` is `{"type": "str
       "name": { "type": "string", "minLength": 1, "maxLength": 64 },
       "card": { "$ref": "#/defs/agent_card" },
       "role": { "type": "string", "enum": ["participant", "observer", "supervisor"], "default": "participant" },
+      "human_key": { "type": "string", "description": "Provisioned human-principal key (4.2); grants origin=human, required for role=supervisor" },
       "history_limit": { "type": "integer", "minimum": 0, "maximum": 500, "default": 50 }
     },
     "required": ["room", "name", "card"]
@@ -615,9 +637,22 @@ Conventions: all schemas are draft 2020-12; `membership_token` is `{"type": "str
       "reply_by": { "type": "string", "format": "date-time" },
       "chunk": { "type": "object", "properties": { "index": { "type": "integer", "minimum": 0 }, "final": { "type": "boolean" } }, "required": ["index", "final"] },
       "refusal": { "type": "object", "properties": { "reason": { "type": "string", "enum": ["busy", "ineligible", "unauthorized", "overloaded", "expired", "declined"] }, "detail": { "type": "string", "maxLength": 200 }, "retry_after_s": { "type": "integer" } }, "required": ["reason"] },
-      "presence": { "type": "string", "enum": ["ready", "busy", "away"] }
+      "presence": { "type": "string", "enum": ["ready", "busy", "away"] },
+      "yield_floor": { "type": "boolean", "default": false, "description": "Floor-controlled rooms: release the floor after this message (holder only, 12.3)" }
     },
     "required": ["room", "membership_token", "message_id", "body"]
+  },
+  "room_admin": {
+    "type": "object",
+    "properties": {
+      "room": { "type": "string" },
+      "membership_token": { "type": "string" },
+      "verb": { "type": "string", "enum": ["hold_member", "release_member", "interrupt", "evict", "quarantine", "inject", "cancel_task", "approve", "reject", "set_policy", "set_role", "grant_floor"] },
+      "target": { "type": "string", "description": "Member ref (most verbs), task id (cancel_task), or approval request_id (approve/reject)" },
+      "reason": { "type": "string", "maxLength": 500, "description": "Audited in the intervention event" },
+      "params": { "type": "object", "description": "Verb-specific: inject {text, mentions?, kind?, conversation_id?, in_reply_to?}, set_policy {policies}, set_role {role}" }
+    },
+    "required": ["room", "membership_token", "verb"]
   },
   "room_listen": {
     "type": "object",
@@ -683,7 +718,7 @@ Conventions: all schemas are draft 2020-12; `membership_token` is `{"type": "str
 }
 ```
 
-(`room_create`, `room_leave`, `room_roster`, `room_task`, `room_admin`, `room_end` schemas follow the same conventions; normative shapes are fixed by the field tables in sections 5, 10, and 12.)
+(`room_create`, `room_leave`, `room_roster`, `room_task`, `room_end` schemas follow the same conventions; normative shapes are fixed by the field tables in sections 5, 10, and 12.)
 
 ## Appendix B: reserved names and registries
 
@@ -726,6 +761,17 @@ Conventions: all schemas are draft 2020-12; `membership_token` is `{"type": "str
 Tool passthrough (invoking a member's own MCP tools through the hub under a namespace); normative REST binding; per-message signature profile and hash-chain audit fields; webhook wake-ups (HMAC-signed) for resident agents; federation (cross-hub rooms; reserve `search_id`, `max_depth`, `scope` per FIPA federated search); contract-net task auction verbs; group E2E encryption (MLS profile); registry integration (publishing hub cards to ANS/NANDA-style directories); latent/binary body parts between homogeneous agents.
 
 ## Appendix E: changelog
+
+**0.1.5 (2026-08-16)** - moderation profile semantics (spec section 12 is now fully implemented by the reference hub):
+- Section 12.1: concrete semantics for every `room_admin` verb; authority rule (host or supervisor; `grant_floor` also the designated moderator); `grant_floor` added to the verb set (implementation experience: moderator mode needs an explicit assignment verb); `release_member` dual-use (unhold / lift quarantine, the latter human-origin only); quarantine keyed by name AND capability digest; approve/reject correlation via intervention `refs` targeting the requester; intervention events carry a `refs` object.
+- Section 12.3: precise floor-control semantics: turn-starting defined syntactically (chat/request without in_reply_to); replies always flow; `not_your_turn` refusals enqueue; `floor_granted` system notices; grace/renewal/cap timer lifecycle with `timeout {scope: "floor"}`; `yield_floor` flag on `room_send` for explicit release; floor state in `room_roster`; floor is restart-transient.
+- Section 4.2: reference binding for human principals: provisioned `human_key`s; wrong key fails loudly, never downgrades.
+- Section 5.2: supervisor assignment guarded (join as supervisor requires a human principal; agents only via host `set_role`); the host is protected from hold/evict/quarantine/re-role.
+- Section 5.1: `policies.moderator` field.
+- Section 7: presence records carry `held`.
+- Supervisors are read-only on `room_send` (observer rights + verbs, as 5.2 always said); the reference hub now enforces it.
+- Leave now emits `gone_quiet` for owed replies just like offline inference and eviction do (a member walking out on a pending request is at least as gone as one timing out).
+- Appendix A: `room_admin` schema; `room_join.human_key`; `room_send.yield_floor`.
 
 **0.1.4 (2026-08-16)** - tasks profile semantics:
 - Section 10.2: concrete task object shape (`evidence`, `verification`, `note`, `created_at`); full verb set incl. `get`/`list`/`verify`; atomic claim rules (submitted + unowned + unblocked); evidence gate flow (complete sets `verification.pending`, verify accept/reject, reject = rework not terminal); `unblocked` task events; `task_overdue` one-shot system notice; task events match the mentions filter for owner/creator/verifier.

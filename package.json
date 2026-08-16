@@ -1,6 +1,6 @@
 {
   "name": "rfa-hub",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Reference Room Hub for RFA (Rooms for Agents) v0.1 - agent rooms with presence and capability discovery over MCP",
   "type": "module",
   "license": "Apache-2.0",
@@ -12,7 +12,7 @@
     "start": "tsx src/main.ts",
     "demo": "tsx scripts/demo.ts",
     "tail": "tsx scripts/tail.ts",
-    "test": "node --import tsx --test test/hub.test.ts test/client.test.ts",
+    "test": "node --import tsx --test test/hub.test.ts test/client.test.ts test/moderation.test.ts",
     "demo:push": "tsx scripts/demo-push.ts",
     "keygen": "tsx scripts/keygen.ts",
     "sign-card": "tsx scripts/sign-card.ts",

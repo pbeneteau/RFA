@@ -65,7 +65,9 @@ export interface RoomMemberOptions {
   topic?: string;
   policies?: Record<string, unknown>;
   historyLimit?: number;
-  role?: "participant" | "observer";
+  role?: "participant" | "observer" | "supervisor";
+  /** Provisioned human-principal key (hub --human-key): grants origin=human, required to join as supervisor. */
+  humanKey?: string;
   clientInfo?: { name: string; version: string };
 }
 
@@ -124,9 +126,16 @@ export class RoomMember {
           name: opts.name,
           card: opts.card,
           role: opts.role,
+          human_key: opts.humanKey,
           history_limit: opts.historyLimit,
         })
-      : await call("room_create", { topic: opts.topic ?? "rfa-client room", name: opts.name, card: opts.card, policies: opts.policies });
+      : await call("room_create", {
+          topic: opts.topic ?? "rfa-client room",
+          name: opts.name,
+          card: opts.card,
+          policies: opts.policies,
+          human_key: opts.humanKey,
+        });
     return new RoomMember({
       hubUrl: opts.hubUrl,
       room: contract.room,
@@ -194,6 +203,26 @@ export class RoomMember {
     this.epoch = res.epoch;
     this.roster = res.roster;
     return this.roster;
+  }
+
+  /** Moderation verbs (spec section 12); requires host or supervisor authority. */
+  async admin(
+    verb:
+      | "hold_member"
+      | "release_member"
+      | "interrupt"
+      | "evict"
+      | "quarantine"
+      | "inject"
+      | "cancel_task"
+      | "approve"
+      | "reject"
+      | "set_policy"
+      | "set_role"
+      | "grant_floor",
+    opts: { target?: string; reason?: string; params?: Record<string, unknown> } = {},
+  ): Promise<Record<string, unknown>> {
+    return this.call("room_admin", { verb, ...opts });
   }
 
   async setPresence(

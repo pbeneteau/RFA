@@ -7,6 +7,8 @@
  *   rfa-hub --data ./data      persistence directory (default ./data; "none" disables)
  *   rfa-hub --trusted-keys k.json   provisioned {kid: publicJWK} map for card verification
  *   rfa-hub --require-signed        refuse joins whose card cannot be verified
+ *   rfa-hub --human-key k1,k2       provisioned human-principal keys (joins presenting one get origin=human;
+ *                                   required for room_admin approve and quarantine release). Also RFA_HUMAN_KEYS.
  */
 import * as fs from "node:fs";
 import * as http from "node:http";
@@ -28,6 +30,7 @@ try {
     dataDir: dataArg === "none" ? null : dataArg,
     trustedKeys: trustedKeysPath ? JSON.parse(fs.readFileSync(trustedKeysPath, "utf8")) : {},
     requireSignedCards: process.argv.includes("--require-signed"),
+    humanKeys: (arg("--human-key") ?? process.env.RFA_HUMAN_KEYS ?? "").split(",").filter(Boolean),
   });
 } catch (err) {
   console.error(`rfa-hub: ${(err as Error).message}`);
