@@ -138,7 +138,7 @@ Payloads/tool results above ~20k tokens offload to files with a 10-line preview;
 
 ### 5.2 The single gated door
 
-The agent-facing interface is the `memory_20250818` tool backed by an in-process handler whose `/memories` root maps to `agents/<name>/memory/` and nowhere else. The handler MUST enforce: MemoryGate on every write payload, block `limit` and `read_only`, and path-traversal validation. SDK `memory: "project"` MUST NOT be enabled for residents (it opens a second, ungated root). Defense in depth: a PostToolUse hook denies file-tool writes to any memory path, so the gate holds even for residents carrying general file tools (R 3.3).
+The agent-facing interface is the memory-tool verb set (view/create/str_replace/insert/delete/rename, the `memory_20250818` surface), served as in-process MCP tools (`mcp__memory__*`, v0.4.1 delta: same verbs, MCP transport instead of the beta tool type) whose `/memories` root maps to `agents/<name>/memory/` and nowhere else. The handler MUST enforce: MemoryGate on every write payload, block `limit` and `read_only`, and path-traversal validation. SDK `memory: "project"` MUST NOT be enabled for residents (it opens a second, ungated root). Defense in depth: a PostToolUse hook denies file-tool writes to any memory path, so the gate holds even for residents carrying general file tools (R 3.3).
 
 ### 5.3 Consolidation
 

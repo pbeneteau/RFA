@@ -436,6 +436,11 @@ export class RoomMember {
     return tools;
   }
 
+  /** Task-board passthrough (tasks profile, spec 10.2). */
+  async task(args: Record<string, unknown>): Promise<any> {
+    return this.call("room_task", args);
+  }
+
   async leave(): Promise<void> {
     await this.call("room_leave", {});
   }
@@ -517,22 +522,36 @@ export class MemoryGate {
 
   inspect(env: Envelope): MemoryGateVerdict {
     const record = RoomMember.sanitizeForMemory(env);
-    const shingles = shinglesOf(record.text);
-    let verdict: MemoryGateVerdict = { ok: true, record };
-    if (record.text.length >= this.minLength) {
+    const v = this.inspectText(record.text, env.from.id);
+    return v.ok ? { ok: true, record } : { ...v, record };
+  }
+
+  /**
+   * Envelope-free gate for direct memory writes (the memory tool): flag text
+   * that near-duplicates recent content from a DIFFERENT sender. An agent
+   * persisting a copy of peer content into its own memory is the exact
+   * worm-persistence move spec 14.3 exists to block.
+   */
+  inspectText(
+    text: string,
+    senderId: string,
+  ): { ok: true } | { ok: false; reason: "replicated"; similarity: number; matchedFrom: string } {
+    const shingles = shinglesOf(text);
+    let verdict: { ok: true } | { ok: false; reason: "replicated"; similarity: number; matchedFrom: string } = { ok: true };
+    if (text.length >= this.minLength) {
       for (let i = this.seen.length - 1; i >= 0; i--) {
         const prior = this.seen[i];
-        if (prior.from === env.from.id) continue;
+        if (prior.from === senderId) continue;
         const sim = jaccard(shingles, prior.shingles);
         if (sim >= this.threshold) {
-          verdict = { ok: false, reason: "replicated", similarity: sim, matchedFrom: prior.from, record };
+          verdict = { ok: false, reason: "replicated", similarity: sim, matchedFrom: prior.from };
           break;
         }
       }
     }
     // Flagged content still enters the window: later copies of the same worm
     // payload must keep matching even after the original entry ages out.
-    this.seen.push({ from: env.from.id, shingles });
+    this.seen.push({ from: senderId, shingles });
     if (this.seen.length > this.windowSize) this.seen.shift();
     return verdict;
   }
