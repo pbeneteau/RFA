@@ -1,6 +1,6 @@
 # Project status and handoff
 
-Last updated: 2026-08-16 (founding day + the platform pivot). **Read this first when resuming work.**
+Last updated: 2026-08-17 (founding day, the platform pivot, and v0.4.0-v0.4.2 shipped). **Read this first when resuming work.**
 
 ## What this is
 
@@ -12,12 +12,13 @@ RFA (Rooms for Agents): a communication protocol where AI agents join rooms, dis
 
 | Piece | State |
 |---|---|
-| Spec | Protocol v0.1.6: every profile implemented (core, push interim, signing, tasks, moderation); extension id `io.github.pbeneteau/rooms`; Apache-2.0. **Platform v0.4.0 draft: [spec/RFA-0.4-platform.md](spec/RFA-0.4-platform.md), not yet implemented** |
-| Hub (`rfa-hub`) | v0.6.0 on MCP v2 SDK, dual-era (2026-07-28 + legacy on one endpoint), 12 tools (`room_admin`) + room console at GET /console + **OTel spans per tool call** (`--otel` for the built-in stderr exporter) |
-| Client SDK | [src/client.ts](src/client.ts): RoomMember (create/resume/ask/serve/projectTools/wrapForModel/admin) + **sanitizeForMemory / MemoryGate** (Morris-II replication defense; wired into pm-agent's conversation memory) |
-| Tests | `npm test` 48/48 (24 hub + 6 client + 12 moderation + 5 memory + 1 otel) · `npm run e2e` 9/9 fast ~4s · `e2e:full` 10/10 ~46s, reports in `reports/` |
-| Repo | github.com/pbeneteau/agent-com (PRIVATE, personal account); commits: 98260e6 init, 6d318ec SDK+dogfood, 4e8ed8b autonomy |
-| Dogfood | LIVE: resident `pm-agent` in standing room `r_9a25e48c0e`, Goodvest knowledge pack, answering in ~11s with citations |
+| Spec | Protocol v0.1.7 (gate, approvals v2, rate budgets, hash chain on the wire). Platform [spec/RFA-0.4-platform.md](spec/RFA-0.4-platform.md): **v0.4.0-v0.4.2 implemented**, v0.4.3+ pending |
+| Hub (`rfa-hub`) | v0.6.0 on MCP v2 SDK, dual-era, 12 tools + console at /console + OTel spans (`--otel`) + **policy gate (`--gate deploy/gate.json`)** + hash-chained event log |
+| Client SDK | [src/client.ts](src/client.ts): RoomMember (ask/serve/projectTools/admin/task) + MemoryGate (inspect + inspectText) |
+| Platform | [src/agentdef.ts](src/agentdef.ts) packs · [src/resident.ts](src/resident.ts) SDK runner · [src/supervisor.ts](src/supervisor.ts) + secrets injection · [src/engine.ts](src/engine.ts) durable runs/steps/schedules · [src/memoryfs.ts](src/memoryfs.ts) gated memory + episodes · [src/execbackend.ts](src/execbackend.ts) srt sandbox seam |
+| Tests | `npm test` 72/72 across 10 files · `npm run e2e` 9/9 fast ~4s · `e2e:full` 10/10 ~46s · parity gate `npx tsx dogfood/parity.ts` |
+| Repo | github.com/pbeneteau/agent-com (PRIVATE, personal account, Apache-2.0) |
+| Dogfood | LIVE: `pm-agent` (Agent SDK brain, haiku, pack at agents/pm-agent/) under the supervisor in room `r_9a25e48c0e`; ~10-20s answers with citations, cost and run_id recorded per answer |
 | Artifacts (claude.ai) | Research report + spec published; same URLs redeploy |
 
 ## Runbook (after a reboot or to resume)
@@ -37,7 +38,7 @@ Room console: `http://localhost:8790/console#r_9a25e48c0e`. Observer = read-only
 - Ask the PM: `/ask-pm <question>` (human shortcut) · sessions consult autonomously via the `consult-room` skill · SDK agents via `projectTools()`.
 - Watch a room: `npm run tail -- data/rooms/<room>.ndjson --follow`.
 - Room join info (handle + secret): `dogfood/ROOM.md` (gitignored).
-- Knowledge pack: `dogfood/knowledge/**` (gitignored; Goodvest handbook exports + spec + README). Refresh by re-exporting handbook pages; the agent re-reads files on every answer.
+- Knowledge pack: `agents/pm-agent/knowledge/**` (gitignored; Goodvest handbook exports; spec + README via globs in agent.md). Refresh by re-exporting handbook pages; the brain Reads/Greps them per answer.
 
 ## Findings ledger (evidence, not vibes)
 
@@ -46,16 +47,17 @@ Room console: `http://localhost:8790/console#r_9a25e48c0e`. Observer = read-only
 - **Answer latency** with haiku brain: ~11s typical, ~25s first/long answers. Wire overhead is milliseconds.
 - **Dogfood product value on day one**: the PM agent flagged a real Goodvest handbook inconsistency (SCPI: 100k service threshold vs per-SCPI catalog minimums 5,000/300) and recommended human arbitration. Worth raising with the handbook owner.
 - **Autonomy verified**: a session given a plain coding task (Goodlife form validation, zero mention of the room) consulted the PM by capability and used the answer.
+- **The parity gate caught a real regression on day one of the platform** (haiku answered a fees question from the glossary instead of the product file after the Read/Grep switch; fixed with per-file retrieval hints; ~5% per-question flake remains, the v0.4.4 pass^k target).
+- **Live gate proof (2026-08-17)**: injection marker -> gate_alert (delivered + audited); private-key material -> policy_refused. Sandboxed echo inside srt works while external egress is blocked (real Seatbelt test).
 
 ## Known limitations and parked edges
 
-- **Moderation implemented (0.1.5)** with three deliberate edges: the pre-delivery policy gate (spec 12.2, a SHOULD outside the conformance profile) is not implemented; `policies.join: "approve"` and `message_ttl_s` stay unimplemented; floor state is restart-transient by design. Human principals need the hub started with `--human-key <k1,k2>` (or `RFA_HUMAN_KEYS`); without one, `approve` and quarantine-release are impossible (that is the point).
+- **Moderation implemented (0.1.5) + the policy gate (0.1.7)**. Still unimplemented by design: `policies.join: "approve"`, `message_ttl_s`; floor state is restart-transient. Human principals need the hub started with `--human-key <k1,k2>` (or `RFA_HUMAN_KEYS`); without one, `approve` and quarantine-release are impossible (that is the point).
 - **Native push binding blocked upstream**: MCP v2 SDK's `SubscriptionFilterSchema` is a closed set (no extension-filter hook), so `subscriptions/listen` push waits on the SDK; `room_watch` (spec 11.2b) is the binding. Watch `McpHttpHandler.notify` as the future attachment point.
 - `room_watch` needs a persistent connection (stdio); the stateless HTTP mode cannot push.
 - Watchers/waiters are process-local (single-hub HA only); per-room event log fully in memory as well as on disk.
 - `ask()` cannot run inside the same member's `serve()` loop (single loop owner; use a second member).
 - Member already offline at boot with a pending reply gets no `gone_quiet` (deadline timeout covers it; deliberate).
-- Extension id `io.github.pbeneteau/rooms` is a placeholder domain; no LICENSE file yet.
 
 ## What's next: the v0.4 platform build ([spec/RFA-0.4-platform.md](spec/RFA-0.4-platform.md) section 13 is the ladder)
 
