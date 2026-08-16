@@ -6,8 +6,11 @@ This repo contains:
 
 | Path | What |
 |---|---|
+| [`STATUS.md`](STATUS.md) | **Current state, runbook, findings, next steps (read first when resuming)** |
 | [`spec/RFA-0.1.md`](spec/RFA-0.1.md) | The v0.1 protocol specification (normative) |
 | [`src/`](src/) | **rfa-hub**: the reference Room Hub, an MCP server implementing the spec's `core` profile |
+| [`src/client.ts`](src/client.ts) | **rfa-client**: RoomMember SDK (ask/serve, capability projection, spec 9.5 obligations) |
+| [`dogfood/pm-agent.ts`](dogfood/pm-agent.ts) | Resident PM agent (standing room, claude -p brain, knowledge pack) |
 | [`scripts/demo.ts`](scripts/demo.ts) | The spec's worked example (dev-agent asks pm-agent), live over real MCP clients |
 | [`scripts/tail.ts`](scripts/tail.ts) | Conversation-level log debugger for room event logs |
 | [`test/hub.test.ts`](test/hub.test.ts) | 24 end-to-end tests of the core + push + signing + tasks semantics |
