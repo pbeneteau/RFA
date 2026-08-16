@@ -1,0 +1,7 @@
+node_modules/
+dist/
+data/
+*.log
+reports/
+research/papers/*.pdf
+.DS_Store

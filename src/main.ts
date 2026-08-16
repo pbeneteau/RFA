@@ -1,0 +1,96 @@
+#!/usr/bin/env node
+/**
+ * rfa-hub entrypoint (MCP v2 SDK: dual-era serving, server/discover native).
+ *
+ *   rfa-hub                    stdio MCP server, dual-era (for `claude mcp add`, Cursor, etc.)
+ *   rfa-hub --http 8790        Streamable HTTP MCP server (stateless, modern era + legacy fallback)
+ *   rfa-hub --data ./data      persistence directory (default ./data; "none" disables)
+ *   rfa-hub --trusted-keys k.json   provisioned {kid: publicJWK} map for card verification
+ *   rfa-hub --require-signed        refuse joins whose card cannot be verified
+ */
+import * as fs from "node:fs";
+import * as http from "node:http";
+import { createMcpHandler } from "@modelcontextprotocol/server";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
+import { createHubServer } from "./hub.js";
+import { RoomHub } from "./store.js";
+
+function arg(name: string): string | undefined {
+  const i = process.argv.indexOf(name);
+  return i >= 0 ? process.argv[i + 1] : undefined;
+}
+
+const dataArg = arg("--data") ?? "./data";
+const trustedKeysPath = arg("--trusted-keys");
+let hub: RoomHub;
+try {
+  hub = new RoomHub({
+    dataDir: dataArg === "none" ? null : dataArg,
+    trustedKeys: trustedKeysPath ? JSON.parse(fs.readFileSync(trustedKeysPath, "utf8")) : {},
+    requireSignedCards: process.argv.includes("--require-signed"),
+  });
+} catch (err) {
+  console.error(`rfa-hub: ${(err as Error).message}`);
+  process.exit(1);
+}
+const httpPort = arg("--http");
+
+process.on("SIGINT", () => {
+  hub.close();
+  process.exit(0);
+});
+process.on("SIGTERM", () => {
+  hub.close();
+  process.exit(0);
+});
+
+if (httpPort) {
+  const port = parseInt(httpPort, 10);
+  // Modern-era stateless handler with legacy fallback on the same endpoint.
+  const handler = createMcpHandler(() => createHubServer(hub), {
+    legacy: "stateless",
+    onerror: (e) => console.error(`rfa-hub http: ${e.message}`),
+  });
+  const server = http.createServer(async (req, res) => {
+    try {
+      const url = `http://${req.headers.host ?? `localhost:${port}`}${req.url ?? "/"}`;
+      const headers = new Headers();
+      for (const [k, v] of Object.entries(req.headers)) {
+        if (typeof v === "string") headers.set(k, v);
+        else if (Array.isArray(v)) headers.set(k, v.join(", "));
+      }
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const hasBody = chunks.length > 0 && req.method !== "GET" && req.method !== "HEAD";
+      const request = new Request(url, {
+        method: req.method,
+        headers,
+        body: hasBody ? new Uint8Array(Buffer.concat(chunks)) : undefined,
+      });
+      const response = await handler.fetch(request);
+      res.writeHead(response.status, Object.fromEntries(response.headers.entries()));
+      if (response.body) {
+        const reader = response.body.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(value);
+        }
+      }
+      res.end();
+    } catch (err) {
+      console.error(`rfa-hub http: ${(err as Error).message}`);
+      if (!res.headersSent) res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "internal error" }));
+    }
+  });
+  server.listen(port, () => {
+    console.error(`rfa-hub: Streamable HTTP MCP at http://localhost:${port}/mcp (data: ${dataArg}, dual-era)`);
+  });
+} else {
+  serveStdio(() => createHubServer(hub), {
+    legacy: "serve",
+    onerror: (e) => console.error(`rfa-hub stdio: ${e.message}`),
+  });
+  console.error(`rfa-hub: MCP server on stdio (data: ${dataArg}, dual-era)`);
+}
