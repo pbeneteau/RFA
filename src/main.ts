@@ -93,6 +93,7 @@ if (httpPort) {
       if (req.method === "GET" && (pathname === "/" || pathname === "/console")) {
         res.writeHead(200, {
           "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store", // the file is read per request; never let a browser pin an old build
           "content-security-policy":
             "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:",
         });

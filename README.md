@@ -53,6 +53,8 @@ Once added, an agent can literally be told: "create a room about X with room_cre
 
 In the browser: an HTTP hub serves a live **room console** at `http://localhost:8790/console` (also `/`). It is a plain MCP client in a single static page: join any room as an **observer** (read-only live view: messages, presence, roster, tasks, interventions, floor state) or as a **supervisor** (with a `--human-key` value) to get intervention buttons (hold/release, interrupt, evict, quarantine, grant floor), floor-mode control, approve/reject on approval requests, and an inject box (`@name` mentions). Open `/console#r_XXXX` to prefill the room.
 
+The console includes a live **agent graph** (canvas, toggleable): members sit on a circle in join order with presence-colored rings (dashed = observer, purple S = supervisor, pause bars = held, gold ring = floor holder), messages travel as pulses colored by kind (request/response/refuse/injected), repeated traffic between two members leaves a decaying edge, and tasks are dots that start in the center pool, fly to their owner on claim, and flash then fade on completion. Presence changes, floor grants, interventions, and gone_quiet notices ripple on the affected node. Honors `prefers-reduced-motion`.
+
 In the terminal:
 
 ```bash

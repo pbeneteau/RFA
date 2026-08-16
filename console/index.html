@@ -98,6 +98,14 @@
   #floor-panel { margin-top: 14px; }
   #floor-body { font-size: 12px; color: var(--dim); padding: 0 4px; overflow-wrap: anywhere; }
 
+  /* ---- graph ---- */
+  #graph-wrap { display: none; border-bottom: 1px solid var(--line); background: var(--panel); }
+  #graph-wrap.on { display: block; }
+  #graph { display: block; width: 100%; height: 280px; }
+  #graph-legend { display: flex; gap: 14px; padding: 0 14px 8px; font-size: 11px; color: var(--faint); flex-wrap: wrap; }
+  #graph-legend .lg { display: inline-flex; align-items: center; gap: 5px; }
+  #graph-legend .sw { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+
   /* ---- stream ---- */
   #stream-wrap { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   #stream { flex: 1; overflow-y: auto; padding: 12px 16px; }
@@ -164,6 +172,7 @@
       <option value="sequential">sequential</option>
       <option value="moderator">moderator</option>
     </select>
+    <label class="chip"><input type="checkbox" id="h-graph" checked style="accent-color: var(--accent)"> graph</label>
     <label class="chip"><input type="checkbox" id="h-ambient" checked style="accent-color: var(--accent)"> ambient</label>
     <button id="h-leave" class="danger">Leave</button>
   </header>
@@ -174,6 +183,20 @@
       <div id="floor-panel"><h2>Floor</h2><div id="floor-body">open mode: no floor control</div></div>
     </aside>
     <section id="stream-wrap">
+      <div id="graph-wrap">
+        <canvas id="graph" aria-label="live agent graph"></canvas>
+        <div id="graph-legend">
+          <span class="lg"><span class="sw" style="background: var(--ok)"></span>ready</span>
+          <span class="lg"><span class="sw" style="background: var(--busy)"></span>busy</span>
+          <span class="lg"><span class="sw" style="background: var(--offline)"></span>offline</span>
+          <span class="lg"><span class="sw" style="background: var(--accent)"></span>request</span>
+          <span class="lg"><span class="sw" style="background: var(--ok)"></span>response</span>
+          <span class="lg"><span class="sw" style="background: var(--danger)"></span>refuse</span>
+          <span class="lg"><span class="sw" style="background: var(--intervene)"></span>intervention</span>
+          <span class="lg"><span class="sw" style="background: var(--human)"></span>floor</span>
+          <span class="lg"><span class="sw" style="border: 1px solid var(--busy); background: transparent"></span>task dots dock under their owner</span>
+        </div>
+      </div>
       <div id="stream" aria-live="polite"></div>
       <div id="stream-foot">
         <span id="ambient-note"></span>
@@ -190,7 +213,7 @@
 const MCP = "/mcp";
 const META = {
   "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-  "io.modelcontextprotocol/clientInfo": { name: "rfa-console", version: "0.5.0" },
+  "io.modelcontextprotocol/clientInfo": { name: "rfa-console", version: "0.6.0" },
   "io.modelcontextprotocol/clientCapabilities": {},
 };
 let rpcId = 0;
@@ -315,7 +338,12 @@ function enter(room, you, topic, policies, epoch, roster, history, cursor) {
   $("inject-text").style.display = sup ? "" : "none";
   $("inject-send").style.display = sup ? "" : "none";
   renderHeader(); renderRoster();
+  if ($("h-graph").checked) { $("graph-wrap").classList.add("on"); Graph.start(you.id); }
   if (Array.isArray(history)) for (const e of history) renderEvent(e, { replay: true });
+  // Seed current task state for the graph (observers may list).
+  tool("room_task", { room: S.room, membership_token: S.token, action: "list" })
+    .then((r) => Graph.seedTasks(r.tasks ?? []))
+    .catch(() => {});
   listenLoop();
 }
 
@@ -364,6 +392,7 @@ function renderRoster() {
   const list = $("roster-list");
   list.replaceChildren();
   for (const m of S.roster) S.names.set(m.id, m.name);
+  Graph.setRoster(S.roster);
   const holder = S.floor?.holder;
   for (const m of S.roster) {
     const badges = [el("span", { class: "badge " + m.role }, m.role)];
@@ -409,6 +438,7 @@ function supervisorActions(m) {
 
 function renderFloor(floor) {
   if (floor) S.floor = floor;
+  Graph.setFloor(S.floor);
   const f = S.floor;
   const body = $("floor-body");
   if (!f || f.mode === "open") { body.textContent = "open mode: no floor control"; return; }
@@ -428,6 +458,7 @@ function line(cls, text, e) {
 }
 
 function renderEvent(e, opts = {}) {
+  Graph.onEvent(e, !!opts.replay);
   switch (e.type) {
     case "message": return renderMessage(e);
     case "presence": {
@@ -525,6 +556,335 @@ function appendToStream(node) {
   while (s.children.length > 1500) s.firstChild.remove(); // bound the DOM
   if (pinned) s.scrollTop = s.scrollHeight;
 }
+
+// ------------------------------------------------------------------ live graph
+// Canvas view of the room fed by the same listen loop: members on a circle
+// (join order), pulses when they talk, decaying who-talks-to-whom edges, task
+// dots docked under their owner, ripples for presence/floor/system signals.
+const Graph = (() => {
+  const wrap = $("graph-wrap");
+  const canvas = $("graph");
+  const g = canvas.getContext("2d");
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const TERMINAL = new Set(["completed", "failed", "cancelled", "rejected"]);
+  const C = {};
+  const nodes = new Map(); // member id -> {id,name,role,state,held,joined,x,y,tx,ty,gone,goneAt}
+  const edges = new Map(); // "a|b" -> {a,b,w,last}
+  const tasks = new Map(); // task id -> {id,owner,state,title,x,y,flash,doneAt}
+  let pulses = []; // {from,to,t0,dur,color,size}
+  let ripples = []; // {id,t0,dur,color}
+  let selfId = null;
+  let floorHolder = null;
+  let hover = null;
+  let running = false;
+  let raf = 0;
+  let lastFrame = 0;
+
+  function theme() {
+    const cs = getComputedStyle(document.documentElement);
+    for (const [k, v] of Object.entries({
+      ok: "--ok", busy: "--busy", away: "--away", offline: "--offline", accent: "--accent",
+      danger: "--danger", intervene: "--intervene", human: "--human", dim: "--dim",
+      faint: "--faint", line: "--line", text: "--text", node: "--panel-2",
+    })) C[k] = cs.getPropertyValue(v).trim();
+  }
+  const stateColor = (s) => ({ ready: C.ok, busy: C.busy, away: C.away, offline: C.offline })[s] ?? C.dim;
+  const kindColor = (k, injected) =>
+    injected ? C.intervene : ({ request: C.accent, response: C.ok, refuse: C.danger, status: C.faint }[k] ?? C.dim);
+  const taskColor = (s) => ({ submitted: C.faint, working: C.busy, input_required: C.accent, completed: C.ok }[s] ?? C.danger);
+  const trunc = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
+
+  function resize() {
+    const dpr = devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.round(canvas.clientWidth * dpr));
+    canvas.height = Math.max(1, Math.round(canvas.clientHeight * dpr));
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    layout();
+  }
+  new ResizeObserver(() => resize()).observe(canvas);
+
+  function layout() {
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    const cx = W / 2, cy = H / 2;
+    const live = [...nodes.values()].filter((n) => !n.gone);
+    live.sort((a, b) => (a.joined ?? "").localeCompare(b.joined ?? "") || a.id.localeCompare(b.id));
+    const R = Math.max(56, Math.min(W, H) / 2 - 46);
+    live.forEach((n, i) => {
+      const ang = -Math.PI / 2 + (2 * Math.PI * i) / live.length;
+      n.tx = cx + R * Math.cos(ang);
+      n.ty = cy + R * Math.sin(ang);
+      if (n.x == null) { n.x = cx; n.y = cy; }
+    });
+  }
+
+  function setRoster(list) {
+    const present = new Set();
+    for (const m of list) {
+      present.add(m.id);
+      const n = nodes.get(m.id) ?? { id: m.id, x: null, y: null };
+      Object.assign(n, { name: m.name, role: m.role, state: m.state, held: m.held, joined: m.joined_at, gone: false, goneAt: 0 });
+      nodes.set(m.id, n);
+    }
+    for (const n of nodes.values()) {
+      if (!present.has(n.id) && !n.gone) { n.gone = true; n.goneAt = performance.now(); }
+    }
+    layout();
+  }
+
+  function pulse(from, to, color, size = 4) {
+    if (pulses.length > 140) pulses.shift();
+    pulses.push({ from, to, t0: performance.now(), dur: reduced ? 400 : 900, color, size });
+  }
+  function ripple(id, color) {
+    if (ripples.length > 60) ripples.shift();
+    ripples.push({ id, t0: performance.now(), dur: 900, color });
+  }
+  function bumpEdge(a, b) {
+    if (a === b) return;
+    const key = a < b ? a + "|" + b : b + "|" + a;
+    const e = edges.get(key) ?? { a, b, w: 0 };
+    e.w = Math.min(1, e.w + 0.45);
+    e.last = performance.now();
+    edges.set(key, e);
+  }
+
+  function onEvent(e, replay) {
+    if (e.type === "task") {
+      const t = e.task;
+      const cur = tasks.get(t.id) ?? { id: t.id, x: null, y: null };
+      const changed = cur.state !== t.state || cur.owner !== t.owner;
+      Object.assign(cur, { owner: t.owner, state: t.state, title: t.title });
+      if (TERMINAL.has(t.state)) cur.doneAt = cur.doneAt || performance.now();
+      if (!replay && changed) cur.flash = performance.now();
+      tasks.set(t.id, cur);
+      return;
+    }
+    if (replay) return; // history builds state above; only live events animate
+    switch (e.type) {
+      case "message": {
+        const env = e.envelope;
+        const color = kindColor(env.kind, !!(env.ext && env.ext["io.github.pbeneteau/injected"]));
+        const targets = env.mentions.filter((id) => nodes.has(id));
+        if (targets.length === 0) ripple(env.from.id, color);
+        for (const t of targets) { pulse(env.from.id, t, color); bumpEdge(env.from.id, t); }
+        return;
+      }
+      case "presence": {
+        const n = nodes.get(e.member.id);
+        if (n && n.state !== e.member.state) ripple(e.member.id, stateColor(e.member.state));
+        return;
+      }
+      case "intervention":
+        if (e.target && nodes.has(e.target)) { pulse(e.actor, e.target, C.intervene, 5); bumpEdge(e.actor, e.target); }
+        else ripple(e.actor, C.intervene);
+        return;
+      case "system": {
+        const r = e.refs ?? {};
+        if (e.event === "floor_granted" && typeof r.member === "string") ripple(r.member, C.human);
+        if ((e.event === "gone_quiet" || e.event === "timeout") && typeof r.member === "string") ripple(r.member, C.danger);
+        return;
+      }
+    }
+  }
+
+  function seedTasks(list) {
+    for (const t of list) onEvent({ type: "task", task: t }, true);
+  }
+
+  function frame(now) {
+    if (!running) return;
+    raf = requestAnimationFrame(frame);
+    if (document.hidden || !wrap.classList.contains("on")) return;
+    const dt = Math.min(64, now - lastFrame || 16);
+    lastFrame = now;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    const cx = W / 2, cy = H / 2;
+    g.clearRect(0, 0, W, H);
+    const k = reduced ? 1 : 1 - Math.exp(-dt / 170);
+
+    // Nodes drift toward their layout slot; departed nodes fade out.
+    for (const n of [...nodes.values()]) {
+      if (n.gone) {
+        if (now - n.goneAt > 1200) {
+          nodes.delete(n.id);
+          for (const [key, e] of edges) if (e.a === n.id || e.b === n.id) edges.delete(key);
+          layout();
+        }
+        continue;
+      }
+      n.x += (n.tx - n.x) * k;
+      n.y += (n.ty - n.y) * k;
+    }
+    const pos = (id) => nodes.get(id);
+
+    // Communication edges decay unless refreshed by traffic.
+    for (const [key, e] of edges) {
+      e.w *= Math.exp(-dt / 45000);
+      if (e.w < 0.02) { edges.delete(key); continue; }
+      const a = pos(e.a), b = pos(e.b);
+      if (!a || !b) continue;
+      g.globalAlpha = e.w * 0.5;
+      g.strokeStyle = C.dim;
+      g.lineWidth = 0.5 + 1.8 * e.w;
+      g.beginPath(); g.moveTo(a.x, a.y); g.lineTo(b.x, b.y); g.stroke();
+    }
+    g.globalAlpha = 1;
+
+    // Unclaimed-task pool in the center.
+    const pool = [...tasks.values()].filter((t) => !t.doneAt || now - t.doneAt < 4200);
+    const unowned = pool.filter((t) => !t.owner || !nodes.has(t.owner) || nodes.get(t.owner).gone);
+    if (unowned.length > 0) {
+      g.globalAlpha = 0.5; g.strokeStyle = C.line; g.setLineDash([3, 4]);
+      g.beginPath(); g.arc(cx, cy, 26, 0, 2 * Math.PI); g.stroke();
+      g.setLineDash([]); g.globalAlpha = 1;
+      g.fillStyle = C.faint; g.font = "9px ui-monospace, monospace"; g.textAlign = "center";
+      g.fillText("tasks", cx, cy + 40);
+    }
+    // Task dots: dock under the owner, or orbit the center pool.
+    const perOwner = new Map();
+    for (const t of pool) {
+      const owner = t.owner && nodes.has(t.owner) && !nodes.get(t.owner).gone ? t.owner : null;
+      let txx, tyy;
+      if (owner) {
+        const sibs = perOwner.get(owner) ?? [];
+        sibs.push(t); perOwner.set(owner, sibs);
+        const i = sibs.length - 1;
+        const o = pos(owner);
+        txx = o.x + (i - 0.5 * (Math.min(5, sibs.length) - 1)) * 11;
+        tyy = o.y + 31;
+      } else {
+        const i = unowned.indexOf(t);
+        const ang = (2 * Math.PI * i) / Math.max(1, unowned.length) - Math.PI / 2;
+        txx = cx + 26 * Math.cos(ang); tyy = cy + 26 * Math.sin(ang);
+      }
+      if (t.x == null) { t.x = cx; t.y = cy; }
+      t.x += (txx - t.x) * k; t.y += (tyy - t.y) * k;
+      const fade = t.doneAt ? Math.max(0, 1 - Math.max(0, now - t.doneAt - 3400) / 800) : 1;
+      g.globalAlpha = fade;
+      g.fillStyle = taskColor(t.state);
+      g.beginPath(); g.arc(t.x, t.y, 4, 0, 2 * Math.PI); g.fill();
+      if (t.flash && now - t.flash < 500) {
+        g.globalAlpha = fade * (1 - (now - t.flash) / 500);
+        g.strokeStyle = taskColor(t.state); g.lineWidth = 2;
+        g.beginPath(); g.arc(t.x, t.y, 4 + 6 * ((now - t.flash) / 500), 0, 2 * Math.PI); g.stroke();
+      }
+      g.globalAlpha = 1;
+      if (t.doneAt && now - t.doneAt > 4200) tasks.delete(t.id);
+    }
+
+    // Ripples.
+    ripples = ripples.filter((r) => now - r.t0 < r.dur);
+    for (const r of ripples) {
+      const n = pos(r.id);
+      if (!n) continue;
+      const t = (now - r.t0) / r.dur;
+      g.globalAlpha = (1 - t) * 0.8;
+      g.strokeStyle = r.color; g.lineWidth = 2;
+      g.beginPath(); g.arc(n.x, n.y, 17 + 24 * t, 0, 2 * Math.PI); g.stroke();
+    }
+    g.globalAlpha = 1;
+
+    // Message pulses travel along the (moving) endpoints.
+    pulses = pulses.filter((p) => now - p.t0 < p.dur);
+    for (const p of pulses) {
+      const a = pos(p.from), b = pos(p.to);
+      if (!a || !b) continue;
+      const t = (now - p.t0) / p.dur;
+      const e = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t; // easeInOut
+      if (reduced) {
+        g.globalAlpha = 1 - t; g.strokeStyle = p.color; g.lineWidth = 1.5;
+        g.beginPath(); g.moveTo(a.x, a.y); g.lineTo(b.x, b.y); g.stroke();
+        g.globalAlpha = 1;
+        continue;
+      }
+      const x = a.x + (b.x - a.x) * e, y = a.y + (b.y - a.y) * e;
+      const xt = a.x + (b.x - a.x) * Math.max(0, e - 0.08), yt = a.y + (b.y - a.y) * Math.max(0, e - 0.08);
+      g.globalAlpha = 0.55; g.strokeStyle = p.color; g.lineWidth = p.size * 0.6;
+      g.beginPath(); g.moveTo(xt, yt); g.lineTo(x, y); g.stroke();
+      g.globalAlpha = 1; g.fillStyle = p.color;
+      g.beginPath(); g.arc(x, y, p.size, 0, 2 * Math.PI); g.fill();
+    }
+
+    // Nodes.
+    g.font = "10px ui-monospace, monospace"; g.textAlign = "center";
+    for (const n of nodes.values()) {
+      const alpha = n.gone ? Math.max(0, 1 - (now - n.goneAt) / 1200) : 1;
+      if (alpha <= 0) continue;
+      g.globalAlpha = alpha;
+      const r = 16;
+      if (floorHolder === n.id) {
+        g.strokeStyle = C.human; g.lineWidth = 2;
+        g.beginPath(); g.arc(n.x, n.y, r + 5, 0, 2 * Math.PI); g.stroke();
+      }
+      if (n.id === selfId) {
+        g.globalAlpha = alpha * 0.6; g.strokeStyle = C.accent; g.lineWidth = 1.5;
+        g.beginPath(); g.arc(n.x, n.y, r + 8, 0, 2 * Math.PI); g.stroke();
+        g.globalAlpha = alpha;
+      }
+      g.fillStyle = C.node;
+      g.beginPath(); g.arc(n.x, n.y, r, 0, 2 * Math.PI); g.fill();
+      g.strokeStyle = stateColor(n.state); g.lineWidth = 2.5;
+      if (n.role === "observer") g.setLineDash([4, 3]);
+      g.beginPath(); g.arc(n.x, n.y, r, 0, 2 * Math.PI); g.stroke();
+      g.setLineDash([]);
+      if (n.held) {
+        g.fillStyle = C.danger;
+        g.fillRect(n.x - 4.5, n.y - 5, 3, 10);
+        g.fillRect(n.x + 1.5, n.y - 5, 3, 10);
+      } else {
+        g.fillStyle = stateColor(n.state);
+        g.beginPath(); g.arc(n.x, n.y, 4, 0, 2 * Math.PI); g.fill();
+      }
+      if (n.role === "supervisor") {
+        g.fillStyle = C.intervene;
+        g.beginPath(); g.arc(n.x + r - 3, n.y - r + 3, 5.5, 0, 2 * Math.PI); g.fill();
+        g.fillStyle = C.node; g.font = "bold 8px ui-monospace, monospace";
+        g.fillText("S", n.x + r - 3, n.y - r + 6);
+        g.font = "10px ui-monospace, monospace";
+      }
+      g.fillStyle = n.id === selfId ? C.text : C.dim;
+      g.fillText(trunc(n.name, 14), n.x, n.y + r + 13);
+      g.globalAlpha = 1;
+    }
+
+    // Hover inspector.
+    if (hover && nodes.has(hover)) {
+      const n = nodes.get(hover);
+      g.fillStyle = C.text; g.font = "11px ui-monospace, monospace"; g.textAlign = "left";
+      g.fillText(`${n.name} · ${n.role} · ${n.state}${n.held ? " · held" : ""}`, 10, 16);
+      g.textAlign = "center";
+    }
+  }
+
+  canvas.addEventListener("mousemove", (ev) => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+    hover = null;
+    for (const n of nodes.values()) {
+      if (!n.gone && (n.x - mx) ** 2 + (n.y - my) ** 2 < 400) { hover = n.id; break; }
+    }
+  });
+  canvas.addEventListener("mouseleave", () => { hover = null; });
+
+  return {
+    start(id) {
+      selfId = id ?? selfId;
+      theme();
+      resize();
+      if (!running) { running = true; lastFrame = 0; raf = requestAnimationFrame(frame); }
+    },
+    stop() { running = false; cancelAnimationFrame(raf); },
+    setRoster, onEvent, seedTasks,
+    setFloor(f) { floorHolder = f?.holder ?? null; },
+  };
+})();
+
+$("h-graph").addEventListener("change", () => {
+  const on = $("h-graph").checked;
+  $("graph-wrap").classList.toggle("on", on);
+  if (on && S.token) Graph.start(S.you?.id);
+  else Graph.stop();
+});
 
 // ------------------------------------------------------------------ controls
 $("h-ambient").addEventListener("change", () => {
