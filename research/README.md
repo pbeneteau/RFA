@@ -1,0 +1,10 @@
+# Research waves
+
+Each wave is a self-contained deep-research pass: a `REPORT.md` synthesis (the only file most readers need), plus the primary sources it was derived from (`papers/` or `notes/`; PDFs are gitignored, indexes are tracked).
+
+| Wave | Date | Question | Outcome |
+|---|---|---|---|
+| [01-protocol](01-protocol/REPORT.md) | 2026-08-16 | What should an agent rooms/presence/discovery protocol be? (13-agent sweep, 70 papers) | RFA spec v0.1.x + the reference hub |
+| [02-platform](02-platform/REPORT.md) | 2026-08-16 | How do we go from a protocol to a working agent platform: capable agents (tools, skills, memory), engine, sandboxes, observability, governance, evals, deployment? Anchored on LangChain deep agents + the 2026 platform landscape | RFA v0.4 platform spec |
+
+Conventions for a new wave: `NN-slug/` with `REPORT.md` (evidence-linked, decision-oriented), `notes/` per-dimension research notes with source URLs, `papers/` for downloaded primary sources. Update this table and the repo docs that point at the latest wave.

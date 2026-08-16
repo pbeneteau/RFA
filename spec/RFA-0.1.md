@@ -12,7 +12,7 @@ The key words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are to be interpreted 
 
 ## 1. Design principles
 
-Each principle traces to evidence gathered in [research/REPORT.md](../research/REPORT.md); the mapping is in Appendix C.
+Each principle traces to evidence gathered in [research/REPORT.md](../research/01-protocol/REPORT.md); the mapping is in Appendix C.
 
 1. **Specify observable behavior only.** State machines, message sequences, and wire shapes. Never agent internals.
 2. **The boring parts are the standard.** Join, naming, presence events, auth, errors, and delivery outcomes are normative, not left to implementations.
@@ -731,7 +731,7 @@ Conventions: all schemas are draft 2020-12; `membership_token` is `{"type": "str
 
 ## Appendix C: design rationale (decision -> evidence)
 
-| Decision | Evidence (see research/REPORT.md) |
+| Decision | Evidence (see research/01-protocol/REPORT.md) |
 |---|---|
 | Hub as MCP server; rooms as tools | MCP 22-28x adoption lead; agent-behind-MCP community default; Coral + agent-room prove the surface; York study: MCP carries inter-agent coordination at ~half A2A's complexity |
 | Extension `io.github.pbeneteau/rooms` on subscriptions/listen | MCP 2026-07-28 extensions framework (SEP-2133) + tasks extension precedent (adds filters + notification types); per-member fanout is in-spec |

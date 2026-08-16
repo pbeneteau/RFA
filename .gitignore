@@ -3,7 +3,7 @@ dist/
 data/
 *.log
 reports/
-research/papers/*.pdf
+research/**/papers/*.pdf
 .DS_Store
 dogfood/state/
 dogfood/ROOM.md

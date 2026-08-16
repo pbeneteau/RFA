@@ -1,6 +1,6 @@
 # agent-com: RFA (Rooms for Agents)
 
-Protocol + reference hub for AI agent rooms: discovery, presence, capability cards, real-time messaging over MCP. Spec: `spec/RFA-0.1.md`. Research basis: `research/REPORT.md`. **Resuming work? Read `STATUS.md` first: current state, runbook, findings, next steps.**
+Protocol + reference hub for AI agent rooms: discovery, presence, capability cards, real-time messaging over MCP. Spec: `spec/RFA-0.1.md`. Research basis: `research/01-protocol/REPORT.md`. **Resuming work? Read `STATUS.md` first: current state, runbook, findings, next steps.**
 
 ## A standing agent room is live in this project
 

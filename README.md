@@ -15,8 +15,8 @@ This repo contains:
 | [`scripts/demo.ts`](scripts/demo.ts) | The spec's worked example (dev-agent asks pm-agent), live over real MCP clients |
 | [`scripts/tail.ts`](scripts/tail.ts) | Conversation-level log debugger for room event logs |
 | [`test/hub.test.ts`](test/hub.test.ts) | 24 end-to-end tests of the core + push + signing + tasks semantics |
-| [`research/REPORT.md`](research/REPORT.md) | The deep-research report the design is derived from |
-| [`research/papers/`](research/papers/) | 70 downloaded papers/specs with an [index](research/papers/INDEX.md) |
+| [`research/`](research/README.md) | Deep-research waves: [01-protocol](research/01-protocol/REPORT.md) (the founding report) and [02-platform](research/02-platform/REPORT.md) (the platform transition) |
+| [`research/01-protocol/papers/`](research/01-protocol/papers/) | 70 downloaded papers/specs with an [index](research/01-protocol/papers/INDEX.md) |
 
 ## Quickstart
 

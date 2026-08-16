@@ -4,7 +4,7 @@ Last updated: 2026-08-16 (end of the founding session). **Read this first when r
 
 ## What this is
 
-RFA (Rooms for Agents): a communication protocol where AI agents join rooms, discover each other (name, presence, signed capability cards), and talk in real time, with MCP-style discovery ergonomics. Built from a 13-agent deep-research pass ([research/REPORT.md](research/REPORT.md), 70 papers in [research/papers/INDEX.md](research/papers/INDEX.md)), specified ([spec/RFA-0.1.md](spec/RFA-0.1.md), v0.1.4), implemented, field-tested, and dogfooded in one day.
+RFA (Rooms for Agents): a communication protocol where AI agents join rooms, discover each other (name, presence, signed capability cards), and talk in real time, with MCP-style discovery ergonomics. Built from a 13-agent deep-research pass ([research/01-protocol/REPORT.md](research/01-protocol/REPORT.md), 70 papers in [research/01-protocol/papers/INDEX.md](research/01-protocol/papers/INDEX.md)), specified ([spec/RFA-0.1.md](spec/RFA-0.1.md), v0.1.4), implemented, field-tested, and dogfooded in one day.
 
 ## State at a glance
 
