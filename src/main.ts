@@ -9,6 +9,8 @@
  *   rfa-hub --require-signed        refuse joins whose card cannot be verified
  *   rfa-hub --human-key k1,k2       provisioned human-principal keys (joins presenting one get origin=human;
  *                                   required for room_admin approve and quarantine release). Also RFA_HUMAN_KEYS.
+ *   rfa-hub --otel                  emit one compact stderr line per tool-call span (spec 13). Without this
+ *                                   flag spans are no-ops unless the operator registers their own OTel SDK.
  */
 import * as fs from "node:fs";
 import * as http from "node:http";
@@ -38,6 +40,33 @@ try {
   process.exit(1);
 }
 const httpPort = arg("--http");
+
+// --otel: the built-in minimal exporter (one line per span on stderr). Serious
+// deployments skip the flag and register a real OTel SDK; the hub only ever
+// depends on @opentelemetry/api.
+if (process.argv.includes("--otel")) {
+  const { trace } = await import("@opentelemetry/api");
+  const { BasicTracerProvider, SimpleSpanProcessor } = await import("@opentelemetry/sdk-trace-base");
+  const exporter = {
+    export(spans: any[], done: (r: { code: number }) => void) {
+      for (const s of spans) {
+        const ms = (s.duration[0] * 1e3 + s.duration[1] / 1e6).toFixed(1);
+        const a = s.attributes ?? {};
+        const extras = ["rfa.room", "rfa.member", "rfa.seq", "rfa.error_code"]
+          .filter((k) => a[k] !== undefined)
+          .map((k) => `${k.slice(4)}=${a[k]}`)
+          .join(" ");
+        console.error(`otel ${s.name} ${ms}ms${extras ? " " + extras : ""}`);
+      }
+      done({ code: 0 });
+    },
+    shutdown: () => Promise.resolve(),
+    forceFlush: () => Promise.resolve(),
+  };
+  const provider = new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter as never)] });
+  trace.setGlobalTracerProvider(provider);
+  console.error("rfa-hub: otel span logging on (stderr)");
+}
 
 process.on("SIGINT", () => {
   hub.close();

@@ -1447,6 +1447,12 @@ export class RoomHub {
     return { watching: true, cursor: room.seq, replayed };
   }
 
+  /** Side-effect-free member lookup for span attribution: never throws, never renews leases. */
+  peekMember(roomHandle: string, token: string): string | null {
+    const entry = this.tokens.get(token);
+    return entry && entry.room === roomHandle ? entry.memberId : null;
+  }
+
   /** Remove every watcher registered by a connection (called when it closes). */
   dropConnection(connectionId: string): void {
     for (const room of this.rooms.values()) {

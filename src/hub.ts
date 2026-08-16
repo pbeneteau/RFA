@@ -3,6 +3,7 @@
  * One McpServer instance per connection; all of them share a RoomHub.
  */
 import { McpServer } from "@modelcontextprotocol/server";
+import { SpanStatusCode, context as otelContext, createTraceState, trace } from "@opentelemetry/api";
 import * as z from "zod";
 import { RfaError } from "./errors.js";
 import type { RoomHub } from "./store.js";
@@ -75,12 +76,72 @@ function fail(err: unknown): ToolResult {
   throw err;
 }
 
-async function run(fn: () => unknown | Promise<unknown>): Promise<ToolResult> {
-  try {
-    return ok(await fn());
-  } catch (err) {
-    return fail(err);
-  }
+const tracer = trace.getTracer("rfa-hub", "0.6.0");
+
+/**
+ * One OTel span per tool call (spec 13): `rfa.{tool}` with rfa.room /
+ * rfa.member / rfa.seq and the MCP semconv method attribute. When the caller
+ * propagated SEP-414 trace context in _meta, the hub span joins that trace.
+ * Without a registered tracer provider this is a no-op (api-only default).
+ */
+async function run(
+  hub: RoomHub,
+  tool: string,
+  rawArgs: unknown,
+  fn: () => unknown | Promise<unknown>,
+): Promise<ToolResult> {
+  const args = (rawArgs ?? {}) as { room?: unknown; membership_token?: unknown; _meta?: unknown };
+  const meta = (args._meta ?? {}) as Record<string, unknown>;
+  const parent = parentFromTraceparent(meta);
+  return tracer.startActiveSpan(
+    `rfa.${tool}`,
+    {
+      attributes: {
+        "mcp.method.name": "tools/call",
+        "mcp.tool.name": tool,
+        ...(typeof args.room === "string" ? { "rfa.room": args.room } : {}),
+      },
+    },
+    parent,
+    async (span) => {
+      if (typeof args.room === "string" && typeof args.membership_token === "string") {
+        const member = hub.peekMember(args.room, args.membership_token);
+        if (member) span.setAttribute("rfa.member", member);
+      }
+      try {
+        const result = await fn();
+        const seq = (result as { seq?: unknown } | null | undefined)?.seq;
+        if (typeof seq === "number") span.setAttribute("rfa.seq", seq);
+        return ok(result);
+      } catch (err) {
+        if (err instanceof RfaError) {
+          span.setAttribute("rfa.error_code", err.code);
+          span.setStatus({ code: SpanStatusCode.ERROR, message: err.code });
+          return fail(err);
+        }
+        span.recordException(err as Error);
+        span.setStatus({ code: SpanStatusCode.ERROR });
+        throw err;
+      } finally {
+        span.end();
+      }
+    },
+  );
+}
+
+/** Parse a W3C traceparent from _meta directly (no dependence on a globally registered propagator). */
+function parentFromTraceparent(meta: Record<string, unknown>): ReturnType<typeof otelContext.active> {
+  const active = otelContext.active();
+  if (typeof meta.traceparent !== "string") return active;
+  const m = /^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/.exec(meta.traceparent);
+  if (!m || m[1] === "0".repeat(32) || m[2] === "0".repeat(16)) return active;
+  return trace.setSpanContext(active, {
+    traceId: m[1],
+    spanId: m[2],
+    traceFlags: parseInt(m[3], 16) & 1,
+    isRemote: true,
+    ...(typeof meta.tracestate === "string" ? { traceState: createTraceState(meta.tracestate) } : {}),
+  });
 }
 
 let connectionCounter = 0;
@@ -115,7 +176,7 @@ export function createHubServer(hub: RoomHub): McpServer {
       },
     },
     async (args) =>
-      run(() => {
+      run(hub, "room_create", args, () => {
         const { join_secret, contract } = hub.createRoom(args);
         return { join_secret, ...contract };
       }),
@@ -144,7 +205,7 @@ export function createHubServer(hub: RoomHub): McpServer {
         history_limit: z.number().int().min(0).max(500).optional(),
       },
     },
-    async (args) => run(() => hub.join(args)),
+    async (args) => run(hub, "room_join", args, () => hub.join(args)),
   );
 
   server.registerTool(
@@ -154,7 +215,7 @@ export function createHubServer(hub: RoomHub): McpServer {
       description: "Leave the room. Your name is freed (rebind-guarded), your token is revoked.",
       inputSchema: { room: z.string(), membership_token: TOKEN },
     },
-    async (args) => run(() => hub.leave(args)),
+    async (args) => run(hub, "room_leave", args, () => hub.leave(args)),
   );
 
   server.registerTool(
@@ -195,7 +256,7 @@ export function createHubServer(hub: RoomHub): McpServer {
         ext: z.record(z.string(), z.unknown()).optional(),
       },
     },
-    async (args) => run(() => hub.send(args as Parameters<typeof hub.send>[0])),
+    async (args) => run(hub, "room_send", args, () => hub.send(args as Parameters<typeof hub.send>[0])),
   );
 
   server.registerTool(
@@ -220,7 +281,7 @@ export function createHubServer(hub: RoomHub): McpServer {
         presence: DECLARED.optional(),
       },
     },
-    async (args) => run(() => hub.listen(args)),
+    async (args) => run(hub, "room_listen", args, () => hub.listen(args)),
   );
 
   server.registerTool(
@@ -232,7 +293,7 @@ export function createHubServer(hub: RoomHub): McpServer {
         "Refresh this after any roster event before addressing members by name.",
       inputSchema: { room: z.string(), membership_token: TOKEN },
     },
-    async (args) => run(() => hub.roster(args)),
+    async (args) => run(hub, "room_roster", args, () => hub.roster(args)),
   );
 
   server.registerTool(
@@ -253,7 +314,7 @@ export function createHubServer(hub: RoomHub): McpServer {
         card: cardSchema.optional(),
       },
     },
-    async (args) => run(() => hub.presence(args)),
+    async (args) => run(hub, "room_presence", args, () => hub.presence(args)),
   );
 
   server.registerTool(
@@ -270,7 +331,7 @@ export function createHubServer(hub: RoomHub): McpServer {
         digest: z.string().optional(),
       },
     },
-    async (args) => run(() => hub.describe(args)),
+    async (args) => run(hub, "agent_describe", args, () => hub.describe(args)),
   );
 
   server.registerTool(
@@ -306,7 +367,7 @@ export function createHubServer(hub: RoomHub): McpServer {
         verdict: z.enum(["accept", "reject"]).optional(),
       },
     },
-    async (args) => run(() => hub.task(args as Parameters<typeof hub.task>[0])),
+    async (args) => run(hub, "room_task", args, () => hub.task(args as Parameters<typeof hub.task>[0])),
   );
 
   server.registerTool(
@@ -347,7 +408,7 @@ export function createHubServer(hub: RoomHub): McpServer {
           .describe("Verb-specific: inject {text, mentions?, kind?}, set_policy {policies}, set_role {role}"),
       },
     },
-    async (args) => run(() => hub.admin(args as Parameters<typeof hub.admin>[0])),
+    async (args) => run(hub, "room_admin", args, () => hub.admin(args as Parameters<typeof hub.admin>[0])),
   );
 
   server.registerTool(
@@ -370,7 +431,7 @@ export function createHubServer(hub: RoomHub): McpServer {
       },
     },
     async (args) =>
-      run(() =>
+      run(hub, "room_watch", args, () =>
         hub.watch({
           ...args,
           connectionId,
@@ -392,7 +453,7 @@ export function createHubServer(hub: RoomHub): McpServer {
       description: "Host only. Ends the room: members are notified, further sends fail, reads keep working.",
       inputSchema: { room: z.string(), membership_token: TOKEN, summary: z.string().max(2000).optional() },
     },
-    async (args) => run(() => hub.end(args)),
+    async (args) => run(hub, "room_end", args, () => hub.end(args)),
   );
 
   return server;

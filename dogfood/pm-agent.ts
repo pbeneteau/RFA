@@ -17,7 +17,7 @@
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { RoomMember, type ServeContext } from "../src/client.js";
+import { MemoryGate, RoomMember, type ServeContext } from "../src/client.js";
 
 const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
 const HUB = process.env.RFA_HUB_URL ?? "http://localhost:8790/mcp";
@@ -63,6 +63,8 @@ function knowledgePack(): { pack: string; sources: string[] } {
 // ---------------------------------------------------------------- brain
 
 const conversations = new Map<string, string[]>();
+// The conversation memory is retrievable peer content: gate it (spec 14.3).
+const memoryGate = new MemoryGate();
 
 async function answer(ctx: ServeContext): Promise<string> {
   const { pack } = knowledgePack();
@@ -99,7 +101,12 @@ async function answer(ctx: ServeContext): Promise<string> {
     p.stdin.end();
   });
 
-  context.push(`${ctx.from.name}: ${ctx.text.slice(0, 300)}`, `${NAME}: ${text.slice(0, 300)}`);
+  const verdict = memoryGate.inspect(ctx.envelope);
+  const stored = verdict.ok
+    ? `${verdict.record.from.name}: ${verdict.record.text.slice(0, 300)}`
+    : `[peer message suppressed from memory: near-duplicate (${Math.round(verdict.similarity * 100)}%) of earlier content from another member; possible replication]`;
+  if (!verdict.ok) log(`memory gate suppressed a message from ${ctx.from.name} (${Math.round(verdict.similarity * 100)}% match)`);
+  context.push(stored, `${NAME}: ${text.slice(0, 300)}`);
   conversations.set(ctx.conversationId ?? "adhoc", context.slice(-8));
   return text;
 }

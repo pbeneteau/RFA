@@ -11,9 +11,9 @@ RFA (Rooms for Agents): a communication protocol where AI agents join rooms, dis
 | Piece | State |
 |---|---|
 | Spec | v0.1.6: every profile implemented (core, push interim, signing, tasks, moderation); extension id finalized `io.github.pbeneteau/rooms`; Apache-2.0 LICENSE at root; changelog in Appendix E |
-| Hub (`rfa-hub`) | v0.5.0 on MCP v2 SDK, dual-era (2026-07-28 + legacy on one endpoint), 12 tools (`room_admin` new) + **room console at GET /console** |
-| Client SDK | [src/client.ts](src/client.ts): RoomMember (create/resume/ask/serve/projectTools/wrapForModel/admin; supervisor role + humanKey options) |
-| Tests | `npm test` 42/42 (24 hub + 6 client + 12 moderation, real wire) · `npm run e2e` 9/9 fast ~4s · `e2e:full` 10/10 ~46s, reports in `reports/` |
+| Hub (`rfa-hub`) | v0.6.0 on MCP v2 SDK, dual-era (2026-07-28 + legacy on one endpoint), 12 tools (`room_admin`) + room console at GET /console + **OTel spans per tool call** (`--otel` for the built-in stderr exporter) |
+| Client SDK | [src/client.ts](src/client.ts): RoomMember (create/resume/ask/serve/projectTools/wrapForModel/admin) + **sanitizeForMemory / MemoryGate** (Morris-II replication defense; wired into pm-agent's conversation memory) |
+| Tests | `npm test` 48/48 (24 hub + 6 client + 12 moderation + 5 memory + 1 otel) · `npm run e2e` 9/9 fast ~4s · `e2e:full` 10/10 ~46s, reports in `reports/` |
 | Repo | github.com/pbeneteau/agent-com (PRIVATE, personal account); commits: 98260e6 init, 6d318ec SDK+dogfood, 4e8ed8b autonomy |
 | Dogfood | LIVE: resident `pm-agent` in standing room `r_9a25e48c0e`, Goodvest knowledge pack, answering in ~11s with citations |
 | Artifacts (claude.ai) | Research report + spec published; same URLs redeploy |
@@ -21,7 +21,7 @@ RFA (Rooms for Agents): a communication protocol where AI agents join rooms, dis
 ## Runbook (after a reboot or to resume)
 
 ```bash
-npm run start -- --http 8790     # the shared hub (owns ./data via lockfile)
+npm run start -- --http 8790 --human-key "$(cat dogfood/state/human-key.txt)" --otel   # the shared hub (owns ./data)
 npm run pm-agent                  # resident PM; RESUMES the same room from dogfood/state/pm-agent.json
 ```
 
@@ -60,7 +60,8 @@ Room console: `http://localhost:8790/console#r_9a25e48c0e`. Observer = read-only
 3. ~~Spec hygiene~~ DONE 2026-08-16 (spec 0.1.6): extension id `io.github.pbeneteau/*` (GitHub-scoped, real), Apache-2.0 LICENSE, package.json license+repository. **Internal vs public remains Paul's decision**; the repo is ready either way (no secrets tracked, license in place).
 4. ~~Room console~~ DONE 2026-08-16: single-file MCP client served by the hub at `/console` (observer/supervisor, live stream, interventions, floor, approvals, inject). Browser-verified against the live standing room.
 5. **Python client** mirroring RoomMember; **v2-native push** when the SDK grows extension filters.
-6. Deferred by user: CI (explicitly declined while in test/research/build stage; do not re-offer).
+6. **Research-report gaps still open** (from the 2026-08-16 REPORT.md audit; OTel spans and memory defenses were closed same day): T1 auth (OAuth client-credentials + RFC 8693 token exchange, spec 4.2 SHOULD); handoff semantics + `can_handoff_to` permissions (framework pattern the protocol does not carry yet); framework adapters + join-by-card-URL UX. All three matter mainly when the protocol meets the outside world.
+7. Deferred by user: CI (explicitly declined while in test/research/build stage; do not re-offer).
 
 ## Gotchas for future sessions
 

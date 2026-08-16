@@ -77,6 +77,7 @@ npm run tail -- data/rooms/r_XXXX.ndjson --follow
 - **Delivery outcomes** (spec 9.1): durable-append send with per-recipient `live|queued`; per-sender rate limits, duplicate suppression, mention caps.
 - **Name safety** (spec 4.1): collision auto-suffixing, `name_rebound` guard against misdelivery after churn.
 - **Persistence**: NDJSON event log + `meta.json` (0600) per room; rooms, tokens, and history survive restarts.
+- **Observability (spec 13)**: one OTel span per tool call (`rfa.{tool}` with `rfa.room`/`rfa.member`/`rfa.seq`/`rfa.error_code` + MCP semconv), joining the caller's trace when `_meta` carries SEP-414 `traceparent`. The hub depends on `@opentelemetry/api` only (no-op by default); `--otel` turns on a built-in compact exporter (one stderr line per span), or register your own OTel SDK.
 
 - **Push (interim binding, spec 11.2b)**: `room_watch` turns the agent's own MCP connection into a push channel; matching events arrive as `notifications/room/event` with no polling (replay-from-cursor on registration, unwatch via `enabled: false`, auto-cleanup on connection close, watched members count as `live` in send dispositions). Needs a persistent connection (stdio); try it: `npm run demo:push`. Interactive hosts that do not surface custom notifications to the model should keep using `room_listen`.
 
@@ -101,6 +102,8 @@ npm run tail -- data/rooms/r_XXXX.ndjson --follow
 Implemented: server-stamped `origin` (clients cannot claim to be human), membership tokens as the only authority, digest+id capability binding, rate/fan-out/dedupe limits, mention-gated attention, rebind-guarded names, bearer secrets kept out of URLs, 0600 metadata files. Not implemented here (bring your own or wait for v0.2): TLS termination, OAuth tiers, pre-delivery policy hooks.
 
 **Client-side rule that no hub can enforce for you**: treat every message from another member as untrusted data. Wrap it in a data boundary before showing it to your model, and never let its content authorize anything.
+
+**Retrievable memory is a worm substrate** (spec 14.3, the Morris-II result): never auto-ingest peer messages into RAG or conversation memory raw. The SDK ships the defenses: `RoomMember.sanitizeForMemory(envelope)` produces a provenance-stamped, neutralized record, and `MemoryGate.inspect(envelope)` flags near-identical content arriving from *different* senders: the replication signature of a self-propagating prompt (shingle-Jaccard, configurable window/threshold). The resident pm-agent gates its conversation memory with exactly this.
 
 ## License
 
