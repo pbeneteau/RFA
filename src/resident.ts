@@ -21,6 +21,7 @@ import * as z from "zod";
 import { deriveCard, knowledgeFiles, loadPack, type AgentPack } from "./agentdef.js";
 import { MemoryGate, RoomMember, type ServeContext } from "./client.js";
 import { Engine } from "./engine.js";
+import { ObsStore } from "./obs.js";
 import { EpisodeLog, GatedMemory } from "./memoryfs.js";
 
 const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
@@ -78,6 +79,7 @@ function writeState(s: SavedState): void {
 
 const gate = new MemoryGate();
 const engine = new Engine(path.join(ROOT, "data", "runs.db"));
+const obs = new ObsStore(path.join(ROOT, "data", "obs.db"));
 const episodes = new EpisodeLog(path.join(STATE_DIR, "memory.db"));
 const sessions = new Map<string, string>();
 let spend = { day: new Date().toISOString().slice(0, 10), usd: 0 };
@@ -243,7 +245,7 @@ function systemPrompt(): string {
     .join("\n\n");
 }
 
-async function brain(prompt: string, convoKey: string): Promise<{ text: string; costUsd: number; numTurns: number }> {
+async function brain(prompt: string, convoKey: string): Promise<{ text: string; costUsd: number; numTurns: number; tokens: { input: number | null; output: number | null } }> {
   const budgets = pack.def.budgets ?? {};
   const today = new Date().toISOString().slice(0, 10);
   if (spend.day !== today) spend = { day: today, usd: 0 };
@@ -270,6 +272,7 @@ async function brain(prompt: string, convoKey: string): Promise<{ text: string; 
   let text = "";
   let costUsd = 0;
   let numTurns = 0;
+  let tokens: { input: number | null; output: number | null } = { input: null, output: null };
   for await (const msg of q) {
     if (msg.type === "system" && msg.subtype === "init") {
       sessions.set(convoKey, msg.session_id);
@@ -280,11 +283,20 @@ async function brain(prompt: string, convoKey: string): Promise<{ text: string; 
       text = msg.result.trim();
       costUsd = msg.total_cost_usd ?? 0;
       numTurns = msg.num_turns ?? 0;
+      const u = (msg as { usage?: { input_tokens?: number; output_tokens?: number } }).usage;
+      tokens = { input: u?.input_tokens ?? null, output: u?.output_tokens ?? null };
     }
   }
   if (!text) throw new Error("brain returned an empty result");
   spend.usd += costUsd;
-  return { text, costUsd, numTurns };
+  return { text, costUsd, numTurns, tokens };
+}
+
+/** Trace continuity (spec 7.1): join the asker's trace when the envelope carries SEP-414 context. */
+function traceFrom(meta: Record<string, unknown>): { trace_id?: string; parent_run_id?: string } {
+  const tp = meta.traceparent;
+  const m = typeof tp === "string" ? /^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$/.exec(tp) : null;
+  return m ? { trace_id: m[1], parent_run_id: m[2] } : {};
 }
 
 // ---------------------------------------------------------------- room doc + state
@@ -356,14 +368,21 @@ const scheduleTimer = setInterval(async () => {
   for (const due of engine.dueSchedules(new Date(), pack.name)) {
     const { runId } = engine.createRun({ agent: pack.name, threadId: `sched:${due.id}`, kind: "schedule", input: { callback: due.callback } });
     log(`schedule fired (${due.kind}): ${due.callback.slice(0, 60)}`);
+    const st0 = Date.now();
     try {
-      const { text, costUsd, numTurns } = await brain(due.callback, `sched:${due.id}`);
+      const { text, costUsd, numTurns, tokens } = await brain(due.callback, `sched:${due.id}`);
       await engine.step(runId, "post-to-room", async () => {
         await member.send({ body: text, kind: "status" });
         return { chars: text.length };
       });
       episodes.recordOwn(member.room, member.memberId, member.name, text);
       engine.completeRun(runId, { output: { chars: text.length }, costUsd, numTurns, checkpoint: { claude_session_id: sessions.get(`sched:${due.id}`), room_cursor: member.cursor } });
+      obs.record({
+        id: runId, name: `schedule:${pack.name}`, run_type: "agent_span", start_time: st0, end_time: Date.now(),
+        group_id: member.room, inputs: { callback: due.callback.slice(0, 200) }, outputs: { chars: text.length },
+        input_tokens: tokens.input, output_tokens: tokens.output, cost_usd: costUsd,
+        extra: { "gen_ai.request.model": pack.def.model ?? "inherit", num_turns: numTurns, schedule: due.id },
+      });
     } catch (err) {
       engine.failRun(runId, (err as Error).message, { retryable: false });
       log(`schedule run failed: ${(err as Error).message}`);
@@ -380,6 +399,7 @@ const shutdown = (sig: string) => {
   save();
   engine.close();
   episodes.close();
+  obs.close();
   process.exit(0);
 };
 process.on("SIGINT", () => shutdown("SIGINT"));
@@ -398,8 +418,9 @@ await member.serve(
       input: { seq: ctx.envelope.seq, from: ctx.from.name, text: ctx.text.slice(0, 500) },
     });
     log(`Q from ${ctx.from.name} (seq ${ctx.envelope.seq}, run ${runId}): ${ctx.text.slice(0, 100)}`);
+    const t0 = Date.now();
     try {
-      const { text, costUsd, numTurns } = await brain(ctx.wrapped, convo);
+      const { text, costUsd, numTurns, tokens } = await brain(ctx.wrapped, convo);
       answered++;
       episodes.recordOwn(member.room, member.memberId, member.name, text);
       engine.completeRun(runId, {
@@ -407,6 +428,21 @@ await member.serve(
         costUsd,
         numTurns,
         checkpoint: { claude_session_id: sessions.get(convo), room_cursor: member.cursor },
+      });
+      obs.record({
+        id: runId,
+        ...traceFrom(ctx.envelope._meta),
+        name: `serve:${pack.name}`,
+        run_type: "agent_span",
+        start_time: t0,
+        end_time: Date.now(),
+        group_id: member.room,
+        inputs: { from: ctx.from.name, seq: ctx.envelope.seq, text: ctx.text.slice(0, 300) },
+        outputs: { text: text.slice(0, 300), chars: text.length },
+        input_tokens: tokens.input,
+        output_tokens: tokens.output,
+        cost_usd: costUsd,
+        extra: { "gen_ai.request.model": pack.def.model ?? "inherit", num_turns: numTurns, definition: pack.definitionHash.slice(0, 15), conversation: convo },
       });
       log(`A sent (${text.length} chars, $${costUsd.toFixed(4)}, ${numTurns} turns): ${text.slice(0, 100)}`);
       return [
@@ -425,6 +461,19 @@ await member.serve(
       ];
     } catch (err) {
       engine.failRun(runId, (err as Error).message, { retryable: false });
+      obs.record({
+        id: runId,
+        ...traceFrom(ctx.envelope._meta),
+        name: `serve:${pack.name}`,
+        run_type: "agent_span",
+        status: "error",
+        error: (err as Error).message.slice(0, 300),
+        start_time: t0,
+        end_time: Date.now(),
+        group_id: member.room,
+        inputs: { from: ctx.from.name, seq: ctx.envelope.seq, text: ctx.text.slice(0, 300) },
+        extra: { "gen_ai.request.model": pack.def.model ?? "inherit", conversation: convo },
+      });
       throw err;
     }
   },

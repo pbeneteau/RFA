@@ -49,6 +49,13 @@ const httpPort = arg("--http");
 if (process.argv.includes("--otel")) {
   const { trace } = await import("@opentelemetry/api");
   const { BasicTracerProvider, SimpleSpanProcessor } = await import("@opentelemetry/sdk-trace-base");
+  // The obs bridge (spec 7.1): every hub tool-call span also lands as a run
+  // row in the local trace store, joined to the caller's trace when present.
+  const obsStore =
+    dataArg === "none"
+      ? null
+      : new (await import("./obs.js")).ObsStore(`${dataArg === "none" ? "." : dataArg}/obs.db`);
+  const hr = (t: [number, number]) => t[0] * 1e3 + t[1] / 1e6;
   const exporter = {
     export(spans: any[], done: (r: { code: number }) => void) {
       for (const s of spans) {
@@ -59,6 +66,26 @@ if (process.argv.includes("--otel")) {
           .map((k) => `${k.slice(4)}=${a[k]}`)
           .join(" ");
         console.error(`otel ${s.name} ${ms}ms${extras ? " " + extras : ""}`);
+        // room_listen long-polls dominate volume with zero diagnostic value when healthy; skip them.
+        if (obsStore && s.name !== "rfa.room_listen") {
+          try {
+            obsStore.record({
+              id: s.spanContext().spanId,
+              trace_id: s.spanContext().traceId,
+              parent_run_id: s.parentSpanContext?.spanId ?? null,
+              name: s.name,
+              run_type: "tool",
+              status: s.status?.code === 2 ? "error" : "success",
+              error: a["rfa.error_code"] ? String(a["rfa.error_code"]) : null,
+              start_time: hr(s.startTime),
+              end_time: hr(s.endTime),
+              group_id: a["rfa.room"] ? String(a["rfa.room"]) : null,
+              extra: { member: a["rfa.member"] ?? null, seq: a["rfa.seq"] ?? null, "mcp.tool.name": a["mcp.tool.name"] },
+            });
+          } catch {
+            /* observability must never break serving */
+          }
+        }
       }
       done({ code: 0 });
     },
@@ -67,7 +94,7 @@ if (process.argv.includes("--otel")) {
   };
   const provider = new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter as never)] });
   trace.setGlobalTracerProvider(provider);
-  console.error("rfa-hub: otel span logging on (stderr)");
+  console.error(`rfa-hub: otel span logging on (stderr)${obsStore ? " + obs.db bridge" : ""}`);
 }
 
 process.on("SIGINT", () => {

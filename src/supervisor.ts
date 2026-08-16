@@ -20,6 +20,9 @@ import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { listPacks, loadPack, type AgentPack } from "./agentdef.js";
+import { RoomMember } from "./client.js";
+import { ObsStore, evaluateAlerts } from "./obs.js";
+import { runBackup } from "./platform.js";
 import { loadSecrets, pickSecrets } from "./secrets.js";
 
 const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
@@ -181,15 +184,121 @@ async function reconcile(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------- platform duties (v0.4.3): #ops alerts, retention, backup
+
+const HUB = process.env.RFA_HUB_URL ?? "http://localhost:8790/mcp";
+const OPS_STATE = path.join(ROOT, "data", "ops-room.json");
+const OBS_DB = path.join(ROOT, "data", "obs.db");
+const OPS = {
+  alertEveryMs: 5 * 60_000,
+  alertWindowMs: 15 * 60_000,
+  alertCooldownMs: 30 * 60_000,
+  retentionDays: 14,
+  backupHourLocal: 3, // daily, once past 03:00
+  backupKeep: 7,
+};
+
+let opsRoom: RoomMember | null = null;
+const alertLastSent = new Map<string, number>();
+
+/** The supervisor is itself a member: it owns the #ops room and speaks alerts into it. */
+async function opsMember(): Promise<RoomMember | null> {
+  if (opsRoom) return opsRoom;
+  try {
+    if (fs.existsSync(OPS_STATE)) {
+      const saved = JSON.parse(fs.readFileSync(OPS_STATE, "utf8"));
+      opsRoom = await RoomMember.resume({ hubUrl: HUB, ...saved, clientInfo: { name: "rfa-supervisor", version: "0.4.3" } });
+      return opsRoom;
+    }
+    opsRoom = await RoomMember.create({
+      hubUrl: HUB,
+      name: "platform",
+      topic: "#ops: platform alerts (error rate, latency, feedback), backups, retention",
+      card: { name: "platform", description: "The supervisor process: posts alerts and platform notices.", skills: [{ id: "ops-alerts", description: "Posts threshold alerts from the local observability store." }] },
+      clientInfo: { name: "rfa-supervisor", version: "0.4.3" },
+    });
+    fs.writeFileSync(
+      OPS_STATE,
+      JSON.stringify({ room: opsRoom.room, membershipToken: opsRoom.membershipToken, memberId: opsRoom.memberId, name: opsRoom.name, joinSecret: opsRoom.joinSecret }, null, 2),
+      { mode: 0o600 },
+    );
+    log(`#ops room created: ${opsRoom.room} (join_secret ${opsRoom.joinSecret}); watch it at /console#${opsRoom.room}`);
+    return opsRoom;
+  } catch (err) {
+    log(`ops room unavailable (${(err as Error).message}); alerts stay in this log`);
+    opsRoom = null;
+    return null;
+  }
+}
+
+async function alertPass(): Promise<void> {
+  if (!fs.existsSync(OBS_DB)) return;
+  const obs = new ObsStore(OBS_DB);
+  try {
+    const summary = obs.summary(OPS.alertWindowMs);
+    const alerts = evaluateAlerts(summary);
+    const now = Date.now();
+    for (const alert of alerts) {
+      if (now - (alertLastSent.get(alert.kind) ?? 0) < OPS.alertCooldownMs) continue;
+      alertLastSent.set(alert.kind, now);
+      log(`ALERT ${alert.kind}: ${alert.message}`);
+      const m = await opsMember();
+      await m?.send({ body: `ALERT ${alert.kind}: ${alert.message}`, kind: "status" }).catch((e) => log(`alert post failed: ${e.message}`));
+    }
+  } finally {
+    obs.close();
+  }
+}
+
+/** Nightly: retention prune + .backup of every SQLite DB + archive of memory/state dirs. */
+let lastBackupDay = "";
+async function nightlyPass(): Promise<void> {
+  const nowD = new Date();
+  const day = nowD.toISOString().slice(0, 10);
+  if (nowD.getHours() < OPS.backupHourLocal || lastBackupDay === day) return;
+  lastBackupDay = day;
+  // Retention first (spec 3.9): prune obs runs unless feedback-bearing or under review.
+  if (fs.existsSync(OBS_DB)) {
+    const obs = new ObsStore(OBS_DB);
+    const pruned = obs.prune(OPS.retentionDays);
+    obs.close();
+    if (pruned > 0) log(`retention: pruned ${pruned} obs runs older than ${OPS.retentionDays}d`);
+  }
+  try {
+    const res = await runBackup({
+      root: ROOT,
+      dbs: [path.join(ROOT, "data", "runs.db"), OBS_DB, ...listPacks(AGENTS).map((p) => path.join(p.dir, "state", "memory.db"))],
+      dirs: ["data/rooms", "dogfood/state", ...listPacks(AGENTS).map((p) => path.relative(ROOT, path.join(p.dir, "memory")))],
+      destRoot: path.join(process.env.HOME ?? ROOT, "Backups", "rfa-agent-com"),
+      keep: OPS.backupKeep,
+      day,
+    });
+    log(`backup written: ${res.dest} (${res.files.length} files, ${res.kept.length} kept)`);
+    const m = await opsMember();
+    await m?.send({ body: `nightly backup written to ${res.dest} (${res.kept.length} kept)`, kind: "status" }).catch(() => {});
+  } catch (err) {
+    log(`backup FAILED: ${(err as Error).message}`);
+    const m = await opsMember();
+    await m?.send({ body: `ALERT backup: nightly backup FAILED: ${(err as Error).message}`, kind: "status" }).catch(() => {});
+  }
+}
+
 // ---------------------------------------------------------------- main
 
 log(`registry: ${AGENTS}`);
 await reconcile();
+void opsMember();
 const timer = setInterval(() => void reconcile(), POLICY.reconcileMs);
+const opsTimer = setInterval(() => {
+  void alertPass();
+  void nightlyPass();
+}, OPS.alertEveryMs);
+opsTimer.unref?.();
 
 async function shutdown(sig: string): Promise<void> {
   log(`${sig}: draining ${children.size} resident(s)`);
   clearInterval(timer);
+  clearInterval(opsTimer);
   await Promise.all([...children.values()].map((c) => drain(c)));
   process.exit(0);
 }

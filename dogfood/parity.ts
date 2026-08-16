@@ -11,6 +11,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { RoomMember } from "../src/client.js";
+import { ObsStore } from "../src/obs.js";
 
 const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
 const FIXTURES = path.join(ROOT, "dogfood", "state", "parity.json");
@@ -30,6 +31,8 @@ const norm = (s: string) => s.toLowerCase().replace(/[\s ]/g, "");
 async function main() {
   const capture = process.argv.includes("--capture");
   const fixtures: Fixture[] = JSON.parse(fs.readFileSync(FIXTURES, "utf8"));
+  const obsPath = path.join(ROOT, "data", "obs.db");
+  const obsStore = fs.existsSync(path.dirname(obsPath)) ? new ObsStore(obsPath) : null;
   const probe = await RoomMember.create({
     hubUrl: HUB, room, joinSecret: secret, name: "parity-probe",
     card: { name: "parity-probe", description: "answer-parity gate probe", skills: [{ id: "parity", description: "checks answer parity across brain changes" }] },
@@ -53,9 +56,23 @@ async function main() {
       console.log(`      kind=${a.kind} cited=${cited} missing=${JSON.stringify(missing)}`);
       console.log(`      got: ${text.slice(0, 200).replace(/\n/g, " ")}`);
     }
+    // The flywheel's first turn: parity verdicts land as evaluator feedback on
+    // the answer's run (the answer json part carries its engine run_id).
+    const runId = (a.parts.find((p) => p.type === "json")?.value as { run_id?: string } | undefined)?.run_id;
+    if (runId && obsStore) {
+      obsStore.feedback({
+        run_id: runId,
+        key: "parity",
+        score: ok ? 1 : 0,
+        comment: ok ? null : `missing=${JSON.stringify(missing)} cited=${cited}`,
+        source_type: "evaluator",
+      });
+      if (!ok) obsStore.markReview(runId, true);
+    }
     if (capture) f.baseline = { text, ms };
   }
   await probe.leave();
+  obsStore?.close();
   if (capture) {
     fs.writeFileSync(FIXTURES, JSON.stringify(fixtures, null, 2));
     console.log(`baseline captured for ${fixtures.length} questions -> ${FIXTURES}`);
