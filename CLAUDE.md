@@ -12,6 +12,6 @@ A resident PM agent holds the Goodvest product knowledge and the RFA spec, and a
 
 ## Working rules
 
-- Verify changes with `npm test` (42 tests) and `npm run e2e` (wire scenarios, writes `reports/latest.md`).
+- Verify changes with `npm test` (48 tests) and `npm run e2e` (wire scenarios, writes `reports/latest.md`).
 - `dogfood/knowledge/`, `dogfood/state/`, `dogfood/ROOM.md`, `data/`, `reports/` are gitignored on purpose (internal docs, secrets, runtime state). Never force-add them.
 - The hub must own its data dir exclusively; for shared use run one HTTP hub (`npm run start -- --http 8790`).

@@ -8,6 +8,7 @@ This repo contains:
 |---|---|
 | [`STATUS.md`](STATUS.md) | **Current state, runbook, findings, next steps (read first when resuming)** |
 | [`spec/RFA-0.1.md`](spec/RFA-0.1.md) | The v0.1 protocol specification (normative) |
+| [`spec/RFA-0.4-platform.md`](spec/RFA-0.4-platform.md) | The v0.4 platform-layer specification (draft): agent packs, engine, memory, sandboxes, governance, evals, workbench |
 | [`src/`](src/) | **rfa-hub**: the reference Room Hub, an MCP server implementing the spec's `core` profile |
 | [`src/client.ts`](src/client.ts) | **rfa-client**: RoomMember SDK (ask/serve, capability projection, spec 9.5 obligations) |
 | [`dogfood/pm-agent.ts`](dogfood/pm-agent.ts) | Resident PM agent (standing room, claude -p brain, knowledge pack) |

@@ -1,16 +1,18 @@
 # Project status and handoff
 
-Last updated: 2026-08-16 (end of the founding session). **Read this first when resuming work.**
+Last updated: 2026-08-16 (founding day + the platform pivot). **Read this first when resuming work.**
 
 ## What this is
 
-RFA (Rooms for Agents): a communication protocol where AI agents join rooms, discover each other (name, presence, signed capability cards), and talk in real time, with MCP-style discovery ergonomics. Built from a 13-agent deep-research pass ([research/01-protocol/REPORT.md](research/01-protocol/REPORT.md), 70 papers in [research/01-protocol/papers/INDEX.md](research/01-protocol/papers/INDEX.md)), specified ([spec/RFA-0.1.md](spec/RFA-0.1.md), v0.1.4), implemented, field-tested, and dogfooded in one day.
+RFA (Rooms for Agents): a communication protocol where AI agents join rooms, discover each other (name, presence, signed capability cards), and talk in real time, with MCP-style discovery ergonomics. Built from a 13-agent deep-research pass ([research/01-protocol/REPORT.md](research/01-protocol/REPORT.md), 70 papers), specified ([spec/RFA-0.1.md](spec/RFA-0.1.md)), implemented, field-tested, and dogfooded in one day.
+
+**Direction since 2026-08-16 evening (owner decision): the platform pivot.** The protocol is the substrate; the product is a personal agent platform for daily Goodvest work: capable resident agents (tools, skills, memory, per-agent model/effort), an engine, sandboxes, observability, governance + budgets, evals, a workbench. Evidence: [research/02-platform/REPORT.md](research/02-platform/REPORT.md) (11-dimension sweep anchored on LangChain deep agents). Normative design: [spec/RFA-0.4-platform.md](spec/RFA-0.4-platform.md) with the v0.4.0-v0.4.6 build path. Core verdict: adopt the industry's schemas, reject its platforms; the Claude Agent SDK is the runtime.
 
 ## State at a glance
 
 | Piece | State |
 |---|---|
-| Spec | v0.1.6: every profile implemented (core, push interim, signing, tasks, moderation); extension id finalized `io.github.pbeneteau/rooms`; Apache-2.0 LICENSE at root; changelog in Appendix E |
+| Spec | Protocol v0.1.6: every profile implemented (core, push interim, signing, tasks, moderation); extension id `io.github.pbeneteau/rooms`; Apache-2.0. **Platform v0.4.0 draft: [spec/RFA-0.4-platform.md](spec/RFA-0.4-platform.md), not yet implemented** |
 | Hub (`rfa-hub`) | v0.6.0 on MCP v2 SDK, dual-era (2026-07-28 + legacy on one endpoint), 12 tools (`room_admin`) + room console at GET /console + **OTel spans per tool call** (`--otel` for the built-in stderr exporter) |
 | Client SDK | [src/client.ts](src/client.ts): RoomMember (create/resume/ask/serve/projectTools/wrapForModel/admin) + **sanitizeForMemory / MemoryGate** (Morris-II replication defense; wired into pm-agent's conversation memory) |
 | Tests | `npm test` 48/48 (24 hub + 6 client + 12 moderation + 5 memory + 1 otel) · `npm run e2e` 9/9 fast ~4s · `e2e:full` 10/10 ~46s, reports in `reports/` |
@@ -53,15 +55,13 @@ Room console: `http://localhost:8790/console#r_9a25e48c0e`. Observer = read-only
 - Member already offline at boot with a pending reply gets no `gone_quiet` (deadline timeout covers it; deliberate).
 - Extension id `io.github.pbeneteau/rooms` is a placeholder domain; no LICENSE file yet.
 
-## What's next (in rough priority)
+## What's next: the v0.4 platform build ([spec/RFA-0.4-platform.md](spec/RFA-0.4-platform.md) section 13 is the ladder)
 
-1. **Let the dogfood week run.** Verdict questions: token economics of mention-gating; lease honesty across laptop sleep; does ask-the-PM beat reading the doc. Log oddities as errata like the last four. (One logged already: the haiku brain leaked a thinking fragment into an answer, "wait, that's not relevant", pm-agent.log 13:09; prompt-quality, not protocol.)
-2. ~~Moderation profile~~ DONE 2026-08-16 (spec 0.1.5, hub 0.5.0): `room_admin` 12 verbs, floor control (sequential/moderator, timers, yield/grant), human principals via `--human-key`, quarantine by name+digest, human-only approve. 12 unit tests + 1 e2e scenario.
-3. ~~Spec hygiene~~ DONE 2026-08-16 (spec 0.1.6): extension id `io.github.pbeneteau/*` (GitHub-scoped, real), Apache-2.0 LICENSE, package.json license+repository. **Internal vs public remains Paul's decision**; the repo is ready either way (no secrets tracked, license in place).
-4. ~~Room console~~ DONE 2026-08-16: single-file MCP client served by the hub at `/console` (observer/supervisor, live stream, interventions, floor, approvals, inject). Browser-verified against the live standing room.
-5. **Python client** mirroring RoomMember; **v2-native push** when the SDK grows extension filters.
-6. **Research-report gaps still open** (from the 2026-08-16 REPORT.md audit; OTel spans and memory defenses were closed same day): T1 auth (OAuth client-credentials + RFC 8693 token exchange, spec 4.2 SHOULD); handoff semantics + `can_handoff_to` permissions (framework pattern the protocol does not carry yet); framework adapters + join-by-card-URL UX. All three matter mainly when the protocol meets the outside world.
-7. Deferred by user: CI (explicitly declined while in test/research/build stage; do not re-offer).
+1. **v0.4.0 (week-one cut)**: Agent SDK swap for pm-agent WITH the answer-parity check (SDK default prompt is minimal: pass the prompt explicitly or use the claude_code preset); session resume replacing the 120KB knowledge re-send (knowledge behind Read/Grep); `agents/pm-agent/agent.md` + `src/agentdef.ts` zod schema + card derived from the definition (announce the one-time digest rotation in the room); `src/supervisor.ts` v0 + two launchd plists + versioned drain; the srt localhost-hub spike.
+2. **v0.4.1** engine + memory v1 · **v0.4.2** governance (12.2 gate, approvals bridge, 3-layer budgets, secrets) + sandbox Tier 1 · **v0.4.3** observability (runs/feedback tables, panels, #ops alerts, retention + nightly backup) · **v0.4.4** evals (computed reward over room logs, baseline gate, promote-case flywheel) · **v0.4.5** workbench stages 2-6 with human_key session-token auth + handoff verb · **v0.4.6** the first real workload: `linear-scribe` + `rfa ask` CLI + Slack channel.
+3. **The dogfood week keeps running underneath**: token economics of mention-gating; lease honesty across laptop sleep; ask-the-PM vs read-the-doc. Errata so far: the haiku thinking-fragment leak (pm-agent.log 13:09); standing rooms accumulate dead memberships (evicted 6 by hand 2026-08-16 evening; a `member_expiry_days` policy is a v0.2-protocol candidate).
+4. Older protocol-tier items, parked behind the platform build: Python client; v2-native push (blocked upstream); T1 OAuth; framework adapters + card-URL join. Handoff moved INTO the v0.4 plan (spec 0.4 section 4.4). **Internal vs public remains Paul's decision.**
+5. Deferred by user: CI (explicitly declined while in test/research/build stage; do not re-offer).
 
 ## Gotchas for future sessions
 
