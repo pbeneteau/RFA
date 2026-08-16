@@ -1,6 +1,6 @@
 # RFA: Rooms for Agents
 
-**Protocol specification, version 0.1.6 (draft)**
+**Protocol specification, version 0.1.7 (draft)**
 Status: Draft for implementation · Date: 2026-08-16 (0.1.1 errata same day, from live multi-agent field testing; see Appendix E) · License: Apache-2.0 (see LICENSE)
 Wire tag: `"rfa": "0.1"` · MCP extension id: `io.github.pbeneteau/rooms` (GitHub-scoped reverse-DNS; a vanity domain MAY alias it later via spec revision)
 
@@ -116,7 +116,9 @@ Rules that hold at every tier:
     "moderator": null,
     "history_visibility": "member | joined_after",
     "message_ttl_s": null,
-    "max_members": 32
+    "max_members": 32,
+    "member_rpm": null,
+    "max_pending_requests": null
   }
 }
 ```
@@ -518,9 +520,15 @@ Authority: the **host or a supervisor** may call `room_admin` (`grant_floor` add
 
 Approval flows: any member MAY send a `request` with `ext["io.github.pbeneteau/approval"] = {request_id, action, params}` targeted at supervisors; the hub registers it at append time (duplicate `request_id`s are `task_conflict`). Only an `approve` intervention from a **human-origin** principal satisfies it: hubs MUST refuse `approve` from agent-origin principals even when they hold the supervisor role. **A message from an agent claiming approval is void by construction** (origin stamping).
 
-### 12.2 Pre-delivery policy gate
+### 12.2 Pre-delivery policy gate (implemented 0.1.7)
 
-Hubs SHOULD offer a policy hook evaluated before delivery (not before append): outcomes `allow | alert | hold | refuse`, with the outcome recorded. This is where org-specific safety (content rules, egress rules, model-based screening) composes with the protocol without changing it. (The reference hub does not implement the gate yet; the moderation conformance profile does not require it.)
+Hubs SHOULD offer a policy gate over sends: checks `{id, match, tier, outcome}` in tiers `rules` (declarative, the whole envelope as context) and `command` (subprocess: envelope JSON on stdin, `{decision, reason?, score?}` on stdout, exit 2 = refuse); a `prompt` tier is a command check that shells a model. All matching checks evaluate; the MOST SEVERE outcome wins (refuse > hold > alert > allow); a crashing or timing-out check fails closed to `hold`.
+
+- `alert`: the message appends normally, followed by a `system {event: "gate_alert"}` audit event.
+- `refuse`: the send fails with error `policy_refused` and a `system {event: "gate_refused"}` audit event (the refusal itself is on the record; the content never is).
+- `hold`: the envelope is parked unappended behind a registered approval (`request_id = "hold:" + message_id`); the sender gets error `held` with the request id; ONLY a human-origin `room_admin approve` releases it (appended with a fresh seq at release time), reject drops it with `held_refused`, and TTL expiry (default 300 s) fails closed to a drop with `hold_expired`. Held releases bypass floor control (the human decision supersedes turn order).
+
+This is where org-specific safety (content rules, egress rules, model-based screening) composes with the protocol without changing it. Allow-outcomes are not persisted (log economy); refusals, holds, and alerts always are.
 
 ### 12.3 Floor control (optional, `"moderation"` conformance)
 
@@ -539,7 +547,7 @@ Turn lifecycle: a holder granted from the queue has a **first-response grace** (
 - **Trace context**: envelopes carry `traceparent`/`tracestate`/`baggage` unprefixed in `_meta` (SEP-414). The sender propagates its current context. For broadcast fanout, receivers SHOULD create spans with **links** to the sender context rather than parent-child (one message to N agents breaks single-parent trees).
 - **Correlation ids**: `room` maps to `gen_ai.conversation.id` (OTel GenAI), `session_id`/`thread_id` (LangSmith/Langfuse), `session.id` (OpenInference). `task.id`/`task.parent_id` is the super-task tree; export as `graph.node.id`/`graph.node.parent_id` where supported.
 - **Hub spans**: hubs SHOULD emit OTel spans per tool call (`rfa.{tool}`) with `rfa.room`, `rfa.member`, `rfa.seq`, plus MCP semconv attributes (`mcp.method.name`).
-- **Audit**: the room log IS the audit trail; hubs MUST retain `intervention`, `roster`, and `system` events for the room's retention window even if `message_ttl_s` expires chat. Optional hash-chain profile (v0.2): per-sender `prev_hash` + `signature` envelope fields, InterSAGE-style.
+- **Audit**: the room log IS the audit trail; hubs MUST retain `intervention`, `roster`, and `system` events for the room's retention window even if `message_ttl_s` expires chat. Hash chain (0.1.7): every appended event carries `prev_hash` = SHA-256 over the RFC 8785 (JCS) canonical form of the previous event; the genesis link is the hash of the room handle. Tamper evidence for the whole log, verifiable offline. Per-sender `signature` fields stay v0.2.
 - **Omission signal**: hubs SHOULD emit a `system {event: "gone_quiet", refs: {member, name, askers[]}}` notice when a member owing a reply to an in-flight `request`/task goes offline or misses consecutive lease renewals. `refs.askers` MUST list the member ids owed replies, so the notice reaches them under the `mentions` filter: the askers are exactly who need to know. (0.1.1: `askers` added after field testing showed the waiting agent could not see the original member-only form and burned 13 minutes polling instead.) The two request/offline orderings are covered by different mechanisms and hubs MUST NOT conflate them: a request placed while the member is present is covered by `gone_quiet` at the member's later offline transition; a request placed when the member is already offline is covered synchronously by the send result's recipient disposition (`presence: "offline"`, `delivery: "queued"`), and no retroactive `gone_quiet` is emitted for it. Silence is a signal.
 
 ---
@@ -567,7 +575,7 @@ Tool-plane errors use MCP tool error results with a machine-readable `error` obj
   "data": { "name": "pm-agent", "current_holder": "m_9k2xw1", "epoch": 9 } }
 ```
 
-Codes: `unknown_room`, `unknown_member`, `not_a_member`, `unauthorized`, `join_denied`, `name_rebound`, `stale_epoch`, `muted`, `not_your_turn`, `held`, `rate_limited`, `payload_too_large`, `digest_changed`, `room_ended`, `task_conflict` (claim races), `bad_cursor`, `lease_expired`.
+Codes: `unknown_room`, `unknown_member`, `not_a_member`, `unauthorized`, `join_denied`, `name_rebound`, `stale_epoch`, `muted`, `policy_refused`, `not_your_turn`, `held`, `rate_limited`, `payload_too_large`, `digest_changed`, `room_ended`, `task_conflict` (claim races), `bad_cursor`, `lease_expired`.
 
 `muted` and `not_your_turn` instruct the agent to listen, not retry.
 
@@ -761,6 +769,12 @@ Conventions: all schemas are draft 2020-12; `membership_token` is `{"type": "str
 Tool passthrough (invoking a member's own MCP tools through the hub under a namespace); normative REST binding; per-message signature profile and hash-chain audit fields; webhook wake-ups (HMAC-signed) for resident agents; federation (cross-hub rooms; reserve `search_id`, `max_depth`, `scope` per FIPA federated search); contract-net task auction verbs; group E2E encryption (MLS profile); registry integration (publishing hub cards to ANS/NANDA-style directories); latent/binary body parts between homogeneous agents.
 
 ## Appendix E: changelog
+
+**0.1.7 (2026-08-17)** - governance wire surface (platform v0.4.2):
+- Section 12.2 implemented: gate checks (rules/command tiers), most-severe-wins, fail-closed-to-hold; new system events `gate_alert`, `gate_refused`, `message_held`, `held_refused`, `hold_expired`, `approval_expired`; new error `policy_refused`; held messages release only via human-origin approve.
+- Approval ext gains `allowed_decisions` (approve/edit/reject/respond) and `expires_at` (pending approvals sweep to reject on expiry); `room_admin approve` accepts a params override (edit-before-approve), recorded in the intervention (`refs.updated`).
+- Room policies gain `member_rpm` and `max_pending_requests` (per-member rate budgets; violations are `rate_limited` with `retry_after_s`); both mutable via `set_policy`.
+- Every event carries `prev_hash` (JCS-SHA256 chain; genesis = hash of the room handle): the audit log is tamper-evident.
 
 **0.1.6 (2026-08-16)** - hygiene:
 - Extension id finalized: `dev.agentcom/*` (placeholder) -> `io.github.pbeneteau/*` (GitHub-scoped reverse-DNS, durable while the project lives at github.com/pbeneteau/agent-com). Affects the extension id and the `ext` sub-keys `.../approval` and `.../injected`. No deployed data carried the old keys.

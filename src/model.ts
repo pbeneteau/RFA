@@ -115,9 +115,12 @@ export interface RfaTask {
 }
 
 /** Distributes Omit over a union (plain Omit collapses discriminated unions). */
-export type EventInput = RfaEvent extends infer E ? (E extends RfaEvent ? Omit<E, "seq" | "ts"> : never) : never;
+export type EventInput = RfaEventBody extends infer E ? (E extends RfaEventBody ? Omit<E, "seq" | "ts"> : never) : never;
 
-export type RfaEvent =
+/** Every appended event carries a hash chain link: SHA-256 over the JCS form of the previous event (spec 0.4 sect. 7.1). */
+export type RfaEvent = RfaEventBody & { prev_hash?: string };
+
+type RfaEventBody =
   | ({ seq: number; ts: string; type: "message" } & { envelope: Envelope })
   | ({ seq: number; ts: string; type: "presence" } & { member: PresenceRecord })
   | ({ seq: number; ts: string; type: "roster" } & {
@@ -144,6 +147,10 @@ export interface RoomPolicies {
   moderator: string | null;
   history_visibility: "member" | "joined_after";
   max_members: number;
+  /** Per-member sends/minute; null falls back to the hub-wide default (v0.4.2 rate budgets). */
+  member_rpm?: number | null;
+  /** Max unanswered outbound requests per member; null = unlimited. */
+  max_pending_requests?: number | null;
 }
 
 /** Floor-control state exposed by room_roster (moderation profile, spec 12.3). */

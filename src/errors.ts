@@ -9,6 +9,7 @@ export type RfaErrorCode =
   | "name_rebound"
   | "stale_epoch"
   | "muted"
+  | "policy_refused"
   | "not_your_turn"
   | "held"
   | "rate_limited"

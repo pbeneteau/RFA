@@ -5,6 +5,7 @@
  * an append-only event log (seq), a roster (epoch), and a policy object.
  * Persistence is an NDJSON event log plus a meta.json snapshot per room.
  */
+import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -60,8 +61,40 @@ export interface HubConfig {
   floorGraceS: number;
   floorRenewS: number;
   floorCapS: number;
+  /** Pre-delivery policy gate checks (spec 12.2, implemented in v0.4.2). */
+  gateChecks: GateCheck[];
+  /** Held messages auto-resolve (refuse) after this many seconds without a human approve. */
+  holdTtlS: number;
   now: () => number;
 }
+
+/**
+ * A policy-gate check (v0.4 spec 7.2). Tiers: `rules` = declarative in-process
+ * match with the whole envelope as context; `command` = subprocess given the
+ * envelope JSON on stdin, answering {decision, reason?, score?} on stdout
+ * (exit 2 = refuse; timeout or crash fails closed to hold). The `prompt` tier
+ * of the spec is a command check that shells a model.
+ */
+export interface GateCheck {
+  id: string;
+  tier: "rules" | "command";
+  match?: {
+    kind?: MessageKind[];
+    origin?: ("human" | "agent")[];
+    /** Case-insensitive regex over the joined text parts. */
+    text_regex?: string;
+    /** Matches when this ext key is present. */
+    ext_key?: string;
+  };
+  /** rules tier: the outcome when match hits. */
+  outcome?: "allow" | "alert" | "hold" | "refuse";
+  /** command tier: argv (the envelope arrives as JSON on stdin). */
+  command?: string[];
+  timeout_ms?: number;
+}
+
+type GateOutcome = "allow" | "alert" | "hold" | "refuse";
+const GATE_SEVERITY: Record<GateOutcome, number> = { allow: 0, alert: 1, hold: 2, refuse: 3 };
 
 export const DEFAULT_CONFIG: HubConfig = {
   dataDir: null,
@@ -86,6 +119,8 @@ export const DEFAULT_CONFIG: HubConfig = {
   floorGraceS: 150,
   floorRenewS: 300,
   floorCapS: 600,
+  gateChecks: [],
+  holdTtlS: 300,
   now: () => Date.now(),
 };
 
@@ -174,10 +209,13 @@ interface Room {
   quarantinedNames: Set<string>;
   quarantinedDigests: Set<string>;
   approvals: Map<string, Approval>;
+  heldMessages: Map<string, HeldMessage>;
+  /** JCS-SHA256 of the last appended event: the hash-chain head. */
+  chainHead: string;
   floor: Floor;
 }
 
-/** Approval-flow record (spec 12.1): satisfied only by a human-origin approve. */
+/** Approval-flow record (spec 12.1, extended v0.4.2): satisfied only by a human-origin approve. */
 interface Approval {
   requestId: string;
   messageId: string;
@@ -185,6 +223,22 @@ interface Approval {
   action: string;
   status: "pending" | "approved" | "rejected";
   decidedBy: string | null;
+  allowedDecisions?: ("approve" | "edit" | "reject" | "respond")[];
+  /** ms epoch; a pending approval past this resolves as reject on sweep. */
+  expiresAt?: number | null;
+  /** Edit-before-approve: the params override the approver supplied, recorded. */
+  decidedParams?: Record<string, unknown> | null;
+  /** Set when this approval guards a held message (gate outcome `hold`). */
+  held?: boolean;
+}
+
+/** A gate-held message: parked, not appended, pending human release (v0.4.2). */
+interface HeldMessage {
+  envelope: Envelope;
+  senderId: string;
+  checkId: string;
+  reason: string;
+  expiresAt: number;
 }
 
 /** Floor-control state (spec 12.3). Transient: resets on hub restart. */
@@ -344,8 +398,11 @@ export class RoomHub {
       quarantinedNames: new Set(),
       quarantinedDigests: new Set(),
       approvals: new Map(),
+      heldMessages: new Map(),
+      chainHead: sha256hex(rid("r") /* placeholder, fixed below */),
       floor: { holder: null, grantedAt: null, turnStartedAt: null, expiresAt: null, queue: [] },
     };
+    room.chainHead = sha256hex(room.handle); // chain genesis = hash of the room handle
     this.rooms.set(room.handle, room);
     const contract = this.doJoin(room, {
       name: args.name,
@@ -655,7 +712,11 @@ export class RoomHub {
     yield_floor?: boolean;
     _meta?: Record<string, unknown>;
     ext?: Record<string, unknown>;
-  }): SendResult {
+  }): Promise<SendResult> {
+    return this.sendInner(args);
+  }
+
+  private async sendInner(args: Parameters<RoomHub["send"]>[0]): Promise<SendResult> {
     const { room, member } = this.auth(args.room, args.membership_token);
     if (room.ended) throw new RfaError("room_ended", `room ${room.handle} has ended`);
     // Observers and supervisors are read-only on the message plane (spec 5.2);
@@ -679,17 +740,27 @@ export class RoomHub {
     const cached = room.dedupe.get(dedupeKey);
     if (cached) return cached;
 
-    // Approval-flow capture (spec 12.1): validated before append, registered
-    // after; only a human-origin room_admin approve can ever satisfy it.
+    // Approval-flow capture (spec 12.1, extended v0.4.2): validated before
+    // append, registered after; only a human-origin approve can satisfy it.
     let pendingApproval: Approval | null = null;
     const approvalExt = (args.ext ?? {})["io.github.pbeneteau/approval"];
     if (approvalExt !== undefined) {
-      const a = approvalExt as { request_id?: unknown; action?: unknown };
+      const a = approvalExt as { request_id?: unknown; action?: unknown; allowed_decisions?: unknown; expires_at?: unknown };
       if (typeof a !== "object" || a === null || typeof a.request_id !== "string" || a.request_id.length < 4) {
         throw new RfaError("bad_request", "ext['io.github.pbeneteau/approval'] requires a request_id string (>= 4 chars)");
       }
       if (room.approvals.has(a.request_id)) {
         throw new RfaError("task_conflict", `approval request_id ${a.request_id} already exists`);
+      }
+      const DECISIONS = ["approve", "edit", "reject", "respond"] as const;
+      const allowed = Array.isArray(a.allowed_decisions)
+        ? (a.allowed_decisions.filter((d) => (DECISIONS as readonly string[]).includes(d as string)) as Approval["allowedDecisions"])
+        : undefined;
+      let expiresAt: number | null = null;
+      if (a.expires_at !== undefined) {
+        const t = Date.parse(String(a.expires_at));
+        if (Number.isNaN(t)) throw new RfaError("bad_request", "approval expires_at must be an ISO 8601 date-time");
+        expiresAt = t;
       }
       pendingApproval = {
         requestId: a.request_id,
@@ -698,6 +769,8 @@ export class RoomHub {
         action: typeof a.action === "string" ? a.action : "",
         status: "pending",
         decidedBy: null,
+        allowedDecisions: allowed,
+        expiresAt,
       };
     }
 
@@ -705,11 +778,22 @@ export class RoomHub {
       throw new RfaError("payload_too_large", `inline body exceeds ${this.cfg.maxInlineBytes} bytes`);
     }
 
-    // Rate limits and duplicate suppression (spec 9.1).
+    // Rate limits and duplicate suppression (spec 9.1 + v0.4.2 room-policy budgets).
     const now = this.cfg.now();
     member.rateWindow = member.rateWindow.filter((t) => now - t < 60_000);
-    if (member.rateWindow.length >= this.cfg.rateMsgsPerMin) {
-      throw new RfaError("rate_limited", "per-sender message rate limit reached", 30);
+    const rpm = Math.min(this.cfg.rateMsgsPerMin, room.policies.member_rpm ?? Infinity);
+    if (member.rateWindow.length >= rpm) {
+      throw new RfaError("rate_limited", `per-sender message rate limit reached (${rpm}/min)`, 30);
+    }
+    if (kind === "request" && room.policies.max_pending_requests != null) {
+      const pending = room.pendingReplies.filter((p) => p.fromId === member.id).length;
+      if (pending >= room.policies.max_pending_requests) {
+        throw new RfaError(
+          "rate_limited",
+          `too many unanswered requests (${pending}/${room.policies.max_pending_requests}); wait for replies or timeouts`,
+          60,
+        );
+      }
     }
     const bodyHash = sha256hex(canonicalize(args.body as unknown as Record<string, unknown>[]));
     member.bodyHashes = member.bodyHashes.filter((b) => now - b.ts < this.cfg.dupWindowS * 1000);
@@ -730,18 +814,6 @@ export class RoomHub {
       if (Number.isNaN(t)) throw new RfaError("bad_request", "reply_by must be an ISO 8601 date-time");
       replyBy = iso(t);
     }
-
-    // Floor control (spec 12.3): turn-starting messages need the floor in
-    // sequential/moderator rooms. Runs after every other validation so a grant
-    // or renewal can only happen for a message that will actually append. A
-    // denial enqueues the sender (that is how the queue forms) and instructs it
-    // to listen for floor_granted.
-    const turnStarting = (kind === "chat" || kind === "request") && !args.in_reply_to;
-    if (room.policies.mode !== "open") this.floorGate(room, member, kind, turnStarting);
-
-    // Presence piggyback before the message so observers see the state first.
-    if (args.presence) this.setPresence(room, member, args.presence);
-    member.leaseExpires = Math.max(member.leaseExpires, now + member.ttlS * 1000);
 
     const conversationId = args.conversation_id ?? (kind === "request" ? rid("c", 4) : null);
     const envelope: Envelope = {
@@ -765,7 +837,77 @@ export class RoomHub {
       ext: args.ext ?? {},
     };
 
+    // Pre-delivery policy gate (spec 12.2, v0.4.2): most severe outcome wins.
+    // refuse blocks with an audit event; hold parks the envelope behind a
+    // human-only approval; alert appends normally and emits the alert after.
+    const gateVerdict = this.cfg.gateChecks.length > 0 ? await this.evaluateGate(envelope) : null;
+    if (gateVerdict?.outcome === "refuse") {
+      this.appendEvent(room, {
+        type: "system",
+        event: "gate_refused",
+        refs: { message_id: args.message_id, member: member.id, check: gateVerdict.checkId, reason: gateVerdict.reason },
+      });
+      throw new RfaError("policy_refused", `refused by policy check ${gateVerdict.checkId}: ${gateVerdict.reason}`, null, {
+        check_id: gateVerdict.checkId,
+      });
+    }
+    if (gateVerdict?.outcome === "hold") {
+      const requestId = `hold:${args.message_id}`;
+      if (!room.heldMessages.has(args.message_id)) {
+        const expiresAt = now + this.cfg.holdTtlS * 1000;
+        room.heldMessages.set(args.message_id, {
+          envelope,
+          senderId: member.id,
+          checkId: gateVerdict.checkId,
+          reason: gateVerdict.reason,
+          expiresAt,
+        });
+        room.approvals.set(requestId, {
+          requestId,
+          messageId: args.message_id,
+          requester: member.id,
+          action: "release_held_message",
+          status: "pending",
+          decidedBy: null,
+          allowedDecisions: ["approve", "reject"],
+          expiresAt,
+          held: true,
+        });
+        this.appendEvent(room, {
+          type: "system",
+          event: "message_held",
+          refs: { message_id: args.message_id, member: member.id, check: gateVerdict.checkId, reason: gateVerdict.reason, request_id: requestId },
+        });
+        this.writeMeta(room);
+      }
+      throw new RfaError(
+        "held",
+        `message held for supervisor review (check ${gateVerdict.checkId}); a human-origin approve of ${requestId} releases it`,
+        this.cfg.holdTtlS,
+        { request_id: requestId },
+      );
+    }
+
+    // Floor control (spec 12.3): turn-starting messages need the floor in
+    // sequential/moderator rooms. Runs after every other validation so a grant
+    // or renewal can only happen for a message that will actually append. A
+    // denial enqueues the sender (that is how the queue forms) and instructs it
+    // to listen for floor_granted.
+    const turnStarting = (kind === "chat" || kind === "request") && !args.in_reply_to;
+    if (room.policies.mode !== "open") this.floorGate(room, member, kind, turnStarting);
+
+    // Presence piggyback before the message so observers see the state first.
+    if (args.presence) this.setPresence(room, member, args.presence);
+    member.leaseExpires = Math.max(member.leaseExpires, now + member.ttlS * 1000);
+
     const event = this.appendEvent(room, { type: "message", envelope });
+    if (gateVerdict?.outcome === "alert") {
+      this.appendEvent(room, {
+        type: "system",
+        event: "gate_alert",
+        refs: { message_id: args.message_id, seq: event.seq, member: member.id, check: gateVerdict.checkId, reason: gateVerdict.reason, score: gateVerdict.score ?? null },
+      });
+    }
     envelope.seq = event.seq;
     envelope.ts = event.ts;
     member.sentIds.add(args.message_id);
@@ -908,6 +1050,96 @@ export class RoomHub {
 
   private floorInfo(room: Room): FloorInfo {
     return { mode: room.policies.mode, holder: room.floor.holder, queue: [...room.floor.queue] };
+  }
+
+  // ---------------------------------------------------------------- policy gate (spec 12.2, v0.4.2)
+
+  /** Evaluate all matching checks; the most severe outcome wins; null = allow. */
+  private async evaluateGate(
+    envelope: Envelope,
+  ): Promise<{ outcome: GateOutcome; checkId: string; reason: string; score?: number } | null> {
+    let worst: { outcome: GateOutcome; checkId: string; reason: string; score?: number } | null = null;
+    for (const check of this.cfg.gateChecks) {
+      if (!this.matchesCheck(check, envelope)) continue;
+      let res: { outcome: GateOutcome; reason: string; score?: number };
+      if (check.tier === "rules") {
+        res = { outcome: check.outcome ?? "alert", reason: `rule ${check.id} matched` };
+      } else {
+        try {
+          res = await this.execCheck(check, envelope);
+        } catch (err) {
+          // Fail closed to hold (spec 7.2): a broken check must not silently allow, nor hard-refuse.
+          res = { outcome: "hold", reason: `check ${check.id} failed closed: ${(err as Error).message.slice(0, 120)}` };
+        }
+      }
+      if (!worst || GATE_SEVERITY[res.outcome] > GATE_SEVERITY[worst.outcome]) {
+        worst = { ...res, checkId: check.id };
+      }
+    }
+    return worst && worst.outcome !== "allow" ? worst : null;
+  }
+
+  private matchesCheck(check: GateCheck, env: Envelope): boolean {
+    const m = check.match;
+    if (!m) return true;
+    if (m.kind && !m.kind.includes(env.kind)) return false;
+    if (m.origin && !m.origin.includes(env.from.origin as "human" | "agent")) return false;
+    if (m.ext_key && !(m.ext_key in env.ext)) return false;
+    if (m.text_regex) {
+      const text = env.body
+        .filter((p): p is Extract<Part, { type: "text" }> => p.type === "text")
+        .map((p) => p.text)
+        .join("\n");
+      if (!new RegExp(m.text_regex, "i").test(text)) return false;
+    }
+    return true;
+  }
+
+  /** command tier: envelope JSON on stdin, {decision, reason?, score?} on stdout; exit 2 = refuse; timeout throws (fails closed). */
+  private execCheck(check: GateCheck, env: Envelope): Promise<{ outcome: GateOutcome; reason: string; score?: number }> {
+    return new Promise((resolve, reject) => {
+      const [cmd, ...argv] = check.command ?? [];
+      if (!cmd) return reject(new Error("command check without command"));
+      const child = execFile(cmd, argv, { timeout: check.timeout_ms ?? 2000, maxBuffer: 64 * 1024 }, (err, stdout) => {
+        const code = (err as (Error & { code?: number }) | null)?.code;
+        if (err && code !== 2) return reject(err);
+        if (code === 2) {
+          return resolve({ outcome: "refuse", reason: stdout.trim().slice(0, 200) || `check ${check.id} exit 2` });
+        }
+        try {
+          const parsed = JSON.parse(stdout) as { decision?: string; reason?: string; score?: number };
+          const outcome = (["allow", "alert", "hold", "refuse"] as const).find((o) => o === parsed.decision);
+          if (!outcome) return reject(new Error(`check returned unknown decision "${parsed.decision}"`));
+          resolve({ outcome, reason: parsed.reason ?? `check ${check.id}`, score: parsed.score });
+        } catch (e) {
+          reject(e as Error);
+        }
+      });
+      child.stdin?.write(JSON.stringify(env));
+      child.stdin?.end();
+    });
+  }
+
+  /** A human approve of a hold: the parked envelope appends NOW (fresh seq) with full sender bookkeeping. */
+  private releaseHeldMessage(room: Room, held: HeldMessage): void {
+    room.heldMessages.delete(held.envelope.message_id);
+    const sender = room.members.get(held.senderId);
+    const event = this.appendEvent(room, { type: "message", envelope: held.envelope });
+    held.envelope.seq = event.seq;
+    held.envelope.ts = event.ts;
+    if (sender) {
+      sender.sentIds.add(held.envelope.message_id);
+      if (held.envelope.kind === "request" && held.envelope.reply_by) {
+        room.pendingReplies.push({
+          messageId: held.envelope.message_id,
+          conversationId: held.envelope.conversation_id,
+          fromId: held.senderId,
+          deadline: Date.parse(held.envelope.reply_by),
+        });
+      }
+    }
+    this.wakeWaiters(room, [event]);
+    this.notifyWatchers(room, [event]);
   }
 
   // ---------------------------------------------------------------- moderation (spec section 12)
@@ -1062,14 +1294,40 @@ export class RoomHub {
             "approve requires a human-origin principal; an agent claiming approval is void by construction (spec 12.1)",
           );
         }
+        // Decision vocabulary (v0.4.2): the requester constrains what deciders may do.
+        const allowed = approval.allowedDecisions;
+        const override = args.params && Object.keys(args.params).length > 0 ? args.params : null;
+        if (allowed) {
+          const decision = args.verb === "reject" ? "reject" : override ? "edit" : "approve";
+          if (!allowed.includes(decision)) {
+            throw new RfaError("unauthorized", `this approval only allows [${allowed.join(", ")}], not ${decision}`);
+          }
+        }
         approval.status = args.verb === "approve" ? "approved" : "rejected";
         approval.decidedBy = member.id;
+        approval.decidedParams = override;
+        if (approval.held) {
+          const held = room.heldMessages.get(approval.messageId);
+          if (held) {
+            if (args.verb === "approve") {
+              this.releaseHeldMessage(room, held);
+            } else {
+              room.heldMessages.delete(approval.messageId);
+              this.appendEvent(room, {
+                type: "system",
+                event: "held_refused",
+                refs: { message_id: approval.messageId, member: held.senderId, check: held.checkId },
+              });
+            }
+          }
+        }
         intervene(approval.requester, {
           request_id: approval.requestId,
           action: approval.action,
           verdict: approval.status,
+          ...(override ? { updated: true } : {}),
         });
-        return done({ request_id: approval.requestId, status: approval.status });
+        return done({ request_id: approval.requestId, status: approval.status, ...(override ? { updated_params: override } : {}) });
       }
       case "set_policy": {
         const patch = (params.policies ?? {}) as Partial<RoomPolicies> & { moderator?: string | null };
@@ -1100,8 +1358,20 @@ export class RoomHub {
           room.policies.max_members = n;
           changes.max_members = n;
         }
+        if (patch.member_rpm !== undefined) {
+          const n = patch.member_rpm === null ? null : Number(patch.member_rpm);
+          if (n !== null && (!Number.isInteger(n) || n < 1 || n > 600)) throw new RfaError("bad_request", "member_rpm must be 1..600 or null");
+          room.policies.member_rpm = n;
+          changes.member_rpm = n;
+        }
+        if (patch.max_pending_requests !== undefined) {
+          const n = patch.max_pending_requests === null ? null : Number(patch.max_pending_requests);
+          if (n !== null && (!Number.isInteger(n) || n < 1 || n > 100)) throw new RfaError("bad_request", "max_pending_requests must be 1..100 or null");
+          room.policies.max_pending_requests = n;
+          changes.max_pending_requests = n;
+        }
         if (Object.keys(changes).length === 0) {
-          throw new RfaError("bad_request", "set_policy accepts params.policies with mode, moderator, attention, max_members");
+          throw new RfaError("bad_request", "set_policy accepts params.policies with mode, moderator, attention, max_members, member_rpm, max_pending_requests");
         }
         intervene(null, { changes });
         return done({ policies: room.policies });
@@ -1602,6 +1872,30 @@ export class RoomHub {
           refs: { message_id: p.messageId, conversation_id: p.conversationId, asker: p.fromId },
         });
       }
+      // Approval expiry (v0.4.2): pending past expires_at resolves as reject;
+      // a held message expiring is dropped (fail closed), never silently sent.
+      let approvalsDirty = false;
+      for (const approval of room.approvals.values()) {
+        if (approval.status !== "pending" || approval.expiresAt == null || now <= approval.expiresAt) continue;
+        approval.status = "rejected";
+        approval.decidedBy = null;
+        approvalsDirty = true;
+        if (approval.held) {
+          room.heldMessages.delete(approval.messageId);
+          this.appendEvent(room, {
+            type: "system",
+            event: "hold_expired",
+            refs: { message_id: approval.messageId, member: approval.requester, request_id: approval.requestId },
+          });
+        } else {
+          this.appendEvent(room, {
+            type: "system",
+            event: "approval_expired",
+            refs: { request_id: approval.requestId, requester: approval.requester, action: approval.action },
+          });
+        }
+      }
+      if (approvalsDirty) this.writeMeta(room);
     }
   }
 
@@ -1748,7 +2042,8 @@ export class RoomHub {
 
   private appendEvent(room: Room, partial: EventInput): RfaEvent {
     room.seq += 1;
-    const event = { ...partial, seq: room.seq, ts: iso(this.cfg.now()) } as RfaEvent;
+    const event = { ...partial, seq: room.seq, ts: iso(this.cfg.now()), prev_hash: room.chainHead } as RfaEvent;
+    room.chainHead = sha256hex(canonicalize(event as unknown as Record<string, unknown>));
     room.events.push(event);
     this.appendToDisk(room, event);
     // Non-message events also wake matching waiters and watchers (presence/roster/system).
@@ -1807,6 +2102,7 @@ export class RoomHub {
       quarantinedNames: [...room.quarantinedNames],
       quarantinedDigests: [...room.quarantinedDigests],
       approvals: [...room.approvals.values()],
+      heldMessages: [...room.heldMessages.entries()],
     };
     const file = path.join(this.roomDir(), `${room.handle}.meta.json`);
     fs.writeFileSync(file, JSON.stringify(meta, null, 1), { encoding: "utf8", mode: 0o600 });
@@ -1842,6 +2138,8 @@ export class RoomHub {
           quarantinedNames: new Set(meta.quarantinedNames ?? []),
           quarantinedDigests: new Set(meta.quarantinedDigests ?? []),
           approvals: new Map(((meta.approvals ?? []) as Approval[]).map((a) => [a.requestId, a])),
+          heldMessages: new Map((meta.heldMessages ?? []) as [string, HeldMessage][]),
+          chainHead: sha256hex(meta.handle),
           // The floor does not survive a restart: everyone is offline anyway;
           // turn-starting sends re-acquire it naturally.
           floor: { holder: null, grantedAt: null, turnStartedAt: null, expiresAt: null, queue: [] },
@@ -1876,6 +2174,7 @@ export class RoomHub {
             const event = JSON.parse(line) as RfaEvent;
             room.events.push(event);
             room.seq = Math.max(room.seq, event.seq);
+            room.chainHead = sha256hex(canonicalize(event as unknown as Record<string, unknown>));
             if (event.type === "message") {
               const sender = room.members.get(event.envelope.from.id);
               sender?.sentIds.add(event.envelope.message_id);

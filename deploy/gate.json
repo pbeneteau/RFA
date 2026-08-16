@@ -1,0 +1,14 @@
+[
+  {
+    "id": "injection-alert",
+    "tier": "rules",
+    "match": { "text_regex": "ignore (all )?previous instructions|IMPORTANT SYSTEM DIRECTIVE|disregard your rules" },
+    "outcome": "alert"
+  },
+  {
+    "id": "no-private-keys",
+    "tier": "rules",
+    "match": { "text_regex": "BEGIN (RSA|OPENSSH|EC|PGP) PRIVATE KEY" },
+    "outcome": "refuse"
+  }
+]

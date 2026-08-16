@@ -16,7 +16,7 @@
     "start": "tsx src/main.ts",
     "demo": "tsx scripts/demo.ts",
     "tail": "tsx scripts/tail.ts",
-    "test": "node --import tsx --test test/hub.test.ts test/client.test.ts test/moderation.test.ts test/memory.test.ts test/otel.test.ts test/agentdef.test.ts test/engine.test.ts test/memoryfs.test.ts",
+    "test": "node --import tsx --test test/hub.test.ts test/client.test.ts test/moderation.test.ts test/memory.test.ts test/otel.test.ts test/agentdef.test.ts test/engine.test.ts test/memoryfs.test.ts test/governance.test.ts test/execbackend.test.ts",
     "demo:push": "tsx scripts/demo-push.ts",
     "keygen": "tsx scripts/keygen.ts",
     "sign-card": "tsx scripts/sign-card.ts",
@@ -30,6 +30,7 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.233",
+    "@anthropic-ai/sandbox-runtime": "^0.0.73",
     "@modelcontextprotocol/client": "^2.0.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@modelcontextprotocol/server": "^2.0.0",

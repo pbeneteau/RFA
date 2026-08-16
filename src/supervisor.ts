@@ -20,6 +20,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { listPacks, loadPack, type AgentPack } from "./agentdef.js";
+import { loadSecrets, pickSecrets } from "./secrets.js";
 
 const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
 const AGENTS = path.join(ROOT, "agents");
@@ -56,10 +57,19 @@ function residentLog(pack: AgentPack): number {
 
 function start(child: Child): void {
   const fd = residentLog(child.pack);
+  // Secrets: the pack declares NAMES; only those values are injected (6.3).
+  let env = process.env;
+  const names = child.pack.def.secrets ?? [];
+  if (names.length > 0) {
+    const { env: picked, missing } = pickSecrets(loadSecrets(path.join(ROOT, "data", "secrets.json")), names);
+    if (missing.length > 0) log(`${child.pack.name}: missing secrets [${missing.join(", ")}] (declare them in data/secrets.json)`);
+    env = { ...process.env, ...picked };
+  }
   const proc = spawn("npx", ["tsx", RESIDENT, "--agent", child.pack.name], {
     cwd: ROOT,
     stdio: ["ignore", fd, fd],
     detached: false,
+    env,
   });
   child.proc = proc;
   child.startedAt = Date.now();

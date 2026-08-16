@@ -34,6 +34,8 @@ try {
     trustedKeys: trustedKeysPath ? JSON.parse(fs.readFileSync(trustedKeysPath, "utf8")) : {},
     requireSignedCards: process.argv.includes("--require-signed"),
     humanKeys: (arg("--human-key") ?? process.env.RFA_HUMAN_KEYS ?? "").split(",").filter(Boolean),
+    // Policy-gate checks (spec 12.2): a JSON array of GateCheck objects.
+    gateChecks: arg("--gate") ? JSON.parse(fs.readFileSync(arg("--gate")!, "utf8")) : [],
   });
 } catch (err) {
   console.error(`rfa-hub: ${(err as Error).message}`);
