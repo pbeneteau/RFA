@@ -1,0 +1,585 @@
+<!doctype html>
+<!--
+  RFA room console: live web view of a room, served by the hub at /console.
+
+  A plain MCP client in the browser: every action is a modern-era tools/call
+  POST to /mcp on the same origin; receiving is a room_listen long-poll loop.
+  Join as observer (default, read-only) or supervisor (needs a provisioned
+  human key, hub --human-key) for room_admin intervention controls.
+
+  Security: every string from the wire (names, topics, message bodies) is
+  agent-controlled and rendered with textContent, never innerHTML.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RFA console</title>
+<style>
+  :root {
+    --bg: #101418; --panel: #171d24; --panel-2: #1d242d; --line: #2a3340;
+    --text: #d7dee8; --dim: #8494a7; --faint: #5b6b7e;
+    --accent: #5aa9e6; --ok: #4cc38a; --busy: #e5b567; --away: #8494a7; --offline: #55606e;
+    --danger: #e5484d; --intervene: #b18af8; --human: #f2c94c;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  button {
+    font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.small { font-size: 12px; padding: 2px 8px; }
+  button.danger:hover { border-color: var(--danger); color: var(--danger); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #0b0f14; font-weight: 600; }
+  input, select {
+    font: inherit; color: var(--text); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
+  }
+  input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .dim { color: var(--dim); }
+
+  /* ---- join screen ---- */
+  #join-screen { max-width: 430px; margin: 9vh auto; padding: 0 16px; }
+  #join-screen h1 { font-size: 22px; margin: 0 0 2px; }
+  #join-screen .sub { color: var(--dim); margin: 0 0 22px; }
+  #join-form { display: grid; gap: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
+  #join-form label { display: grid; gap: 4px; font-size: 12px; color: var(--dim); }
+  #join-form input, #join-form select { width: 100%; }
+  #join-error { color: var(--danger); font-size: 13px; min-height: 1em; margin: 0; }
+
+  /* ---- app layout ---- */
+  #app { display: none; height: 100%; flex-direction: column; }
+  #app.on { display: flex; }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  header .topic { font-weight: 650; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 5px; font-size: 12px;
+    border: 1px solid var(--line); border-radius: 999px; padding: 1px 9px; color: var(--dim);
+  }
+  .chip b { color: var(--text); font-weight: 600; }
+  #conn-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--offline); }
+  #conn-dot.live { background: var(--ok); }
+  header .grow { flex: 1; }
+
+  main { flex: 1; display: flex; min-height: 0; }
+
+  /* ---- roster ---- */
+  #roster {
+    width: 280px; flex: none; overflow-y: auto; background: var(--panel);
+    border-right: 1px solid var(--line); padding: 10px;
+  }
+  #roster h2, #floor-panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--faint); margin: 4px 4px 8px; }
+  .member { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; background: var(--panel-2); }
+  .member .row1 { display: flex; align-items: center; gap: 7px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .dot.ready { background: var(--ok); } .dot.busy { background: var(--busy); }
+  .dot.away { background: var(--away); } .dot.offline { background: var(--offline); }
+  .member .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .badge { font-size: 10px; border-radius: 4px; padding: 0 5px; border: 1px solid var(--line); color: var(--dim); flex: none; }
+  .badge.supervisor { color: var(--intervene); border-color: var(--intervene); }
+  .badge.observer { color: var(--dim); }
+  .badge.held { color: var(--danger); border-color: var(--danger); }
+  .badge.floor { color: var(--busy); border-color: var(--busy); }
+  .badge.human { color: var(--human); border-color: var(--human); }
+  .member .detail { font-size: 12px; color: var(--dim); margin: 3px 0 0 16px; overflow-wrap: anywhere; }
+  .member .skills { font-size: 11px; color: var(--faint); margin: 2px 0 0 16px; font-family: var(--mono); overflow-wrap: anywhere; }
+  .member .actions { display: none; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+  .member.expanded .actions { display: flex; }
+  #floor-panel { margin-top: 14px; }
+  #floor-body { font-size: 12px; color: var(--dim); padding: 0 4px; overflow-wrap: anywhere; }
+
+  /* ---- stream ---- */
+  #stream-wrap { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #stream { flex: 1; overflow-y: auto; padding: 12px 16px; }
+  .ev { margin-bottom: 8px; max-width: 100%; }
+  .ev .meta { font-size: 11px; color: var(--faint); font-family: var(--mono); }
+  .ev-msg { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
+  .ev-msg .head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .ev-msg .from { font-weight: 650; }
+  .kind { font-size: 10px; border-radius: 4px; padding: 0 5px; border: 1px solid var(--line); color: var(--dim); }
+  .kind.request { color: var(--accent); border-color: var(--accent); }
+  .kind.response { color: var(--ok); border-color: var(--ok); }
+  .kind.refuse { color: var(--danger); border-color: var(--danger); }
+  .kind.injected { color: var(--intervene); border-color: var(--intervene); }
+  .ev-msg .body { margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .ev-msg .body .json { font-family: var(--mono); font-size: 12px; color: var(--dim); display: block; overflow-x: auto; }
+  .ev-line { font-size: 12.5px; color: var(--dim); padding-left: 2px; overflow-wrap: anywhere; }
+  .ev-line.intervention { color: var(--intervene); }
+  .ev-line.alarm { color: var(--danger); }
+  .ev-line.grant { color: var(--busy); }
+  .approval { margin-top: 6px; display: flex; align-items: center; gap: 8px; font-size: 12px; }
+  .approval .st-pending { color: var(--busy); } .approval .st-approved { color: var(--ok); } .approval .st-rejected { color: var(--danger); }
+  #stream-foot {
+    display: flex; gap: 8px; align-items: center; padding: 8px 14px;
+    background: var(--panel); border-top: 1px solid var(--line);
+  }
+  #inject-text { flex: 1; }
+  #ambient-note { font-size: 12px; color: var(--faint); }
+  @media (max-width: 700px) { #roster { display: none; } }
+</style>
+</head>
+<body>
+
+<div id="join-screen">
+  <h1>RFA console</h1>
+  <p class="sub">Live view of a room on this hub. Observers watch; supervisors intervene.</p>
+  <form id="join-form">
+    <label>Room handle <input id="f-room" placeholder="r_XXXXXXXXXX" required autocomplete="off"></label>
+    <label>Join secret <input id="f-secret" placeholder="required unless the room is open" autocomplete="off"></label>
+    <label>Your name <input id="f-name" value="console" required maxlength="64"></label>
+    <label>Role
+      <select id="f-role">
+        <option value="observer" selected>observer (read-only)</option>
+        <option value="supervisor">supervisor (interventions; needs a human key)</option>
+      </select>
+    </label>
+    <label id="f-key-wrap" style="display:none">Human key <input id="f-key" placeholder="hub --human-key value" autocomplete="off"></label>
+    <p id="join-error"></p>
+    <button type="submit" class="primary">Join room</button>
+  </form>
+</div>
+
+<div id="app">
+  <header>
+    <span id="conn-dot" title="listen loop state"></span>
+    <span class="topic" id="h-topic"></span>
+    <span class="chip mono" id="h-room"></span>
+    <span class="chip" id="h-you"></span>
+    <span class="chip" id="h-epoch"></span>
+    <span class="chip" id="h-mode"></span>
+    <span class="grow"></span>
+    <select id="h-mode-set" title="set_policy mode (supervisor)" style="display:none">
+      <option value="">floor mode...</option>
+      <option value="open">open</option>
+      <option value="sequential">sequential</option>
+      <option value="moderator">moderator</option>
+    </select>
+    <label class="chip"><input type="checkbox" id="h-ambient" checked style="accent-color: var(--accent)"> ambient</label>
+    <button id="h-leave" class="danger">Leave</button>
+  </header>
+  <main>
+    <aside id="roster">
+      <h2>Roster</h2>
+      <div id="roster-list"></div>
+      <div id="floor-panel"><h2>Floor</h2><div id="floor-body">open mode: no floor control</div></div>
+    </aside>
+    <section id="stream-wrap">
+      <div id="stream" aria-live="polite"></div>
+      <div id="stream-foot">
+        <span id="ambient-note"></span>
+        <input id="inject-text" placeholder="inject a message as supervisor... (mention with @name)" style="display:none">
+        <button id="inject-send" style="display:none">Inject</button>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+"use strict";
+// ------------------------------------------------------------------ mcp client
+const MCP = "/mcp";
+const META = {
+  "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+  "io.modelcontextprotocol/clientInfo": { name: "rfa-console", version: "0.5.0" },
+  "io.modelcontextprotocol/clientCapabilities": {},
+};
+let rpcId = 0;
+
+async function rpc(method, params, opts = {}) {
+  const res = await fetch(MCP, {
+    method: "POST",
+    keepalive: opts.keepalive ?? false,
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      "Mcp-Method": method,
+      ...(typeof params.name === "string" ? { "Mcp-Name": params.name } : {}),
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", id: ++rpcId, method, params: { ...params, _meta: META } }),
+  });
+  const text = await res.text();
+  const payload = text.startsWith("event:") || text.includes("\ndata: ")
+    ? JSON.parse(text.split("\n").find((l) => l.startsWith("data: ")).slice(6))
+    : JSON.parse(text);
+  if (payload.error) throw new Error(payload.error.message);
+  return payload.result;
+}
+
+async function tool(name, args, opts = {}) {
+  const result = await rpc("tools/call", { name, arguments: args }, opts);
+  let inner;
+  try { inner = JSON.parse(result.content[0].text); }
+  catch { throw new Error(name + ": non-JSON tool result"); }
+  if (result.isError || inner.error) {
+    const e = inner.error ?? { code: "error", message: "tool error" };
+    const err = new Error(e.message); err.code = e.code; err.data = e.data ?? {};
+    throw err;
+  }
+  return inner;
+}
+
+// ------------------------------------------------------------------ state
+const S = {
+  room: null, token: null, you: null, role: null,
+  cursor: 0, epoch: 0, topic: "", policies: null, floor: null,
+  roster: [],                     // PresenceRecord[]
+  names: new Map(),               // member id -> last known name (incl. departed)
+  approvals: new Map(),           // request_id -> {action, requester, status}
+  listening: false, stopped: false,
+  ambient: true,
+};
+const $ = (id) => document.getElementById(id);
+const nameOf = (id) => S.names.get(id) || id;
+
+// DOM helper: children are appended; strings become TEXT nodes (never HTML).
+function el(tag, attrs = {}, ...children) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") n.className = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+    else n.setAttribute(k, v);
+  }
+  for (const c of children) if (c != null) n.append(c);
+  return n;
+}
+
+// ------------------------------------------------------------------ join / resume
+const saveKey = () => "rfa-console:" + ($("#f-room") ? "" : "") + S.room;
+$("f-role").addEventListener("change", () => {
+  $("f-key-wrap").style.display = $("f-role").value === "supervisor" ? "" : "none";
+});
+$("join-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  $("join-error").textContent = "";
+  const role = $("f-role").value;
+  try {
+    const contract = await tool("room_join", {
+      room: $("f-room").value.trim(),
+      join_secret: $("f-secret").value.trim() || undefined,
+      name: $("f-name").value.trim(),
+      card: {
+        name: $("f-name").value.trim(),
+        description: role === "supervisor" ? "human supervisor console" : "read-only console observer",
+      },
+      role,
+      human_key: role === "supervisor" ? ($("f-key").value.trim() || undefined) : undefined,
+      history_limit: 200,
+    });
+    enter(contract.room, contract.you, contract.topic, contract.policies, contract.epoch,
+          contract.roster, contract.history.events, contract.history.cursor);
+    sessionStorage.setItem("rfa-console:" + contract.room,
+      JSON.stringify({ token: contract.you.membership_token, you: contract.you, cursor: 0 }));
+  } catch (err) {
+    $("join-error").textContent = (err.code ? err.code + ": " : "") + err.message;
+  }
+});
+
+// Resume a same-tab session if the URL hash names a room we have a token for.
+(async function tryResume() {
+  const room = location.hash.slice(1);
+  if (room) $("f-room").value = room;
+  const saved = room && sessionStorage.getItem("rfa-console:" + room);
+  if (!saved) return;
+  try {
+    const { token, you } = JSON.parse(saved);
+    S.token = token;
+    const r = await tool("room_roster", { room, membership_token: token });
+    enter(room, you, r.topic, r.policies, r.epoch, [], r.cursor, r.cursor);
+    S.roster = r.roster; renderRoster(); renderFloor(r.floor);
+    line("dim", "console reattached (existing membership)");
+  } catch { sessionStorage.removeItem("rfa-console:" + room); S.token = null; }
+})();
+
+function enter(room, you, topic, policies, epoch, roster, history, cursor) {
+  S.room = room; S.token = you.membership_token ?? S.token; S.you = you; S.role = you.role;
+  S.topic = topic; S.policies = policies; S.epoch = epoch; S.roster = roster;
+  S.cursor = typeof history === "number" ? history : cursor;
+  location.hash = room;
+  $("join-screen").style.display = "none";
+  $("app").classList.add("on");
+  $("h-topic").textContent = topic;
+  $("h-room").textContent = room;
+  $("h-you").append("you: ", el("b", {}, you.name), " (" + you.role + (you.origin === "human" ? ", human" : "") + ")");
+  const sup = you.role === "supervisor";
+  $("h-mode-set").style.display = sup ? "" : "none";
+  $("inject-text").style.display = sup ? "" : "none";
+  $("inject-send").style.display = sup ? "" : "none";
+  renderHeader(); renderRoster();
+  if (Array.isArray(history)) for (const e of history) renderEvent(e, { replay: true });
+  listenLoop();
+}
+
+// ------------------------------------------------------------------ live loop
+async function listenLoop() {
+  if (S.listening) return;
+  S.listening = true;
+  while (!S.stopped) {
+    try {
+      const res = await tool("room_listen", {
+        room: S.room, membership_token: S.token,
+        since: S.cursor, timeout_ms: 25000, wait_for: "all",
+      });
+      $("conn-dot").classList.add("live");
+      S.cursor = res.cursor;
+      for (const e of res.events) renderEvent(e);
+      if (res.epoch !== S.epoch) await refreshRoster();
+      sessionStorage.setItem("rfa-console:" + S.room,
+        JSON.stringify({ token: S.token, you: S.you, cursor: S.cursor }));
+    } catch (err) {
+      $("conn-dot").classList.remove("live");
+      if (err.code === "not_a_member" || err.code === "unknown_room") {
+        line("alarm", "membership ended (" + err.code + "); reload to re-join");
+        break;
+      }
+      if (err.code === "room_ended") { line("alarm", "room ended"); break; }
+      await new Promise((r) => setTimeout(r, 2500)); // network hiccup: retry
+    }
+  }
+  S.listening = false;
+}
+
+async function refreshRoster() {
+  const r = await tool("room_roster", { room: S.room, membership_token: S.token });
+  S.epoch = r.epoch; S.roster = r.roster; S.policies = r.policies;
+  renderHeader(); renderRoster(); renderFloor(r.floor);
+}
+
+// ------------------------------------------------------------------ rendering
+function renderHeader() {
+  $("h-epoch").textContent = "epoch " + S.epoch;
+  $("h-mode").textContent = "mode " + (S.policies?.mode ?? "open");
+}
+
+function renderRoster() {
+  const list = $("roster-list");
+  list.replaceChildren();
+  for (const m of S.roster) S.names.set(m.id, m.name);
+  const holder = S.floor?.holder;
+  for (const m of S.roster) {
+    const badges = [el("span", { class: "badge " + m.role }, m.role)];
+    if (m.held) badges.push(el("span", { class: "badge held" }, "held"));
+    if (holder === m.id) badges.push(el("span", { class: "badge floor" }, "floor"));
+    if (m.card_verified === true) badges.push(el("span", { class: "badge" }, "signed"));
+    const row = el("div", { class: "member", role: "button", tabindex: "0" },
+      el("div", { class: "row1" },
+        el("span", { class: "dot " + m.state, title: m.state }),
+        el("span", { class: "name", title: m.id }, m.name),
+        ...badges),
+      m.detail ? el("div", { class: "detail" }, m.detail) : null,
+      m.card_summary?.skill_ids?.length ? el("div", { class: "skills" }, m.card_summary.skill_ids.join(" ")) : null,
+      supervisorActions(m));
+    row.addEventListener("click", (ev) => {
+      if (ev.target.tagName !== "BUTTON") row.classList.toggle("expanded");
+    });
+    list.append(row);
+  }
+  renderFloor(S.floor);
+}
+
+function supervisorActions(m) {
+  if (S.role !== "supervisor" || m.id === S.you.id) return null;
+  const act = (verb, extra = {}) => async () => {
+    try {
+      await tool("room_admin", { room: S.room, membership_token: S.token, verb, target: m.id, ...extra });
+      await refreshRoster();
+    } catch (err) { line("alarm", verb + " failed: " + (err.code ?? "") + " " + err.message); }
+  };
+  const b = (label, verb, cls = "", extra = {}) =>
+    el("button", { class: ("small " + cls).trim(), onclick: act(verb, extra) }, label);
+  const wrap = el("div", { class: "actions" });
+  wrap.append(
+    m.held ? b("release", "release_member") : b("hold", "hold_member"),
+    b("interrupt", "interrupt"),
+    b("grant floor", "grant_floor"),
+    b("evict", "evict", "danger"),
+    b("quarantine", "quarantine", "danger"),
+  );
+  return wrap;
+}
+
+function renderFloor(floor) {
+  if (floor) S.floor = floor;
+  const f = S.floor;
+  const body = $("floor-body");
+  if (!f || f.mode === "open") { body.textContent = "open mode: no floor control"; return; }
+  body.replaceChildren(
+    el("div", {}, "mode: " + f.mode),
+    el("div", {}, "holder: ", f.holder ? el("b", {}, nameOf(f.holder)) : "(free)"),
+    el("div", {}, "queue: " + (f.queue.length ? f.queue.map(nameOf).join(", ") : "(empty)")),
+  );
+}
+
+function stamp(e) { return e.ts.slice(11, 19) + " #" + e.seq; }
+
+function line(cls, text, e) {
+  const div = el("div", { class: "ev" },
+    el("div", { class: "ev-line " + cls }, (e ? stamp(e) + "  " : "") + text));
+  appendToStream(div);
+}
+
+function renderEvent(e, opts = {}) {
+  switch (e.type) {
+    case "message": return renderMessage(e);
+    case "presence": {
+      S.names.set(e.member.id, e.member.name);
+      if (!opts.replay) { // live presence also patches the roster in place
+        const i = S.roster.findIndex((r) => r.id === e.member.id);
+        if (i >= 0) S.roster[i] = e.member; renderRoster();
+      }
+      if (!S.ambient) return;
+      return line("dim", e.member.name + " is " + e.member.state + (e.member.detail ? " (" + e.member.detail + ")" : ""), e);
+    }
+    case "roster": {
+      for (const m of e.members) S.names.set(m.id, m.name);
+      if (!opts.replay) { S.roster = e.members; S.epoch = e.epoch; renderHeader(); renderRoster(); }
+      return line(e.reason === "evict" ? "alarm" : "dim",
+        "roster " + e.reason + ": " + nameOf(e.actor) + " (epoch " + e.epoch + ")", e);
+    }
+    case "task":
+      return line("dim", "task " + e.task.id + " " + e.action + " by " + nameOf(e.actor) +
+        ": " + e.task.title + " [" + e.task.state + "]", e);
+    case "intervention": {
+      if (e.verb === "approve" || e.verb === "reject") {
+        const a = S.approvals.get(e.refs?.request_id);
+        if (a) { a.status = e.refs.verdict ?? (e.verb === "approve" ? "approved" : "rejected"); a.render?.(); }
+      }
+      return line("intervention",
+        "INTERVENTION " + e.verb + " by " + nameOf(e.actor) +
+        (e.target ? " -> " + nameOf(e.target) : "") +
+        (e.reason ? " (" + e.reason + ")" : "") +
+        (e.refs && Object.keys(e.refs).length ? "  " + JSON.stringify(e.refs) : ""), e);
+    }
+    case "system": {
+      const cls = e.event === "floor_granted" ? "grant" : (e.event === "gone_quiet" || e.event === "timeout") ? "alarm" : "dim";
+      return line(cls, e.event + " " + JSON.stringify(e.refs), e);
+    }
+  }
+}
+
+function renderMessage(e) {
+  const env = e.envelope;
+  S.names.set(env.from.id, env.from.name);
+  const head = el("div", { class: "head" },
+    el("span", { class: "from" }, env.from.name),
+    env.from.origin === "human" ? el("span", { class: "badge human" }, "human") : null,
+    el("span", { class: "kind " + env.kind }, env.kind),
+    env.ext && env.ext["io.github.pbeneteau/injected"] ? el("span", { class: "kind injected" }, "injected") : null,
+    env.chunk ? el("span", { class: "kind" }, "chunk " + env.chunk.index + (env.chunk.final ? " final" : "")) : null,
+    el("span", { class: "meta" }, stamp(e) +
+      (env.mentions.length ? "  @" + env.mentions.map(nameOf).join(" @") : "") +
+      (env.in_reply_to ? "  re:" + env.in_reply_to : "")));
+  const body = el("div", { class: "body" });
+  for (const part of env.body) {
+    if (part.type === "text") body.append(part.text, "\n");
+    else if (part.type === "json") body.append(el("span", { class: "json" }, JSON.stringify(part.value)));
+    else body.append(el("span", { class: "json" }, "[file " + part.name + " " + part.mime + "]"));
+  }
+  if (env.refusal) body.append(el("span", { class: "json" },
+    "refused: " + env.refusal.reason + (env.refusal.detail ? " (" + env.refusal.detail + ")" : "")));
+  const card = el("div", { class: "ev ev-msg" }, head, body);
+  const apr = env.ext && env.ext["io.github.pbeneteau/approval"];
+  if (apr && typeof apr.request_id === "string") card.append(approvalStrip(apr, env.from.id));
+  appendToStream(card);
+}
+
+function approvalStrip(apr, requester) {
+  const a = S.approvals.get(apr.request_id) ??
+    { action: apr.action ?? "", requester, status: "pending" };
+  S.approvals.set(apr.request_id, a);
+  const status = el("span", {}, "");
+  const strip = el("div", { class: "approval" },
+    el("span", { class: "badge" }, "approval"),
+    el("span", { class: "mono" }, apr.request_id + (a.action ? " (" + a.action + ")" : "")),
+    status);
+  a.render = () => {
+    status.className = "st-" + a.status;
+    status.textContent = a.status;
+    strip.querySelectorAll("button").forEach((b) => b.remove());
+    if (a.status === "pending" && S.role === "supervisor") {
+      const decide = (verb) => async () => {
+        try { await tool("room_admin", { room: S.room, membership_token: S.token, verb, target: apr.request_id }); }
+        catch (err) { line("alarm", verb + " failed: " + (err.code ?? "") + " " + err.message); }
+      };
+      strip.append(el("button", { class: "small", onclick: decide("approve") }, "approve"),
+                   el("button", { class: "small danger", onclick: decide("reject") }, "reject"));
+    }
+  };
+  a.render();
+  return strip;
+}
+
+function appendToStream(node) {
+  const s = $("stream");
+  const pinned = s.scrollTop + s.clientHeight >= s.scrollHeight - 60;
+  s.append(node);
+  while (s.children.length > 1500) s.firstChild.remove(); // bound the DOM
+  if (pinned) s.scrollTop = s.scrollHeight;
+}
+
+// ------------------------------------------------------------------ controls
+$("h-ambient").addEventListener("change", () => {
+  S.ambient = $("h-ambient").checked;
+  $("ambient-note").textContent = S.ambient ? "" : "ambient presence lines muted";
+});
+
+$("h-mode-set").addEventListener("change", async () => {
+  const mode = $("h-mode-set").value;
+  $("h-mode-set").value = "";
+  if (!mode) return;
+  try {
+    await tool("room_admin", { room: S.room, membership_token: S.token, verb: "set_policy", params: { policies: { mode } } });
+    await refreshRoster();
+  } catch (err) { line("alarm", "set_policy failed: " + (err.code ?? "") + " " + err.message); }
+});
+
+async function injectNow() {
+  const text = $("inject-text").value.trim();
+  if (!text) return;
+  // "@name " prefixes become mentions, resolved against the roster.
+  const mentions = [];
+  let rest = text;
+  for (;;) {
+    const m = /^@(\S+)\s+/.exec(rest);
+    if (!m) break;
+    const member = S.roster.find((r) => r.name === m[1]);
+    if (!member) break;
+    mentions.push(member.id);
+    rest = rest.slice(m[0].length);
+  }
+  try {
+    await tool("room_admin", {
+      room: S.room, membership_token: S.token, verb: "inject",
+      params: { text: rest, ...(mentions.length ? { mentions } : {}) },
+    });
+    $("inject-text").value = "";
+  } catch (err) { line("alarm", "inject failed: " + (err.code ?? "") + " " + err.message); }
+}
+$("inject-send").addEventListener("click", injectNow);
+$("inject-text").addEventListener("keydown", (ev) => { if (ev.key === "Enter") injectNow(); });
+
+$("h-leave").addEventListener("click", async () => {
+  S.stopped = true;
+  try { await tool("room_leave", { room: S.room, membership_token: S.token }); } catch {}
+  sessionStorage.removeItem("rfa-console:" + S.room);
+  location.hash = "";
+  location.reload();
+});
+
+// Best effort: don't linger in rosters when the tab closes (lease covers the rest).
+addEventListener("pagehide", () => {
+  if (!S.token || S.stopped) return;
+  try { tool("room_leave", { room: S.room, membership_token: S.token }, { keepalive: true }); } catch {}
+});
+</script>
+</body>
+</html>

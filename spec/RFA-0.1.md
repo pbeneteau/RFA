@@ -1,8 +1,8 @@
 # RFA: Rooms for Agents
 
-**Protocol specification, version 0.1.5 (draft)**
-Status: Draft for implementation · Date: 2026-08-16 (0.1.1 errata same day, from live multi-agent field testing; see Appendix E) · License: intended Apache-2.0
-Wire tag: `"rfa": "0.1"` · MCP extension id: `dev.agentcom/rooms` (replace with your final domain before publishing)
+**Protocol specification, version 0.1.6 (draft)**
+Status: Draft for implementation · Date: 2026-08-16 (0.1.1 errata same day, from live multi-agent field testing; see Appendix E) · License: Apache-2.0 (see LICENSE)
+Wire tag: `"rfa": "0.1"` · MCP extension id: `io.github.pbeneteau/rooms` (GitHub-scoped reverse-DNS; a vanity domain MAY alias it later via spec revision)
 
 RFA lets AI agents join a shared **room**, discover the other members (name, presence state, typed capabilities), and exchange messages in real time, with the same discovery ergonomics as MCP tools. It is a **layer beside MCP, not a rival protocol**: a Room Hub is an MCP server, agents are MCP clients, and every room action is an MCP tool call.
 
@@ -56,7 +56,7 @@ Each principle traces to evidence gathered in [research/REPORT.md](../research/R
   |                            ROOM HUB (MCP server)                    |
   |                                                                     |
   |  Tool plane:  room_create/join/leave/send/listen/roster/presence... |
-  |  Push plane:  MCP extension dev.agentcom/rooms over subscriptions/  |
+  |  Push plane:  MCP extension io.github.pbeneteau/rooms over subscriptions/  |
   |               listen (2026-07-28 hosts); long-poll fallback (all)   |
   |  Per room:    append-only event log (seq) + roster (epoch)          |
   |               + presence leases + policies                          |
@@ -66,7 +66,7 @@ Each principle traces to evidence gathered in [research/REPORT.md](../research/R
 Two planes:
 
 - **Tool plane (required).** All actions are MCP tool calls. Works on every MCP host, both protocol eras.
-- **Push plane (optional).** For MCP 2026-07-28 hosts, the hub declares the `dev.agentcom/rooms` extension and pushes room events over the client's `subscriptions/listen` stream (section 11.2). Hosts without it poll with `room_listen`.
+- **Push plane (optional).** For MCP 2026-07-28 hosts, the hub declares the `io.github.pbeneteau/rooms` extension and pushes room events over the client's `subscriptions/listen` stream (section 11.2). Hosts without it poll with `room_listen`.
 
 Hubs MUST target MCP 2026-07-28 semantics and SHOULD serve dual-era so 2025-11-25 hosts can join with poll-based presence. Hubs MUST NOT depend on MCP sessions (`Mcp-Session-Id`), sampling, elicitation, or roots. Cross-call state rides in **server-minted handles passed as ordinary tool arguments** (room handles, membership tokens, cursors), which keeps the hub horizontally scalable.
 
@@ -454,7 +454,7 @@ Core profile = the first eight minus `room_task`. Tool descriptions served to mo
 For 2026-07-28 hosts, the hub declares in its `server/discover` capabilities:
 
 ```json
-{ "capabilities": { "tools": {}, "extensions": { "dev.agentcom/rooms": { "version": "0.1" } } } }
+{ "capabilities": { "tools": {}, "extensions": { "io.github.pbeneteau/rooms": { "version": "0.1" } } } }
 ```
 
 A client subscribed via `subscriptions/listen` MAY include the extension filter:
@@ -462,7 +462,7 @@ A client subscribed via `subscriptions/listen` MAY include the extension filter:
 ```json
 { "method": "subscriptions/listen",
   "params": { "notifications": { "toolsListChanged": false },
-              "dev.agentcom/rooms": { "rooms": [ { "room": "r_kx82mm", "membership_token": "...", "since": 4180, "wait_for": "all" } ] } } }
+              "io.github.pbeneteau/rooms": { "rooms": [ { "room": "r_kx82mm", "membership_token": "...", "since": 4180, "wait_for": "all" } ] } } }
 ```
 
 The hub then delivers `notifications/room/event` on that stream, each carrying one event object (section 9.4) plus the subscription id per MCP rules. Push replaces polling but not the cursor contract: on stream loss the client re-subscribes (or calls `room_listen`) from its last cursor; the hub keeps NO per-stream replay state. Fanout is per-member streams; the hub duplicates events across them (in-spec for MCP 2026-07-28).
@@ -507,7 +507,7 @@ Authority: the **host or a supervisor** may call `room_admin` (`grant_floor` add
 - `interrupt`: pure signal (intervention event targeting the member) telling it to abandon its current turn.
 - `evict`: remove membership. Token revocation takes effect on the next call (spec 14.8), the name frees (rebind-guarded), the epoch bumps with a `roster {reason: "evict"}` event, the member's parked listens resolve and watchers drop, and members owed replies by the evictee get the `gone_quiet` notice immediately.
 - `quarantine`: evict + mark the identity, keyed by **name and capability digest**; the hub refuses re-joins matching either, pending human action.
-- `inject`: speak with the supervisor's stamped principal class (`params: {text, mentions?, kind: chat|status, conversation_id?, in_reply_to?}`). The envelope carries `ext["dev.agentcom/injected"] = true` and the paired intervention event carries the `message_id`. This is a supervisor's only voice: supervisors and observers are read-only on `room_send`.
+- `inject`: speak with the supervisor's stamped principal class (`params: {text, mentions?, kind: chat|status, conversation_id?, in_reply_to?}`). The envelope carries `ext["io.github.pbeneteau/injected"] = true` and the paired intervention event carries the `message_id`. This is a supervisor's only voice: supervisors and observers are read-only on `room_send`.
 - `cancel_task`: cancel any non-terminal task by id, overriding ownership; emits both the task event and the intervention.
 - `approve` / `reject`: decide an approval request by `request_id` (the verb's `target`). The intervention targets the **requester** and carries `refs: {request_id, action, verdict}` so the verdict reaches them under the mentions filter. Deciding twice is `task_conflict`.
 - `set_policy`: mutate `params.policies` (`mode`, `moderator`, `attention`, `max_members`). Mode changes reset the floor.
@@ -516,7 +516,7 @@ Authority: the **host or a supervisor** may call `room_admin` (`grant_floor` add
 
 `release_member` is dual-use: on a present member it lifts a hold; on an evicted, quarantined identity it lifts the quarantine, and that action is the "pending human action": it REQUIRES a human-origin principal.
 
-Approval flows: any member MAY send a `request` with `ext["dev.agentcom/approval"] = {request_id, action, params}` targeted at supervisors; the hub registers it at append time (duplicate `request_id`s are `task_conflict`). Only an `approve` intervention from a **human-origin** principal satisfies it: hubs MUST refuse `approve` from agent-origin principals even when they hold the supervisor role. **A message from an agent claiming approval is void by construction** (origin stamping).
+Approval flows: any member MAY send a `request` with `ext["io.github.pbeneteau/approval"] = {request_id, action, params}` targeted at supervisors; the hub registers it at append time (duplicate `request_id`s are `task_conflict`). Only an `approve` intervention from a **human-origin** principal satisfies it: hubs MUST refuse `approve` from agent-origin principals even when they hold the supervisor role. **A message from an agent claiming approval is void by construction** (origin stamping).
 
 ### 12.2 Pre-delivery policy gate
 
@@ -578,12 +578,12 @@ Codes: `unknown_room`, `unknown_member`, `not_a_member`, `unauthorized`, `join_d
 | Profile | Requires |
 |---|---|
 | **core** | Tools `room_create/join/leave/send/listen/roster/presence`, `agent_describe`; envelope; presence leases; join contract; attention rule; delivery outcomes; errors; security section 14 items 1-3, 5, 7, 9 |
-| **push** | core + the `dev.agentcom/rooms` subscriptions/listen extension, or the interim `room_watch` binding (11.2b) |
+| **push** | core + the `io.github.pbeneteau/rooms` subscriptions/listen extension, or the interim `room_watch` binding (11.2b) |
 | **tasks** | core + `room_task` with the A2A-mapped state machine |
 | **moderation** | core + roles observer/supervisor + `room_admin` verbs + floor-control modes |
 | **signing** | core + JWS card verification (trusted-set and embedded-jwk resolution), `card_verified` surfacing, per-signature detail in `agent_describe`, optional `require_signed_cards` enforcement |
 
-A hub advertises its profiles in `server/discover` extension settings: `{"dev.agentcom/rooms": {"version": "0.1", "profiles": ["core", "push", "tasks"]}}`.
+A hub advertises its profiles in `server/discover` extension settings: `{"io.github.pbeneteau/rooms": {"version": "0.1", "profiles": ["core", "push", "tasks"]}}`.
 
 ---
 
@@ -727,14 +727,14 @@ Conventions: all schemas are draft 2020-12; `membership_token` is `{"type": "str
 - Refusal `reason`: `busy, ineligible, unauthorized, overloaded, expired, declined`.
 - Error `code`: list in section 15.
 - `_meta` keys: unprefixed `traceparent, tracestate, baggage` only; all else reverse-DNS.
-- Extension id: `dev.agentcom/rooms`; sub-keys under `ext` reverse-DNS.
+- Extension id: `io.github.pbeneteau/rooms`; sub-keys under `ext` reverse-DNS.
 
 ## Appendix C: design rationale (decision -> evidence)
 
 | Decision | Evidence (see research/REPORT.md) |
 |---|---|
 | Hub as MCP server; rooms as tools | MCP 22-28x adoption lead; agent-behind-MCP community default; Coral + agent-room prove the surface; York study: MCP carries inter-agent coordination at ~half A2A's complexity |
-| Extension `dev.agentcom/rooms` on subscriptions/listen | MCP 2026-07-28 extensions framework (SEP-2133) + tasks extension precedent (adds filters + notification types); per-member fanout is in-spec |
+| Extension `io.github.pbeneteau/rooms` on subscriptions/listen | MCP 2026-07-28 extensions framework (SEP-2133) + tasks extension precedent (adds filters + notification types); per-member fanout is in-spec |
 | No sampling/elicitation/roots/sessions | Deprecated or removed in MCP 2026-07-28; VS Code/Cursor lag argues dual-era serving |
 | Card-compatible descriptors, not native A2A | A2A has zero multi-party primitives and unresolved discovery; cards are the universally implemented part; enterprise bridges become mechanical |
 | Join contract ordering (self, roster, history, live) | XMPP MUC XEP-0045 join contract; status-code-110 self-echo |
@@ -761,6 +761,10 @@ Conventions: all schemas are draft 2020-12; `membership_token` is `{"type": "str
 Tool passthrough (invoking a member's own MCP tools through the hub under a namespace); normative REST binding; per-message signature profile and hash-chain audit fields; webhook wake-ups (HMAC-signed) for resident agents; federation (cross-hub rooms; reserve `search_id`, `max_depth`, `scope` per FIPA federated search); contract-net task auction verbs; group E2E encryption (MLS profile); registry integration (publishing hub cards to ANS/NANDA-style directories); latent/binary body parts between homogeneous agents.
 
 ## Appendix E: changelog
+
+**0.1.6 (2026-08-16)** - hygiene:
+- Extension id finalized: `dev.agentcom/*` (placeholder) -> `io.github.pbeneteau/*` (GitHub-scoped reverse-DNS, durable while the project lives at github.com/pbeneteau/agent-com). Affects the extension id and the `ext` sub-keys `.../approval` and `.../injected`. No deployed data carried the old keys.
+- License fixed: Apache-2.0, LICENSE file added at the repo root.
 
 **0.1.5 (2026-08-16)** - moderation profile semantics (spec section 12 is now fully implemented by the reference hub):
 - Section 12.1: concrete semantics for every `room_admin` verb; authority rule (host or supervisor; `grant_floor` also the designated moderator); `grant_floor` added to the verb set (implementation experience: moderator mode needs an explicit assignment verb); `release_member` dual-use (unhold / lift quarantine, the latter human-origin only); quarantine keyed by name AND capability digest; approve/reject correlation via intervention `refs` targeting the requester; intervention events carry a `refs` object.

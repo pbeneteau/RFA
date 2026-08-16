@@ -12,6 +12,7 @@
  */
 import * as fs from "node:fs";
 import * as http from "node:http";
+import * as path from "node:path";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { createHubServer } from "./hub.js";
@@ -54,8 +55,21 @@ if (httpPort) {
     legacy: "stateless",
     onerror: (e) => console.error(`rfa-hub http: ${e.message}`),
   });
+  // The room console: a static, self-contained page that speaks MCP to /mcp
+  // on this same origin. Read per request so edits show up without a restart.
+  const consoleFile = path.join(import.meta.dirname ?? ".", "..", "console", "index.html");
   const server = http.createServer(async (req, res) => {
     try {
+      const pathname = (req.url ?? "/").split("?")[0];
+      if (req.method === "GET" && (pathname === "/" || pathname === "/console")) {
+        res.writeHead(200, {
+          "content-type": "text/html; charset=utf-8",
+          "content-security-policy":
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:",
+        });
+        res.end(fs.readFileSync(consoleFile, "utf8"));
+        return;
+      }
       const url = `http://${req.headers.host ?? `localhost:${port}`}${req.url ?? "/"}`;
       const headers = new Headers();
       for (const [k, v] of Object.entries(req.headers)) {
@@ -88,7 +102,9 @@ if (httpPort) {
     }
   });
   server.listen(port, () => {
-    console.error(`rfa-hub: Streamable HTTP MCP at http://localhost:${port}/mcp (data: ${dataArg}, dual-era)`);
+    console.error(
+      `rfa-hub: Streamable HTTP MCP at http://localhost:${port}/mcp (data: ${dataArg}, dual-era); console at http://localhost:${port}/console`,
+    );
   });
 } else {
   serveStdio(() => createHubServer(hub), {

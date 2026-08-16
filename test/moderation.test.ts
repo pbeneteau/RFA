@@ -123,7 +123,7 @@ test("supervisors are read-only on the message plane and speak via inject", asyn
   const got = await call(s.aliceC, "room_listen", { room: s.room, membership_token: s.t.alice, since: 0, timeout_ms: 0 });
   const msg = got.events.find((e: any) => e.type === "message");
   assert.equal(msg.envelope.from.origin, "human");
-  assert.equal(msg.envelope.ext["dev.agentcom/injected"], true);
+  assert.equal(msg.envelope.ext["io.github.pbeneteau/injected"], true);
   // The intervention audit trail is in the log.
   const all = await call(s.aliceC, "room_listen", { room: s.room, membership_token: s.t.alice, since: 0, timeout_ms: 0, wait_for: "all" });
   assert.ok(all.events.some((e: any) => e.type === "intervention" && e.verb === "inject"));
@@ -243,7 +243,7 @@ test("approval flow: only a human-origin approve satisfies; agents approving is 
     kind: "request",
     body: [{ type: "text", text: "requesting permission to deploy to prod" }],
     mentions: [s.id.eve],
-    ext: { "dev.agentcom/approval": { request_id: "apr_deploy_1", action: "deploy_prod" } },
+    ext: { "io.github.pbeneteau/approval": { request_id: "apr_deploy_1", action: "deploy_prod" } },
   });
   // Agent-origin supervisor: refused. Reject would be allowed, approve is not.
   assert.equal(
@@ -275,7 +275,7 @@ test("approval flow: only a human-origin approve satisfies; agents approving is 
         message_id: mid(),
         kind: "request",
         body: [{ type: "text", text: "again" }],
-        ext: { "dev.agentcom/approval": { request_id: "apr_deploy_1", action: "deploy_prod" } },
+        ext: { "io.github.pbeneteau/approval": { request_id: "apr_deploy_1", action: "deploy_prod" } },
       }),
     ),
     "task_conflict",
@@ -393,7 +393,7 @@ test("moderation state survives a restart: quarantine, held, origin, approvals",
     message_id: mid(),
     kind: "request",
     body: [{ type: "text", text: "may I?" }],
-    ext: { "dev.agentcom/approval": { request_id: "apr_persist_1", action: "ship" } },
+    ext: { "io.github.pbeneteau/approval": { request_id: "apr_persist_1", action: "ship" } },
   });
   await call(eveC, "room_admin", { room: created.room, membership_token: eve.you.membership_token, verb: "hold_member", target: alice.you.id });
   const bobC = await connectAgent(hub1, "bob-conn");

@@ -230,7 +230,11 @@ await scenario("dual-era: legacy initialize + modern server/discover", async () 
   assert(data.result?.protocolVersion === "2025-06-18", "legacy initialize not served");
   const tools = await modernRpc(mainHub.url, "tools/list", {});
   assert(tools.tools.length === 12, `expected 12 tools, got ${tools.tools.length}`);
-  return `2026-07-28 + 2025-06-18 on one endpoint; ${tools.tools.length} tools listed`;
+  // The console rides the same origin.
+  const consoleRes = await fetch(mainHub.url.replace(/\/mcp$/, "/console"));
+  assert(consoleRes.status === 200, `console not served: ${consoleRes.status}`);
+  assert((await consoleRes.text()).includes("RFA console"), "console page content missing");
+  return `2026-07-28 + 2025-06-18 on one endpoint; ${tools.tools.length} tools listed; console served`;
 });
 
 // 4. Core flow: the spec section 17 worked example over HTTP
@@ -392,7 +396,7 @@ await scenario("moderation: human supervisor, inject, floor control, approval, q
   await call(u, "room_send", {
     room: host.room, membership_token: alice.you.membership_token, message_id: "e2e_mod_apr", kind: "request",
     mentions: [eve.you.id], body: [{ type: "text", text: "permission to deploy?" }],
-    ext: { "dev.agentcom/approval": { request_id: "apr_e2e_1", action: "deploy" } },
+    ext: { "io.github.pbeneteau/approval": { request_id: "apr_e2e_1", action: "deploy" } },
   });
   const verdict = await call(u, "room_admin", { room: host.room, membership_token: eve.you.membership_token, verb: "approve", target: "apr_e2e_1" });
   assert(verdict.status === "approved", "human approve should succeed");

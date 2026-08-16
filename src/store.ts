@@ -682,11 +682,11 @@ export class RoomHub {
     // Approval-flow capture (spec 12.1): validated before append, registered
     // after; only a human-origin room_admin approve can ever satisfy it.
     let pendingApproval: Approval | null = null;
-    const approvalExt = (args.ext ?? {})["dev.agentcom/approval"];
+    const approvalExt = (args.ext ?? {})["io.github.pbeneteau/approval"];
     if (approvalExt !== undefined) {
       const a = approvalExt as { request_id?: unknown; action?: unknown };
       if (typeof a !== "object" || a === null || typeof a.request_id !== "string" || a.request_id.length < 4) {
-        throw new RfaError("bad_request", "ext['dev.agentcom/approval'] requires a request_id string (>= 4 chars)");
+        throw new RfaError("bad_request", "ext['io.github.pbeneteau/approval'] requires a request_id string (>= 4 chars)");
       }
       if (room.approvals.has(a.request_id)) {
         throw new RfaError("task_conflict", `approval request_id ${a.request_id} already exists`);
@@ -1024,7 +1024,7 @@ export class RoomHub {
           chunk: null,
           refusal: null,
           _meta: {},
-          ext: { "dev.agentcom/injected": true },
+          ext: { "io.github.pbeneteau/injected": true },
         };
         intervene(null, { message_id: envelope.message_id });
         const event = this.appendEvent(room, { type: "message", envelope });

@@ -159,6 +159,7 @@ function writeRoomMd(m: RoomMember, joinSecret: string | null): void {
       "```",
       ``,
       `Watch live: \`npm run tail -- data/rooms/${m.room}.ndjson --follow\``,
+      `Or in the browser: ${HUB.replace(/\/mcp$/, "/console")}#${m.room} (join as observer with the secret above)`,
     ].join("\n"),
   );
 }

@@ -4,6 +4,10 @@
   "description": "Reference Room Hub for RFA (Rooms for Agents) v0.1 - agent rooms with presence and capability discovery over MCP",
   "type": "module",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pbeneteau/agent-com.git"
+  },
   "bin": {
     "rfa-hub": "dist/main.js"
   },
