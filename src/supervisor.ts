@@ -50,7 +50,24 @@ interface Child {
 }
 
 const children = new Map<string, Child>();
+const manualStopped = new Set<string>();
 const log = (...a: unknown[]) => console.log(new Date().toISOString().slice(11, 19), "[supervisor]", ...a);
+
+/** The workbench reads this (v0.4.5): the supervisor's view of every resident. */
+function writeStateFile(): void {
+  const agents: Record<string, unknown> = {};
+  for (const [name, c] of children) {
+    agents[name] = {
+      pid: c.proc?.pid ?? null,
+      status: manualStopped.has(name) ? "stopped" : c.proc ? "running" : c.restarts.length > POLICY.maxRestarts ? "crash-looped" : "restarting",
+      started_at: c.startedAt ? new Date(c.startedAt).toISOString() : null,
+      definition_hash: c.pack.definitionHash,
+      restarts_in_window: c.restarts.length,
+    };
+  }
+  fs.mkdirSync(path.join(ROOT, "data"), { recursive: true });
+  fs.writeFileSync(path.join(ROOT, "data", "supervisor-state.json"), JSON.stringify({ ts: new Date().toISOString(), agents }, null, 1));
+}
 
 function residentLog(pack: AgentPack): number {
   const dir = path.join(pack.dir, "state");
@@ -78,10 +95,12 @@ function start(child: Child): void {
   child.startedAt = Date.now();
   child.draining = false;
   log(`started ${child.pack.name} (pid ${proc.pid}, definition ${child.pack.definitionHash.slice(0, 15)})`);
+  writeStateFile();
   proc.on("exit", (code, signal) => {
     fs.closeSync(fd);
     const uptime = Date.now() - child.startedAt;
     child.proc = null;
+    writeStateFile();
     if (child.draining) {
       log(`${child.pack.name} drained (uptime ${Math.round(uptime / 1000)}s)`);
       return; // the drain caller respawns
@@ -160,7 +179,7 @@ async function reconcile(): Promise<void> {
     if (!existing) {
       const child: Child = { pack, proc: null, startedAt: 0, restarts: [], backoffMs: POLICY.backoffBaseMs, draining: false };
       children.set(pack.name, child);
-      start(child);
+      if (!manualStopped.has(pack.name)) start(child);
       fs.watch(path.join(pack.dir, "agent.md"), () => void redeploy(children.get(pack.name)!));
       continue;
     }
@@ -182,6 +201,58 @@ async function reconcile(): Promise<void> {
       children.delete(name);
     }
   }
+}
+
+// ---------------------------------------------------------------- workbench commands (v0.4.5)
+
+const CMD_FILE = path.join(ROOT, "data", "supervisor-commands.ndjson");
+let cmdOffset = fs.existsSync(CMD_FILE) ? fs.statSync(CMD_FILE).size : 0;
+
+async function drainCommands(): Promise<void> {
+  if (!fs.existsSync(CMD_FILE)) return;
+  const size = fs.statSync(CMD_FILE).size;
+  if (size <= cmdOffset) return;
+  const fd = fs.openSync(CMD_FILE, "r");
+  const buf = Buffer.alloc(size - cmdOffset);
+  fs.readSync(fd, buf, 0, buf.length, cmdOffset);
+  fs.closeSync(fd);
+  cmdOffset = size;
+  for (const line of buf.toString("utf8").split("\n").filter((l) => l.trim())) {
+    let cmd: { agent: string; action: string };
+    try {
+      cmd = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const child = children.get(cmd.agent);
+    log(`command: ${cmd.action} ${cmd.agent}`);
+    if (cmd.action === "stop" && child) {
+      manualStopped.add(cmd.agent);
+      await drain(child);
+      writeStateFile();
+    } else if (cmd.action === "start") {
+      manualStopped.delete(cmd.agent);
+      if (child && !child.proc) {
+        child.restarts = [];
+        child.backoffMs = POLICY.backoffBaseMs;
+        start(child);
+      } else if (!child) {
+        await reconcile();
+      }
+    } else if (cmd.action === "restart" && child) {
+      manualStopped.delete(cmd.agent);
+      child.restarts = [];
+      await drain(child);
+      start(child);
+    }
+  }
+}
+try {
+  fs.mkdirSync(path.join(ROOT, "data"), { recursive: true });
+  if (!fs.existsSync(CMD_FILE)) fs.writeFileSync(CMD_FILE, "");
+  fs.watch(CMD_FILE, () => void drainCommands());
+} catch (err) {
+  log(`command channel unavailable: ${(err as Error).message}`);
 }
 
 // ---------------------------------------------------------------- platform duties (v0.4.3): #ops alerts, retention, backup
@@ -287,6 +358,7 @@ async function nightlyPass(): Promise<void> {
 
 log(`registry: ${AGENTS}`);
 await reconcile();
+writeStateFile();
 void opsMember();
 const timer = setInterval(() => void reconcile(), POLICY.reconcileMs);
 const opsTimer = setInterval(() => {

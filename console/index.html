@@ -98,6 +98,60 @@
   #floor-panel { margin-top: 14px; }
   #floor-body { font-size: 12px; color: var(--dim); padding: 0 4px; overflow-wrap: anywhere; }
 
+  /* ---- tabs (v0.4.5 workbench) ---- */
+  #tabs {
+    display: flex; align-items: center; gap: 4px; padding: 6px 12px;
+    background: var(--bg); border-bottom: 1px solid var(--line);
+  }
+  #tabs button {
+    background: transparent; border: 1px solid transparent; color: var(--dim);
+    padding: 5px 14px; border-radius: 6px 6px 0 0; font-size: 13px;
+  }
+  #tabs button.on { color: var(--text); background: var(--panel); border-color: var(--line); border-bottom-color: var(--panel); font-weight: 600; }
+  #tabs .grow { flex: 1; }
+  #inbox-badge {
+    display: none; background: var(--danger); color: #fff; border-radius: 999px;
+    font-size: 10px; padding: 0 6px; margin-left: 4px; font-weight: 700;
+  }
+  #wb-auth { font-size: 12px; }
+  #wb-auth.ok { color: var(--ok); border-color: var(--ok); }
+  .tab { display: none; }
+  .tab.on { display: block; height: calc(100% - 45px); overflow: hidden; }
+  #tab-room.on { display: block; }
+  .wb-wrap { height: 100%; overflow-y: auto; padding: 16px 18px; }
+  .wb-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px;
+  }
+  .card h3 { margin: 0 0 4px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+  .card .desc { color: var(--dim); font-size: 12.5px; margin: 0 0 8px; }
+  .kv { font-size: 12px; color: var(--dim); display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+  .kv b { color: var(--text); font-weight: 600; }
+  .card .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .dotgreen { color: var(--ok); } .dotred { color: var(--danger); } .dotgrey { color: var(--faint); }
+  #editor-overlay {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 40;
+    align-items: center; justify-content: center;
+  }
+  #editor-overlay.on { display: flex; }
+  #editor-box {
+    width: min(860px, 92vw); height: min(640px, 88vh); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 10px; display: flex; flex-direction: column; padding: 14px; gap: 8px;
+  }
+  #editor-text { flex: 1; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; font-family: var(--mono); font-size: 12px; padding: 10px; resize: none; }
+  #editor-err { color: var(--danger); font-size: 12px; min-height: 1em; }
+  .panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  .panel .v { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .panel .k { font-size: 11px; color: var(--faint); text-transform: uppercase; letter-spacing: .06em; }
+  table.runs { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  table.runs th { text-align: left; color: var(--faint); font-weight: 600; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+  table.runs td { padding: 4px 8px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  table.runs tr.click { cursor: pointer; }
+  table.runs tr.click:hover td { background: var(--panel-2); }
+  .trace-row { font-family: var(--mono); font-size: 12px; padding: 2px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .fb-btn { padding: 1px 7px; font-size: 13px; }
+
   /* ---- graph ---- */
   #graph-wrap { display: none; border-bottom: 1px solid var(--line); background: var(--panel); }
   #graph-wrap.on { display: block; }
@@ -138,6 +192,16 @@
 </head>
 <body>
 
+<nav id="tabs">
+  <button data-tab="room" class="on">Room</button>
+  <button data-tab="agents">Agents</button>
+  <button data-tab="runs">Runs</button>
+  <button data-tab="inbox">Inbox<span id="inbox-badge"></span></button>
+  <span class="grow"></span>
+  <button id="wb-auth" title="unlock write actions with the human key">unlock</button>
+</nav>
+
+<div id="tab-room" class="tab on">
 <div id="join-screen">
   <h1>RFA console</h1>
   <p class="sub">Live view of a room on this hub. Observers watch; supervisors intervene.</p>
@@ -206,6 +270,27 @@
     </section>
   </main>
 </div>
+</div>
+
+<div id="tab-agents" class="tab"><div class="wb-wrap"><div id="agents-list" class="wb-grid"></div></div></div>
+
+<div id="tab-runs" class="tab"><div class="wb-wrap">
+  <div class="panels" id="runs-panels"></div>
+  <div id="runs-table"></div>
+  <div id="trace-view" style="margin-top:14px"></div>
+</div></div>
+
+<div id="tab-inbox" class="tab"><div class="wb-wrap"><div id="inbox-list" class="wb-grid"></div></div></div>
+
+<div id="editor-overlay"><div id="editor-box">
+  <div style="display:flex; gap:8px; align-items:center">
+    <b id="editor-title">agent.md</b><span class="grow" style="flex:1"></span>
+    <button id="editor-save" class="primary">Save (validates, live-redeploys)</button>
+    <button id="editor-close">Close</button>
+  </div>
+  <textarea id="editor-text" spellcheck="false"></textarea>
+  <div id="editor-err"></div>
+</div></div>
 
 <script>
 "use strict";
@@ -940,6 +1025,249 @@ addEventListener("pagehide", () => {
   if (!S.token || S.stopped) return;
   try { tool("room_leave", { room: S.room, membership_token: S.token }, { keepalive: true }); } catch {}
 });
+
+// ------------------------------------------------------------------ workbench (v0.4.5)
+// Tabs over the hub's /api/* surface. Reads are tokenless; writes need the
+// session token minted from the human key (unlock button, POST /auth).
+
+const WB = {
+  token: sessionStorage.getItem("wb_token") || null,
+  tab: "room",
+  timer: 0,
+};
+
+function wbAuthUi() {
+  const b = $("wb-auth");
+  b.textContent = WB.token ? "unlocked" : "unlock";
+  b.classList.toggle("ok", !!WB.token);
+}
+wbAuthUi();
+
+$("wb-auth").addEventListener("click", async () => {
+  if (WB.token) { WB.token = null; sessionStorage.removeItem("wb_token"); wbAuthUi(); return; }
+  const key = prompt("human key (hub --human-key value):");
+  if (!key) return;
+  const r = await fetch("/auth", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ human_key: key.trim() }) });
+  if (!r.ok) { alert("invalid key"); return; }
+  WB.token = (await r.json()).session_token;
+  sessionStorage.setItem("wb_token", WB.token);
+  wbAuthUi();
+});
+
+async function wb(pathname, opts = {}) {
+  const r = await fetch(pathname, {
+    method: opts.method ?? "GET",
+    headers: {
+      ...(opts.body ? { "content-type": "application/json" } : {}),
+      ...(WB.token ? { authorization: "Bearer " + WB.token } : {}),
+    },
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  const data = await r.json().catch(() => ({}));
+  if (r.status === 401) { WB.token = null; sessionStorage.removeItem("wb_token"); wbAuthUi(); }
+  if (!r.ok) throw new Error(data.error ?? r.status);
+  return data;
+}
+
+for (const btn of document.querySelectorAll("#tabs button[data-tab]")) {
+  btn.addEventListener("click", () => {
+    WB.tab = btn.dataset.tab;
+    document.querySelectorAll("#tabs button[data-tab]").forEach((b) => b.classList.toggle("on", b === btn));
+    document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("on", t.id === "tab-" + WB.tab));
+    refreshTab();
+  });
+}
+
+function refreshTab() {
+  clearInterval(WB.timer);
+  const load = { agents: loadAgents, runs: loadRuns, inbox: loadInbox }[WB.tab];
+  if (!load) return;
+  void load();
+  WB.timer = setInterval(() => void load(), 15_000);
+}
+
+// Inbox badge polls regardless of tab.
+setInterval(async () => {
+  try {
+    const approvals = await wb("/api/approvals");
+    const b = $("inbox-badge");
+    b.style.display = approvals.length ? "inline-block" : "none";
+    b.textContent = String(approvals.length);
+  } catch { /* hub away */ }
+}, 20_000);
+
+// ---- Agents tab ----
+async function loadAgents() {
+  const agents = await wb("/api/agents");
+  const list = $("agents-list");
+  list.replaceChildren();
+  for (const a of agents) {
+    const sup = a.supervisor ?? {};
+    const status = sup.status ?? (a.heartbeat_age_s != null && a.heartbeat_age_s < 300 ? "running" : "unknown");
+    const dotCls = status === "running" ? "dotgreen" : status === "stopped" ? "dotgrey" : "dotred";
+    const life = (action) => async () => {
+      try { await wb(`/api/agents/${a.name}/lifecycle`, { method: "POST", body: { action } }); setTimeout(loadAgents, 1200); }
+      catch (e) { alert(e.message); }
+    };
+    const boundRoom = (a.rooms ?? []).find((r) => r.serve)?.room ?? null;
+    const askInput = el("input", { placeholder: boundRoom && S.room === boundRoom ? "playground: ask this agent..." : "join its room (Room tab) to use the playground", style: "flex:1; min-width:180px" });
+    const askOut = el("div", { class: "desc", style: "white-space:pre-wrap" });
+    const doAsk = async () => {
+      const q = askInput.value.trim();
+      if (!q || !S.token || S.room !== boundRoom) return;
+      askOut.textContent = "asking...";
+      try {
+        const target = S.roster.find((r) => (a.offers ?? []).some((o) => r.card_summary.skill_ids.includes(o)));
+        if (!target) throw new Error("agent not in the roster");
+        const send = await tool("room_send", {
+          room: S.room, membership_token: S.token, message_id: "pg_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+          kind: "request", mentions: [target.id], body: [{ type: "text", text: q }],
+          reply_by: new Date(Date.now() + 120000).toISOString(),
+        });
+        let cursor = send.seq;
+        for (let i = 0; i < 8; i++) {
+          const res = await tool("room_listen", { room: S.room, membership_token: S.token, since: cursor, timeout_ms: 25000 });
+          cursor = res.cursor;
+          const hit = res.events.find((e) => e.type === "message" && e.envelope.in_reply_to === send.message_id);
+          if (hit) {
+            const cost = (hit.envelope.body.find((p) => p.type === "json")?.value ?? {}).cost_usd;
+            askOut.textContent = hit.envelope.body.filter((p) => p.type === "text").map((p) => p.text).join("\n") + (cost != null ? `\n[$${cost}]` : "");
+            return;
+          }
+        }
+        askOut.textContent = "(no reply within the window)";
+      } catch (e) { askOut.textContent = "error: " + e.message; }
+    };
+    askInput.addEventListener("keydown", (ev) => { if (ev.key === "Enter") void doAsk(); });
+    list.append(el("div", { class: "card" },
+      el("h3", {}, el("span", { class: dotCls }, "\u25CF"), a.name, el("span", { class: "badge" }, a.model + (a.effort ? "/" + a.effort : ""))),
+      el("p", { class: "desc" }, a.description),
+      el("div", { class: "kv" },
+        el("span", {}, "status ", el("b", {}, status)),
+        el("span", {}, "def ", el("b", { class: "mono" }, (a.definition_hash ?? "").slice(7, 15))),
+        el("span", {}, "heartbeat ", el("b", {}, a.heartbeat_age_s != null ? a.heartbeat_age_s + "s" : "-")),
+        el("span", {}, "room ", el("b", { class: "mono" }, boundRoom ?? "-"))),
+      el("div", { class: "row" },
+        el("button", { class: "small", onclick: () => void openEditor(a.name) }, "edit definition"),
+        el("button", { class: "small", onclick: life("restart") }, "restart"),
+        status === "stopped"
+          ? el("button", { class: "small", onclick: life("start") }, "start")
+          : el("button", { class: "small danger", onclick: life("stop") }, "stop")),
+      el("div", { class: "row", style: "margin-top:8px" }, askInput, el("button", { class: "small", onclick: () => void doAsk() }, "ask")),
+      askOut,
+    ));
+  }
+}
+
+let editorAgent = null;
+async function openEditor(name) {
+  editorAgent = name;
+  const { content } = await wb(`/api/agents/${name}/definition`);
+  $("editor-title").textContent = `agents/${name}/agent.md`;
+  $("editor-text").value = content;
+  $("editor-err").textContent = "";
+  $("editor-overlay").classList.add("on");
+}
+$("editor-close").addEventListener("click", () => $("editor-overlay").classList.remove("on"));
+$("editor-save").addEventListener("click", async () => {
+  try {
+    const r = await wb(`/api/agents/${editorAgent}/definition`, { method: "PUT", body: { content: $("editor-text").value } });
+    $("editor-err").textContent = "";
+    $("editor-overlay").classList.remove("on");
+    line("dim", `definition saved: ${r.definition_hash.slice(0, 15)} (supervisor redeploys)`);
+    setTimeout(loadAgents, 1500);
+  } catch (e) {
+    $("editor-err").textContent = e.message;
+  }
+});
+
+// ---- Runs tab ----
+async function loadRuns() {
+  const [summary, runs] = await Promise.all([wb("/api/summary?window_m=60"), wb("/api/runs?limit=30")]);
+  const panels = $("runs-panels");
+  panels.replaceChildren();
+  const panel = (k, v) => el("div", { class: "panel" }, el("div", { class: "v" }, v), el("div", { class: "k" }, k));
+  if (summary) {
+    panels.append(
+      panel("runs / 1h", String(summary.runs)),
+      panel("errors", `${summary.errors} (${summary.error_pct.toFixed(0)}%)`),
+      panel("avg latency", (summary.avg_latency_ms / 1000).toFixed(1) + "s"),
+      panel("cost / 1h", "$" + summary.cost_usd.toFixed(3)),
+      panel("avg feedback", summary.avg_feedback == null ? "-" : summary.avg_feedback.toFixed(2)),
+    );
+  }
+  const tbl = el("table", { class: "runs" },
+    el("tr", {}, ...["", "run", "type", "status", "latency", "cost", "room", ""].map((h) => el("th", {}, h))));
+  for (const r of runs) {
+    const fb = async (score) => {
+      try { await wb("/api/feedback", { method: "POST", body: { run_id: r.id, key: "thumbs", score } }); loadRuns(); }
+      catch (e) { alert(e.message); }
+    };
+    const row = el("tr", { class: "click" },
+      el("td", {}, el("span", { class: r.status === "error" ? "dotred" : "dotgreen" }, "\u25CF")),
+      el("td", { class: "mono" }, r.name + " " + r.id.slice(0, 10)),
+      el("td", {}, r.run_type.replace("_span", "")),
+      el("td", {}, r.status + (r.needs_review ? " (review)" : "")),
+      el("td", {}, ((r.end_time - r.start_time) / 1000).toFixed(1) + "s"),
+      el("td", {}, r.cost_usd != null ? "$" + r.cost_usd.toFixed(4) : "-"),
+      el("td", { class: "mono" }, r.group_id ?? "-"),
+      el("td", {},
+        el("button", { class: "small fb-btn", onclick: (ev) => { ev.stopPropagation(); void fb(1); } }, "\uD83D\uDC4D"),
+        " ",
+        el("button", { class: "small fb-btn", onclick: (ev) => { ev.stopPropagation(); void fb(0); } }, "\uD83D\uDC4E")),
+    );
+    row.addEventListener("click", () => void loadTrace(r.trace_id));
+    tbl.append(row);
+  }
+  $("runs-table").replaceChildren(tbl);
+}
+
+async function loadTrace(traceId) {
+  const runs = await wb("/api/runs?trace=" + encodeURIComponent(traceId));
+  const view = $("trace-view");
+  view.replaceChildren(el("h3", {}, "trace ", el("span", { class: "mono" }, traceId.slice(0, 16))));
+  for (const r of runs) {
+    const depth = r.dotted_order.split(".").length - 1;
+    view.append(el("div", { class: "trace-row", style: `padding-left:${depth * 22}px; color:${r.status === "error" ? "var(--danger)" : "var(--text)"}` },
+      `${r.name}  ${((r.end_time - r.start_time) / 1000).toFixed(2)}s` +
+      (r.cost_usd != null ? `  $${r.cost_usd.toFixed(4)}` : "") +
+      (r.error ? `  ${r.error}` : "")));
+  }
+}
+
+// ---- Inbox tab ----
+async function loadInbox() {
+  const approvals = await wb("/api/approvals");
+  const list = $("inbox-list");
+  list.replaceChildren();
+  if (!approvals.length) list.append(el("p", { class: "desc" }, "no pending approvals"));
+  for (const a of approvals) {
+    const paramsBox = el("input", { placeholder: "params override (JSON, optional = edit-before-approve)", style: "width:100%" });
+    const decide = (verb) => async () => {
+      let params;
+      if (paramsBox.value.trim()) {
+        try { params = JSON.parse(paramsBox.value); } catch { alert("params must be JSON"); return; }
+      }
+      try { await wb("/api/approvals/decide", { method: "POST", body: { room: a.room, request_id: a.request_id, verb, params } }); loadInbox(); }
+      catch (e) { alert(e.message); }
+    };
+    const canEdit = !a.allowed_decisions || a.allowed_decisions.includes("edit");
+    list.append(el("div", { class: "card" },
+      el("h3", {}, a.held ? "held message" : "approval", el("span", { class: "badge" }, a.action || "-")),
+      el("p", { class: "desc" }, `${a.requester_name} in ${a.topic}`),
+      a.message_preview ? el("p", { class: "desc", style: "font-style:italic" }, '"' + a.message_preview + '"') : null,
+      el("div", { class: "kv" },
+        el("span", { class: "mono" }, a.request_id),
+        a.expires_at ? el("span", {}, "expires ", el("b", {}, a.expires_at.slice(11, 19))) : null,
+        a.allowed_decisions ? el("span", {}, "allows ", el("b", {}, a.allowed_decisions.join("/"))) : null),
+      canEdit && !a.held ? paramsBox : null,
+      el("div", { class: "row", style: "margin-top:8px" },
+        el("button", { class: "small primary", onclick: decide("approve") }, a.held ? "release" : "approve"),
+        el("button", { class: "small danger", onclick: decide("reject") }, "reject")),
+    ));
+  }
+}
+
 </script>
 </body>
 </html>

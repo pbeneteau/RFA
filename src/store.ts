@@ -1142,6 +1142,80 @@ export class RoomHub {
     this.notifyWatchers(room, [event]);
   }
 
+  // ---------------------------------------------------------------- workbench surface (v0.4.5)
+
+  /** Every pending approval across rooms, for the console inbox. */
+  pendingApprovals(): {
+    room: string;
+    topic: string;
+    request_id: string;
+    requester: string;
+    requester_name: string;
+    action: string;
+    allowed_decisions: string[] | null;
+    expires_at: string | null;
+    held: boolean;
+    message_preview: string | null;
+  }[] {
+    const out: ReturnType<RoomHub["pendingApprovals"]> = [];
+    for (const room of this.rooms.values()) {
+      if (room.ended) continue;
+      for (const a of room.approvals.values()) {
+        if (a.status !== "pending") continue;
+        const held = room.heldMessages.get(a.messageId);
+        const preview = held
+          ? held.envelope.body
+              .filter((p): p is Extract<Part, { type: "text" }> => p.type === "text")
+              .map((p) => p.text)
+              .join(" ")
+              .slice(0, 200)
+          : this.findMessage(room, a.messageId)?.body
+              .filter((p): p is Extract<Part, { type: "text" }> => p.type === "text")
+              .map((p) => p.text)
+              .join(" ")
+              .slice(0, 200) ?? null;
+        out.push({
+          room: room.handle,
+          topic: room.topic,
+          request_id: a.requestId,
+          requester: a.requester,
+          requester_name: room.members.get(a.requester)?.name ?? a.requester,
+          action: a.action,
+          allowed_decisions: a.allowedDecisions ?? null,
+          expires_at: a.expiresAt ? iso(a.expiresAt) : null,
+          held: !!a.held,
+          message_preview: preview,
+        });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * The console's supervisor membership in a room, minted by the hub itself
+   * (spec 3.8: a session token chained to a provisioned human key IS a human
+   * principal, so its decisions must land as ordinary, auditable, human-origin
+   * interventions: same machinery, no new authority path). Reused per room.
+   */
+  consoleMembership(roomHandle: string): { membership_token: string; member_id: string } {
+    const room = this.getRoom(roomHandle);
+    for (const m of room.members.values()) {
+      if (m.present && m.origin === "human" && m.role === "supervisor" && m.name.startsWith("console")) {
+        return { membership_token: m.token, member_id: m.id };
+      }
+    }
+    const contract = this.doJoin(room, {
+      name: "console",
+      card: { name: "console", description: "the workbench console (human operator)" },
+      role: "supervisor",
+      origin: "human",
+      historyLimit: 0,
+      isHost: false,
+    });
+    this.writeMeta(room);
+    return { membership_token: contract.you.membership_token, member_id: contract.you.id };
+  }
+
   // ---------------------------------------------------------------- moderation (spec section 12)
 
   admin(args: {
