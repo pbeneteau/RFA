@@ -23,7 +23,8 @@ import { interruptMatch, joinSidekick, requestApproval } from "./bridge.js";
 import { MemoryGate, RoomMember, type ServeContext } from "./client.js";
 import { Engine } from "./engine.js";
 import { ObsStore } from "./obs.js";
-import { EpisodeLog, GatedMemory } from "./memoryfs.js";
+import { consolidate } from "./consolidate.js";
+import { EpisodeLog, FactStore, GatedMemory } from "./memoryfs.js";
 
 const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
 const HUB = process.env.RFA_HUB_URL ?? "http://localhost:8790/mcp";
@@ -86,6 +87,7 @@ const gate = new MemoryGate();
 const engine = new Engine(path.join(ROOT, "data", "runs.db"));
 const obs = new ObsStore(path.join(ROOT, "data", "obs.db"));
 const episodes = new EpisodeLog(path.join(STATE_DIR, "memory.db"));
+const facts = new FactStore(path.join(STATE_DIR, "memory.db"), gate, "self");
 const sessions = new Map<string, string>();
 let spend = { day: new Date().toISOString().slice(0, 10), usd: 0 };
 
@@ -502,11 +504,31 @@ scheduleTimer.unref?.();
 // ---------------------------------------------------------------- serve
 
 let answered = 0;
+let serving = false;
+let sinceConsolidation = 0;
+let lastConsolidation = Date.now();
+
+// Background consolidation (spec 5.3): after 8 gated exchanges or 6h, when idle.
+const consolidationTimer = setInterval(() => {
+  if (serving) return;
+  if (sinceConsolidation < 8 && Date.now() - lastConsolidation < 6 * 3600_000) return;
+  sinceConsolidation = 0;
+  lastConsolidation = Date.now();
+  void consolidate(pack.name)
+    .then((r) => {
+      if (r.episodes > 0) log(`consolidated ${r.episodes} episodes: +${r.added} facts, ~${r.updated}, -${r.invalidated} ($${r.cost_usd.toFixed(4)})`);
+    })
+    .catch((err) => log(`consolidation failed: ${(err as Error).message}`));
+}, 60_000);
+consolidationTimer.unref?.();
+
 const shutdown = (sig: string) => {
   log(`${sig}: draining after ${answered} answers`);
   save();
+  clearInterval(consolidationTimer);
   engine.close();
   episodes.close();
+  facts.close();
   obs.close();
   process.exit(0);
 };
@@ -527,9 +549,16 @@ await member.serve(
     });
     log(`Q from ${ctx.from.name} (seq ${ctx.envelope.seq}, run ${runId}): ${ctx.text.slice(0, 100)}`);
     currentRunId = runId;
+    serving = true;
     const t0 = Date.now();
     try {
-      const { text, costUsd, numTurns, tokens } = await brain(ctx.wrapped, convo);
+      // L3 retrieval (spec 5.1): consolidated facts relevant to THIS question,
+      // origin-tagged, injected per turn (never the whole store).
+      const relevant = facts.retrieve(ctx.text, 5);
+      const memoryBlock = relevant.length
+        ? `<consolidated-memory note="your own distilled conclusions; [origin] tags the source trust tier; may be stale">\n${relevant.map((f) => `- [${f.source_origin}] ${f.text}`).join("\n")}\n</consolidated-memory>\n\n`
+        : "";
+      const { text, costUsd, numTurns, tokens } = await brain(memoryBlock + ctx.wrapped, convo);
       answered++;
       episodes.recordOwn(member.room, member.memberId, member.name, text);
       engine.completeRun(runId, {
@@ -553,6 +582,8 @@ await member.serve(
         cost_usd: costUsd,
         extra: { "gen_ai.request.model": pack.def.model ?? "inherit", num_turns: numTurns, definition: pack.definitionHash.slice(0, 15), conversation: convo },
       });
+      serving = false;
+      sinceConsolidation++;
       log(`A sent (${text.length} chars, $${costUsd.toFixed(4)}, ${numTurns} turns): ${text.slice(0, 100)}`);
       return [
         { type: "text", text },
@@ -569,6 +600,7 @@ await member.serve(
         },
       ];
     } catch (err) {
+      serving = false;
       engine.failRun(runId, (err as Error).message, { retryable: false });
       obs.record({
         id: runId,

@@ -18,6 +18,7 @@ import Database from "better-sqlite3";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import YAML from "yaml";
+import { sha256hex } from "./jcs.js";
 import type { Envelope } from "./model.js";
 import type { MemoryGate } from "./client.js";
 
@@ -186,6 +187,182 @@ function listRec(dir: string, root: string, out: string[] = []): string[] {
   return out;
 }
 
+// ---------------------------------------------------------------- facts (L3 semantic, v0.4 spec 5.1)
+
+/**
+ * The semantic layer: durable facts distilled from episodes by background
+ * consolidation. Mem0's reconciliation events over Graphiti's bi-temporal
+ * columns: created_at/expired_at are TRANSACTION time (when we started and
+ * stopped believing the row), valid_at/invalid_at are EVENT time (when the
+ * fact held in the world). DELETE invalidates, never removes: "who said what
+ * when" stays answerable in a moderated multi-agent space.
+ */
+export interface Fact {
+  id: number;
+  text: string;
+  hash: string;
+  importance: number;
+  /** Trust tier from provenance: human > self (own conclusions) > agent (peer-derived). */
+  source_origin: "human" | "self" | "agent";
+  episode_ids: number[];
+  supersedes: number | null;
+  created_at: string;
+  expired_at: string | null;
+  valid_at: string | null;
+  invalid_at: string | null;
+}
+
+/** Mem0's exact reconciliation item shape. */
+export interface ReconciliationItem {
+  id?: number;
+  text: string;
+  event: "ADD" | "UPDATE" | "DELETE" | "NONE";
+  old_memory?: string;
+  importance?: number;
+}
+
+export class FactStore {
+  private db: Database.Database;
+
+  constructor(dbPath: string, private gate?: MemoryGate, private selfId = "self") {
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    this.db = new Database(dbPath);
+    this.db.pragma("journal_mode = WAL");
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS facts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT NOT NULL,
+        hash TEXT NOT NULL,
+        importance REAL NOT NULL DEFAULT 0.5,
+        source_origin TEXT NOT NULL DEFAULT 'agent' CHECK (source_origin IN ('human','self','agent')),
+        episode_ids TEXT NOT NULL DEFAULT '[]',
+        supersedes INTEGER,
+        created_at TEXT NOT NULL,
+        expired_at TEXT,
+        valid_at TEXT,
+        invalid_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_facts_hash ON facts(hash);
+      CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(text, content='facts', content_rowid='id');
+      CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
+        INSERT INTO facts_fts(rowid, text) VALUES (new.id, new.text);
+      END;
+    `);
+  }
+
+  close(): void {
+    this.db.close();
+  }
+
+  /** Live facts loosely matching a query: the reconciliation candidate set. */
+  candidates(query: string, k = 5): Fact[] {
+    return this.search(query, k).map((r) => r.fact);
+  }
+
+  /**
+   * Retrieval for the answer path: FTS BM25 reranked by recency x importance
+   * (Generative Agents' shape). Live facts only.
+   */
+  retrieve(query: string, k = 5): Fact[] {
+    const now = Date.now();
+    return this.search(query, k * 3)
+      .map((r) => {
+        const ageDays = (now - Date.parse(r.fact.created_at)) / 86_400_000;
+        const recency = Math.exp(-ageDays / 30);
+        return { fact: r.fact, score: r.bm25 * (0.4 + 0.6 * recency) * (0.4 + 0.6 * r.fact.importance) };
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, k)
+      .map((r) => r.fact);
+  }
+
+  private search(query: string, k: number): { fact: Fact; bm25: number }[] {
+    const terms = query
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N} ]/gu, " ")
+      .split(/\s+/)
+      .filter((t) => t.length > 2)
+      .slice(0, 12);
+    if (terms.length === 0) return [];
+    const match = terms.map((t) => `"${t}"`).join(" OR ");
+    const rows = this.db
+      .prepare(
+        `SELECT f.*, bm25(facts_fts) AS rank FROM facts_fts
+         JOIN facts f ON f.id = facts_fts.rowid
+         WHERE facts_fts MATCH ? AND f.expired_at IS NULL AND f.invalid_at IS NULL
+         ORDER BY rank LIMIT ?`,
+      )
+      .all(match, k) as (FactRow & { rank: number })[];
+    // bm25() is smaller-is-better; normalize to a positive score.
+    return rows.map((r) => ({ fact: hydrateFact(r), bm25: 1 / (1 + Math.max(0, r.rank)) }));
+  }
+
+  live(limit = 200): Fact[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM facts WHERE expired_at IS NULL AND invalid_at IS NULL ORDER BY id DESC LIMIT ?`)
+      .all(limit) as FactRow[];
+    return rows.map(hydrateFact);
+  }
+
+  /** Apply one Mem0 reconciliation item. Returns what happened (gate rejections skip). */
+  apply(item: ReconciliationItem, episodeIds: number[], origin: Fact["source_origin"]): "added" | "updated" | "invalidated" | "skipped" {
+    const now = new Date().toISOString();
+    if (item.event === "NONE") return "skipped";
+    if (item.event === "DELETE") {
+      if (item.id == null) return "skipped";
+      this.db.prepare(`UPDATE facts SET invalid_at = ?, expired_at = ? WHERE id = ? AND expired_at IS NULL`).run(now, now, item.id);
+      return "invalidated";
+    }
+    // ADD / UPDATE write new text: the gate holds at this door too (a fact that
+    // near-duplicates recent peer content is the worm asking to be remembered).
+    if (this.gate) {
+      const v = this.gate.inspectText(item.text, this.selfId);
+      if (!v.ok) return "skipped";
+    }
+    const hash = sha256hex(item.text.toLowerCase().replace(/\s+/g, " ").trim()).slice(0, 32);
+    const dup = this.db.prepare(`SELECT id FROM facts WHERE hash = ? AND expired_at IS NULL`).get(hash);
+    if (dup) return "skipped";
+    let supersedes: number | null = null;
+    if (item.event === "UPDATE" && item.id != null) {
+      this.db.prepare(`UPDATE facts SET expired_at = ? WHERE id = ? AND expired_at IS NULL`).run(now, item.id);
+      supersedes = item.id;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO facts (text, hash, importance, source_origin, episode_ids, supersedes, created_at, valid_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(item.text, hash, clamp01(item.importance ?? 0.5), origin, JSON.stringify(episodeIds), supersedes, now, now);
+    return item.event === "UPDATE" ? "updated" : "added";
+  }
+
+  count(): { live: number; total: number } {
+    const total = (this.db.prepare(`SELECT COUNT(*) AS n FROM facts`).get() as { n: number }).n;
+    const live = (this.db.prepare(`SELECT COUNT(*) AS n FROM facts WHERE expired_at IS NULL AND invalid_at IS NULL`).get() as { n: number }).n;
+    return { live, total };
+  }
+}
+
+interface FactRow {
+  id: number;
+  text: string;
+  hash: string;
+  importance: number;
+  source_origin: "human" | "self" | "agent";
+  episode_ids: string;
+  supersedes: number | null;
+  created_at: string;
+  expired_at: string | null;
+  valid_at: string | null;
+  invalid_at: string | null;
+}
+
+function hydrateFact(r: FactRow): Fact {
+  return { ...r, episode_ids: JSON.parse(r.episode_ids) as number[] };
+}
+
+const clamp01 = (n: number) => Math.max(0, Math.min(1, n));
+
 // ---------------------------------------------------------------- episodes (L2)
 
 export interface Episode {
@@ -249,6 +426,23 @@ export class EpisodeLog {
 
   recent(n = 20): Episode[] {
     return this.db.prepare(`SELECT * FROM episodes ORDER BY id DESC LIMIT ?`).all(n) as Episode[];
+  }
+
+  /** Episodes after a marker, oldest first (the consolidation input). */
+  since(id: number, limit = 100): Episode[] {
+    return this.db.prepare(`SELECT * FROM episodes WHERE id > ? ORDER BY id LIMIT ?`).all(id, limit) as Episode[];
+  }
+
+  /** Tiny KV beside the episodes (e.g. the consolidation watermark): same DB, no state-file races. */
+  getMeta(key: string): string | null {
+    this.db.exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`);
+    const row = this.db.prepare(`SELECT value FROM meta WHERE key = ?`).get(key) as { value: string } | undefined;
+    return row?.value ?? null;
+  }
+
+  setMeta(key: string, value: string): void {
+    this.db.exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`);
+    this.db.prepare(`INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(key, value);
   }
 
   count(): number {
