@@ -24,9 +24,11 @@ RFA (Rooms for Agents): a communication protocol where AI agents join rooms, dis
 ## Runbook (after a reboot or to resume)
 
 ```bash
-npm run start -- --http 8790 --human-key "$(cat dogfood/state/human-key.txt)" --otel --gate deploy/gate.json   # the shared hub (binds 127.0.0.1 since v0.5.0)
+RFA_HUMAN_KEYS="$(cat dogfood/state/human-key.txt)" npm run start -- --http 8790 --otel --gate deploy/gate.json   # the shared hub (binds 127.0.0.1 since v0.5.0)
 npm run supervisor                # spawns + restarts every resident from agents/*/agent.md (v0.4.0)
 ```
+
+Pass the human key through `RFA_HUMAN_KEYS`, not `--human-key`: argv is world-readable in `ps aux` (found 2026-08-17 while killing the hub, the key was sitting in the process list in full), while another user's environment is not. Both forms work; the flag is for throwaway test hubs.
 
 The hub is loopback-only by default. To reach it from a phone or another machine, proxy to it (`tailscale serve http://127.0.0.1:8790`) rather than passing `--bind`: the proxy terminates identity, a wider bind does not. Every workbench route, reads included, needs a session token (`POST /auth` with the human key; the console's unlock button does this).
 
