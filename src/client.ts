@@ -10,7 +10,10 @@
  * Speaks the modern-era (2026-07-28) MCP wire over HTTP; works against any
  * conforming hub.
  */
-import type { AgentCard, Envelope, Part, PresenceRecord, RfaEvent, SendResult } from "./model.js";
+import type { AgentCard, Envelope, Part, PresenceRecord, RefusalReason, RfaEvent, SendResult } from "./model.js";
+
+/** Wire 12.4 (0.1.8) added `deadline_expired`; `RefusalReason` and the hub's send schema still predate it. */
+export type SendableRefusalReason = RefusalReason | "deadline_expired";
 
 const META = {
   "io.modelcontextprotocol/protocolVersion": "2026-07-28",
@@ -43,6 +46,21 @@ export interface ServeContext {
   wrapped: string;
   conversationId: string | null;
   from: { id: string; name: string };
+}
+
+/**
+ * A serve handler's answer when the answer is a refusal, not prose (wire 12.4:
+ * an approval that closed on the clock owes the asker `deadline_expired`).
+ * The refusal is sent by this member's own client; the hub never speaks in a
+ * member's voice, so nothing else can produce it.
+ */
+export class ServeRefusal {
+  constructor(
+    readonly reason: SendableRefusalReason,
+    readonly detail: string,
+    /** What the asker reads; defaults to the detail. */
+    readonly body: string | Part[] = detail,
+  ) {}
 }
 
 export interface ProjectedTool {
@@ -333,7 +351,7 @@ export class RoomMember {
    * the room ends.
    */
   async serve(
-    handler: (ctx: ServeContext) => Promise<string | Part[]>,
+    handler: (ctx: ServeContext) => Promise<string | Part[] | ServeRefusal>,
     opts: { signal?: AbortSignal; presence?: "ready" | "busy" | "away"; onCycle?: (cursor: number) => void; onError?: (err: Error) => void } = {},
   ): Promise<void> {
     this.looping = true;
@@ -367,11 +385,12 @@ export class RoomMember {
               from: { id: env.from.id, name: env.from.name },
             });
             await this.send({
-              kind: env.kind === "request" ? "response" : "chat",
+              kind: answer instanceof ServeRefusal ? "refuse" : env.kind === "request" ? "response" : "chat",
               inReplyTo: env.message_id,
               conversationId: env.conversation_id ?? undefined,
               to: [env.from.id],
-              body: typeof answer === "string" ? [{ type: "text", text: answer }] : answer,
+              body: answer instanceof ServeRefusal ? answer.body : answer,
+              refusal: answer instanceof ServeRefusal ? { reason: answer.reason, detail: answer.detail.slice(0, 200) } : undefined,
               presence: opts.presence ?? "ready",
             });
           } catch (err) {

@@ -35,6 +35,39 @@ export interface ApprovalOutcome {
   /** Edit-before-approve: the params the human substituted, when they did. */
   params?: Record<string, unknown>;
   reason: string;
+  /** A clock closed the window, not a person (wire 12.4: `expired`, never `rejected`). */
+  expired?: boolean;
+}
+
+/** Delivery margin subtracted from the asker's deadline, so the card dies first (spec 16.1). */
+const REPLY_BY_MARGIN_MS = 30_000;
+/** Floor: a nearly-expired ask still gets a real chance at a human (spec 16.1). */
+const APPROVAL_FLOOR_MS = 60_000;
+/**
+ * Window for an ask that carries no `reply_by` (spec 16.1), matching the
+ * `npm run ask` default. There is no ceiling above this: a longer asker
+ * deadline buys a longer window, bounded only by what the in-process wait of
+ * 16.4 survives (minutes to about an hour, not hours).
+ */
+export const DEFAULT_APPROVAL_WINDOW_MS = 30 * 60_000;
+
+/**
+ * The approval window, derived from the asker's own deadline (spec 16.1): the
+ * card must never outlive its audience, and must never die before it either.
+ */
+export function approvalWindowMs(replyBy: string | null | undefined, now: number = Date.now()): number {
+  const remaining = replyBy ? Date.parse(replyBy) - now - REPLY_BY_MARGIN_MS : NaN;
+  return Number.isFinite(remaining) ? Math.max(APPROVAL_FLOOR_MS, remaining) : DEFAULT_APPROVAL_WINDOW_MS;
+}
+
+/**
+ * The refusal reason a denied tool call owes the asker (wire 12.4). Only the
+ * clock is `deadline_expired`; a human "no" is `declined`. Null when nothing
+ * was denied, so the answer is an ordinary response.
+ */
+export function refusalForOutcome(outcome: ApprovalOutcome): "deadline_expired" | "declined" | null {
+  if (outcome.approved) return null;
+  return outcome.expired ? "deadline_expired" : "declined";
 }
 
 let approvalSeq = 0;
@@ -56,7 +89,7 @@ export async function requestApproval(
     runId?: string;
   },
 ): Promise<ApprovalOutcome> {
-  const timeoutMs = opts.timeoutMs ?? 10 * 60_000;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_APPROVAL_WINDOW_MS;
   const requestId = `apr_${opts.runId ?? "run"}_${++approvalSeq}_${Date.now().toString(36)}`;
   const inputPreview = JSON.stringify(opts.input);
   const send = await member.send({
@@ -94,11 +127,13 @@ export async function requestApproval(
       }
       if (e.type === "system" && e.event === "approval_expired") {
         const refs = e.refs as { request_id?: string };
-        if (refs.request_id === requestId) return { approved: false, reason: "approval expired unanswered" };
+        if (refs.request_id === requestId) return { approved: false, reason: "approval expired unanswered", expired: true };
       }
     }
   }
-  return { approved: false, reason: "approval wait timed out" };
+  // The sweep's event never reached us, but the window closed all the same:
+  // still a clock, so still `expired` rather than a human refusal (12.4).
+  return { approved: false, reason: "approval wait timed out", expired: true };
 }
 
 /** The lazy observer sidekick: joined once per resident process, reused. */

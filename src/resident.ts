@@ -19,12 +19,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as z from "zod";
 import { deriveCard, knowledgeFiles, loadPack, type AgentPack } from "./agentdef.js";
-import { interruptMatch, joinSidekick, requestApproval } from "./bridge.js";
-import { MemoryGate, RoomMember, type ServeContext } from "./client.js";
+import { approvalWindowMs, interruptMatch, joinSidekick, refusalForOutcome, requestApproval } from "./bridge.js";
+import { MemoryGate, RoomMember, ServeRefusal, type ServeContext } from "./client.js";
 import { Engine } from "./engine.js";
 import { ObsStore } from "./obs.js";
 import { consolidate } from "./consolidate.js";
 import { EpisodeLog, FactStore, GatedMemory } from "./memoryfs.js";
+import type { Part } from "./model.js";
 
 const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
 const HUB = process.env.RFA_HUB_URL ?? "http://localhost:8790/mcp";
@@ -297,6 +298,8 @@ const linearServer = createSdkMcpServer({
 let sidekick: RoomMember | null = null;
 let currentRunId: string | null = null;
 let currentReplyBy: string | null = null;
+/** Set by the bridge when this turn's approval died on the clock (wire 12.4); cleared per turn. */
+let pendingRefusal: string | null = null;
 
 async function ensureSidekick(): Promise<RoomMember> {
   sidekick ??= await joinSidekick(HUB, member.room, joinSecret, pack.name);
@@ -383,17 +386,23 @@ async function brain(prompt: string, convoKey: string): Promise<{ text: string; 
         }
         // The card must never outlive its audience (found live: a 10-min card
         // vs a 600s asker left a 35s window where an approval would have saved
-        // a document for a departed asker). Cap the window at reply_by minus a
-        // margin, floored so a nearly-expired ask still gets a real chance.
-        const replyByMs = currentReplyBy ? Date.parse(currentReplyBy) - Date.now() - 30_000 : NaN;
+        // a document for a departed asker), and never die before it either: the
+        // window is the asker's deadline minus a margin, no platform ceiling
+        // (spec 16.1). The bound is what this in-process wait survives (16.4).
         const outcome = await requestApproval(member, sk, {
           toolName,
           input: input as Record<string, unknown>,
           allowedDecisions: rule.allowed_decisions,
           runId: currentRunId ?? undefined,
-          ...(Number.isFinite(replyByMs) ? { timeoutMs: Math.max(60_000, Math.min(10 * 60_000, replyByMs)) } : {}),
+          timeoutMs: approvalWindowMs(currentReplyBy),
         });
         log(`approval ${toolName}: ${outcome.reason}`);
+        // A clock is not a decision (wire 12.4): the asker is owed a
+        // `deadline_expired` refusal, sent by this client, not a prose answer
+        // that reads like a human said no. The turn's LAST outcome governs: a
+        // human who then approves or rejects has engaged, so the answer is
+        // theirs and not the clock's.
+        pendingRefusal = refusalForOutcome(outcome) === "deadline_expired" ? outcome.reason : null;
         return outcome.approved
           // Edit-before-approve MERGES over the original input: the human edits
           // fields, they do not retype the whole call (found live: a title-only
@@ -598,6 +607,7 @@ await member.serve(
     log(`Q from ${ctx.from.name} (seq ${ctx.envelope.seq}, run ${runId}): ${ctx.text.slice(0, 100)}`);
     currentRunId = runId;
     currentReplyBy = ctx.envelope.reply_by;
+    pendingRefusal = null;
     serving = true;
     const t0 = Date.now();
     try {
@@ -634,7 +644,7 @@ await member.serve(
       serving = false;
       sinceConsolidation++;
       log(`A sent (${text.length} chars, $${costUsd.toFixed(4)}, ${numTurns} turns): ${text.slice(0, 100)}`);
-      return [
+      const body: Part[] = [
         { type: "text", text },
         {
           type: "json",
@@ -648,6 +658,9 @@ await member.serve(
           },
         },
       ];
+      // The turn produced prose, but the guarded action did not happen and no
+      // human said no: the asker gets the machine-readable reason (wire 12.4).
+      return pendingRefusal ? new ServeRefusal("deadline_expired", pendingRefusal, body) : body;
     } catch (err) {
       serving = false;
       engine.failRun(runId, (err as Error).message, { retryable: false });

@@ -2,8 +2,8 @@
  * The CLI channel (RFA v0.4 spec 3.10): ask a resident from the terminal, as
  * a HUMAN principal (requests carry origin: human).
  *
- *   npm run ask -- "your question"
- *   npm run ask -- --capability draft-linear-document --timeout 300 "draft an expression de besoin from: ..."
+ *   npm run ask -- "your question"                        (waits 30 min: --timeout in seconds)
+ *   npm run ask -- --capability draft-linear-document "draft an expression de besoin from: ..."
  *   npm run ask -- --room r_xxx "..."       (default: the standing room from dogfood/ROOM.md)
  */
 import * as fs from "node:fs";
@@ -19,11 +19,14 @@ function flag(name: string): string | undefined {
 const positional = process.argv.slice(2).filter((a, i, all) => !a.startsWith("--") && all[i - 1]?.startsWith("--") !== true);
 const question = positional.join(" ").trim();
 if (!question) {
-  console.error('usage: npm run ask -- [--capability answer-product-question] [--room r_x] [--timeout 180] "question"');
+  console.error('usage: npm run ask -- [--capability answer-product-question] [--room r_x] [--timeout 1800] "question"');
   process.exit(2);
 }
 const capability = flag("--capability") ?? "answer-product-question";
-const timeoutS = Number(flag("--timeout") ?? 180);
+// 30 minutes (spec 16.1): the asker's deadline governs the resident's approval
+// window, so this is what buys "I stepped away". One clock, not two: reply_by
+// equals the wait below, so the card dies a margin before the asker gives up.
+const timeoutS = Number(flag("--timeout") ?? 1800);
 
 const roomMd = fs.readFileSync(path.join(ROOT, "dogfood", "ROOM.md"), "utf8");
 const room = flag("--room") ?? /Room: `(r_\w+)`/.exec(roomMd)![1];

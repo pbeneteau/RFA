@@ -6,7 +6,7 @@ export type Role = "participant" | "observer" | "supervisor";
 /** Principal class, hub-derived at join (spec 14.1). Agents can never produce "human". */
 export type Origin = "human" | "agent";
 export type MessageKind = "chat" | "request" | "response" | "refuse" | "status" | "system";
-export type RefusalReason = "busy" | "ineligible" | "unauthorized" | "overloaded" | "expired" | "declined";
+export type RefusalReason = "busy" | "ineligible" | "unauthorized" | "overloaded" | "expired" | "declined" | "deadline_expired";
 
 export interface AgentSkill {
   id: string;
@@ -173,6 +173,13 @@ export interface SendResult {
   message_id: string;
   conversation_id: string | null;
   recipients: RecipientDisposition[];
+  /**
+   * Set when this message_id was already appended and the hub is answering
+   * from the durable log rather than sending again (spec 9.1). Dispositions
+   * are computed at send time and never persisted, so `recipients` is empty
+   * here: an implementation MUST NOT fabricate them to fill the shape.
+   */
+  replayed?: true;
 }
 
 export interface ListenResult {

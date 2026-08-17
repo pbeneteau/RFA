@@ -242,7 +242,10 @@ export function createHubServer(hub: RoomHub): McpServer {
         chunk: z.object({ index: z.number().int().min(0), final: z.boolean() }).optional(),
         refusal: z
           .object({
-            reason: z.enum(["busy", "ineligible", "unauthorized", "overloaded", "expired", "declined"]),
+            // `deadline_expired` (spec 12.4) is a clock, distinct from `declined`,
+            // which is a human saying no. The sender's own client emits it; the
+            // hub never speaks in a member's voice.
+            reason: z.enum(["busy", "ineligible", "unauthorized", "overloaded", "expired", "declined", "deadline_expired"]),
             detail: z.string().max(200).optional(),
             retry_after_s: z.number().int().optional(),
           })

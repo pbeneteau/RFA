@@ -4,8 +4,15 @@ import { after, before, test } from "node:test";
 import { spawn, type ChildProcess } from "node:child_process";
 import * as net from "node:net";
 import * as path from "node:path";
-import { interruptMatch, joinSidekick, requestApproval } from "../src/bridge.js";
-import { RoomMember } from "../src/client.js";
+import {
+  approvalWindowMs,
+  DEFAULT_APPROVAL_WINDOW_MS,
+  interruptMatch,
+  joinSidekick,
+  refusalForOutcome,
+  requestApproval,
+} from "../src/bridge.js";
+import { RoomMember, ServeRefusal } from "../src/client.js";
 
 const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -108,6 +115,93 @@ test("requestApproval: human approve (with edit) resolves the waiting bridge; re
   await human.leave();
   await sidekick.leave();
   await agent.leave();
+});
+
+test("v0.5.0 card clock: the window derives from the asker, floored, with no ceiling and a 30 minute fallback", () => {
+  const now = Date.parse("2026-08-18T10:00:00Z");
+  const deadlineIn = (ms: number) => new Date(now + ms).toISOString();
+
+  // A longer asker deadline buys a longer human window: the ten-minute ceiling
+  // is gone, so the derived value tracks reply_by minus the 30s margin (16.1).
+  assert.equal(approvalWindowMs(deadlineIn(10 * 60_000), now), 10 * 60_000 - 30_000);
+  assert.equal(approvalWindowMs(deadlineIn(30 * 60_000), now), 30 * 60_000 - 30_000);
+  assert.ok(approvalWindowMs(deadlineIn(45 * 60_000), now) > 10 * 60_000, "no platform ceiling below the asker's deadline");
+  assert.ok(approvalWindowMs(deadlineIn(45 * 60_000), now) < 45 * 60_000, "and never past it: the card must not outlive its audience");
+
+  // No reply_by is a live path (an ask that states no deadline), and it falls
+  // back to the stated 30 minutes, not to ten.
+  assert.equal(approvalWindowMs(null, now), 30 * 60_000);
+  assert.equal(approvalWindowMs(undefined, now), DEFAULT_APPROVAL_WINDOW_MS);
+  assert.equal(approvalWindowMs("whenever you get to it", now), DEFAULT_APPROVAL_WINDOW_MS, "an unparseable deadline is no deadline");
+
+  // A nearly-expired ask still gets a real chance at a human.
+  assert.equal(approvalWindowMs(deadlineIn(40_000), now), 60_000);
+  assert.equal(approvalWindowMs(deadlineIn(-5 * 60_000), now), 60_000);
+});
+
+test("v0.5.0 card clock: expiry refuses with deadline_expired, distinguishable from a human 'no'", async () => {
+  const agent = await RoomMember.create({
+    hubUrl, name: "clockworker", topic: "clock test",
+    card: { name: "clockworker", description: "does work", skills: [{ id: "work", description: "works" }] },
+  });
+  const sidekick = await joinSidekick(hubUrl, agent.room, agent.joinSecret, "clockworker");
+  const human = await RoomMember.create({
+    hubUrl, room: agent.room, joinSecret: agent.joinSecret ?? undefined, name: "boss",
+    card: { name: "boss", description: "human supervisor" }, role: "supervisor", humanKey: HK,
+  });
+
+  // A clock, not a person: nobody answers the short card.
+  const expired = await requestApproval(agent, sidekick, { toolName: "mcp__linear__save_document", input: {}, timeoutMs: 4_000 });
+  assert.equal(expired.approved, false, "expiry fails closed");
+  assert.equal(expired.expired, true);
+  assert.equal(refusalForOutcome(expired), "deadline_expired");
+
+  // A person: the same denial, a different record.
+  const pending = requestApproval(agent, sidekick, { toolName: "mcp__linear__save_document", input: { title: "x" }, timeoutMs: 30_000 });
+  await sleep(600);
+  const cards = (await wbGet("/api/approvals").then((r) => r.json())) as { request_id: string; room: string; status: string }[];
+  const mine = cards.find((c) => c.room === agent.room && c.status === "pending")!;
+  await human.admin("reject", { target: mine.request_id });
+  const rejected = await pending;
+  assert.equal(rejected.approved, false);
+  assert.ok(!rejected.expired, "a human decision is never a clock");
+  assert.equal(refusalForOutcome(rejected), "declined");
+  assert.notEqual(refusalForOutcome(rejected), refusalForOutcome(expired));
+
+  await human.leave();
+  await sidekick.leave();
+  await agent.leave();
+});
+
+test("v0.5.0 card clock: a serve handler answers a refusal on the wire, not prose", async () => {
+  // Wire 12.4: the refusal is sent by the requesting member's OWN client, so
+  // serve needs a way to return one. The reason travels verbatim; the
+  // resident's `deadline_expired` rides this path once the hub's room_send
+  // enum carries it (src/hub.ts, src/model.ts).
+  const resident = await RoomMember.create({
+    hubUrl, name: "refuser", topic: "refusal test",
+    card: { name: "refuser", description: "refuses", skills: [{ id: "work", description: "works" }] },
+  });
+  const asker = await RoomMember.create({
+    hubUrl, room: resident.room, joinSecret: resident.joinSecret ?? undefined, name: "asker",
+    card: { name: "asker", description: "asks", skills: [{ id: "ask", description: "asks" }] },
+  });
+  const stop = new AbortController();
+  const serving = resident.serve(
+    async () => new ServeRefusal("declined", "the tool call was not authorized; no side effect happened"),
+    { signal: stop.signal },
+  );
+
+  const answer = await asker.ask(resident.memberId, "save the draft", { timeoutMs: 25_000 });
+  assert.equal(answer.kind, "refuse");
+  assert.equal(answer.refusal?.reason, "declined");
+  assert.match(answer.refusal?.detail ?? "", /not authorized/);
+  assert.match(answer.text, /no side effect/, "the body still reaches the asker");
+
+  stop.abort();
+  await serving;
+  await asker.leave();
+  await resident.leave();
 });
 
 test("v0.5.0 exposure: every workbench read is operator-only, and a bad token is refused", async () => {

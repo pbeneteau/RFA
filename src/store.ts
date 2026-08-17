@@ -302,6 +302,10 @@ const NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N} _.\-]*$/u;
  * authoritative as `console`.
  */
 /** How long an expired approval stays visible in the operator's inbox (spec 16.3). */
+/** Lock liveness: stamped this often, considered abandoned after this long. */
+const LOCK_HEARTBEAT_MS = 10_000;
+const LOCK_STALE_MS = 60_000;
+
 const EXPIRED_VISIBLE_MS = 6 * 3600_000;
 
 const RESERVED_FIRST_TOKENS = new Set(["human", "console", "system", "hub", "rfa"]);
@@ -343,39 +347,62 @@ export class RoomHub {
    */
   private lockPath: string | null = null;
   private lockNonce = randomBytes(8).toString("hex");
+  private lockHeartbeat: NodeJS.Timeout | null = null;
 
   private acquireLock(): void {
     const lock = path.join(this.cfg.dataDir!, ".hub.lock");
-    let existing: { pid: number; nonce: string } | null = null;
-    try {
-      existing = JSON.parse(fs.readFileSync(lock, "utf8"));
-    } catch {
-      existing = null; // missing or corrupt: treat as unowned
-    }
-    if (existing && existing.nonce !== this.lockNonce) {
-      let alive = false;
+    // O_EXCL is the actual mutual exclusion: read-then-write let two starts
+    // race through the liveness check and both believe they won. PID liveness
+    // is also meaningless across containers and PID namespaces, so the lock
+    // carries a heartbeat and staleness is judged on that.
+    for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        process.kill(existing.pid, 0);
-        alive = true;
-      } catch {
-        alive = false; // stale lock from a dead process: take it over
+        const fd = fs.openSync(lock, "wx", 0o600);
+        fs.writeSync(fd, JSON.stringify({ pid: process.pid, nonce: this.lockNonce, startedAt: this.cfg.now(), heartbeat: this.cfg.now() }));
+        fs.closeSync(fd);
+        this.lockPath = lock;
+        this.lockHeartbeat = setInterval(() => this.touchLock(), LOCK_HEARTBEAT_MS);
+        this.lockHeartbeat.unref?.();
+        return;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
       }
-      if (alive) {
+      let existing: { pid?: number; nonce?: string; heartbeat?: number; startedAt?: number } | null = null;
+      try {
+        existing = JSON.parse(fs.readFileSync(lock, "utf8"));
+      } catch {
+        existing = null; // corrupt: treat as abandoned
+      }
+      const beat = existing?.heartbeat ?? existing?.startedAt ?? 0;
+      const stale = this.cfg.now() - beat > LOCK_STALE_MS;
+      if (existing && existing.nonce !== this.lockNonce && !stale) {
         throw new Error(
-          `data dir "${this.cfg.dataDir}" is already owned by a live rfa-hub (pid ${existing.pid}). ` +
+          `data dir "${this.cfg.dataDir}" is already owned by a live rfa-hub (pid ${existing.pid ?? "?"}, ` +
+            `last heartbeat ${Math.round((this.cfg.now() - beat) / 1000)}s ago). ` +
             `Run ONE shared hub instead: \`npm run start -- --http 8790\` and connect MCP hosts to ` +
             `http://localhost:8790/mcp, or point this instance at a different --data dir.`,
         );
       }
+      fs.rmSync(lock, { force: true }); // stale or corrupt: take it over on the next pass
     }
-    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, nonce: this.lockNonce, startedAt: this.cfg.now() }), {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    this.lockPath = lock;
+    throw new Error(`could not acquire the lock on "${this.cfg.dataDir}" (raced twice); retry or check for a stuck hub`);
+  }
+
+  /** Prove liveness to any hub that finds this lock, without relying on PIDs. */
+  private touchLock(): void {
+    if (!this.lockPath) return;
+    try {
+      const existing = JSON.parse(fs.readFileSync(this.lockPath, "utf8")) as { nonce: string };
+      if (existing.nonce !== this.lockNonce) return; // someone took it over; do not stamp theirs
+      fs.writeFileSync(this.lockPath, JSON.stringify({ pid: process.pid, nonce: this.lockNonce, heartbeat: this.cfg.now() }), { mode: 0o600 });
+    } catch {
+      // a missing lock is not worth crashing a serving hub over
+    }
   }
 
   private releaseLock(): void {
+    if (this.lockHeartbeat) clearInterval(this.lockHeartbeat);
+    this.lockHeartbeat = null;
     if (!this.lockPath) return;
     try {
       const existing = JSON.parse(fs.readFileSync(this.lockPath, "utf8")) as { nonce: string };
@@ -786,10 +813,34 @@ export class RoomHub {
     }
     if (kind === "refuse" && !args.refusal) throw new RfaError("bad_request", 'kind "refuse" requires a refusal object');
 
-    // Idempotent retry.
+    // Idempotent retry. The in-memory cache answers within a process life;
+    // across a restart it is empty, so fall back to the log-derived sent set,
+    // which IS rebuilt on load. Without this a peer that resends after a hub
+    // restart double-appends, and a remote worker retrying a completion is
+    // exactly the case this protocol has to survive.
     const dedupeKey = `${member.id}:${args.message_id}`;
     const cached = room.dedupe.get(dedupeKey);
     if (cached) return cached;
+    if (member.sentIds.has(args.message_id)) {
+      const prior = room.events.find(
+        (e): e is Extract<RfaEvent, { type: "message" }> =>
+          e.type === "message" && e.envelope.message_id === args.message_id && e.envelope.from.id === member.id,
+      );
+      if (prior) {
+        // Degraded on purpose: the original dispositions were never persisted.
+        return {
+          // The event's seq, not the envelope's: the envelope carries 0 until
+          // appendEvent stamps the event, and the result has always reported
+          // the event's.
+          seq: prior.seq,
+          ts: prior.ts,
+          message_id: prior.envelope.message_id,
+          conversation_id: prior.envelope.conversation_id ?? null,
+          recipients: [],
+          replayed: true,
+        };
+      }
+    }
 
     // Approval-flow capture (spec 12.1, extended v0.4.2): validated before
     // append, registered after; only a human-origin approve can satisfy it.
@@ -2280,8 +2331,28 @@ export class RoomHub {
     // rename(2) is atomic within a directory, so a reader sees old or new.
     const file = path.join(this.roomDir(), `${room.handle}.meta.json`);
     const tmp = `${file}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(meta, null, 1), { encoding: "utf8", mode: 0o600 });
+    // Write, fsync, rename, fsync the directory. rename(2) is atomic WITHIN a
+    // directory but does not by itself order the data against a power loss, so
+    // without the first fsync the rename can land pointing at a file whose
+    // bytes never arrived.
+    const fd = fs.openSync(tmp, "w", 0o600);
+    try {
+      fs.writeSync(fd, JSON.stringify(meta, null, 1));
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
     fs.renameSync(tmp, file);
+    try {
+      const dir = fs.openSync(this.roomDir(), "r");
+      try {
+        fs.fsyncSync(dir);
+      } finally {
+        fs.closeSync(dir);
+      }
+    } catch {
+      // Directory fsync is not portable everywhere; the rename still stands.
+    }
   }
 
   private loadFromDisk(): void {
@@ -2355,6 +2426,14 @@ export class RoomHub {
               const sender = room.members.get(event.envelope.from.id);
               sender?.sentIds.add(event.envelope.message_id);
             }
+            // The log outranks the snapshot for tasks. `emit` appends the task
+            // event BEFORE writeMeta, so a crash in that gap used to revert a
+            // winning claim while its claim event stayed in the chain, letting
+            // a second worker win the same task. Task events carry the whole
+            // object, so replaying them restores the true board.
+            if (event.type === "task" && event.task) {
+              room.tasks.set(event.task.id, event.task as RfaTask);
+            }
           }
         }
         // Rebuild deadline tracking from the log: reply_by timeouts (and the
@@ -2386,9 +2465,94 @@ export class RoomHub {
         }
         this.rooms.set(room.handle, room);
       } catch (err) {
-        console.error(`rfa-hub: skipping corrupt room file ${f}: ${(err as Error).message}`);
+        // Meta is a CACHE: the log is the room. Skipping cost the room its
+        // existence (its events still on disk, unreachable) for what is often a
+        // half-written snapshot. Rebuilding costs everyone a rejoin instead.
+        const handle = f.replace(/\.meta\.json$/, "");
+        console.error(`rfa-hub: snapshot for ${handle} is unreadable (${(err as Error).message}); rebuilding from the log`);
+        try {
+          const rebuilt = this.rebuildFromLog(handle);
+          if (rebuilt) {
+            this.rooms.set(rebuilt.handle, rebuilt);
+            this.writeMeta(rebuilt);
+            console.error(`rfa-hub: ${handle} rebuilt from ${rebuilt.events.length} events; members must rejoin`);
+          } else {
+            console.error(`rfa-hub: ${handle} has no readable log either; leaving both files untouched for inspection`);
+          }
+        } catch (rebuildErr) {
+          console.error(`rfa-hub: rebuilding ${handle} failed (${(rebuildErr as Error).message}); leaving files untouched`);
+        }
       }
     }
+  }
+
+  /**
+   * Reconstruct a room from its event log when the snapshot is unusable.
+   * Everything durable is derivable: roster events carry a roster snapshot,
+   * task events carry the whole task object, and seq plus the chain head come
+   * from the events themselves. Memberships are NOT recoverable (tokens were
+   * only ever in the snapshot), so every member has to rejoin; that is the
+   * price, and it beats losing the room.
+   */
+  private rebuildFromLog(handle: string): Room | null {
+    const log = path.join(this.roomDir(), `${handle}.ndjson`);
+    if (!fs.existsSync(log)) return null;
+    const events: RfaEvent[] = [];
+    for (const line of fs.readFileSync(log, "utf8").split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        events.push(JSON.parse(line) as RfaEvent);
+      } catch {
+        break; // a torn last line ends the readable prefix; keep what is whole
+      }
+    }
+    if (events.length === 0) return null;
+    const room: Room = {
+      handle,
+      topic: `${handle} (rebuilt from log)`,
+      // Defaults, not the room's originals: policy changes are audited as
+      // interventions but the effective set lives only in the snapshot. The
+      // operator must re-apply anything non-default, and history_visibility
+      // starts at the safer of the two.
+      policies: { join: "open", attention: "mentions", mode: "open", moderator: null, history_visibility: "joined_after", max_members: 50 },
+      joinSecret: null, // unrecoverable: the operator must re-issue one
+      createdAt: this.cfg.now(),
+      ended: false,
+      endedSummary: null,
+      epoch: 0,
+      seq: 0,
+      members: new Map(),
+      names: new Map(),
+      nameHistory: new Map(),
+      events: [],
+      waiters: [],
+      watchers: [],
+      pendingReplies: [],
+      dedupe: new Map(),
+      tasks: new Map(),
+      taskSeq: 0,
+      taskOverdueNotified: new Set(),
+      quarantinedNames: new Set(),
+      quarantinedDigests: new Set(),
+      approvals: new Map(),
+      heldMessages: new Map(),
+      chainHead: sha256hex(handle),
+      floor: { holder: null, grantedAt: null, turnStartedAt: null, expiresAt: null, queue: [] },
+    };
+    for (const event of events) {
+      room.events.push(event);
+      room.seq = Math.max(room.seq, event.seq);
+      room.chainHead = sha256hex(canonicalize(event as unknown as Record<string, unknown>));
+      if (event.type === "roster") room.epoch = Math.max(room.epoch, event.epoch ?? 0);
+      // Task events carry the full object, so the board survives verbatim.
+      if (event.type === "task" && event.task) {
+        room.tasks.set(event.task.id, event.task as RfaTask);
+        const n = Number(String(event.task.id).replace(/\D/g, ""));
+        if (Number.isFinite(n)) room.taskSeq = Math.max(room.taskSeq, n);
+      }
+      if (event.type === "system" && event.event === "room_ended") room.ended = true;
+    }
+    return room;
   }
 }
 
