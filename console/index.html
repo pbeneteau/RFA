@@ -576,7 +576,13 @@ function renderEvent(e, opts = {}) {
         (e.refs && Object.keys(e.refs).length ? "  " + JSON.stringify(e.refs) : ""), e);
     }
     case "system": {
-      const cls = e.event === "floor_granted" ? "grant" : (e.event === "gone_quiet" || e.event === "timeout") ? "alarm" : "dim";
+      // A clock is not a decision: an approval or hold that ran out must stop
+      // showing live buttons and must say it expired, not sit there as pending.
+      if (e.event === "approval_expired" || e.event === "hold_expired") {
+        const a = S.approvals.get(e.refs?.request_id);
+        if (a) { a.status = "expired"; a.render?.(); }
+      }
+      const cls = e.event === "floor_granted" ? "grant" : (e.event === "gone_quiet" || e.event === "timeout") ? "alarm" : (e.event === "approval_expired" || e.event === "hold_expired") ? "alarm" : "dim";
       return line(cls, e.event + " " + JSON.stringify(e.refs), e);
     }
   }
@@ -619,7 +625,7 @@ function approvalStrip(apr, requester) {
     status);
   a.render = () => {
     status.className = "st-" + a.status;
-    status.textContent = a.status;
+    status.textContent = a.status === "expired" ? "expired (nobody decided in time)" : a.status;
     strip.querySelectorAll("button").forEach((b) => b.remove());
     if (a.status === "pending" && S.role === "supervisor") {
       const decide = (verb) => async () => {

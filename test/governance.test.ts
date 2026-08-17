@@ -22,7 +22,13 @@ async function connectAgent(hub: RoomHub): Promise<Client> {
 }
 
 class ToolError extends Error {
-  constructor(public code: string, message: string, public data: Record<string, unknown>) {
+  constructor(
+    public code: string,
+    message: string,
+    public data: Record<string, unknown>,
+    /** Rides the error envelope, not `data`: the hub's own retry hint. */
+    public retryAfterS: number | null = null,
+  ) {
     super(message);
   }
 }
@@ -30,7 +36,7 @@ class ToolError extends Error {
 async function call(client: Client, name: string, args: Record<string, unknown>): Promise<any> {
   const res = (await client.callTool({ name, arguments: args })) as any;
   const parsed = JSON.parse(res.content[0].text);
-  if (res.isError) throw new ToolError(parsed.error.code, parsed.error.message, parsed.error.data ?? {});
+  if (res.isError) throw new ToolError(parsed.error.code, parsed.error.message, parsed.error.data ?? {}, parsed.error.retry_after_s ?? null);
   return parsed;
 }
 
@@ -57,7 +63,7 @@ async function setup(gateChecks: GateCheck[] = [], cfg: Record<string, unknown> 
   const eve = await call(eveC, "room_join", {
     room: host.room, join_secret: host.join_secret, name: "eve", card: card("eve"), role: "supervisor", human_key: HK,
   });
-  return { hub, hostC, aliceC, eveC, room: host.room, t: { host: host.you.membership_token, alice: alice.you.membership_token, eve: eve.you.membership_token }, id: { host: host.you.id, alice: alice.you.id, eve: eve.you.id } };
+  return { hub, hostC, aliceC, eveC, room: host.room, joinSecret: host.join_secret, t: { host: host.you.membership_token, alice: alice.you.membership_token, eve: eve.you.membership_token }, id: { host: host.you.id, alice: alice.you.id, eve: eve.you.id } };
 }
 
 const send = (c: Client, room: string, tok: string, text: string, extra: Record<string, unknown> = {}) =>
@@ -148,7 +154,8 @@ test("approval upgrades: allowed_decisions constrain verbs, expiry sweeps to rej
   });
   assert.equal(await code(call(s.eveC, "room_admin", { room: s.room, membership_token: s.t.eve, verb: "approve", target: "apr_ro_1" })), "unauthorized");
   await call(s.eveC, "room_admin", { room: s.room, membership_token: s.t.eve, verb: "reject", target: "apr_ro_1" });
-  // expiry: pending approvals past expires_at resolve as reject on sweep.
+  // expiry: pending approvals past expires_at resolve as EXPIRED, never as a
+  // human refusal (spec 12.4). A clock is not a decision.
   await send(s.aliceC, s.room, s.t.alice, "expiring ask", {
     kind: "request",
     ext: { "io.github.pbeneteau/approval": { request_id: "apr_exp_1", action: "y", expires_at: new Date(now + 30_000).toISOString() } },
@@ -156,8 +163,12 @@ test("approval upgrades: allowed_decisions constrain verbs, expiry sweeps to rej
   now += 31_000;
   s.hub.sweep();
   const all = await call(s.aliceC, "room_listen", { room: s.room, membership_token: s.t.alice, since: 0, timeout_ms: 0, wait_for: "all" });
-  assert.ok(all.events.some((e: any) => e.type === "system" && e.event === "approval_expired" && e.refs.request_id === "apr_exp_1"));
-  assert.equal(await code(call(s.eveC, "room_admin", { room: s.room, membership_token: s.t.eve, verb: "approve", target: "apr_exp_1" })), "task_conflict");
+  const expiredEvent = all.events.find((e: any) => e.type === "system" && e.event === "approval_expired" && e.refs.request_id === "apr_exp_1");
+  assert.ok(expiredEvent, "expiry audited");
+  assert.equal(expiredEvent.refs.resolution, "expired", "resolution is expired, never rejected");
+  const conflict = await call(s.eveC, "room_admin", { room: s.room, membership_token: s.t.eve, verb: "approve", target: "apr_exp_1" }).catch((e: any) => e);
+  assert.equal(await code(Promise.reject(conflict)), "task_conflict");
+  assert.match(String(conflict.message ?? conflict), /expired/, "the conflict names the expiry, not a rejection");
   // edit-before-approve: params override recorded and surfaced.
   await send(s.aliceC, s.room, s.t.alice, "deploy widget v2?", {
     kind: "request",
@@ -216,4 +227,63 @@ test("hash chain: every event links to the previous via JCS-SHA256, across resta
   }
   hub2.close();
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("hold clock: a held envelope is held against its own reply_by, not one global constant", async () => {
+  let now = 1_000_000_000_000;
+  // The configured default is deliberately short so a derived window is
+  // visibly longer than it: the bug was one constant governing every hold.
+  const s = await setup([{ id: "risky", tier: "rules", match: { text_regex: "prod" }, outcome: "hold" }], {
+    holdTtlS: 120,
+    now: () => now,
+  });
+  const held = (id: string, text: string, extra: Record<string, unknown> = {}) =>
+    call(s.aliceC, "room_send", { room: s.room, membership_token: s.t.alice, message_id: id, body: [{ type: "text", text }], ...extra })
+      .then(() => null, (e: ToolError) => e);
+  const holdEvents = async () => {
+    const all = await call(s.hostC, "room_listen", { room: s.room, membership_token: s.t.host, since: 0, timeout_ms: 0, wait_for: "all" });
+    return all.events.filter((e: any) => e.event === "hold_expired").map((e: any) => e.refs.message_id);
+  };
+
+  const plain = await held("msg_no_deadline", "ship to prod");
+  assert.equal(plain?.code, "held");
+  const far = await held("msg_far_deadline", "ship to prod again", { kind: "request", reply_by: new Date(now + 40 * 60_000).toISOString() });
+  assert.equal(far?.code, "held");
+  assert.ok((far?.retryAfterS ?? 0) > 30 * 60, "the sender is told the real window, not the 120s default");
+
+  // Twenty minutes on: the default-governed hold is gone, the one carrying a
+  // live deadline is still waiting. One clock could not produce both.
+  now += 20 * 60_000;
+  s.hub.sweep();
+  let expired = await holdEvents();
+  assert.ok(expired.includes("msg_no_deadline"), "the default applies when there is no deadline");
+  assert.ok(!expired.includes("msg_far_deadline"), "a message with a live deadline is still waiting");
+
+  // Past the asker's own deadline it fails closed AND is surfaced.
+  now += 25 * 60_000;
+  s.hub.sweep();
+  expired = await holdEvents();
+  assert.ok(expired.includes("msg_far_deadline"), "expiry is visible, never a silent drop");
+  const all = await call(s.hostC, "room_listen", { room: s.room, membership_token: s.t.host, since: 0, timeout_ms: 0, wait_for: "all" });
+  assert.equal(all.events.find((e: any) => e.event === "hold_expired").refs.resolution, "expired");
+  assert.ok(!all.events.some((e: any) => e.type === "message" && /prod/.test(JSON.stringify(e))), "held messages were never delivered");
+});
+
+test("reserved name prefixes: only a human-origin principal may wear an authority name", async () => {
+  const s = await setup();
+  const join = async (name: string, extra: Record<string, unknown> = {}) => {
+    const c = await connectAgent(s.hub);
+    return call(c, "room_join", { room: s.room, join_secret: s.joinSecret, name, card: card(name), ...extra });
+  };
+
+  for (const name of ["human-oversight", "Console", "hub.ops", "system_notice", "rfa-admin"]) {
+    assert.equal(await code(join(name)), "bad_request", `${name} must be refused for an agent`);
+  }
+  // The first token is the unit, so an ordinary word that merely starts with
+  // the same letters stays legal.
+  const humanity = await join("humanity");
+  assert.equal(humanity.you.name, "humanity");
+  // A human principal may hold one, which is how the console gets its name.
+  const operator = await join("human-oversight", { role: "supervisor", human_key: HK });
+  assert.equal(operator.you.origin, "human");
 });

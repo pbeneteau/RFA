@@ -65,7 +65,12 @@ export interface HubConfig {
   floorCapS: number;
   /** Pre-delivery policy gate checks (spec 12.2, implemented in v0.4.2). */
   gateChecks: GateCheck[];
-  /** Held messages auto-resolve (refuse) after this many seconds without a human approve. */
+  /**
+   * Fallback hold TTL, in seconds, for a held envelope carrying no `reply_by`.
+   * A held envelope that HAS a deadline derives its TTL from that instead
+   * (spec 12.4): a hold clock shorter than the approval window reintroduces
+   * "it died while I was away" through the other door.
+   */
   holdTtlS: number;
   now: () => number;
 }
@@ -123,7 +128,9 @@ export const DEFAULT_CONFIG: HubConfig = {
   floorRenewS: 300,
   floorCapS: 600,
   gateChecks: [],
-  holdTtlS: 300,
+  // 1800s, matching the `npm run ask` default deadline (platform spec 16.3,
+  // which deliberately raises the 300s this shipped with).
+  holdTtlS: 1800,
   now: () => Date.now(),
 };
 
@@ -224,10 +231,15 @@ interface Approval {
   messageId: string;
   requester: string;
   action: string;
-  status: "pending" | "approved" | "rejected";
+  /**
+   * `expired` is deliberately distinct from `rejected` (spec 12.4): a clock is
+   * not a decision, and a log that cannot tell them apart is worse than no log.
+   * `expired` is not a member of `allowed_decisions`; nobody may choose it.
+   */
+  status: "pending" | "approved" | "rejected" | "expired";
   decidedBy: string | null;
   allowedDecisions?: ("approve" | "edit" | "reject" | "respond")[];
-  /** ms epoch; a pending approval past this resolves as reject on sweep. */
+  /** ms epoch; a pending approval past this resolves as `expired` on sweep. */
   expiresAt?: number | null;
   /** Edit-before-approve: the params override the approver supplied, recorded. */
   decidedParams?: Record<string, unknown> | null;
@@ -280,6 +292,21 @@ function rid(prefix: string, bytes = 5): string {
 }
 
 const NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N} _.\-]*$/u;
+
+/**
+ * First tokens only a human-origin principal may claim (spec 4.1). Name text
+ * renders next to origin in every console and prompt, so an agent calling
+ * itself `human-oversight` is a free impersonation primitive. Matching is on
+ * the FIRST TOKEN, so `humanity` stays legal while `human-oversight` does not.
+ * Auto-suffixing is not an acceptable resolution: `console-2` reads just as
+ * authoritative as `console`.
+ */
+/** How long an expired approval stays visible in the operator's inbox (spec 16.3). */
+const EXPIRED_VISIBLE_MS = 6 * 3600_000;
+
+const RESERVED_FIRST_TOKENS = new Set(["human", "console", "system", "hub", "rfa"]);
+
+const firstToken = (name: string): string => name.split(/[ _.\-]/, 1)[0].toLowerCase();
 
 export class RoomHub {
   readonly cfg: HubConfig;
@@ -476,6 +503,14 @@ export class RoomHub {
     if (!NAME_RE.test(args.name) || args.name.length > 64) {
       throw new RfaError("bad_request", "name must match the RFA name grammar (section 4.1)");
     }
+    // The exemption is a testable condition, not a hub-internal one: only a
+    // principal the hub authenticated as human may wear an authority name.
+    if (RESERVED_FIRST_TOKENS.has(firstToken(args.name)) && args.origin !== "human") {
+      throw new RfaError(
+        "bad_request",
+        `"${firstToken(args.name)}" is a reserved first name token (spec 4.1); only a human-origin principal may use it`,
+      );
+    }
     if (args.role === "participant" && !(args.card.skills ?? []).some((s) => s.id && s.description)) {
       throw new RfaError("bad_request", "participant cards require at least one skill with id and description");
     }
@@ -577,6 +612,19 @@ export class RoomHub {
     this.removeMembership(room, member, "leave");
     this.writeMeta(room);
     return { ok: true };
+  }
+
+  /**
+   * How long a held envelope waits for a human (spec 12.4). A message that
+   * carries its own deadline is held against THAT deadline (minus a 30s margin
+   * so the sender is still listening when the verdict lands, floored at 60s so
+   * a nearly-expired message still gets a real chance); anything else falls
+   * back to the room's configured default.
+   */
+  private holdWindowMs(replyBy: string | null | undefined, now: number): number {
+    const deadline = replyBy ? Date.parse(replyBy) : NaN;
+    if (!Number.isFinite(deadline)) return this.cfg.holdTtlS * 1000;
+    return Math.max(60_000, deadline - now - 30_000);
   }
 
   /** Shared removal core for leave and evict: token revocation is immediate (spec 14.8). */
@@ -857,7 +905,8 @@ export class RoomHub {
     if (gateVerdict?.outcome === "hold") {
       const requestId = `hold:${args.message_id}`;
       if (!room.heldMessages.has(args.message_id)) {
-        const expiresAt = now + this.cfg.holdTtlS * 1000;
+        const holdMs = this.holdWindowMs(envelope.reply_by, now);
+        const expiresAt = now + holdMs;
         room.heldMessages.set(args.message_id, {
           envelope,
           senderId: member.id,
@@ -886,7 +935,7 @@ export class RoomHub {
       throw new RfaError(
         "held",
         `message held for supervisor review (check ${gateVerdict.checkId}); a human-origin approve of ${requestId} releases it`,
-        this.cfg.holdTtlS,
+        Math.round(this.holdWindowMs(envelope.reply_by, now) / 1000),
         { request_id: requestId },
       );
     }
@@ -1159,12 +1208,18 @@ export class RoomHub {
     expires_at: string | null;
     held: boolean;
     message_preview: string | null;
+    status: "pending" | "expired";
   }[] {
     const out: ReturnType<RoomHub["pendingApprovals"]> = [];
     for (const room of this.rooms.values()) {
       if (room.ended) continue;
       for (const a of room.approvals.values()) {
-        if (a.status !== "pending") continue;
+        // Recently expired requests stay in this list (marked, undecidable) so
+        // the operator SEES that a decision died on a clock. A card that simply
+        // vanishes from the inbox is how "nobody told me" happens.
+        const recentlyExpired =
+          a.status === "expired" && a.expiresAt != null && this.cfg.now() - a.expiresAt < EXPIRED_VISIBLE_MS;
+        if (a.status !== "pending" && !recentlyExpired) continue;
         const held = room.heldMessages.get(a.messageId);
         const preview = held
           ? held.envelope.body
@@ -1188,6 +1243,7 @@ export class RoomHub {
           expires_at: a.expiresAt ? iso(a.expiresAt) : null,
           held: !!a.held,
           message_preview: preview,
+          status: a.status === "expired" ? "expired" : "pending",
         });
       }
     }
@@ -1203,7 +1259,9 @@ export class RoomHub {
   consoleMembership(roomHandle: string): { membership_token: string; member_id: string } {
     const room = this.getRoom(roomHandle);
     for (const m of room.members.values()) {
-      if (m.present && m.origin === "human" && m.role === "supervisor" && m.name.startsWith("console")) {
+      // Exact name, never a prefix: `startsWith` would hand the console's
+      // membership to anything called `console-something`.
+      if (m.present && m.origin === "human" && m.role === "supervisor" && m.name === "console") {
         return { membership_token: m.token, member_id: m.id };
       }
     }
@@ -1406,7 +1464,13 @@ export class RoomHub {
           // waiting bridge can substitute the human's params (v0.4.6).
           ...(override ? { updated: true, params: override } : {}),
         });
-        return done({ request_id: approval.requestId, status: approval.status, ...(override ? { updated_params: override } : {}) });
+        // `resolution` is the spec 12.4 name; `status` stays for older clients.
+        return done({
+          request_id: approval.requestId,
+          resolution: approval.status,
+          status: approval.status,
+          ...(override ? { updated_params: override } : {}),
+        });
       }
       case "set_policy": {
         const patch = (params.policies ?? {}) as Partial<RoomPolicies> & { moderator?: string | null };
@@ -1963,26 +2027,41 @@ export class RoomHub {
           refs: { message_id: p.messageId, conversation_id: p.conversationId, asker: p.fromId },
         });
       }
-      // Approval expiry (v0.4.2): pending past expires_at resolves as reject;
-      // a held message expiring is dropped (fail closed), never silently sent.
+      // Approval expiry (spec 12.4): pending past expires_at resolves as
+      // `expired`, NEVER as `rejected`. Recording a clock as a human refusal
+      // makes the two indistinguishable in the log forever, which is the whole
+      // reason the state exists. Expiry still fails closed: the guarded action
+      // does not happen and a held message is dropped, never silently sent.
       let approvalsDirty = false;
       for (const approval of room.approvals.values()) {
         if (approval.status !== "pending" || approval.expiresAt == null || now <= approval.expiresAt) continue;
-        approval.status = "rejected";
+        approval.status = "expired";
         approval.decidedBy = null;
         approvalsDirty = true;
         if (approval.held) {
           room.heldMessages.delete(approval.messageId);
+          // Fail closed on delivery, fail open on visibility: the sender learns
+          // its message died on a clock rather than being read and refused.
           this.appendEvent(room, {
             type: "system",
             event: "hold_expired",
-            refs: { message_id: approval.messageId, member: approval.requester, request_id: approval.requestId },
+            refs: {
+              message_id: approval.messageId,
+              member: approval.requester,
+              request_id: approval.requestId,
+              resolution: "expired",
+            },
           });
         } else {
           this.appendEvent(room, {
             type: "system",
             event: "approval_expired",
-            refs: { request_id: approval.requestId, requester: approval.requester, action: approval.action },
+            refs: {
+              request_id: approval.requestId,
+              requester: approval.requester,
+              action: approval.action,
+              resolution: "expired",
+            },
           });
         }
       }
