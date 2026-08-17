@@ -723,3 +723,30 @@ test("tasks: survive a hub restart", async () => {
   hub2.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test("sweep prunes observers lease-dead past observerPruneMs; participants survive (zombie sidekicks)", async () => {
+  let now = 1_000_000_000_000;
+  const hub = new RoomHub({ dataDir: null, sweepIntervalMs: 0, defaultLeaseS: 60, flapWindowS: 10, observerPruneMs: 3600_000, now: () => now });
+  const a = hub.createRoom({ topic: "t", name: "pm-agent", card: pmCard });
+  hub.join({ room: a.room, join_secret: a.join_secret!, name: "scribe-hitl", card: { name: "scribe-hitl", description: "approval watcher" }, role: "observer" });
+  hub.join({ room: a.room, join_secret: a.join_secret!, name: "dev-agent", card: devCard, role: "participant" });
+  const tok = a.contract.you.membership_token;
+
+  now += 71_000; // both lease-expired -> offline, but neither prunable yet
+  hub.sweep();
+  let r = hub.roster({ room: a.room, membership_token: tok });
+  assert.equal(r.roster.length, 3, "offline members stay in the roster before the prune window");
+
+  now += 3600_000; // observer past the prune window
+  hub.sweep();
+  r = hub.roster({ room: a.room, membership_token: tok });
+  const names = r.roster.map((m: any) => m.name);
+  assert.ok(!names.includes("scribe-hitl"), "dead observer pruned");
+  assert.ok(names.includes("dev-agent"), "participant keeps resumable identity");
+  assert.ok(names.includes("pm-agent"), "host untouched");
+  const events = (hub.listen({ room: a.room, membership_token: tok, since: 0, timeout_ms: 0, wait_for: "all" }) as any).events;
+  assert.ok(
+    events.some((e: any) => e.type === "roster" && e.reason === "evict"),
+    "the prune is an audited eviction",
+  );
+});

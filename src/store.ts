@@ -52,6 +52,8 @@ export interface HubConfig {
   maxInlineBytes: number;
   maxMentions: number;
   sweepIntervalMs: number;
+  /** Present-but-lease-expired OBSERVERS older than this are pruned by the sweep (zombie sidekicks); 0 disables. */
+  observerPruneMs: number;
   describeTtlMs: number;
   trustedKeys: Record<string, Jwk>;
   allowEmbeddedJwk: boolean;
@@ -111,6 +113,7 @@ export const DEFAULT_CONFIG: HubConfig = {
   maxInlineBytes: 262_144,
   maxMentions: 10,
   sweepIntervalMs: 2_000,
+  observerPruneMs: 24 * 3600_000,
   describeTtlMs: 300_000,
   trustedKeys: {},
   allowEmbeddedJwk: true,
@@ -1912,6 +1915,18 @@ export class RoomHub {
               event: "gone_quiet",
               refs: { member: member.id, name: member.name, askers: [...new Set(owedTo)] },
             });
+          }
+        }
+      }
+      // Zombie hygiene (found live: five dead hitl sidekicks after a day of
+      // restarts): an observer whose lease has been expired for a full day is
+      // not coming back as the same membership; prune it like an eviction.
+      // Observers only: participants and supervisors keep resumable identity.
+      if (this.cfg.observerPruneMs > 0) {
+        for (const member of [...room.members.values()]) {
+          if (!member.present || member.role !== "observer" || member.isHost) continue;
+          if (now > member.leaseExpires + this.cfg.observerPruneMs) {
+            this.removeMembership(room, member, "evict");
           }
         }
       }

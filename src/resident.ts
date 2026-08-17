@@ -567,11 +567,18 @@ const shutdown = (sig: string) => {
   log(`${sig}: draining after ${answered} answers`);
   save();
   clearInterval(consolidationTimer);
-  engine.close();
-  episodes.close();
-  facts.close();
-  obs.close();
-  process.exit(0);
+  clearInterval(keepaliveTimer);
+  // The sidekick is a real membership: dying without leaving strands a zombie
+  // observer in the roster (found live: five hitl corpses after a day of
+  // restarts). Best-effort leave, capped so a dead hub cannot stall the drain.
+  const bye = sidekick ? sidekick.leave().catch(() => {}) : Promise.resolve();
+  void Promise.race([bye, new Promise((r) => setTimeout(r, 2_000))]).then(() => {
+    engine.close();
+    episodes.close();
+    facts.close();
+    obs.close();
+    process.exit(0);
+  });
 };
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
