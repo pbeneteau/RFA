@@ -16,7 +16,7 @@
     "start": "tsx src/main.ts",
     "demo": "tsx scripts/demo.ts",
     "tail": "tsx scripts/tail.ts",
-    "test": "node --import tsx --test test/hub.test.ts test/client.test.ts test/moderation.test.ts test/memory.test.ts test/otel.test.ts test/agentdef.test.ts test/engine.test.ts test/memoryfs.test.ts test/governance.test.ts test/execbackend.test.ts test/obs.test.ts test/evals.test.ts",
+    "test": "node --import tsx --test test/hub.test.ts test/client.test.ts test/moderation.test.ts test/memory.test.ts test/otel.test.ts test/agentdef.test.ts test/engine.test.ts test/memoryfs.test.ts test/governance.test.ts test/execbackend.test.ts test/obs.test.ts test/evals.test.ts test/bridge.test.ts",
     "demo:push": "tsx scripts/demo-push.ts",
     "keygen": "tsx scripts/keygen.ts",
     "sign-card": "tsx scripts/sign-card.ts",
@@ -25,7 +25,8 @@
     "pm-agent": "tsx src/resident.ts --agent pm-agent",
     "supervisor": "tsx src/supervisor.ts",
     "evals": "tsx src/evals/runner.ts",
-    "evals:judged": "tsx src/evals/runner.ts --judged"
+    "evals:judged": "tsx src/evals/runner.ts --judged",
+    "ask": "tsx scripts/ask.ts"
   },
   "engines": {
     "node": ">=20"

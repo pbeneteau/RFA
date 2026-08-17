@@ -1399,7 +1399,9 @@ export class RoomHub {
           request_id: approval.requestId,
           action: approval.action,
           verdict: approval.status,
-          ...(override ? { updated: true } : {}),
+          // Edit-before-approve travels IN the intervention (auditable), so the
+          // waiting bridge can substitute the human's params (v0.4.6).
+          ...(override ? { updated: true, params: override } : {}),
         });
         return done({ request_id: approval.requestId, status: approval.status, ...(override ? { updated_params: override } : {}) });
       }

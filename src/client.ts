@@ -245,6 +245,7 @@ export class RoomMember {
     refusal?: { reason: string; detail?: string; retry_after_s?: number };
     presence?: "ready" | "busy" | "away";
     meta?: Record<string, unknown>;
+    ext?: Record<string, unknown>;
   }): Promise<SendResult> {
     return this.call("room_send", {
       message_id: mid("msg_" + this.name.replace(/[^a-zA-Z0-9]/g, "").slice(0, 12)),
@@ -259,6 +260,7 @@ export class RoomMember {
       refusal: args.refusal,
       presence: args.presence,
       _meta: args.meta,
+      ext: args.ext,
     });
   }
 

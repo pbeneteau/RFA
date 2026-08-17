@@ -19,6 +19,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as z from "zod";
 import { deriveCard, knowledgeFiles, loadPack, type AgentPack } from "./agentdef.js";
+import { interruptMatch, joinSidekick, requestApproval } from "./bridge.js";
 import { MemoryGate, RoomMember, type ServeContext } from "./client.js";
 import { Engine } from "./engine.js";
 import { ObsStore } from "./obs.js";
@@ -60,7 +61,11 @@ interface SavedState {
 }
 
 function readState(): SavedState | null {
-  for (const file of [STATE_FILE, LEGACY_STATE]) {
+  // The legacy migration path belongs to pm-agent alone: any other pack
+  // falling back to it would RESUME PM'''S MEMBERSHIP (found live: the scribe
+  // answered product questions as pm-agent for 40 seconds).
+  const candidates = pack.name === 'pm-agent' ? [STATE_FILE, LEGACY_STATE] : [STATE_FILE];
+  for (const file of candidates) {
     if (fs.existsSync(file)) {
       const s = JSON.parse(fs.readFileSync(file, "utf8")) as SavedState;
       if (file === LEGACY_STATE) log(`migrating legacy state from ${path.relative(ROOT, file)}`);
@@ -120,7 +125,11 @@ async function boot(): Promise<{ member: RoomMember; joinSecret: string | null; 
     clientInfo: { name: `rfa-resident-${pack.name}`, version: "0.4.1" },
   });
   log(`joined room ${member.room}${member.joinSecret ? ` (join_secret ${member.joinSecret})` : ""}`);
-  return { member, joinSecret: member.joinSecret, prevHash: null };
+  // Joiners must RETAIN the secret they joined with: the approval sidekick and
+  // future resumes need it (found live: the scribe's sidekick got null and the
+  // whole approval bridge answered join_denied).
+  const effectiveSecret = member.joinSecret ?? (binding?.room ? process.env.RFA_JOIN_SECRET ?? null : null);
+  return { member, joinSecret: effectiveSecret, prevHash: null };
 }
 
 const { member, joinSecret, prevHash } = await boot();
@@ -208,6 +217,78 @@ const memoryServer = createSdkMcpServer({
   ],
 });
 
+// ---- linear tools (v0.4.6): dry-run without LINEAR_API_KEY, GraphQL with it ----
+
+const LINEAR_KEY = process.env.LINEAR_API_KEY;
+
+async function linearGql(gql: string, variables: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const res = await fetch("https://api.linear.app/graphql", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: LINEAR_KEY! },
+    body: JSON.stringify({ query: gql, variables }),
+  });
+  const data = (await res.json()) as { data?: Record<string, unknown>; errors?: { message: string }[] };
+  if (data.errors?.length) throw new Error(data.errors.map((e) => e.message).join("; "));
+  return data.data ?? {};
+}
+
+const linearServer = createSdkMcpServer({
+  name: "linear",
+  version: "0.4.6",
+  tools: [
+    tool(
+      "search_project",
+      "Find a Linear project by name (returns ids). Use before save_document when the doc belongs to a project.",
+      { query: z.string() },
+      async (a) => {
+        if (!LINEAR_KEY) return asText("[dry-run] LINEAR_API_KEY not configured: skip project linking and save without a project.");
+        try {
+          const data = await linearGql(
+            `query($q: String!) { projects(filter: { name: { containsIgnoreCase: $q } }, first: 5) { nodes { id name state } } }`,
+            { q: a.query },
+          );
+          return asText((data.projects as { nodes: unknown[] }).nodes);
+        } catch (err) {
+          return asError(err);
+        }
+      },
+    ),
+    tool(
+      "save_document",
+      "Create a Linear document with the final draft. REQUIRES human approval (the call pauses on an approve/edit/reject decision). Call exactly once, with the complete markdown.",
+      { title: z.string(), content: z.string(), project_id: z.string().optional() },
+      async (a) => {
+        if (!LINEAR_KEY) {
+          const dir = path.join(STATE_DIR, "drafts");
+          fs.mkdirSync(dir, { recursive: true });
+          const file = path.join(dir, `${new Date().toISOString().slice(0, 19).replace(/[:]/g, "-")}-${a.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40)}.md`);
+          fs.writeFileSync(file, `# ${a.title}\n\n${a.content}\n`);
+          return asText(`[dry-run] LINEAR_API_KEY not configured; draft saved to ${path.relative(ROOT, file)}. A human can paste it into Linear.`);
+        }
+        try {
+          const data = await linearGql(
+            `mutation($input: DocumentCreateInput!) { documentCreate(input: $input) { success document { id title url } } }`,
+            { input: { title: a.title, content: a.content, ...(a.project_id ? { projectId: a.project_id } : {}) } },
+          );
+          return asText((data.documentCreate as { document: unknown }).document);
+        } catch (err) {
+          return asError(err);
+        }
+      },
+    ),
+  ],
+});
+
+// ---- approval bridge (v0.4.6): interrupt_on tools pause on a human decision ----
+
+let sidekick: RoomMember | null = null;
+let currentRunId: string | null = null;
+
+async function ensureSidekick(): Promise<RoomMember> {
+  sidekick ??= await joinSidekick(HUB, member.room, joinSecret, pack.name);
+  return sidekick;
+}
+
 const MCP_TOOLS = [
   "mcp__rfa__roster",
   "mcp__rfa__task_read",
@@ -260,9 +341,36 @@ async function brain(prompt: string, convoKey: string): Promise<{ text: string; 
       ...(pack.def.effort ? { effort: pack.def.effort } : {}),
       systemPrompt: systemPrompt(),
       settingSources: [],
-      mcpServers: { rfa: rfaServer, memory: memoryServer },
-      allowedTools: [...(pack.def.tools?.allow ?? []), ...MCP_TOOLS],
+      mcpServers: { rfa: rfaServer, memory: memoryServer, linear: linearServer },
+      // interrupt_on tools are EXCLUDED from the allowlist so they fall through
+      // to canUseTool, where the human decision happens (spec 7.3).
+      allowedTools: [...(pack.def.tools?.allow ?? []), ...MCP_TOOLS].filter((t) => !interruptMatch(pack.def.interrupt_on, t)),
       disallowedTools: pack.def.tools?.deny,
+      canUseTool: async (toolName, input) => {
+        const rule = interruptMatch(pack.def.interrupt_on, toolName);
+        if (!rule) return { behavior: "deny" as const, message: `tool ${toolName} is not allowed for this pack` };
+        log(`approval needed: ${toolName}`);
+        let sk: RoomMember;
+        try {
+          sk = await ensureSidekick();
+        } catch (err) {
+          log(`approval bridge unavailable: ${(err as Error).message}`);
+          return { behavior: "deny" as const, message: `the approval channel is unavailable (${(err as Error).message}); report this and include your draft in the answer instead` };
+        }
+        const outcome = await requestApproval(member, sk, {
+          toolName,
+          input: input as Record<string, unknown>,
+          allowedDecisions: rule.allowed_decisions,
+          runId: currentRunId ?? undefined,
+        });
+        log(`approval ${toolName}: ${outcome.reason}`);
+        return outcome.approved
+          // Edit-before-approve MERGES over the original input: the human edits
+          // fields, they do not retype the whole call (found live: a title-only
+          // edit clobbered the document content).
+          ? { behavior: "allow" as const, updatedInput: { ...(input as Record<string, unknown>), ...(outcome.params ?? {}) } }
+          : { behavior: "deny" as const, message: `human decision: ${outcome.reason}. Report this outcome; do not retry the tool.` };
+      },
       permissionMode: (pack.def.sandbox?.permission_mode ?? "default") as "default",
       maxTurns: budgets.max_turns ?? 10,
       ...(budgets.per_task_usd ? { maxBudgetUsd: budgets.per_task_usd } : {}),
@@ -418,6 +526,7 @@ await member.serve(
       input: { seq: ctx.envelope.seq, from: ctx.from.name, text: ctx.text.slice(0, 500) },
     });
     log(`Q from ${ctx.from.name} (seq ${ctx.envelope.seq}, run ${runId}): ${ctx.text.slice(0, 100)}`);
+    currentRunId = runId;
     const t0 = Date.now();
     try {
       const { text, costUsd, numTurns, tokens } = await brain(ctx.wrapped, convo);
