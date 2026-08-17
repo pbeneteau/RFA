@@ -11,6 +11,13 @@
  *                                   required for room_admin approve and quarantine release). Also RFA_HUMAN_KEYS.
  *   rfa-hub --otel                  emit one compact stderr line per tool-call span (spec 13). Without this
  *                                   flag spans are no-ops unless the operator registers their own OTel SDK.
+ *   rfa-hub --bind 0.0.0.0          HTTP bind address (default 127.0.0.1: loopback only, per MCP
+ *                                   2026-07-28 Streamable HTTP guidance). Reach a loopback hub from
+ *                                   another device with a proxy that terminates identity
+ *                                   (`tailscale serve` proxies http://127.0.0.1), never by widening this.
+ *   rfa-hub --allow-origin a,b      extra browser origins allowed to POST (localhost forms are always
+ *                                   allowed; a request with NO Origin header, i.e. any non-browser
+ *                                   client, is unaffected). Rejections are logged with the value seen.
  */
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
@@ -121,7 +128,13 @@ if (httpPort) {
 // Session-token auth: the operator presents a provisioned human_key ONCE;
 // the hub mints a short-lived token; every write carries it. Because the
 // token chains to a human key, console decisions land as human-origin
-// interventions through the ordinary room machinery. Reads stay tokenless.
+// interventions through the ordinary room machinery.
+//
+// Reads are tokened too (v0.5.0). They were not, and the same release found the
+// server binding every interface: agent definitions (the Goodvest system
+// prompt), run payloads, and pending approval cards (whole draft documents)
+// were readable by anything on the laptop's network. Read routes are cheap to
+// gate because the console already sends the bearer and re-prompts on 401.
 
 const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
 const AGENTS_DIR = path.join(ROOT, "agents");
@@ -132,6 +145,25 @@ function obs(): ObsStore | null {
   if (dataArg === "none") return null;
   obsStore ??= new ObsStore(path.join(dataArg, "obs.db"));
   return obsStore;
+}
+
+/** Extra browser origins the operator allowlisted (loopback forms are implicit). */
+const extraOrigins = (arg("--allow-origin") ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+/** True when this request may proceed: no Origin (non-browser client), a loopback origin, or an allowlisted one. */
+function originAllowed(req: http.IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  if (extraOrigins.includes(origin)) return true;
+  try {
+    const h = new URL(origin).hostname;
+    return h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "[::1]";
+  } catch {
+    return false;
+  }
 }
 
 function authed(req: http.IncomingMessage): boolean {
@@ -187,6 +219,8 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
       sessions.set(token, Date.now() + SESSION_TTL_MS);
       return send(res, 200, { session_token: token, ttl_s: SESSION_TTL_MS / 1000 });
     }
+    // Every route below this line is operator-only: reads included.
+    if (!authed(req)) return send(res, 401, { error: "session token required (POST /auth)" });
     if (req.method === "GET" && pathname === "/api/agents") return send(res, 200, agentStatus());
     const defMatch = /^\/api\/agents\/([\w.-]+)\/definition$/.exec(pathname);
     if (defMatch) {
@@ -278,6 +312,18 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
   const server = http.createServer(async (req, res) => {
     try {
       const pathname = (req.url ?? "/").split("?")[0];
+      // DNS-rebinding defense (MCP 2026-07-28 Streamable HTTP: Origin
+      // validation is a MUST, loopback binding a SHOULD). Only BROWSER
+      // requests carry Origin, so a missing header is a non-browser client and
+      // passes; a present-but-unlisted one is refused and logged, because
+      // whether a proxy rewrites Host or Origin is deployment-specific and a
+      // silent 403 on the first phone request is impossible to diagnose.
+      if (!originAllowed(req)) {
+        console.error(
+          `rfa-hub http: refused cross-origin ${req.method} ${pathname} (origin=${req.headers.origin ?? "-"} host=${req.headers.host ?? "-"}); allow it with --allow-origin`,
+        );
+        return send(res, 403, { error: "origin not allowed" });
+      }
       if (pathname === "/auth" || pathname.startsWith("/api/")) {
         await workbench(req, res, pathname);
         return;
@@ -323,9 +369,15 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
       res.end(JSON.stringify({ error: "internal error" }));
     }
   });
-  server.listen(port, () => {
+  // Loopback by default: the previous `listen(port)` bound every interface, so
+  // any device on the laptop's network could read the workbench.
+  const bindHost = arg("--bind") ?? "127.0.0.1";
+  server.listen(port, bindHost, () => {
     console.error(
       `rfa-hub: Streamable HTTP MCP at http://localhost:${port}/mcp (data: ${dataArg}, dual-era); console at http://localhost:${port}/console`,
+    );
+    console.error(
+      `rfa-hub: bound ${bindHost}${bindHost === "127.0.0.1" ? " (loopback only; proxy a tailnet to it rather than passing --bind)" : " -- REACHABLE OFF-HOST: every workbench read needs a session token, but prefer --bind 127.0.0.1 behind a proxy"}`,
     );
   });
 } else {
