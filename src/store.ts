@@ -2195,8 +2195,14 @@ export class RoomHub {
       approvals: [...room.approvals.values()],
       heldMessages: [...room.heldMessages.entries()],
     };
+    // Write-then-rename: a crash mid-write used to leave a truncated
+    // meta.json, and loadFromDisk skips a file it cannot parse, so the room
+    // silently failed to come back (its event log survived, unreadable).
+    // rename(2) is atomic within a directory, so a reader sees old or new.
     const file = path.join(this.roomDir(), `${room.handle}.meta.json`);
-    fs.writeFileSync(file, JSON.stringify(meta, null, 1), { encoding: "utf8", mode: 0o600 });
+    const tmp = `${file}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(meta, null, 1), { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(tmp, file);
   }
 
   private loadFromDisk(): void {
