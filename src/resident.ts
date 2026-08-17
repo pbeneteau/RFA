@@ -240,16 +240,22 @@ const linearServer = createSdkMcpServer({
   tools: [
     tool(
       "search_project",
-      "Find a Linear project by name (returns ids). Use before save_document when the doc belongs to a project.",
+      "Find a Linear project or team by name (returns ids). ALWAYS use before save_document: a live save requires exactly one parent (project_id or team_id).",
       { query: z.string() },
       async (a) => {
         if (!LINEAR_KEY) return asText("[dry-run] LINEAR_API_KEY not configured: skip project linking and save without a project.");
         try {
           const data = await linearGql(
-            `query($q: String!) { projects(filter: { name: { containsIgnoreCase: $q } }, first: 5) { nodes { id name state } } }`,
+            `query($q: String!) {
+               projects(filter: { name: { containsIgnoreCase: $q } }, first: 5) { nodes { id name state } }
+               teams(filter: { name: { containsIgnoreCase: $q } }, first: 5) { nodes { id name key } }
+             }`,
             { q: a.query },
           );
-          return asText((data.projects as { nodes: unknown[] }).nodes);
+          return asText({
+            projects: (data.projects as { nodes: unknown[] }).nodes,
+            teams: (data.teams as { nodes: unknown[] }).nodes,
+          });
         } catch (err) {
           return asError(err);
         }
@@ -257,8 +263,8 @@ const linearServer = createSdkMcpServer({
     ),
     tool(
       "save_document",
-      "Create a Linear document with the final draft. REQUIRES human approval (the call pauses on an approve/edit/reject decision). Call exactly once, with the complete markdown.",
-      { title: z.string(), content: z.string(), project_id: z.string().optional() },
+      "Create a Linear document with the final draft. REQUIRES human approval (the call pauses on an approve/edit/reject decision). Call exactly once, with the complete markdown. Linear requires exactly one parent: pass project_id OR team_id (find either with search_project first).",
+      { title: z.string(), content: z.string(), project_id: z.string().optional(), team_id: z.string().optional() },
       async (a) => {
         if (!LINEAR_KEY) {
           const dir = path.join(STATE_DIR, "drafts");
@@ -267,10 +273,15 @@ const linearServer = createSdkMcpServer({
           fs.writeFileSync(file, `# ${a.title}\n\n${a.content}\n`);
           return asText(`[dry-run] LINEAR_API_KEY not configured; draft saved to ${path.relative(ROOT, file)}. A human can paste it into Linear.`);
         }
+        // Linear enforces exactly one parent at runtime (found live: the first
+        // approved save died on it, wasting a human decision).
+        if (!a.project_id && !a.team_id) {
+          return asError(new Error("Linear requires exactly one parent for a document. Call search_project, then retry with project_id or team_id."));
+        }
         try {
           const data = await linearGql(
             `mutation($input: DocumentCreateInput!) { documentCreate(input: $input) { success document { id title url } } }`,
-            { input: { title: a.title, content: a.content, ...(a.project_id ? { projectId: a.project_id } : {}) } },
+            { input: { title: a.title, content: a.content, ...(a.project_id ? { projectId: a.project_id } : { teamId: a.team_id }) } },
           );
           return asText((data.documentCreate as { document: unknown }).document);
         } catch (err) {
@@ -285,6 +296,7 @@ const linearServer = createSdkMcpServer({
 
 let sidekick: RoomMember | null = null;
 let currentRunId: string | null = null;
+let currentReplyBy: string | null = null;
 
 async function ensureSidekick(): Promise<RoomMember> {
   sidekick ??= await joinSidekick(HUB, member.room, joinSecret, pack.name);
@@ -351,6 +363,16 @@ async function brain(prompt: string, convoKey: string): Promise<{ text: string; 
       canUseTool: async (toolName, input) => {
         const rule = interruptMatch(pack.def.interrupt_on, toolName);
         if (!rule) return { behavior: "deny" as const, message: `tool ${toolName} is not allowed for this pack` };
+        // Preflight before paging a human: a live save without a parent is doomed
+        // at Linear's door, so bounce it back to the model instead of burning an
+        // approval on it.
+        if (toolName === "mcp__linear__save_document" && LINEAR_KEY) {
+          const i = input as { project_id?: string; team_id?: string };
+          if (!i.project_id && !i.team_id) {
+            log(`preflight deny: ${toolName} without project_id/team_id`);
+            return { behavior: "deny" as const, message: "Linear requires exactly one parent. Call mcp__linear__search_project, then retry save_document with project_id or team_id." };
+          }
+        }
         log(`approval needed: ${toolName}`);
         let sk: RoomMember;
         try {
@@ -359,11 +381,17 @@ async function brain(prompt: string, convoKey: string): Promise<{ text: string; 
           log(`approval bridge unavailable: ${(err as Error).message}`);
           return { behavior: "deny" as const, message: `the approval channel is unavailable (${(err as Error).message}); report this and include your draft in the answer instead` };
         }
+        // The card must never outlive its audience (found live: a 10-min card
+        // vs a 600s asker left a 35s window where an approval would have saved
+        // a document for a departed asker). Cap the window at reply_by minus a
+        // margin, floored so a nearly-expired ask still gets a real chance.
+        const replyByMs = currentReplyBy ? Date.parse(currentReplyBy) - Date.now() - 30_000 : NaN;
         const outcome = await requestApproval(member, sk, {
           toolName,
           input: input as Record<string, unknown>,
           allowedDecisions: rule.allowed_decisions,
           runId: currentRunId ?? undefined,
+          ...(Number.isFinite(replyByMs) ? { timeoutMs: Math.max(60_000, Math.min(10 * 60_000, replyByMs)) } : {}),
         });
         log(`approval ${toolName}: ${outcome.reason}`);
         return outcome.approved
@@ -522,6 +550,19 @@ const consolidationTimer = setInterval(() => {
 }, 60_000);
 consolidationTimer.unref?.();
 
+// Long turns starve both the lease and the heartbeat: the serve loop only
+// breathes between listens, so a multi-minute tool run or approval wait looks
+// wedged to the supervisor and gone_quiet to the room (found live: the scribe
+// was SIGTERMed 38s after a human approved its save). While serving, renew
+// both from a timer; a truly wedged event loop stops the timer too, so the
+// supervisor's staleness check still catches real hangs.
+const keepaliveTimer = setInterval(() => {
+  if (!serving) return;
+  fs.writeFileSync(HEARTBEAT, String(Date.now()));
+  void member.setPresence("busy", { detail: "serving" }).catch(() => {});
+}, 30_000);
+keepaliveTimer.unref?.();
+
 const shutdown = (sig: string) => {
   log(`${sig}: draining after ${answered} answers`);
   save();
@@ -549,6 +590,7 @@ await member.serve(
     });
     log(`Q from ${ctx.from.name} (seq ${ctx.envelope.seq}, run ${runId}): ${ctx.text.slice(0, 100)}`);
     currentRunId = runId;
+    currentReplyBy = ctx.envelope.reply_by;
     serving = true;
     const t0 = Date.now();
     try {

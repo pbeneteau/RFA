@@ -10,8 +10,9 @@
  *   (1s doubling, capped 60s), max_restarts within a crash-loop window,
  *   min_uptime to reset the counter, kill_timeout = SIGTERM drain then SIGKILL.
  * - Health: the resident heartbeat file, written by the same serve cycle that
- *   renews its presence lease (the lease proxy; v0.4.1 upgrades this to
- *   reading lease_expires from the roster as an observer member).
+ *   renews its presence lease, and by a keepalive timer while a long turn
+ *   (tool run, approval wait) blocks the cycle. A wedged event loop stops
+ *   both, so staleness still means wedged.
  * - A definition edit triggers a versioned drain: validate the new agent.md
  *   first (a broken edit must never kill a healthy resident), then SIGTERM,
  *   wait, respawn. The new card digest in the roster marks the deploy.
