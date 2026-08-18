@@ -19,6 +19,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as z from "zod";
 import { deriveCard, knowledgeFiles, loadPack, type AgentPack } from "./agentdef.js";
+import { fileHint } from "./knowledge.js";
 import { approvalWindowMs, interruptMatch, joinSidekick, refusalForOutcome, requestApproval } from "./bridge.js";
 import { MemoryGate, RoomMember, ServeRefusal, type ServeContext } from "./client.js";
 import { Engine } from "./engine.js";
@@ -391,13 +392,6 @@ const MCP_TOOLS = [
 ];
 
 // ---------------------------------------------------------------- brain
-
-/** First heading (or first line) of a knowledge file: the retrieval hint. */
-function fileHint(f: string): string {
-  const head = fs.readFileSync(f, "utf8").slice(0, 2000);
-  const line = head.split("\n").find((l) => l.trim().length > 0) ?? "";
-  return line.replace(/^#+\s*/, "").trim().slice(0, 90);
-}
 
 function systemPrompt(): string {
   const files = knowledgeFiles(pack)
