@@ -211,7 +211,7 @@ export interface JoinContract {
   room: string;
   topic: string;
   policies: RoomPolicies;
-  you: { id: string; name: string; role: Role; origin: Origin; membership_token: string; requested_name_adjusted: boolean };
+  you: { id: string; name: string; role: Role; origin: Origin; home?: string; membership_token: string; requested_name_adjusted: boolean };
   roster: PresenceRecord[];
   epoch: number;
   history: { events: RfaEvent[]; cursor: number; truncated: boolean };

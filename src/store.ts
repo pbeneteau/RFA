@@ -640,12 +640,15 @@ export class RoomHub {
         name,
         role: member.role,
         origin: member.origin,
+        // Spec 11.3: a joiner must learn its own `home` here, not only by
+        // finding itself in the roster.
+        home: member.home,
         membership_token: member.token,
         requested_name_adjusted: adjusted,
       },
       roster: this.rosterSnapshot(room),
       epoch: room.epoch,
-      history: { events: history, cursor: room.seq, truncated },
+      history: { events: this.withWrapped(history), cursor: room.seq, truncated },
       instructions,
     };
   }
@@ -877,7 +880,11 @@ export class RoomHub {
     // exactly the case this protocol has to survive.
     const dedupeKey = `${member.id}:${args.message_id}`;
     const cached = room.dedupe.get(dedupeKey);
-    if (cached) return cached;
+    // A replay is a replay whether the cache is warm or cold. The warm path can
+    // still report the ORIGINAL dispositions, which is strictly better
+    // information than the cold path's empty list, so it keeps them; what it
+    // must not do is look like a fresh send.
+    if (cached) return { ...cached, replayed: true };
     if (member.sentIds.has(args.message_id)) {
       const prior = room.events.find(
         (e): e is Extract<RfaEvent, { type: "message" }> =>

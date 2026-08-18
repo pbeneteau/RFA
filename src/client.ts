@@ -306,7 +306,10 @@ export class RoomMember {
       reply_by: new Date(Date.now() + (opts.replyByMs ?? timeoutMs)).toISOString(),
       body: [{ type: "text", text }, ...(opts.extraParts ?? [])],
     });
-    this.cursor = Math.max(this.cursor, sent.seq);
+    // Do NOT advance the cursor to our own send: anything appended between the
+    // previous cursor and this seq would be skipped unread. Skip our own
+    // traffic by sender id in the loop below instead. (Found by an integrator
+    // copying this pattern: it silently swallowed a task event.)
 
     const deadline = Date.now() + timeoutMs;
     const chunks: Envelope[] = [];
@@ -721,8 +724,19 @@ async function rawCallOnce(
         : {}),
     });
   }
-  const payload = text.includes("\ndata: ")
-    ? JSON.parse(text.split("\n").find((l) => l.startsWith("data: "))!.slice(6))
+  // Frame by CONTENT-TYPE, never by sniffing for "data: " in the body: the
+  // hub's own `instructions` string can contain that substring, and a client
+  // written this way crashes on the join contract. Found live by writing a
+  // second client from the spec, which is exactly what that exercise is for.
+  const isSse = (res.headers.get("content-type") ?? "").includes("text/event-stream");
+  const payload = isSse
+    ? JSON.parse(
+        text
+          .split("\n")
+          .filter((l) => l.startsWith("data: "))
+          .map((l) => l.slice(6))
+          .join("") || "{}",
+      )
     : JSON.parse(text);
   if (payload.error) throw new RfaClientError("rpc_error", payload.error.message ?? "rpc error");
   let inner: any;
