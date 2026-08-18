@@ -18,10 +18,38 @@ RFA (Rooms for Agents): a communication protocol where AI agents join rooms, dis
 | Hub (`rfa-hub`) | v0.6.0 on MCP v2 SDK, dual-era, 12 tools + console at /console + OTel spans (`--otel`) + **policy gate (`--gate deploy/gate.json`)** + hash-chained event log |
 | Client SDK | [src/client.ts](src/client.ts): RoomMember (ask/serve/projectTools/admin/task) + MemoryGate (inspect + inspectText) |
 | Platform | [src/agentdef.ts](src/agentdef.ts) packs · [src/resident.ts](src/resident.ts) SDK runner · [src/supervisor.ts](src/supervisor.ts) + secrets injection · [src/engine.ts](src/engine.ts) durable runs/steps/schedules · [src/memoryfs.ts](src/memoryfs.ts) gated memory + episodes · [src/execbackend.ts](src/execbackend.ts) srt sandbox seam |
-| Tests | `npm test` 121/121 (glob over `test/*.test.ts`, so a new file is in the gate the moment it exists) · `npm run e2e` 9/9 fast ~4s · `e2e:full` 10/10 ~46s · parity gate `npx tsx dogfood/parity.ts` |
+| Tests | `npm test` 122/122 (glob over `test/*.test.ts`, so a new file is in the gate the moment it exists) · `npm run e2e` 9/9 fast ~4s · `e2e:full` 10/10 ~46s · parity gate `npx tsx dogfood/parity.ts` |
 | Repo | github.com/pbeneteau/agent-com (PRIVATE, personal account, Apache-2.0) |
 | Dogfood | LIVE: `pm-agent` (Agent SDK brain, haiku, pack at agents/pm-agent/) under the supervisor in room `r_9a25e48c0e`; ~10-20s answers with citations, cost and run_id recorded per answer |
 | Artifacts (claude.ai) | Research report + spec published; same URLs redeploy |
+
+## Reaching the hub from a phone (v0.5.1, partially shipped)
+
+Tailscale is up on the Mac, the iPhone and the Mac Studio (tailnet `pbeneteau.github`, this host is `macbook-pro-de-paul.tailb95b2d.ts.net`). **BLOCKED on one click**: `tailscale serve` needs the feature enabled once per tailnet at https://login.tailscale.com/f/serve?node=nzQVs89wB111CNTRL (an account action; only Paul can do it). Then:
+
+```bash
+/Applications/Tailscale.app/Contents/MacOS/Tailscale serve --bg --https=443 http://127.0.0.1:8790
+```
+
+Serve proxies ONLY `http://127.0.0.1`, which is why the hub can stay loopback-bound and still be reachable from the phone. On the phone: Tailscale from the App Store signed into the same account, then the console at `https://macbook-pro-de-paul.tailb95b2d.ts.net/console`, unlocked by pasting the human key (12h session). **Unmeasured and gating the live-stream half**: whether Serve passes the console's 20-second `room_listen` long-poll without buffering. Try `X-Accel-Buffering: no` first; if it buffers, the Inbox still works because it polls.
+
+Push and capture are SHIPPED and do not need Serve:
+
+```bash
+RFA_HUMAN_KEYS="$(cat dogfood/state/human-key.txt)" npm run start -- --http 8790 --otel --gate deploy/gate.json \
+  --push-url https://ntfy.sh/<your-private-topic> --console-url https://macbook-pro-de-paul.tailb95b2d.ts.net
+```
+
+Push is notification-only by design: a title and a link, never a credential and never an approve button, because a verdict arriving over a broadcast transport with a bearer in it is a forgeable approval. `test/push.test.ts` asserts the absence of all of it. The console stays the only surface where a decision can be made.
+
+`POST /api/ask` is the five-second capture path (spec 17.5), behind the session token, rate limited to 20/hour:
+
+```bash
+curl -s -X POST https://<host>/api/ask -H "authorization: Bearer $SESSION" -H 'content-type: application/json' \
+  -d '{"room":"r_9a25e48c0e","capability":"answer-product-question","question":"...","reply_by_s":1800}'
+```
+
+It returns 202 with an `ask_id` and a `poll` path, because a 30-minute reply window cannot be held open on an HTTP request. Verified live: 202, pm-agent answered in ~25s, `GET /api/ask/<id>` returned the answer with a file citation.
 
 ## Runbook (after a reboot or to resume)
 

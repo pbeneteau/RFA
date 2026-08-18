@@ -24,6 +24,11 @@
  *                                   2026-07-28 Streamable HTTP guidance). Reach a loopback hub from
  *                                   another device with a proxy that terminates identity
  *                                   (`tailscale serve` proxies http://127.0.0.1), never by widening this.
+ *   rfa-hub --push-url URL         notification-only push on approval-card creation and expiry (also
+ *                                   RFA_PUSH_URL). Any webhook; ntfy header names are used. Carries a
+ *                                   title and a link, NEVER a credential and never an action button.
+ *   rfa-hub --console-url URL       public base URL the push link points at (also RFA_CONSOLE_URL),
+ *                                   e.g. the tailnet name in front of this hub.
  *   rfa-hub --allow-origin a,b      extra browser origins allowed to POST (localhost forms are always
  *                                   allowed; a request with NO Origin header, i.e. any non-browser
  *                                   client, is unaffected). Rejections are logged with the value seen.
@@ -197,6 +202,92 @@ function originAllowed(req: http.IncomingMessage): boolean {
   } catch {
     return false;
   }
+}
+
+
+// ---------------------------------------------------------------- capture path (v0.5.1, spec 17.5)
+// The binding constraint on every instrument in this project is that it has
+// produced a few dozen agent turns in its entire life, and the cheapest lever
+// on that number is the five seconds between having a question and asking it.
+// This is also the only spend-triggering write endpoint, on a credential with
+// no revocation path, so it is rate limited per token.
+
+const ASK_RATE_PER_HOUR = 20;
+const askRate = new Map<string, number[]>(); // session token -> ms timestamps
+
+function askRateOk(token: string): boolean {
+  const now = Date.now();
+  const hits = (askRate.get(token) ?? []).filter((t) => now - t < 3600_000);
+  if (hits.length >= ASK_RATE_PER_HOUR) {
+    askRate.set(token, hits);
+    return false;
+  }
+  hits.push(now);
+  askRate.set(token, hits);
+  return true;
+}
+
+/** Answers we are still waiting for, so a phone can poll instead of holding a request open. */
+const pendingAsks = new Map<string, { room: string; asked: string; conversationId: string | null; replyBy: string; asked_at: number }>();
+
+/**
+ * Notification-only push (spec 17.2 and 17.4): a title and a link, never a
+ * credential and never an action button. A verdict arriving over a broadcast
+ * channel carrying a bearer is a forgeable approval, so the console stays the
+ * only surface where a decision can be made. Any webhook works: the body is
+ * plain text with ntfy's header names, which Pushover and a bare webhook also
+ * tolerate.
+ */
+const pushUrl = (arg("--push-url") ?? process.env.RFA_PUSH_URL ?? "").trim();
+const consoleBase = (arg("--console-url") ?? process.env.RFA_CONSOLE_URL ?? "").trim();
+const pushedCards = new Map<string, string>(); // request_id -> last state pushed
+
+async function push(title: string, body: string, clickPath: string): Promise<void> {
+  if (!pushUrl) return;
+  try {
+    await fetch(pushUrl, {
+      method: "POST",
+      headers: {
+        Title: title.slice(0, 120),
+        Priority: "default",
+        Tags: "bell",
+        ...(consoleBase ? { Click: `${consoleBase}${clickPath}` } : {}),
+      },
+      body: body.slice(0, 400),
+    });
+  } catch (err) {
+    console.error(`rfa-hub push: ${(err as Error).message}`);
+  }
+}
+
+/** Poll our own approval list rather than threading a callback through the store. */
+function watchCards(): void {
+  if (!pushUrl) return;
+  setInterval(() => {
+    let pending: ReturnType<RoomHub["pendingApprovals"]>;
+    try {
+      pending = hub.pendingApprovals();
+    } catch {
+      return;
+    }
+    const seen = new Set<string>();
+    for (const card of pending) {
+      seen.add(card.request_id);
+      const state = card.status;
+      if (pushedCards.get(card.request_id) === state) continue;
+      pushedCards.set(card.request_id, state);
+      if (state === "pending") {
+        void push(
+          `Approval needed: ${card.action}`,
+          `${card.requester_name} in ${card.room}. Decide in the console; this notification cannot approve anything.`,
+          `/console#${card.room}`,
+        );
+      } else {
+        void push(`Approval expired: ${card.action}`, `Nobody decided in time. ${card.request_id}`, `/console#${card.room}`);
+      }
+    }
+    for (const id of [...pushedCards.keys()]) if (!seen.has(id)) pushedCards.delete(id);
+  }, 5_000).unref?.();
 }
 
 function authed(req: http.IncomingMessage): boolean {
@@ -628,6 +719,93 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
       return send(res, 200, { ok: true });
     }
     if (req.method === "GET" && pathname === "/api/approvals") return send(res, 200, hub.pendingApprovals());
+
+    // POST /api/ask (spec 17.5): asynchronous by construction, because a
+    // 30-minute reply window cannot be held open on an HTTP request. Returns
+    // 202 with an id to poll.
+    if (req.method === "POST" && pathname === "/api/ask") {
+      const token = /^Bearer (.+)$/.exec(req.headers.authorization ?? "")?.[1] ?? "";
+      if (!askRateOk(token)) {
+        return send(res, 429, { error: "ask rate limit reached", retry_after_s: 300 }, { "Retry-After": "300" });
+      }
+      const b = await body(req);
+      const question = typeof b.question === "string" ? b.question.trim() : "";
+      const room = typeof b.room === "string" ? b.room : "";
+      if (!room || !question) return send(res, 400, { error: "room and question are required" });
+      if (question.length > 4000) return send(res, 400, { error: "question exceeds 4000 chars" });
+      const replyByS = Number.isFinite(Number(b.reply_by_s)) ? Math.max(60, Number(b.reply_by_s)) : 1800;
+      let membership: { membership_token: string; member_id: string };
+      try {
+        // Not the console membership: a supervisor cannot send (spec 12.1).
+        membership = hub.captureMembership(room);
+      } catch (err) {
+        return send(res, 404, { error: (err as Error).message });
+      }
+      // Select by capability exactly as the CLI does, and refuse rather than
+      // guess when the room is ambiguous.
+      const roster = hub.roster({ room, membership_token: membership.membership_token }).roster;
+      const capability = typeof b.capability === "string" ? b.capability : null;
+      const candidates = roster.filter(
+        (m) =>
+          m.id !== membership.member_id &&
+          m.role === "participant" &&
+          (capability ? (m.card_summary.skill_ids ?? []).includes(capability) : (m.card_summary.skill_ids ?? []).length > 0),
+      );
+      if (candidates.length === 0) return send(res, 409, { error: "no_capable_member", capability });
+      if (candidates.length > 1 && !capability) return send(res, 409, { error: "ambiguous_capability", candidates: candidates.map((m) => m.id) });
+      const target = candidates.find((m) => m.state === "ready") ?? candidates[0];
+      const askId = `ask_${randomBytes(8).toString("base64url")}`;
+      const replyBy = new Date(Date.now() + replyByS * 1000).toISOString();
+      const sent = await hub.send({
+        room,
+        membership_token: membership.membership_token,
+        message_id: askId,
+        kind: "request",
+        mentions: [target.id],
+        reply_by: replyBy,
+        body: [{ type: "text", text: question }],
+      });
+      pendingAsks.set(askId, { room, asked: target.id, conversationId: sent.conversation_id, replyBy, asked_at: Date.now() });
+      return send(res, 202, {
+        ask_id: askId,
+        asked_member: target.id,
+        asked_name: target.name,
+        conversation_id: sent.conversation_id,
+        reply_by: replyBy,
+        poll: `/api/ask/${askId}`,
+      });
+    }
+    const askMatch = /^\/api\/ask\/([\w.-]+)$/.exec(pathname);
+    if (req.method === "GET" && askMatch) {
+      const rec = pendingAsks.get(askMatch[1]);
+      if (!rec) return send(res, 404, { error: "unknown ask id" });
+      const membership = hub.captureMembership(rec.room);
+      const events = (await hub.listen({
+        room: rec.room,
+        membership_token: membership.membership_token,
+        since: 0,
+        timeout_ms: 0,
+        wait_for: "all",
+      })) as { events: { type: string; envelope?: Record<string, unknown> }[] };
+      const reply = events.events.find(
+        (e) => e.type === "message" && (e.envelope as { in_reply_to?: string })?.in_reply_to === askMatch[1],
+      );
+      if (!reply) {
+        const expired = Date.parse(rec.replyBy) < Date.now();
+        return send(res, 200, { ask_id: askMatch[1], state: expired ? "no_reply" : "pending", reply_by: rec.replyBy });
+      }
+      const env = reply.envelope as {
+        kind: string;
+        body: { type: string; text?: string }[];
+        refusal?: { reason: string; detail?: string };
+      };
+      return send(res, 200, {
+        ask_id: askMatch[1],
+        state: env.kind === "refuse" ? "refused" : "answered",
+        text: env.body.filter((p) => p.type === "text").map((p) => p.text).join("\n"),
+        refusal: env.refusal ?? null,
+      });
+    }
     if (req.method === "POST" && pathname === "/api/approvals/decide") {
       if (!authed(req)) return send(res, 401, { error: "session token required" });
       const b = await body(req);
@@ -728,10 +906,16 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
   // Loopback by default: the previous `listen(port)` bound every interface, so
   // any device on the laptop's network could read the workbench.
   const bindHost = arg("--bind") ?? "127.0.0.1";
+  watchCards();
   server.listen(port, bindHost, () => {
     console.error(
       `rfa-hub: Streamable HTTP MCP at http://localhost:${port}/mcp (data: ${dataArg}, dual-era); console at http://localhost:${port}/console`,
     );
+    if (pushUrl) {
+      console.error(
+        `rfa-hub: notification-only push on (${new URL(pushUrl).host}${consoleBase ? `, links to ${consoleBase}` : ", no --console-url so notifications carry no link"}). Never a credential, never an approve button: the console is the only verdict surface`,
+      );
+    }
     console.error(
       `rfa-hub: bound ${bindHost}${bindHost === "127.0.0.1" ? " (loopback only; proxy a tailnet to it rather than passing --bind)" : " -- REACHABLE OFF-HOST: every workbench read needs a session token, but prefer --bind 127.0.0.1 behind a proxy"}`,
     );

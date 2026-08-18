@@ -1371,6 +1371,38 @@ export class RoomHub {
    * principal, so its decisions must land as ordinary, auditable, human-origin
    * interventions: same machinery, no new authority path). Reused per room.
    */
+  /**
+   * The capture path's membership (spec 17.5). Distinct from the console's
+   * because a supervisor is deliberately read-only on `room_send` (12.1: a
+   * supervisor's only voice is `inject`, which carries neither `request` kind
+   * nor `reply_by`, so it cannot ask a question that correlates). This is a
+   * PARTICIPANT with human origin: same authority chain as the console, since a
+   * session token chains to a provisioned human key, so its questions are
+   * human-origin by construction and land as ordinary auditable traffic.
+   */
+  captureMembership(roomHandle: string): { membership_token: string; member_id: string } {
+    const room = this.getRoom(roomHandle);
+    for (const m of room.members.values()) {
+      if (m.present && m.origin === "human" && m.role === "participant" && m.name === "capture") {
+        return { membership_token: m.token, member_id: m.id };
+      }
+    }
+    const contract = this.doJoin(room, {
+      name: "capture",
+      card: {
+        name: "capture",
+        description: "the operator's capture path (human questions from a phone or a hotkey)",
+        skills: [{ id: "ask-question", description: "Asks a question on the operator's behalf; never answers one." }],
+      },
+      role: "participant",
+      origin: "human",
+      historyLimit: 0,
+      isHost: false,
+    });
+    this.writeMeta(room);
+    return { membership_token: contract.you.membership_token, member_id: contract.you.id };
+  }
+
   consoleMembership(roomHandle: string): { membership_token: string; member_id: string } {
     const room = this.getRoom(roomHandle);
     for (const m of room.members.values()) {
