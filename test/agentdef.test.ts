@@ -55,6 +55,31 @@ test("parseAgentMd: precise rejections", () => {
   assert.throws(() => parseAgentMd(VALID.replace(/---\n\nYou are[\s\S]*$/, "---\n")), /body/);
 });
 
+test("tools.allow_subagents: fan-out is opt-in and the refusal names the tool (spec 18.7)", () => {
+  // Default false, so an existing pack keeps its meaning without declaring it.
+  assert.equal(parseAgentMd(VALID).def.tools?.allow_subagents, false);
+  for (const entry of ["Agent", "Task", "task", "Agent(explore)"]) {
+    assert.throws(
+      () => parseAgentMd(VALID.replace("allow: [Read, Grep]", `allow: [Read, ${entry}]`)),
+      (err: Error) => {
+        // The error must NAME the offending tool and the field that unlocks it.
+        assert.match(err.message, /tools\.allow/);
+        assert.ok(err.message.includes(entry), `error should name ${entry}: ${err.message}`);
+        assert.match(err.message, /allow_subagents/);
+        return true;
+      },
+      `${entry} in tools.allow must fail validation`,
+    );
+  }
+  // Declared explicitly, the same definition is valid.
+  const opted = parseAgentMd(VALID.replace("allow: [Read, Grep]", "allow: [Read, Agent]\n  allow_subagents: true"));
+  assert.equal(opted.def.tools?.allow_subagents, true);
+  assert.deepEqual(opted.def.tools?.allow, ["Read", "Agent"]);
+  // `deny` is not an admission, and a lookalike tool name is not fan-out.
+  assert.ok(parseAgentMd(VALID.replace("allow: [Read, Grep]", "allow: [Read]\n  deny: [Agent, Task]")));
+  assert.ok(parseAgentMd(VALID.replace("allow: [Read, Grep]", "allow: [Read, TaskBoard, AgentCard]")));
+});
+
 test("deriveCard: card comes from the definition and its digest rotates with it", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-pack-"));
   fs.mkdirSync(path.join(dir, "test-agent"));

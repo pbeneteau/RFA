@@ -18,15 +18,44 @@ import * as z from "zod";
 import { sha256hex } from "./jcs.js";
 import type { AgentCard } from "./model.js";
 
+/**
+ * Tool names that turn one pack into a fan-out tree (spec 18.7). Matching is on
+ * the tool HEAD, so a specifier form (`Task(explore)`) cannot slip past the
+ * assertion.
+ */
+const SUBAGENT_TOOLS = new Set(["agent", "task"]);
+
+/**
+ * Fan-out is opt-in (spec 18.7). The assertion lives in the schema, at the
+ * layer where the risk would arrive: `canUseTool` default-denying today is a
+ * property of the current runtime, not a control, and a runtime check on a path
+ * that does not exist cannot be relied on when the path appears.
+ */
+const toolsSchema = z
+  .object({
+    allow: z.array(z.string()).optional(),
+    deny: z.array(z.string()).optional(),
+    allow_subagents: z.boolean().default(false),
+  })
+  .superRefine((tools, ctx) => {
+    if (tools.allow_subagents) return;
+    for (const entry of tools.allow ?? []) {
+      if (!SUBAGENT_TOOLS.has(entry.split("(")[0].trim().toLowerCase())) continue;
+      ctx.addIssue({
+        code: "custom",
+        path: ["allow"],
+        message: `lists \`${entry}\`, which spawns subagents; declare tools.allow_subagents: true to permit fan-out`,
+      });
+    }
+  });
+
 export const agentDefSchema = z.object({
   rfa_agent: z.literal(1),
   name: z.string().min(1).max(64),
   description: z.string().min(1).max(1024),
   model: z.string().optional(),
   effort: z.enum(["low", "medium", "high", "xhigh", "max"]).optional(),
-  tools: z
-    .object({ allow: z.array(z.string()).optional(), deny: z.array(z.string()).optional() })
-    .optional(),
+  tools: toolsSchema.optional(),
   skills: z.array(z.string()).optional(),
   knowledge: z.array(z.string()).optional(),
   offers: z

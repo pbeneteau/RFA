@@ -16,10 +16,15 @@
  * - A definition edit triggers a versioned drain: validate the new agent.md
  *   first (a broken edit must never kill a healthy resident), then SIGTERM,
  *   wait, respawn. The new card digest in the roster marks the deploy.
+ * - v0.5.2: it also owns the account layer (spec 18.6): the global cap on model
+ *   turns in flight, the sweep of leases whose owner died, and the account-wide
+ *   pause after a provider rate limit. The shared state is `src/account.ts` over
+ *   `data/runs.db`; residents consult it, the supervisor governs it.
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { AccountLedger, DEFAULT_CAP, RATE_LIMIT_PAUSE_FLOOR_MS } from "./account.js";
 import { listPacks, loadPack, type AgentPack } from "./agentdef.js";
 import { RoomMember } from "./client.js";
 import { ObsStore, evaluateAlerts } from "./obs.js";
@@ -54,6 +59,26 @@ const children = new Map<string, Child>();
 const manualStopped = new Set<string>();
 const log = (...a: unknown[]) => console.log(new Date().toISOString().slice(11, 19), "[supervisor]", ...a);
 
+// ---------------------------------------------------------------- account layer (v0.5.2, spec 18.6)
+
+const ACCOUNT = {
+  passMs: 5_000,
+  /** Escalation ceiling for the account-wide hold after repeated provider rate limits. */
+  pauseCapMs: 15 * 60_000,
+  /** Rate limits inside this window escalate the hold instead of restarting the ladder. */
+  escalationWindowMs: 10 * 60_000,
+};
+
+function configuredCap(): number {
+  const raw = Number(process.env.RFA_ACCOUNT_MAX_INFLIGHT);
+  return Number.isInteger(raw) && raw >= 1 ? raw : DEFAULT_CAP;
+}
+
+const account = new AccountLedger(path.join(ROOT, "data", "runs.db"));
+let pauseStreak = 0;
+let lastPauseAt = 0;
+let announcedPauseUntil = 0;
+
 /** The workbench reads this (v0.4.5): the supervisor's view of every resident. */
 function writeStateFile(): void {
   const agents: Record<string, unknown> = {};
@@ -67,7 +92,10 @@ function writeStateFile(): void {
     };
   }
   fs.mkdirSync(path.join(ROOT, "data"), { recursive: true });
-  fs.writeFileSync(path.join(ROOT, "data", "supervisor-state.json"), JSON.stringify({ ts: new Date().toISOString(), agents }, null, 1));
+  fs.writeFileSync(
+    path.join(ROOT, "data", "supervisor-state.json"),
+    JSON.stringify({ ts: new Date().toISOString(), agents, account: account.snapshot() }, null, 1),
+  );
 }
 
 function residentLog(pack: AgentPack): number {
@@ -137,6 +165,10 @@ async function drain(child: Child): Promise<void> {
       resolve();
     });
   });
+  // A SIGKILLed resident cannot release its own slot, and a slot nobody is using
+  // is a slot the account has lost until the sweep notices.
+  const freed = account.releaseAgent(child.pack.name);
+  if (freed > 0) log(`account: released ${freed} lease(s) held by the drained ${child.pack.name}`);
 }
 
 /** A definition edit: validate first, then versioned drain + respawn. */
@@ -209,17 +241,30 @@ async function reconcile(): Promise<void> {
 const CMD_FILE = path.join(ROOT, "data", "supervisor-commands.ndjson");
 let cmdOffset = fs.existsSync(CMD_FILE) ? fs.statSync(CMD_FILE).size : 0;
 
+/** One reader at a time: the watch and the poll below must not both consume the same bytes. */
+let commandsDraining = false;
+
 async function drainCommands(): Promise<void> {
+  if (commandsDraining) return;
   if (!fs.existsSync(CMD_FILE)) return;
   const size = fs.statSync(CMD_FILE).size;
   if (size <= cmdOffset) return;
+  commandsDraining = true;
+  try {
+    await readCommands(size);
+  } finally {
+    commandsDraining = false;
+  }
+}
+
+async function readCommands(size: number): Promise<void> {
   const fd = fs.openSync(CMD_FILE, "r");
   const buf = Buffer.alloc(size - cmdOffset);
   fs.readSync(fd, buf, 0, buf.length, cmdOffset);
   fs.closeSync(fd);
   cmdOffset = size;
   for (const line of buf.toString("utf8").split("\n").filter((l) => l.trim())) {
-    let cmd: { agent: string; action: string };
+    let cmd: { agent: string; action: string; principal?: string };
     try {
       cmd = JSON.parse(line);
     } catch {
@@ -227,7 +272,20 @@ async function drainCommands(): Promise<void> {
     }
     const child = children.get(cmd.agent);
     log(`command: ${cmd.action} ${cmd.agent}`);
-    if (cmd.action === "stop" && child) {
+    // pause/resume are ACCOUNT-wide whatever agent they name (spec 18.6): the
+    // subscription is the resource, and it is shared.
+    if (cmd.action === "pause") {
+      const { paused_until } = account.pause(`operator pause (${cmd.principal ?? "cli"})`, ACCOUNT.pauseCapMs);
+      announcedPauseUntil = Date.parse(paused_until);
+      log(`account: PAUSED pickup account-wide until ${paused_until} (operator)`);
+      writeStateFile();
+    } else if (cmd.action === "resume") {
+      account.resume();
+      pauseStreak = 0;
+      announcedPauseUntil = 0;
+      log("account: pickup resumed account-wide (operator)");
+      writeStateFile();
+    } else if (cmd.action === "stop" && child) {
       manualStopped.add(cmd.agent);
       await drain(child);
       writeStateFile();
@@ -355,13 +413,67 @@ async function nightlyPass(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------- account pass (spec 18.6)
+
+/**
+ * The supervisor's half of layer 3: it does not sit in the admission path (an
+ * RPC per model turn buys nothing on one laptop), it governs the shared table
+ * residents consult. Three duties: reclaim slots whose owner died, turn a
+ * reported provider rate limit into an account-wide hold with an escalating
+ * duration, and say out loud when the hold lifts.
+ */
+function accountPass(): void {
+  const swept = account.sweep();
+  if (swept > 0) log(`account: swept ${swept} lease(s) whose owner is gone`);
+  const reports = account.pendingRateLimits();
+  if (reports.length > 0) {
+    const now = Date.now();
+    pauseStreak = now - lastPauseAt < ACCOUNT.escalationWindowMs ? pauseStreak + 1 : 1;
+    lastPauseAt = now;
+    const holdMs = Math.min(ACCOUNT.pauseCapMs, RATE_LIMIT_PAUSE_FLOOR_MS * 2 ** (pauseStreak - 1));
+    const agents = [...new Set(reports.map((r) => r.agent))].join(", ");
+    const { paused_until } = account.pause(`provider rate limit (${agents})`, holdMs);
+    account.markRateLimitsHandled(reports.map((r) => r.id));
+    announcedPauseUntil = Date.parse(paused_until);
+    log(
+      `account: PAUSED pickup account-wide until ${paused_until} (${reports.length} rate-limit report(s) from ${agents}; hold ${Math.round(holdMs / 1000)}s, streak ${pauseStreak})`,
+    );
+    void opsMember().then((m) =>
+      m
+        ?.send({ body: `ALERT account: provider rate limit reported by ${agents}; pickup paused account-wide until ${paused_until}`, kind: "status" })
+        .catch((e) => log(`account alert post failed: ${e.message}`)),
+    );
+    writeStateFile();
+    return;
+  }
+  if (announcedPauseUntil > 0 && account.pausedUntil() === 0) {
+    announcedPauseUntil = 0;
+    log("account: hold lapsed; pickup resumed account-wide");
+    writeStateFile();
+  }
+}
+
 // ---------------------------------------------------------------- main
 
 log(`registry: ${AGENTS}`);
+account.setCap(configuredCap());
+account.sweep();
+log(`account layer: cap ${account.cap()} model turn(s) in flight (lane limits: serve ${account.laneLimit("serve")}, schedule ${account.laneLimit("schedule")}, background ${account.laneLimit("background")})`);
+if (account.pausedUntil() > 0) {
+  announcedPauseUntil = account.pausedUntil();
+  log(`account: pickup is still paused until ${new Date(announcedPauseUntil).toISOString()} (${account.pauseReason() ?? "no reason recorded"})`);
+}
 await reconcile();
 writeStateFile();
 void opsMember();
 const timer = setInterval(() => void reconcile(), POLICY.reconcileMs);
+const accountTimer = setInterval(() => {
+  accountPass();
+  // The command channel is watched, but fs.watch drops events under load and the
+  // retirement script waits on a stop actually landing.
+  void drainCommands();
+}, ACCOUNT.passMs);
+accountTimer.unref?.();
 const opsTimer = setInterval(() => {
   void alertPass();
   void nightlyPass();
@@ -372,7 +484,9 @@ async function shutdown(sig: string): Promise<void> {
   log(`${sig}: draining ${children.size} resident(s)`);
   clearInterval(timer);
   clearInterval(opsTimer);
+  clearInterval(accountTimer);
   await Promise.all([...children.values()].map((c) => drain(c)));
+  account.close();
   process.exit(0);
 }
 process.on("SIGINT", () => void shutdown("SIGINT"));

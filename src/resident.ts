@@ -22,6 +22,7 @@ import { deriveCard, knowledgeFiles, loadPack, type AgentPack } from "./agentdef
 import { approvalWindowMs, interruptMatch, joinSidekick, refusalForOutcome, requestApproval } from "./bridge.js";
 import { MemoryGate, RoomMember, ServeRefusal, type ServeContext } from "./client.js";
 import { Engine } from "./engine.js";
+import { AccountLedger, isRateLimitError, type Lane } from "./account.js";
 import { ObsStore } from "./obs.js";
 import { consolidate } from "./consolidate.js";
 import { EpisodeLog, FactStore, GatedMemory } from "./memoryfs.js";
@@ -59,6 +60,21 @@ class BudgetStop extends Error {
   ) {
     super(message);
     this.name = "BudgetStop";
+  }
+}
+
+/**
+ * The account has no slot, or pickup is paused account-wide after a provider
+ * rate limit. Like BudgetStop this is a ceiling rather than a crash, so it
+ * reaches the asker as `overloaded` with the numbers (spec 18.3).
+ */
+class AccountStop extends Error {
+  constructor(
+    message: string,
+    readonly retryAfterS: number | null,
+  ) {
+    super(message);
+    this.name = "AccountStop";
   }
 }
 
@@ -105,6 +121,10 @@ function writeState(s: SavedState): void {
 
 const gate = new MemoryGate();
 const engine = new Engine(path.join(ROOT, "data", "runs.db"));
+// Layer 3 (spec 18.6): one account-wide cap on model turns in flight, shared
+// with every other resident and background pass through the same SQLite file.
+const account = new AccountLedger(path.join(ROOT, "data", "runs.db"));
+let currentLease: string | null = null;
 const obs = new ObsStore(path.join(ROOT, "data", "obs.db"));
 const episodes = new EpisodeLog(path.join(STATE_DIR, "memory.db"));
 const facts = new FactStore(path.join(STATE_DIR, "memory.db"), gate, "self");
@@ -396,7 +416,7 @@ function systemPrompt(): string {
     .join("\n\n");
 }
 
-async function brain(prompt: string, convoKey: string): Promise<{ text: string; costUsd: number; numTurns: number; tokens: { input: number | null; output: number | null } }> {
+async function brain(prompt: string, convoKey: string, lane: Lane = "serve"): Promise<{ text: string; costUsd: number; numTurns: number; tokens: { input: number | null; output: number | null } }> {
   const budgets = pack.def.budgets ?? {};
   const today = new Date().toISOString().slice(0, 10);
   if (spend.day !== today) spend = { day: today, usd: 0 };
@@ -412,6 +432,13 @@ async function brain(prompt: string, convoKey: string): Promise<{ text: string; 
     );
   }
   const taskCeiling = Math.min(budgets.per_task_usd ?? Infinity, remaining);
+  // Admission before the model call (spec 18.6). Reservation-based, so a
+  // human-facing serve can fill the cap while background work must leave room:
+  // the point is that consolidation never starves an answer someone is waiting
+  // for. A denied caller retries; the serve loop and the timers already do.
+  const slot = await account.waitForSlot({ agent: pack.name, lane, runId: currentRunId }, { timeoutMs: 120_000 });
+  if (!slot.ok) throw new AccountStop(slot.detail ?? "no account slot", slot.retry_after_s ?? null);
+  currentLease = slot.lease?.lease_id ?? null;
   const q = query({
     prompt,
     options: {
@@ -485,6 +512,7 @@ async function brain(prompt: string, convoKey: string): Promise<{ text: string; 
   let costUsd = 0;
   let numTurns = 0;
   let tokens: { input: number | null; output: number | null } = { input: null, output: null };
+  try {
   for await (const msg of q) {
     if (msg.type === "system" && msg.subtype === "init") {
       sessions.set(convoKey, msg.session_id);
@@ -515,6 +543,12 @@ async function brain(prompt: string, convoKey: string): Promise<{ text: string; 
   if (!text) throw new Error("brain returned an empty result");
   spend.usd += costUsd;
   return { text, costUsd, numTurns, tokens };
+  } finally {
+    // Always: a lease held by a dead run blocks every other resident until the
+    // supervisor's sweep reclaims it.
+    if (currentLease) account.release(currentLease);
+    currentLease = null;
+  }
 }
 
 /** Trace continuity (spec 7.1): join the asker's trace when the envelope carries SEP-414 context. */
@@ -600,7 +634,7 @@ const scheduleTimer = setInterval(async () => {
     log(`schedule fired (${due.kind}): ${due.callback.slice(0, 60)}`);
     const st0 = Date.now();
     try {
-      const { text, costUsd, numTurns, tokens } = await brain(due.callback, `sched:${due.id}`);
+      const { text, costUsd, numTurns, tokens } = await brain(due.callback, `sched:${due.id}`, "schedule");
       await engine.step(runId, "post-to-room", async () => {
         await member.send({ body: text, kind: "status" });
         return { chars: text.length };
@@ -640,6 +674,7 @@ const consolidationTimer = setInterval(() => {
       // roughly 3% of the resident's spend in a separate maxBudgetUsd.
       spend.usd += r.cost_usd;
       save();
+      if (r.deferred) log(`consolidation deferred: ${r.deferred}`);
       if (r.episodes > 0) log(`consolidated ${r.episodes} episodes: +${r.added} facts, ~${r.updated}, -${r.invalidated} ($${r.cost_usd.toFixed(4)}, day now $${spend.usd.toFixed(4)})`);
     })
     .catch((err) => log(`consolidation failed: ${(err as Error).message}`));
@@ -654,6 +689,9 @@ consolidationTimer.unref?.();
 // supervisor's staleness check still catches real hangs.
 const keepaliveTimer = setInterval(() => {
   if (!serving) return;
+  // The lease TTL is shorter than a human approval wait, so renew it here for
+  // the same reason the heartbeat is renewed here.
+  if (currentLease) account.renew(currentLease);
   fs.writeFileSync(HEARTBEAT, String(Date.now()));
   void member.setPresence("busy", { detail: "serving" }).catch(() => {});
 }, 30_000);
@@ -664,12 +702,14 @@ const shutdown = (sig: string) => {
   save();
   clearInterval(consolidationTimer);
   clearInterval(keepaliveTimer);
+  if (currentLease) account.release(currentLease);
   // The sidekick is a real membership: dying without leaving strands a zombie
   // observer in the roster (found live: five hitl corpses after a day of
   // restarts). Best-effort leave, capped so a dead hub cannot stall the drain.
   const bye = sidekick ? sidekick.leave().catch(() => {}) : Promise.resolve();
   void Promise.race([bye, new Promise((r) => setTimeout(r, 2_000))]).then(() => {
     engine.close();
+    account.close();
     episodes.close();
     facts.close();
     obs.close();
@@ -751,6 +791,7 @@ await member.serve(
     } catch (err) {
       serving = false;
       const budgetStop = err instanceof BudgetStop ? err : null;
+      const accountStop = err instanceof AccountStop ? err : null;
       engine.failRun(runId, (err as Error).message, { retryable: false });
       obs.record({
         id: runId,
@@ -773,6 +814,20 @@ await member.serve(
       if (budgetStop) {
         log(`budget stop: ${budgetStop.message}`);
         return new ServeRefusal("overloaded", budgetStop.message);
+      }
+      // Returned, never thrown: a thrown refusal is swallowed by the serve
+      // wrapper into a generic "answer generation failed".
+      if (accountStop) {
+        const detail = accountStop.retryAfterS ? `${accountStop.message} (retry in ${accountStop.retryAfterS}s)` : accountStop.message;
+        log(`account stop: ${detail}`);
+        return new ServeRefusal("overloaded", detail);
+      }
+      // A provider rate limit is an account-wide condition, not this run's
+      // fault: park it and let the supervisor hold pickup for everyone, rather
+      // than failing it into a retry against the same wall.
+      if (isRateLimitError(err)) {
+        account.reportRateLimit({ agent: pack.name, runId, detail: (err as Error).message });
+        log(`provider rate limit reported; account pickup paused`);
       }
       throw err;
     }

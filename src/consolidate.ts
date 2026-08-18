@@ -18,6 +18,7 @@ import * as path from "node:path";
 import { loadPack } from "./agentdef.js";
 import { MemoryGate } from "./client.js";
 import { EpisodeLog, FactStore, type Episode, type ReconciliationItem } from "./memoryfs.js";
+import { AccountLedger } from "./account.js";
 
 const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
 const WATERMARK = "consolidation_watermark";
@@ -31,6 +32,8 @@ export interface ConsolidationResult {
   skipped: number;
   cost_usd: number;
   watermark: number;
+  /** Set when the account layer refused a slot, so the caller can say why nothing happened. */
+  deferred?: string;
 }
 
 async function llm(systemPrompt: string, prompt: string, model: string): Promise<{ text: string; cost: number }> {
@@ -81,6 +84,15 @@ Respond with ONLY: {"memory": [{"id": <candidate id, when UPDATE/DELETE>, "text"
 
 export async function consolidate(agentName: string, opts: { model?: string; batch?: number } = {}): Promise<ConsolidationResult> {
   const pack = loadPack(path.join(ROOT, "agents", agentName));
+  // Background lane (spec 18.6): consolidation yields to anything a human is
+  // waiting on. Refused rather than queued, because the caller is an idle timer
+  // that will simply come back.
+  const ledger = new AccountLedger(path.join(ROOT, "data", "runs.db"));
+  const slot = ledger.acquire({ agent: agentName, lane: "background" });
+  if (!slot.ok) {
+    ledger.close();
+    return { episodes: 0, extracted: 0, added: 0, updated: 0, invalidated: 0, skipped: 0, cost_usd: 0, watermark: 0, deferred: slot.detail ?? "no account slot" };
+  }
   const dbPath = path.join(pack.dir, "state", "memory.db");
   const episodes = new EpisodeLog(dbPath);
   const model = opts.model ?? "haiku";
@@ -134,6 +146,8 @@ export async function consolidate(agentName: string, opts: { model?: string; bat
     facts.close();
     return { episodes: batch.length, extracted: extracted.length, ...counts, cost_usd: totalCost, watermark: newWatermark };
   } finally {
+    if (slot.lease) ledger.release(slot.lease.lease_id);
+    ledger.close();
     episodes.close();
   }
 }
