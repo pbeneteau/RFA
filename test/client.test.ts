@@ -2,6 +2,7 @@
 import { strict as assert } from "node:assert";
 import { after, before, test } from "node:test";
 import { spawn, type ChildProcess } from "node:child_process";
+import * as http from "node:http";
 import * as net from "node:net";
 import * as path from "node:path";
 import { RoomMember, RfaClientError } from "../src/client.js";
@@ -185,4 +186,33 @@ test("client: wrapForModel strips control and bidi characters, matching the memo
   assert.ok(wrapped.includes("pay") && wrapped.includes("invoice"), "legible text survives");
   // The two paths must agree, or memory and prompt disagree about what was said.
   assert.equal(RoomMember.sanitizeForMemory(env).wrapped, wrapped);
+});
+
+test("client: a transport refusal is named, not swallowed as 'rpc error'", async () => {
+  // A hub that requires a bearer answers 401 with a plain JSON body, which is
+  // not a JSON-RPC envelope. Parsing it as one used to yield "rpc error", which
+  // tells an integrator nothing about what to fix.
+  const srv = http.createServer((req, res) => {
+    res.writeHead(401, { "content-type": "application/json", "www-authenticate": 'Bearer realm="test"' });
+    res.end(JSON.stringify({ error: "Authorization: Bearer <token> required" }));
+  });
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+  const port = (srv.address() as import("node:net").AddressInfo).port;
+  try {
+    await RoomMember.create({
+      hubUrl: `http://127.0.0.1:${port}/mcp`,
+      name: "probe",
+      topic: "t",
+      card: { name: "probe", description: "p", skills: [{ id: "s", description: "d" }] },
+    });
+    assert.fail("should have refused");
+  } catch (err) {
+    const e = err as { code: string; message: string; data: Record<string, unknown> };
+    assert.equal(e.code, "unauthorized");
+    assert.match(e.message, /401/);
+    assert.match(e.message, /Bearer/);
+    assert.match(String(e.data.hint), /RFA_TOKEN/, "and it says which knob to turn");
+  } finally {
+    srv.close();
+  }
 });

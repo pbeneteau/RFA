@@ -657,6 +657,19 @@ async function rawCall(
   throw lastErr;
 }
 
+/**
+ * Transport credential for a hub that requires one (spec 4.2). Read from the
+ * environment rather than threaded through every call site, because it belongs
+ * to the PROCESS and its deployment, not to a membership: one agent may hold
+ * several memberships and they all present the same bearer. A hub with no
+ * tokens configured ignores it, so setting it is always safe.
+ *
+ * UNRUN SPIKE (RFA-0.6 section 4.4): whether a third-party MCP host can carry a
+ * static Authorization header into a registered server is unmeasured. If it
+ * cannot, the credential moves into tool arguments and this changes shape.
+ */
+const RFA_TOKEN = process.env.RFA_TOKEN?.trim();
+
 async function rawCallOnce(
   hubUrl: string,
   clientInfo: { name: string; version: string },
@@ -670,6 +683,7 @@ async function rawCallOnce(
       accept: "application/json, text/event-stream",
       "Mcp-Method": "tools/call",
       "Mcp-Name": tool,
+      ...(RFA_TOKEN ? { authorization: `Bearer ${RFA_TOKEN}` } : {}),
     },
     body: JSON.stringify({
       jsonrpc: "2.0",
@@ -679,6 +693,34 @@ async function rawCallOnce(
     }),
   });
   const text = await res.text();
+  // A transport-level refusal is not JSON-RPC: the hub answers 401/403/429 with
+  // a plain JSON body, and parsing it as an envelope produced the useless
+  // "rpc error" that a stranger would have had to guess at. Name it instead.
+  if (!res.ok && res.status !== 200) {
+    let detail = text.slice(0, 200);
+    try {
+      const body = JSON.parse(text) as { error?: string };
+      if (typeof body.error === "string") detail = body.error;
+    } catch {
+      /* not JSON: keep the raw prefix */
+    }
+    const code =
+      res.status === 401 || res.status === 403
+        ? "unauthorized"
+        : res.status === 429
+          ? "rate_limited"
+          : res.status >= 500
+            ? "overloaded"
+            : "bad_request";
+    const retryAfter = Number(res.headers.get("retry-after") ?? 0);
+    throw new RfaClientError(code, `hub returned ${res.status}: ${detail}`, {
+      status: res.status,
+      ...(retryAfter > 0 ? { retry_after_s: retryAfter } : {}),
+      ...(code === "unauthorized" && res.headers.get("www-authenticate")
+        ? { hint: "this hub requires a transport credential; set RFA_TOKEN" }
+        : {}),
+    });
+  }
   const payload = text.includes("\ndata: ")
     ? JSON.parse(text.split("\n").find((l) => l.startsWith("data: "))!.slice(6))
     : JSON.parse(text);

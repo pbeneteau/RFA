@@ -34,10 +34,23 @@ export async function runBackup(opts: {
   const files: string[] = [];
   for (const db of opts.dbs.filter((f) => fs.existsSync(f))) {
     const out = path.join(dest, path.relative(opts.root, db).replaceAll(path.sep, "__"));
+    // better-sqlite3's own backup, not the sqlite3 CLI: the driver is already a
+    // dependency, the CLI is not guaranteed to exist, and shelling out put the
+    // destination path through a shell-quoted string. The plain-copy fallback
+    // stays because a corrupt-but-present backup file is worse than a warned
+    // one, but it is now genuinely last-resort: with WAL enabled a byte copy
+    // can miss committed transactions still in the -wal file.
     try {
-      await execFileP("sqlite3", [db, `.backup '${out}'`]);
-    } catch {
-      fs.copyFileSync(db, out); // no sqlite3 CLI: plain copy (WAL risk accepted for the fallback)
+      const { default: Database } = await import("better-sqlite3");
+      const src = new Database(db, { readonly: true });
+      try {
+        await src.backup(out);
+      } finally {
+        src.close();
+      }
+    } catch (err) {
+      console.error(`backup: driver backup of ${db} failed (${(err as Error).message}); falling back to a byte copy, which may miss WAL commits`);
+      fs.copyFileSync(db, out);
     }
     files.push(out);
   }

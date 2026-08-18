@@ -108,3 +108,29 @@ test("the store lock is exclusive, and an abandoned lock is taken over", () => {
   assert.throws(() => new RoomHub({ dataDir: dir, sweepIntervalMs: 0 }), /already owned/);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test("the nightly backup captures commits still living in the WAL file", async () => {
+  // The backup used to shell out to the sqlite3 CLI and fall back to a byte
+  // copy when it was missing. With WAL enabled a byte copy can miss committed
+  // transactions that are still in the -wal file, so the fallback could write a
+  // backup that silently lost recent work. This uses the driver's own backup.
+  const { default: Database } = await import("better-sqlite3");
+  const { runBackup } = await import("../src/platform.js");
+  const root = tmpdir();
+  const dest = tmpdir();
+  const dbPath = path.join(root, "live.db");
+  const db = new Database(dbPath);
+  db.pragma("journal_mode = WAL");
+  db.exec("create table t(x)");
+  const ins = db.prepare("insert into t values (?)");
+  for (let i = 0; i < 500; i++) ins.run(i);
+
+  const res = await runBackup({ root, dbs: [dbPath], dirs: [], destRoot: dest, keep: 3 });
+  const copy = new Database(res.files[0], { readonly: true });
+  const { c } = copy.prepare("select count(*) c from t").get() as { c: number };
+  assert.equal(c, 500, "every committed row is in the backup, WAL or not");
+  db.close();
+  copy.close();
+  fs.rmSync(root, { recursive: true, force: true });
+  fs.rmSync(dest, { recursive: true, force: true });
+});
