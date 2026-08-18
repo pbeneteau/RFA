@@ -809,3 +809,28 @@ test("v0.6.0a: `home` is stamped by the hub on the roster and every envelope, de
   const msg = res.events.find((e) => e.type === "message");
   assert.equal(msg.envelope.from.home, "local", "and it rides the envelope next to origin");
 });
+
+test("ambient_skipped counts what the filter dropped while parked, not just on replay", async () => {
+  // Found by an outside integrator: the replay path counted correctly and the
+  // long-poll path always reported 0, so a client using the counter to decide
+  // "I missed ambient context, go re-read" under-counted exactly when it was
+  // waiting rather than catching up.
+  const hub = new RoomHub({ dataDir: null, sweepIntervalMs: 0 });
+  const a = hub.createRoom({ topic: "ambient", name: "listener", card: pmCard });
+  const b = hub.join({ room: a.room, join_secret: a.join_secret!, name: "chatter", card: devCard });
+  const tok = a.contract.you.membership_token;
+
+  // Park on mentions, then append traffic that mentions nobody, then one that does.
+  const parked = hub.listen({ room: a.room, membership_token: tok, since: a.contract.history.cursor, timeout_ms: 5_000, wait_for: "mentions" });
+  await new Promise((r) => setTimeout(r, 50));
+  for (const id of ["msg_amb_1", "msg_amb_2"]) {
+    await hub.send({ room: a.room, membership_token: b.you.membership_token, message_id: id, body: [{ type: "text", text: `ambient ${id}` }] });
+  }
+  await hub.send({
+    room: a.room, membership_token: b.you.membership_token, message_id: "msg_for_you",
+    mentions: [a.contract.you.id], body: [{ type: "text", text: "this one is for you" }],
+  });
+  const res = (await parked) as { events: unknown[]; ambient_skipped: number };
+  assert.equal(res.events.length, 1, "only the mention woke it");
+  assert.ok(res.ambient_skipped >= 2, `the two ambient messages are counted (got ${res.ambient_skipped})`);
+});

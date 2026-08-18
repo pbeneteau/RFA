@@ -182,6 +182,8 @@ interface Waiter {
   memberId: string;
   filter: Filter;
   matched: RfaEvent[];
+  /** Events appended while parked that this waiter's filter dropped (spec 4.1). */
+  skipped: number;
   resolve: (r: ListenResult) => void;
   timer: NodeJS.Timeout;
   done: boolean;
@@ -1728,6 +1730,7 @@ export class RoomHub {
         memberId: member.id,
         filter,
         matched: [],
+        skipped: 0,
         resolve,
         done: false,
         timer: setTimeout(() => this.resolveWaiter(room, waiter), timeoutMs),
@@ -1749,7 +1752,7 @@ export class RoomHub {
       cursor: room.seq,
       epoch: room.epoch,
       lease_expires: iso(member.leaseExpires),
-      ambient_skipped: 0,
+      ambient_skipped: waiter.skipped,
       compacted: 0,
     });
   }
@@ -2027,6 +2030,12 @@ export class RoomHub {
       const member = room.members.get(w.memberId);
       if (!member) continue;
       const hits = events.filter((e) => this.matches(room, e, member, w.filter));
+      // Count what the filter dropped even while parked. Reporting 0 here made
+      // `ambient_skipped` exact on the replay path and silently wrong on the
+      // long-poll path, so a client using it to decide "I missed ambient
+      // context, go re-read" under-counted. Found by an outside integrator
+      // building the counter into its own client.
+      w.skipped += events.length - hits.length;
       if (hits.length > 0) {
         w.matched.push(...hits);
         woken.add(w.memberId);
