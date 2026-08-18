@@ -46,6 +46,25 @@ const HEARTBEAT = path.join(STATE_DIR, "heartbeat");
 const LEGACY_STATE = path.join(ROOT, "dogfood", "state", "pm-agent.json");
 const ROOM_MD = path.join(ROOT, "dogfood", "ROOM.md");
 
+/**
+ * A cost ceiling was reached. Distinct from a crash so the serve path can
+ * answer the asker with the `overloaded` refusal of spec 18.3, carrying the
+ * spend and the budget, instead of a generic thrown error.
+ */
+class BudgetStop extends Error {
+  constructor(
+    message: string,
+    readonly spendUsd: number,
+    readonly budgetUsd: number,
+  ) {
+    super(message);
+    this.name = "BudgetStop";
+  }
+}
+
+/** Below this, a run buys one truncated request instead of an answer (spec 18.1). */
+const VIABLE_BUDGET_USD = 0.05;
+
 const log = (...a: unknown[]) => console.log(new Date().toISOString().slice(11, 19), `[${pack.name}]`, ...a);
 
 // ---------------------------------------------------------------- state
@@ -381,9 +400,18 @@ async function brain(prompt: string, convoKey: string): Promise<{ text: string; 
   const budgets = pack.def.budgets ?? {};
   const today = new Date().toISOString().slice(0, 10);
   if (spend.day !== today) spend = { day: today, usd: 0 };
-  if (budgets.per_day_usd && spend.usd >= budgets.per_day_usd) {
-    throw new Error(`daily budget exhausted (spend=${spend.usd.toFixed(2)} budget=${budgets.per_day_usd})`);
+  // A viability floor, not `> 0` (spec 18.1): the SDK enforces the cap BETWEEN
+  // model requests, so a two-cent remainder buys one real request and returns a
+  // truncated answer. Refusing at pickup is cheaper and more honest.
+  const remaining = budgets.per_day_usd ? budgets.per_day_usd - spend.usd : Infinity;
+  if (remaining < VIABLE_BUDGET_USD) {
+    throw new BudgetStop(
+      `daily budget exhausted (spend=${spend.usd.toFixed(2)} budget=${budgets.per_day_usd})`,
+      spend.usd,
+      budgets.per_day_usd ?? 0,
+    );
   }
+  const taskCeiling = Math.min(budgets.per_task_usd ?? Infinity, remaining);
   const q = query({
     prompt,
     options: {
@@ -446,7 +474,10 @@ async function brain(prompt: string, convoKey: string): Promise<{ text: string; 
       },
       permissionMode: (pack.def.sandbox?.permission_mode ?? "default") as "default",
       maxTurns: budgets.max_turns ?? 10,
-      ...(budgets.per_task_usd ? { maxBudgetUsd: budgets.per_task_usd } : {}),
+      // min(per_task, per_day - spend) (spec 18.1). A min() over an ABSENT
+      // per_task_usd is not a ceiling, which is why the per-day remainder is
+      // the ceiling on its own when a pack declares no per-task budget.
+      ...(Number.isFinite(taskCeiling) ? { maxBudgetUsd: taskCeiling } : {}),
       ...(sessions.has(convoKey) ? { resume: sessions.get(convoKey) } : {}),
     },
   });
@@ -458,11 +489,24 @@ async function brain(prompt: string, convoKey: string): Promise<{ text: string; 
     if (msg.type === "system" && msg.subtype === "init") {
       sessions.set(convoKey, msg.session_id);
     } else if (msg.type === "result") {
+      // Hoisted above the guard (spec 18.2): a run that ends in error still
+      // spent money, and the guard used to throw before the ledger was touched,
+      // so every failed run was free as far as the day's total knew.
+      costUsd = msg.total_cost_usd ?? 0;
       if (msg.subtype !== "success" || msg.is_error) {
+        spend.usd += costUsd;
+        // The SDK's own budget and turn stops (spec 18.3) carry the numbers so
+        // the asker learns a ceiling was hit rather than "something broke".
+        if (msg.subtype === "error_max_budget_usd" || msg.subtype === "error_max_turns") {
+          throw new BudgetStop(
+            `${msg.subtype} (spend=${spend.usd.toFixed(2)} budget=${Number.isFinite(taskCeiling) ? taskCeiling.toFixed(2) : "none"})`,
+            spend.usd,
+            Number.isFinite(taskCeiling) ? taskCeiling : 0,
+          );
+        }
         throw new Error(`brain error: ${msg.subtype}${"result" in msg ? `: ${String(msg.result).slice(0, 200)}` : ""}`);
       }
       text = msg.result.trim();
-      costUsd = msg.total_cost_usd ?? 0;
       numTurns = msg.num_turns ?? 0;
       const u = (msg as { usage?: { input_tokens?: number; output_tokens?: number } }).usage;
       tokens = { input: u?.input_tokens ?? null, output: u?.output_tokens ?? null };
@@ -526,6 +570,11 @@ const save = () =>
 save();
 writeRoomMd();
 log(`definition ${pack.definitionHash.slice(0, 15)} (model ${pack.def.model ?? "inherit"}); knowledge: ${knowledgeFiles(pack).length} files; episodes so far: ${episodes.count()}`);
+// Once per pack at startup (spec 18.1): a pack with neither ceiling can spend
+// without bound, and silence about that is the worst of the three states.
+if (!pack.def.budgets?.per_task_usd && !pack.def.budgets?.per_day_usd) {
+  log("WARNING: this pack declares neither per_task_usd nor per_day_usd, so its runs have no cost ceiling");
+}
 
 if (prevHash && prevHash !== pack.definitionHash) {
   await member.send({
@@ -587,7 +636,11 @@ const consolidationTimer = setInterval(() => {
   lastConsolidation = Date.now();
   void consolidate(pack.name)
     .then((r) => {
-      if (r.episodes > 0) log(`consolidated ${r.episodes} episodes: +${r.added} facts, ~${r.updated}, -${r.invalidated} ($${r.cost_usd.toFixed(4)})`);
+      // The same daily ledger as answer-path work (spec 18.4). It was hiding
+      // roughly 3% of the resident's spend in a separate maxBudgetUsd.
+      spend.usd += r.cost_usd;
+      save();
+      if (r.episodes > 0) log(`consolidated ${r.episodes} episodes: +${r.added} facts, ~${r.updated}, -${r.invalidated} ($${r.cost_usd.toFixed(4)}, day now $${spend.usd.toFixed(4)})`);
     })
     .catch((err) => log(`consolidation failed: ${(err as Error).message}`));
 }, 60_000);
@@ -697,6 +750,7 @@ await member.serve(
       return pendingRefusal ? new ServeRefusal("deadline_expired", pendingRefusal, body) : body;
     } catch (err) {
       serving = false;
+      const budgetStop = err instanceof BudgetStop ? err : null;
       engine.failRun(runId, (err as Error).message, { retryable: false });
       obs.record({
         id: runId,
@@ -709,8 +763,17 @@ await member.serve(
         end_time: Date.now(),
         group_id: member.room,
         inputs: { from: ctx.from.name, seq: ctx.envelope.seq, text: ctx.text.slice(0, 300) },
+        // A failed run still spent money (spec 18.2). Writing NULL here made
+        // every error look free, which is how a day total ends up low.
+        cost_usd: budgetStop ? budgetStop.spendUsd : undefined,
         extra: { "gen_ai.request.model": pack.def.model ?? "inherit", conversation: convo },
       });
+      // A ceiling is not a crash: the asker gets the spec 18.3 refusal with the
+      // numbers, so it can tell "you are out of budget" from "you are broken".
+      if (budgetStop) {
+        log(`budget stop: ${budgetStop.message}`);
+        return new ServeRefusal("overloaded", budgetStop.message);
+      }
       throw err;
     }
   },
