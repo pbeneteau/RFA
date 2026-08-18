@@ -1054,7 +1054,22 @@ $("wb-auth").addEventListener("click", async () => {
   const key = prompt("human key (hub --human-key value):");
   if (!key) return;
   const r = await fetch("/auth", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ human_key: key.trim() }) });
-  if (!r.ok) { alert("invalid key"); return; }
+  if (!r.ok) {
+    // Never report every failure as "invalid key": the first attempt from a
+    // phone fails on the Origin allowlist, and blaming the credential sends the
+    // operator hunting the wrong thing (it did exactly that once).
+    const detail = await r.json().catch(() => ({}));
+    const why =
+      r.status === 403
+        ? `this origin (${location.origin}) is not allowed by the hub.\nStart it with --allow-origin ${location.origin}`
+        : r.status === 429
+          ? `too many attempts; wait ${detail.retry_after_s ?? 900}s`
+          : r.status === 401
+            ? "the hub rejected that key"
+            : `unlock failed: HTTP ${r.status}${detail.error ? ` (${detail.error})` : ""}`;
+    alert(why);
+    return;
+  }
   WB.token = (await r.json()).session_token;
   sessionStorage.setItem("wb_token", WB.token);
   wbAuthUi();
