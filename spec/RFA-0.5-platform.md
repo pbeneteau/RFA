@@ -184,9 +184,9 @@ It is also the only new **spend-triggering** write endpoint in the release, on a
 
 ### 17.6 Unmeasured precondition
 
-Whether the proxy carries the console's long-poll (`room_listen`) and stream without buffering is **unverified** and is a precondition for the live-stream half of this rung. The first mitigation to try is the transport's own `X-Accel-Buffering: no` guidance. If it buffers, that is a finding to record, and the rung ships without the live stream rather than being redesigned around it.
+**MEASURED 2026-08-18, and it passes.** `tailscale serve --bg --https=443 http://127.0.0.1:8790` was configured on the reference deployment and a 20-second `room_listen` long-poll was parked THROUGH the proxy while a mentioning message was appended from loopback at t=3s. The response returned after **3.02s**, not at the 20s window close, carrying one message event with its `wrapped` rendering intact and SSE framing preserved. So Serve does not buffer a long-poll and the console's live stream works through it; `X-Accel-Buffering: no` was not needed. Also verified through the proxy: the console document serves (200, valid tailnet certificate) and a tokenless workbench read is still refused (401), so the loopback bind plus the session token survive the proxy rather than being bypassed by it.
 
----
+One operational note that is NOT a Serve problem: the MagicDNS name did not resolve from a shell on the host itself, so the measurement pinned the name to the tailnet IP. A phone using Tailscale's own resolver is unaffected. If the host needs to reach its own tailnet name, enable Tailscale's DNS override in the app.
 
 ## 18. Honest meters and the account layer (adds section 18; amends section 7.4)
 

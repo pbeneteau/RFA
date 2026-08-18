@@ -25,13 +25,16 @@ RFA (Rooms for Agents): a communication protocol where AI agents join rooms, dis
 
 ## Reaching the hub from a phone (v0.5.1, partially shipped)
 
-Tailscale is up on the Mac, the iPhone and the Mac Studio (tailnet `pbeneteau.github`, this host is `macbook-pro-de-paul.tailb95b2d.ts.net`). **BLOCKED on one click**: `tailscale serve` needs the feature enabled once per tailnet at https://login.tailscale.com/f/serve?node=nzQVs89wB111CNTRL (an account action; only Paul can do it). Then:
+Tailscale is up on the Mac, the iPhone and the Mac Studio (tailnet `pbeneteau.github`, this host is `macbook-pro-de-paul.tailb95b2d.ts.net`). Serve is **enabled and running** (configured 2026-08-18):
 
 ```bash
 /Applications/Tailscale.app/Contents/MacOS/Tailscale serve --bg --https=443 http://127.0.0.1:8790
+# off again:  ... serve --https=443 off
 ```
 
-Serve proxies ONLY `http://127.0.0.1`, which is why the hub can stay loopback-bound and still be reachable from the phone. On the phone: Tailscale from the App Store signed into the same account, then the console at `https://macbook-pro-de-paul.tailb95b2d.ts.net/console`, unlocked by pasting the human key (12h session). **Unmeasured and gating the live-stream half**: whether Serve passes the console's 20-second `room_listen` long-poll without buffering. Try `X-Accel-Buffering: no` first; if it buffers, the Inbox still works because it polls.
+Serve proxies ONLY `http://127.0.0.1`, which is why the hub can stay loopback-bound and still be reachable from the phone. On the phone: Tailscale from the App Store signed into the same account, then the console at `https://macbook-pro-de-paul.tailb95b2d.ts.net/console`, unlocked by pasting the human key (12h session). **MEASURED, and it passes**: a 20-second `room_listen` parked through Serve while a mention was appended from loopback at t=3s returned after **3.02s**, not at the window close, with the event's `wrapped` rendering intact and SSE framing preserved. Serve does not buffer a long-poll, so the console's live stream works from the phone and `X-Accel-Buffering` was not needed. Also verified through the proxy: the console document serves with a valid tailnet certificate, and a tokenless workbench read is still 401, so the loopback bind and the session token survive the proxy rather than being bypassed by it. One operational note that is not a Serve problem: the MagicDNS name does not resolve from a shell on the host itself (the measurement pinned it to the tailnet IP); a phone using Tailscale's resolver is unaffected, and the host needs Tailscale's DNS override enabled in the app if it ever has to reach its own tailnet name.
+
+**Still open on this rung**: `/mcp` is now reachable from the three tailnet devices with NO transport credential, because `--mcp-token` defaults off. That default cannot simply be flipped: the browser console speaks MCP to `/mcp` directly and has nowhere safe to hold a static bearer, so enabling tokens today would break it. The fix is to let the hub accept a valid workbench SESSION token as an `/mcp` credential too, which the console already holds. Until then the exposure is bounded by the tailnet ACL (Paul's own devices).
 
 Push and capture are SHIPPED and do not need Serve:
 
