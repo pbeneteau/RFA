@@ -36,10 +36,19 @@ test("a torn snapshot rebuilds the room from its log instead of losing it", asyn
   };
   assert.equal(listed.tasks.length, 1, "the task board came back from the log");
   assert.equal(listed.tasks[0].title, "survive a crash");
-  const events = (await hub.listen({
+  // The events came back into the room, but a member that joined AFTER the
+  // rebuild does not get to replay them: a rebuilt room defaults to
+  // history_visibility "joined_after" and the since clamp enforces it. So the
+  // recovery evidence is the log on disk plus the board, not a fresh replay.
+  const logged = fs.readFileSync(path.join(dir, "rooms", `${host.room}.ndjson`), "utf8");
+  assert.ok(logged.includes("before the crash"), "the log still holds the history");
+  const replay = (await hub.listen({
     room: host.room, membership_token: rejoined.you.membership_token, since: 0, timeout_ms: 0, wait_for: "all",
   })) as { events: { type: string }[] };
-  assert.ok(events.events.some((e) => e.type === "message"), "the history came back too");
+  assert.ok(
+    !replay.events.some((e) => e.type === "message"),
+    "and a member who joined after the rebuild cannot replay what was said before it arrived",
+  );
   // The snapshot was rewritten, so the next boot is clean.
   assert.doesNotThrow(() => JSON.parse(fs.readFileSync(meta, "utf8")), "a healthy snapshot was written back");
   hub.close();

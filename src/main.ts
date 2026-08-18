@@ -5,12 +5,19 @@
  *   rfa-hub                    stdio MCP server, dual-era (for `claude mcp add`, Cursor, etc.)
  *   rfa-hub --http 8790        Streamable HTTP MCP server (stateless, modern era + legacy fallback)
  *   rfa-hub --data ./data      persistence directory (default ./data; "none" disables). Also holds
- *                              auth.log.ndjson: one aggregated row per window of POST /auth outcomes,
+ *                              auth.log.ndjson: one aggregated row per window of POST /auth outcomes
+ *                              plus, when --mcp-token is set, of /mcp transport-auth outcomes,
  *                              kept out of every room's event chain on purpose (spec 15.5).
  *   rfa-hub --trusted-keys k.json   provisioned {kid: publicJWK} map for card verification
  *   rfa-hub --require-signed        refuse joins whose card cannot be verified
  *   rfa-hub --human-key k1,k2       provisioned human-principal keys (joins presenting one get origin=human;
  *                                   required for room_admin approve and quarantine release). Also RFA_HUMAN_KEYS.
+ *   rfa-hub --mcp-token t1,t2       OPT-IN transport bearers for /mcp (RFA-0.6 sect. 4.2). Also RFA_MCP_TOKENS.
+ *                                   DEFAULT OFF: with none configured /mcp behaves exactly as it does today,
+ *                                   uncredentialed, which is what the residents, the ask CLI, the console and
+ *                                   the eval harness rely on. With one or more configured, every /mcp request
+ *                                   must carry `Authorization: Bearer <token>` or it is refused 401. The hub
+ *                                   only ever VALIDATES a token; there is no minting endpoint (sect. 4.3).
  *   rfa-hub --otel                  emit one compact stderr line per tool-call span (spec 13). Without this
  *                                   flag spans are no-ops unless the operator registers their own OTel SDK.
  *   rfa-hub --bind 0.0.0.0          HTTP bind address (default 127.0.0.1: loopback only, per MCP
@@ -55,6 +62,29 @@ try {
   process.exit(1);
 }
 const httpPort = arg("--http");
+
+// ---------------------------------------------------------------- /mcp transport bearer (RFA-0.6 sect. 4.2)
+// Operator-configured bearers for the MCP endpoint, same shape as
+// --human-key/RFA_HUMAN_KEYS: comma-separated, the flag winning over the env var.
+//
+// DEFAULT OFF, and that is a requirement rather than a convenience. /mcp is
+// uncredentialed today (sect. 4.1) and every live client POSTs there with no
+// Authorization header: both residents, the ask CLI, the console page and the
+// eval harness, because src/client.ts `rawCall` sends none. An empty list
+// therefore MUST mean "behave exactly as before"; the startup banner states
+// which of the two modes is in force so an operator never has to guess.
+//
+// UNRESOLVED, sect. 4.4 spike 11, UNRUN: it is not known whether a real MCP
+// host (Claude Code, Cursor) can carry a static Authorization header into a
+// registered server. If it cannot, the credential has to move into the tool
+// arguments instead and this flag's shape changes. Nothing below is evidence
+// that the header path works with a host: it is only known to work for a client
+// that makes its own HTTP request.
+// A flag value is visible in `ps`, so RFA_MCP_TOKENS is the better of the two paths for a real token.
+const mcpTokens = (arg("--mcp-token") ?? process.env.RFA_MCP_TOKENS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 // --otel: the built-in minimal exporter (one line per span on stderr). Serious
 // deployments skip the flag and register a real OTel SDK; the hub only ever
@@ -192,25 +222,36 @@ const AUTH_SOURCE_CAP = 4096; // an unauthenticated caller must not grow the per
 const AUTH_LOG_WINDOW_MS = 5 * 60_000; // one aggregated auth-log row per window, whatever the attempt volume
 
 /**
- * Constant-time membership test for a presented human_key. timingSafeEqual
- * throws on a length mismatch, so a wrong-length candidate is compared against
- * a same-length zero filler instead of short-circuiting: every configured key
+ * Constant-time membership test for a presented secret. timingSafeEqual throws
+ * on a length mismatch, so a wrong-length candidate is compared against a
+ * same-length zero filler instead of short-circuiting: every configured secret
  * costs exactly one comparison of its own length whatever arrives, and the
  * length check that decides the verdict runs after the comparison, never
- * instead of it. The join path (src/store.ts) still uses includes() and stays
- * PENDING per 15.5; it is guarded by a room handle and a join secret, not by
- * this endpoint's reach.
+ * instead of it.
+ *
+ * Both credentials this hub validates go through here, the human_key on
+ * POST /auth and the transport bearer on /mcp, because a second copy of this
+ * loop is a second chance to get it wrong.
  */
-function humanKeyMatches(presented: string): boolean {
+function constantTimeMatch(presented: string, configured: readonly string[]): boolean {
   const p = Buffer.from(presented, "utf8");
   let ok = false;
-  for (const configured of hub.cfg.humanKeys) {
-    const k = Buffer.from(configured, "utf8");
+  for (const secret of configured) {
+    const k = Buffer.from(secret, "utf8");
     const sameLength = k.length === p.length;
     const candidate = sameLength ? p : Buffer.alloc(k.length);
     ok = (timingSafeEqual(k, candidate) && sameLength) || ok;
   }
   return ok;
+}
+
+/**
+ * The join path (src/store.ts) still uses includes() and stays PENDING per
+ * 15.5; it is guarded by a room handle and a join secret, not by this
+ * endpoint's reach.
+ */
+function humanKeyMatches(presented: string): boolean {
+  return constantTimeMatch(presented, hub.cfg.humanKeys);
 }
 
 type AuthAttempts = { failures: number; windowStart: number; lockedUntil: number };
@@ -261,9 +302,26 @@ function authFailed(source: string, now: number): boolean {
 // bounded by elapsed time rather than by attempt volume. `failures` counts every
 // refused request, including those refused by an active lock, so the row stays
 // an honest volume signal; `lockouts` counts trips.
+//
+// /mcp transport-auth outcomes land in the SAME log and the same window, under
+// their own three counters rather than a second file. Separate counters, not
+// shared ones: /auth guards the workbench with a human_key and /mcp guards the
+// protocol surface with an operator bearer, so folding a trip on one path into
+// the other path's number would make the row unreadable as evidence. The three
+// stay 0 unless --mcp-token/RFA_MCP_TOKENS is configured, since with the check
+// off there is no outcome to record.
 const AUTH_LOG_GENESIS = sha256hex("rfa-auth-log/v1");
 const authLogFile = dataArg === "none" ? null : path.join(dataArg, "auth.log.ndjson");
-type AuthWindow = { start: number; successes: number; failures: number; lockouts: number; sources: Set<string> };
+type AuthWindow = {
+  start: number;
+  successes: number;
+  failures: number;
+  lockouts: number;
+  mcpSuccesses: number;
+  mcpFailures: number;
+  mcpLockouts: number;
+  sources: Set<string>;
+};
 let authWindow: AuthWindow | null = null;
 let authChainHead: string | null = null;
 
@@ -293,6 +351,9 @@ function flushAuthWindow(at: number = Date.now()): void {
     failures: w.failures,
     distinct_sources: w.sources.size,
     lockouts: w.lockouts,
+    mcp_successes: w.mcpSuccesses,
+    mcp_failures: w.mcpFailures,
+    mcp_lockouts: w.mcpLockouts,
     prev_hash: authChainResume(authLogFile),
   };
   const hash = sha256hex(JSON.stringify(row));
@@ -309,15 +370,35 @@ function flushAuthWindow(at: number = Date.now()): void {
   }
 }
 
+/** Which counter each outcome advances. One table so an outcome cannot land in two fields. */
+const AUTH_AUDIT_COUNTER = {
+  success: "successes",
+  failure: "failures",
+  lockout: "lockouts",
+  mcp_success: "mcpSuccesses",
+  mcp_failure: "mcpFailures",
+  mcp_lockout: "mcpLockouts",
+} as const;
+type AuthOutcome = keyof typeof AUTH_AUDIT_COUNTER;
+
 /** Fold one outcome into the open window, rolling the window over when it is due. */
-function authAudit(outcome: "success" | "failure" | "lockout", source: string, now: number): void {
+function authAudit(outcome: AuthOutcome, source: string, now: number): void {
   if (!authLogFile) return; // --data none: the hub persists nothing, auth log included
   if (authWindow && now - authWindow.start >= AUTH_LOG_WINDOW_MS) flushAuthWindow(now);
-  authWindow ??= { start: now, successes: 0, failures: 0, lockouts: 0, sources: new Set() };
-  if (outcome === "success") authWindow.successes++;
-  else if (outcome === "failure") authWindow.failures++;
-  else authWindow.lockouts++;
+  authWindow ??= {
+    start: now,
+    successes: 0,
+    failures: 0,
+    lockouts: 0,
+    mcpSuccesses: 0,
+    mcpFailures: 0,
+    mcpLockouts: 0,
+    sources: new Set(),
+  };
+  authWindow[AUTH_AUDIT_COUNTER[outcome]]++;
   // Capped for the same reason as the attempt map; distinct_sources is a floor once it is hit.
+  // The socket address is what is counted, never the endpoint it hit, so one caller
+  // reaching both /auth and /mcp stays one source.
   if (authWindow.sources.size < AUTH_SOURCE_CAP) authWindow.sources.add(source);
 }
 
@@ -328,6 +409,94 @@ setInterval(() => {
   if (authWindow && Date.now() - authWindow.start >= AUTH_LOG_WINDOW_MS) flushAuthWindow();
 }, 60_000).unref();
 process.on("exit", () => flushAuthWindow());
+
+// ------------------------------------------------- the /mcp credential check (RFA-0.6 sect. 4.2)
+// With tokens configured the hub is an OAuth 2.1 *resource server* on this path
+// and nothing more: it validates an opaque high-entropy string and never issues
+// one. An authorization server inside the hub is rejected permanently (sect.
+// 3.4), so there is no counterpart to POST /auth here and no minting route.
+//
+// Audience binding takes its equivalent form for an opaque bearer, which carries
+// no `aud` claim to check: "this token was issued for this resource", which the
+// operator-configured list establishes by construction, because a string that is
+// not in this hub's own list is not a credential for this hub (sect. 4.2).
+//
+// Storage, since sect. 4.2 is specific about it: there it is the admission
+// record that holds a hex SHA-256 and never the plaintext. This rung has no
+// admission record, so the hub persists nothing at all; the tokens live in argv
+// or the environment for the life of the process and are compared as plaintext,
+// in constant time. When sect. 3's record lands, a digest comparison against it
+// replaces this list.
+//
+// WHAT THIS IS NOT, because the difference decides whether a peer may be
+// admitted. Both remaining halves need files outside this change:
+//   - The transport principal is NOT recorded on the membership, so protocol
+//     4.3's linkage rule (reject a call whose membership was admitted under a
+//     different transport principal) is NOT enforced. That needs src/store.ts
+//     and the admission record of sect. 3.
+//   - room_create is NOT separately credentialed per sect. 4.2 item 2, and no
+//     token here is peer-scoped: this is one flat operator credential for the
+//     whole endpoint.
+// A single operator-configured token list is the whole of rung v0.6.0a items 1
+// to 3. It is NOT sufficient to admit a peer.
+
+/**
+ * Gate a request bound for the MCP handler. True when it may proceed; when
+ * false, this function has already answered and the caller must return.
+ *
+ * The refusal is written for a client rather than for a human reading a log:
+ * 401 with a JSON body and `WWW-Authenticate: Bearer`, so an MCP client can
+ * tell "you need a credential" from "your call was malformed". RFC 9728
+ * protected-resource metadata is deferred until a second peer exists (sect.
+ * 4.2), hence a realm and no metadata URL in the challenge.
+ *
+ * Failures are rate-limited and audited on the same machinery as POST /auth,
+ * with one difference: the attempt key is namespaced, so guessing at /mcp
+ * cannot lock the operator out of the console and console typos cannot lock out
+ * a peer.
+ */
+function mcpAuthorized(req: http.IncomingMessage, res: http.ServerResponse): boolean {
+  if (mcpTokens.length === 0) return true; // the default: no header expected, nothing audited, behavior unchanged
+  // Answer without the MCP handler running. Drains the request first: Node
+  // closes the socket on an unread body, and a client must read the 401 rather
+  // than a connection reset.
+  const refuse = (status: number, data: unknown, headers: Record<string, string>): false => {
+    req.resume();
+    send(res, status, data, headers);
+    return false;
+  };
+  const now = Date.now();
+  const source = authSource(req);
+  const key = `mcp:${source}`;
+  const locked = authLockoutMs(key, now);
+  if (locked > 0) {
+    authAudit("mcp_failure", source, now); // refused by the lock still counts as volume
+    const retryS = Math.ceil(locked / 1000);
+    return refuse(429, { error: "too many attempts", retry_after_s: retryS }, { "retry-after": String(retryS) });
+  }
+  const presented = /^Bearer (.+)$/.exec(req.headers.authorization ?? "")?.[1];
+  if (presented !== undefined && constantTimeMatch(presented, mcpTokens)) {
+    authAttempts.delete(key); // a good token clears the source's record, exactly as a good human_key does
+    authAudit("mcp_success", source, now);
+    return true;
+  }
+  const tripped = authFailed(key, now);
+  authAudit("mcp_failure", source, now);
+  if (tripped) {
+    authAudit("mcp_lockout", source, now);
+    // One stderr line per trip, never per attempt.
+    console.error(
+      `rfa-hub http: locked out ${source} from ${req.method} ${(req.url ?? "/").split("?")[0]} for ${AUTH_LOCKOUT_MS / 1000}s after ${AUTH_MAX_FAILURES} bearer failures`,
+    );
+    const retryS = AUTH_LOCKOUT_MS / 1000;
+    return refuse(429, { error: "too many attempts", retry_after_s: retryS }, { "retry-after": String(retryS) });
+  }
+  return refuse(
+    401,
+    { error: presented === undefined ? "Authorization: Bearer <token> required" : "invalid bearer token" },
+    { "www-authenticate": 'Bearer realm="rfa-hub"' },
+  );
+}
 
 async function body(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
@@ -513,6 +682,18 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
         res.end(fs.readFileSync(consoleFile, "utf8"));
         return;
       }
+      // Everything from here down falls through to the MCP handler, so this is
+      // the credential check sect. 4.2 item 1 requires "before the MCP handler
+      // sees it". It gates the whole fall-through rather than the literal /mcp
+      // path, because any other pathname reaches the same handler. A no-op
+      // unless --mcp-token/RFA_MCP_TOKENS is configured.
+      //
+      // The workbench routes and the console document handled above are
+      // deliberately outside this gate: they keep the session token from
+      // POST /auth and the private-network posture of v0.5 sect. 17.1. Two
+      // audiences, two proxies, two credentials (sect. 4.5), and a browser
+      // cannot put a bearer on a document load in any case.
+      if (!mcpAuthorized(req, res)) return;
       const url = `http://${req.headers.host ?? `localhost:${port}`}${req.url ?? "/"}`;
       const headers = new Headers();
       for (const [k, v] of Object.entries(req.headers)) {
@@ -554,6 +735,13 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
     console.error(
       `rfa-hub: bound ${bindHost}${bindHost === "127.0.0.1" ? " (loopback only; proxy a tailnet to it rather than passing --bind)" : " -- REACHABLE OFF-HOST: every workbench read needs a session token, but prefer --bind 127.0.0.1 behind a proxy"}`,
     );
+    // Never make an operator guess which mode is in force: the two differ by
+    // whether room_create takes a credential at all.
+    console.error(
+      mcpTokens.length
+        ? `rfa-hub: /mcp AUTHENTICATED: Authorization: Bearer required on every request (${mcpTokens.length} operator token${mcpTokens.length === 1 ? "" : "s"}; 401 otherwise, failures rate-limited and counted in auth.log.ndjson). Clients without a header, src/client.ts included, will be refused`
+        : `rfa-hub: /mcp UNAUTHENTICATED: no --mcp-token/RFA_MCP_TOKENS set, so anything that reaches this listener can call room_create. This is the default and the loopback bind is the only gate; set tokens before exposing /mcp through any proxy`,
+    );
   });
 } else {
   serveStdio(() => createHubServer(hub), {
@@ -561,4 +749,11 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
     onerror: (e) => console.error(`rfa-hub stdio: ${e.message}`),
   });
   console.error(`rfa-hub: MCP server on stdio (data: ${dataArg}, dual-era)`);
+  if (mcpTokens.length) {
+    // Silently ignoring a configured credential is how an operator comes to
+    // believe a surface is guarded when it is not.
+    console.error(
+      "rfa-hub: --mcp-token/RFA_MCP_TOKENS has no effect on stdio (no HTTP transport to authenticate; the process boundary is the gate). Pass --http to use it",
+    );
+  }
 }

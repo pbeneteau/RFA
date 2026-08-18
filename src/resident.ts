@@ -135,7 +135,41 @@ async function boot(): Promise<{ member: RoomMember; joinSecret: string | null; 
   return { member, joinSecret: effectiveSecret, prevHash: null };
 }
 
-const { member, joinSecret, prevHash } = await boot();
+/**
+ * A hub outage must be survivable, not fatal. Found live (2026-08-18): the hub
+ * was stopped for a few minutes, every resident died on the unreachable hub,
+ * the supervisor restarted each one until it hit the crash-loop ceiling, and
+ * then gave up "until the definition changes". So a brief hub restart took the
+ * agents down PERMANENTLY, and nobody noticed until someone read the roster.
+ * Boot now waits for the hub instead of exiting, with a bounded backoff so a
+ * genuinely misconfigured URL still shows up in the log every 30 seconds
+ * rather than spinning silently.
+ */
+async function bootWithRetry(): Promise<Awaited<ReturnType<typeof boot>>> {
+  const MAX_DELAY_MS = 30_000;
+  let delay = 1_000;
+  let announced = false;
+  for (;;) {
+    try {
+      return await boot();
+    } catch (err) {
+      const reason = (err as Error).message;
+      // Only a reachability failure is worth waiting on: anything else (a bad
+      // pack, a refused join, a revoked token) will not fix itself.
+      const unreachable = /fetch failed|ECONNREFUSED|ENOTFOUND|socket hang up|EHOSTUNREACH|ETIMEDOUT/i.test(reason);
+      if (!unreachable) throw err;
+      if (!announced) {
+        log(`hub at ${HUB} is unreachable (${reason}); waiting for it rather than exiting`);
+        announced = true;
+      }
+      await new Promise((r) => setTimeout(r, delay));
+      if (delay < MAX_DELAY_MS) delay = Math.min(MAX_DELAY_MS, delay * 2);
+      else log(`still waiting for ${HUB}`);
+    }
+  }
+}
+
+const { member, joinSecret, prevHash } = await bootWithRetry();
 const memory = new GatedMemory(path.join(pack.dir, "memory"), gate, member.memberId);
 
 // ---------------------------------------------------------------- in-process MCP tools

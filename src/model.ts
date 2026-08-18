@@ -46,7 +46,12 @@ export interface Envelope {
   seq: number;
   ts: string;
   room: string;
-  from: { id: string; name: string; origin: "human" | "agent" | "system" };
+  /**
+   * `home` (0.1.8) is the sender's organization, hub-derived and never
+   * client-supplied; `"local"` is the hub's own. It rides here because a reader
+   * deciding how much to trust a message needs it in the same glance as origin.
+   */
+  from: { id: string; name: string; origin: "human" | "agent" | "system"; home?: string };
   kind: MessageKind;
   to: string[];
   mentions: string[];
@@ -78,6 +83,8 @@ export interface PresenceRecord {
   digest: string;
   card_verified: boolean | null;
   card_summary: CardSummary;
+  /** The member's organization (0.1.8); `"local"` is this hub's own. */
+  home?: string;
   joined_at: string;
   last_seen: string;
   lease_expires: string;
@@ -121,7 +128,16 @@ export type EventInput = RfaEventBody extends infer E ? (E extends RfaEventBody 
 export type RfaEvent = RfaEventBody & { prev_hash?: string };
 
 type RfaEventBody =
-  | ({ seq: number; ts: string; type: "message" } & { envelope: Envelope })
+  | ({ seq: number; ts: string; type: "message" } & {
+      envelope: Envelope;
+      /**
+       * The hub's own untrusted-data boundary rendering (spec 9.6). A RESULT
+       * field: present on events leaving the hub, never stored in the log,
+       * never counted against the envelope cap. Derived from `envelope`, which
+       * stays the content of record.
+       */
+      wrapped?: string;
+    })
   | ({ seq: number; ts: string; type: "presence" } & { member: PresenceRecord })
   | ({ seq: number; ts: string; type: "roster" } & {
       reason: "join" | "leave" | "evict" | "role" | "rebind";

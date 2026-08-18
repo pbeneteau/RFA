@@ -13,6 +13,7 @@ import { RfaError } from "./errors.js";
 import { canonicalize, digestCard, sha256hex } from "./jcs.js";
 import { verifyCard, type Jwk, type VerificationDetail } from "./signing.js";
 import { TERMINAL_TASK_STATES } from "./model.js";
+import { renderWrapped } from "./wrap.js";
 import type {
   AgentCard,
   EventInput,
@@ -158,6 +159,19 @@ interface Member {
   observedEpoch: number;
   present: boolean;
   leftAt: number | null;
+  /**
+   * The log position this membership began at (spec 5.4). Persisted, because
+   * `history_visibility` is only enforceable against it: without this the join
+   * contract sliced history politely while `room_listen(since=0)` replayed
+   * everything anyway.
+   */
+  joinSeq: number;
+  /**
+   * Which organization this member belongs to (spec 4.3). Hub-derived, never
+   * client-supplied. `"local"` is the hub's own org and the default, so an
+   * upgrading hub does not lock out its own residents.
+   */
+  home: string;
   sentIds: Set<string>;
   rateWindow: number[];
   bodyHashes: { hash: string; ts: number }[];
@@ -525,7 +539,7 @@ export class RoomHub {
 
   private doJoin(
     room: Room,
-    args: { name: string; card: AgentCard; role: Role; origin: Origin; historyLimit: number; isHost: boolean },
+    args: { name: string; card: AgentCard; role: Role; origin: Origin; historyLimit: number; isHost: boolean; home?: string },
   ): JoinContract {
     if (!NAME_RE.test(args.name) || args.name.length > 64) {
       throw new RfaError("bad_request", "name must match the RFA name grammar (section 4.1)");
@@ -580,6 +594,8 @@ export class RoomHub {
       observedEpoch: 0,
       present: true,
       leftAt: null,
+      joinSeq: room.seq + 1, // the roster event this join is about to emit
+      home: args.home ?? "local",
       sentIds: new Set(),
       rateWindow: [],
       bodyHashes: [],
@@ -639,6 +655,47 @@ export class RoomHub {
     this.removeMembership(room, member, "leave");
     this.writeMeta(room);
     return { ok: true };
+  }
+
+  /**
+   * Attach the hub's own boundary rendering to every message event leaving the
+   * hub (spec 9.6). A stranger's client cannot be trusted to wrap peer content
+   * before handing it to a model, and a client that skips it is the wormable
+   * default the spec forbids, so the hub renders it and ships it alongside.
+   * Derived, never authoritative: `body` stays the content of record, and this
+   * is a RESULT field that is never stored in the log or counted against the
+   * envelope cap.
+   */
+  private withWrapped(events: RfaEvent[]): RfaEvent[] {
+    return events.map((e) => {
+      if (e.type !== "message") return e;
+      const text = e.envelope.body
+        .filter((p): p is Extract<Part, { type: "text" }> => p.type === "text")
+        .map((p) => p.text)
+        .join("\n");
+      return {
+        ...e,
+        wrapped: renderWrapped({
+          name: e.envelope.from.name,
+          origin: e.envelope.from.origin,
+          kind: e.envelope.kind,
+          home: e.envelope.from.home,
+          text,
+        }),
+      };
+    });
+  }
+
+  /**
+   * The earliest log position this member may read from (spec 5.4). Under
+   * `history_visibility: "joined_after"` that is its own join point, so a
+   * member cannot replay what the room said before it arrived. `member` is
+   * REQUIRED for any member whose `home` is not local; the stricter policy
+   * applies it to everyone.
+   */
+  private visibleSince(room: Room, member: Member, requested: number): number {
+    if (room.policies.history_visibility !== "joined_after" && member.home === "local") return requested;
+    return Math.max(requested, member.joinSeq - 1);
   }
 
   /**
@@ -924,7 +981,7 @@ export class RoomHub {
       seq: 0, // assigned by appendEvent
       ts: "",
       room: room.handle,
-      from: { id: member.id, name: member.name, origin: member.origin },
+      from: { id: member.id, name: member.name, origin: member.origin, home: member.home },
       kind,
       to,
       mentions,
@@ -1430,7 +1487,7 @@ export class RoomHub {
           seq: 0,
           ts: "",
           room: room.handle,
-          from: { id: member.id, name: member.name, origin: member.origin },
+          from: { id: member.id, name: member.name, origin: member.origin, home: member.home },
           kind,
           to: mentions,
           mentions,
@@ -1629,6 +1686,12 @@ export class RoomHub {
     const { room, member } = this.auth(args.room, args.membership_token, { allowEnded: true });
     const timeoutMs = Math.min(this.cfg.listenCapMs, Math.max(0, args.timeout_ms ?? 30_000));
     if (args.since > room.seq) throw new RfaError("bad_cursor", `since=${args.since} is beyond the log tip ${room.seq}`);
+    // History visibility is enforced HERE or nowhere (spec 5.4): the join
+    // contract's polite slice meant nothing while any member could ask for
+    // since=0 and replay the whole retained log. Required for a member whose
+    // home is not this hub's own; applied to every member under the stricter
+    // policy so behavior does not depend on who is asking.
+    const since = this.visibleSince(room, member, args.since);
     if (args.presence) this.setPresence(room, member, args.presence);
     member.leaseExpires = Math.max(
       member.leaseExpires,
@@ -1637,14 +1700,14 @@ export class RoomHub {
     const filter = this.parseFilter(room, member, args.wait_for ?? "mentions");
 
     // Replay-before-park closes the poll-gap race (spec 9.3).
-    const scanned = room.events.filter((e) => e.seq > args.since);
+    const scanned = room.events.filter((e) => e.seq > since);
     const matched = scanned.filter((e) => this.matches(room, e, member, filter));
     member.observedEpoch = room.epoch;
 
     if (matched.length > 0 || timeoutMs === 0 || room.ended) {
       const compacted = Math.max(0, matched.length - this.cfg.replayCap);
       return {
-        events: matched.slice(-this.cfg.replayCap),
+        events: this.withWrapped(matched.slice(-this.cfg.replayCap)),
         cursor: room.seq,
         epoch: room.epoch,
         lease_expires: iso(member.leaseExpires),
@@ -1675,7 +1738,7 @@ export class RoomHub {
     const member = room.members.get(waiter.memberId)!;
     member.observedEpoch = room.epoch;
     waiter.resolve({
-      events: waiter.matched,
+      events: this.withWrapped(waiter.matched),
       cursor: room.seq,
       epoch: room.epoch,
       lease_expires: iso(member.leaseExpires),
@@ -1899,9 +1962,10 @@ export class RoomHub {
     }
     if (args.since > room.seq) throw new RfaError("bad_cursor", `since=${args.since} is beyond the log tip ${room.seq}`);
     const filter = this.parseFilter(room, member, args.wait_for ?? "mentions");
+    const watchSince = this.visibleSince(room, member, args.since); // same rule as listen
     let replayed = 0;
     for (const e of room.events) {
-      if (e.seq > args.since && this.matches(room, e, member, filter)) {
+      if (e.seq > watchSince && this.matches(room, e, member, filter)) {
         args.deliver({ room: room.handle, member: member.id, cursor: e.seq, event: e });
         replayed++;
       }
@@ -2242,6 +2306,7 @@ export class RoomHub {
       digest: m.digest,
       card_verified: m.cardVerified,
       card_summary: { description: String(m.card.description ?? "").slice(0, 200), skill_ids: skills },
+      home: m.home,
       joined_at: iso(m.joinedAt),
       last_seen: iso(m.lastSeen),
       lease_expires: iso(m.leaseExpires),
@@ -2314,6 +2379,8 @@ export class RoomHub {
         present: m.present,
         leftAt: m.leftAt,
         ttlS: m.ttlS,
+        joinSeq: m.joinSeq,
+        home: m.home,
       })),
       names: [...room.names.entries()],
       nameHistory: [...room.nameHistory.entries()],
@@ -2398,6 +2465,12 @@ export class RoomHub {
             ...m,
             origin: m.origin ?? "agent",
             held: m.held ?? false,
+            // Snapshots written before 0.1.8 carry neither field. joinSeq 0
+            // means "has always been here", which preserves exactly the
+            // pre-upgrade visibility for existing members rather than
+            // retroactively hiding history from them.
+            joinSeq: m.joinSeq ?? 0,
+            home: m.home ?? "local",
             cardVerified: verification.verified,
             cardVerification: verification.details,
             state: m.present ? "offline" : m.declaredState, // everyone is offline after a restart until they call in
