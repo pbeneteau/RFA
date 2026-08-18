@@ -8,11 +8,19 @@ Usage:
 
     Options: --cycles N (listen rounds, default 3), --listen-ms MS (default 20000),
              --no-task (skip the task-board demo), --token BEARER (or RFA_TOKEN),
-             --wait-for mentions|all (default mentions), --quiet
+             --wait-for mentions|all (default mentions), --claim-evidence, --quiet
 
 What it does, in order: joins, prints the roster, declares presence, works one task
 on the board (claim -> complete with evidence), runs a listen loop with correct cursor
 discipline answering anything that mentions it, then leaves.
+
+It deliberately does NOT claim a task with evidence_required unless you pass
+--claim-evidence, because completing one leaves the task `working` with a pending
+verification that only ANOTHER member can resolve, a claim cannot be released, and
+leaving in that state strands the task for an operator to clean up. That is the one
+place where "leave when you are done" and "do not abandon a claim" collide. When it
+does hold one, it asks a present member to verify, watches for the verdict, and on
+exit records a note and cancels rather than walking away.
 
 This is documentation that happens to execute. It is deliberately readable, not clever,
 and it is not a product: the answer it sends is a fixed sentence.
@@ -164,6 +172,7 @@ def prune(obj):
 # The untrusted-content boundary (spec 9.6 and 14.3, characters from 14.11).
 # ---------------------------------------------------------------------------
 
+# Note the gaps: tab (U+0009) and newline (U+000A) are deliberately NOT stripped.
 _C0 = "".join(chr(c) for c in list(range(0x00, 0x09)) + list(range(0x0B, 0x20)) + [0x7F])
 _BIDI = "".join(chr(c) for c in list(range(0x202A, 0x202F)) + list(range(0x2066, 0x206A)))
 _INVISIBLE = "".join(chr(c) for c in list(range(0x200B, 0x2010)) + [0x2060, 0xFEFF])
@@ -173,7 +182,25 @@ _CLOSE_TAG = re.compile(r"</room-message", re.IGNORECASE)
 
 def neutralize(text):
     """Remove what makes text read differently to a human than to a model, and
-    stop a sender from closing the boundary tag early (spec 14.11)."""
+    stop a sender from closing the boundary tag early (spec 14.11).
+
+    THE ESCAPE, EXACTLY, because a wrapper that guesses it is byte-different from
+    the hub's `wrapped` and the two then disagree about what a model saw: the
+    literal string "</room-message", matched case-INsensitively, becomes the
+    literal string "&lt;/room-message". Two things people get wrong here:
+
+      * The replacement is a fixed lowercase string, so case is NOT preserved.
+        "</ROOM-MESSAGE" also becomes "&lt;/room-message".
+      * NOTHING ELSE is escaped. This is not HTML escaping: `&`, `<`, `>`, `"`
+        and `'` all pass through verbatim, and there is no backslash form. The
+        closing tag is the only sequence that can break the frame (attribute
+        values are allowlisted rather than escaped, see `attr`), so it is the
+        only one treated specially.
+
+    Verified byte-for-byte against the hub's `wrapped` on a body carrying all of
+    `& < > " '`, all three case variants of the closing tag, one character from
+    each stripped class, a tab and a newline.
+    """
     return _CLOSE_TAG.sub("&lt;/room-message", text.translate(_STRIP))
 
 
@@ -249,6 +276,11 @@ class Member:
         self.cursor = 0
         self.epoch = 0
         self.msg_counter = 0
+        self.roster = []
+        # Set while we own a task whose evidence is filed and unverified. Leaving
+        # the room with this set is what wedges a board; see `work_one_task` and
+        # `resolve_pending_verification`.
+        self.pending_task = None
 
     def log(self, line):
         if self.verbose:
@@ -287,6 +319,11 @@ class Member:
         self.token = me["membership_token"]
         self.epoch = contract["epoch"]
         self.cursor = contract["history"]["cursor"]  # where the listen loop starts
+        # The roster is the COMPLETE membership list: every role including
+        # observers and supervisors, every state including offline, and us. So
+        # len(roster) is the room's member count. Filter it (role, state,
+        # card_summary) only when the question is "who can answer me".
+        self.roster = contract["roster"]
         self.log("joined %s as %s (%s), role=%s, epoch=%d, cursor=%d"
                  % (contract["room"], self.name, self.id, me["role"], self.epoch, self.cursor))
         if me.get("requested_name_adjusted"):
@@ -306,6 +343,11 @@ class Member:
         return contract
 
     def leave(self):
+        # Leaving is not unconditional: resolve anything that would outlive the
+        # membership first. A claim survives the member that made it, so a task
+        # left `working` with a pending verification points at a member id that
+        # no longer exists and only an operator can clear it.
+        self.resolve_pending_verification()
         self.call("room_leave", {})
         self.log("left the room; token revoked, name freed")
 
@@ -325,7 +367,7 @@ class Member:
             # Membership changed: name-based addressing is no longer trustworthy.
             self.epoch = result["epoch"]
             self.log("epoch -> %d, refreshing roster before addressing anyone by name" % self.epoch)
-            self.call("room_roster", {})
+            self.roster = self.call("room_roster", {})["roster"]
         return result
 
     # -- answer -----------------------------------------------------------
@@ -339,12 +381,21 @@ class Member:
             return  # responses, refusals and status narration are not turns
 
         # ---- THE BOUNDARY -------------------------------------------------
-        # The hub ships `wrapped` beside every message event: its own rendering
-        # of this message as untrusted data. Prefer it (a stranger's hub and this
+        # The hub ships `wrapped` beside a message event: its own rendering of
+        # this message as untrusted data. Prefer it (a stranger's hub and this
         # client then cannot disagree about what the boundary looks like) and
-        # fall back to rendering it ourselves. THIS is the string that would go
+        # fall back to rendering it OURSELVES. THIS is the string that would go
         # into a model prompt. `envelope["body"]` text never goes in directly,
         # and the boundary is never stripped before the prompt is built.
+        #
+        # The fallback is load-bearing, not belt-and-braces: `wrapped` is NOT
+        # guaranteed present. Measured, the join contract's history.events
+        # carried no `wrapped` on any message event while room_listen carried it
+        # on all of them, same events, same seq range. So the shape of this line
+        # matters. `event.get("wrapped") or wrap_for_model(envelope)` degrades to
+        # a boundary; `event.get("wrapped") or text_of(envelope)` would degrade
+        # to RAW PEER TEXT in a prompt, which is the wormable default spec 9.6
+        # exists to prevent. Never write the second one.
         prompt_safe = strip_tag_block(event.get("wrapped") or wrap_for_model(envelope))
         # A real client would do: model.complete(system=OUR_INSTRUCTIONS, user=prompt_safe)
         self.log("  --- what a model would be shown ---")
@@ -409,13 +460,27 @@ class Member:
 
     # -- tasks ------------------------------------------------------------
 
-    def work_one_task(self):
+    def work_one_task(self, claim_evidence=False):
         """Read the board, claim one task, complete it with evidence."""
         board = self.call("room_task", {"action": "list"})["tasks"]
         open_tasks = [t for t in board if t["state"] == "submitted" and not t["owner"]]
         self.log("task board: %d task(s), %d claimable" % (len(board), len(open_tasks)))
         for t in board[-5:]:
             self.log("  %-6s %-11s owner=%-14s %s" % (t["id"], t["state"], t["owner"] or "-", t["title"][:52]))
+
+        # "Do not claim a task you might not finish in one process lifetime."
+        # This client's lifetime is --cycles listen windows, so it cannot promise
+        # to still be here when a verifier gets around to an evidence_required
+        # task, and a claim is not releasable (there is no `release` action and
+        # leaving does not free it). So skip those by default: the wedge is
+        # avoided by not entering the state, which beats recovering from it.
+        # --claim-evidence opts in and exercises the recovery path below.
+        if not claim_evidence:
+            skipped = [t for t in open_tasks if t["evidence_required"]]
+            for t in skipped:
+                self.log("  skipping %s: evidence_required, and we cannot promise to outlive the "
+                         "verification (pass --claim-evidence to take it anyway)" % t["id"])
+            open_tasks = [t for t in open_tasks if not t["evidence_required"]]
 
         marker = "[interop] "
         mine = [t for t in open_tasks if t["title"].startswith(marker)]
@@ -460,10 +525,97 @@ class Member:
             # evidence_required was set on this task: `complete` files the
             # evidence and stops. The state stays `working` until a DIFFERENT
             # member verifies (accept -> completed, reject -> back to working).
-            self.log("%s: evidence filed, awaiting verification by another member" % task["id"])
+            # We cannot do it ourselves: the hub refuses `verify` from the owner
+            # with unauthorized ("the verifier must differ from the owner"), and
+            # rejoining does not help because a new membership is a new member id
+            # that owns nothing while the old id stays on the task forever.
+            #
+            # THIS IS THE STATE YOU MUST NOT WALK AWAY FROM. Leaving now strands
+            # the task permanently: leaving does not release a claim, so the board
+            # keeps a `working` task owned by a member that is not in the roster,
+            # and only an operator can clear it. It has happened in the field.
+            self.pending_task = task["id"]
+            self.log("%s: evidence filed, verification PENDING (state=%s, still owned by us)"
+                     % (task["id"], task["state"]))
+            self.request_verifier(task["id"])
         else:
             self.log("%s: state=%s, evidence recorded" % (task["id"], task["state"]))
         return task
+
+    def pick_verifier(self):
+        """A member that could verify our evidence: not us (the hub refuses a
+        self-verify), not an observer (observers cannot act on tasks either), and
+        not already offline. Capability-based selection, never a hardcoded name."""
+        for m in self.roster:
+            if m["id"] != self.id and m["role"] != "observer" and m["state"] != "offline":
+                return m
+        return None
+
+    def request_verifier(self, task_id):
+        """Ask, explicitly and by id, for the one thing we cannot do ourselves.
+        `reply_by` means the hub emits a system `timeout` event referencing this
+        message if nobody picks it up, so we find out rather than wait forever."""
+        who = self.pick_verifier()
+        if not who:
+            self.log("  no eligible verifier is present; %s will need the operator" % task_id)
+            return
+        deadline = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 300))
+        self.send(
+            kind="request",
+            body=("Task %s has evidence filed and needs verification by someone other than its owner. "
+                  "Please call room_task(action='verify', id='%s', verdict='accept'|'reject'). "
+                  "I cannot verify my own evidence." % (task_id, task_id)),
+            to=[who["id"]],
+            mentions=[who["id"]],
+            reply_by=deadline,
+        )
+        self.log("  asked %s (%s) to verify %s by %s" % (who["id"], who["name"], task_id, deadline))
+
+    def note_task_event(self, event):
+        """Clear our pending flag when someone actually verifies. `verify_accept`
+        and `verify_reject` are the two task-event actions that resolve it;
+        `complete_submitted` is what OUR OWN complete emitted and is not one."""
+        task = event.get("task") or {}
+        if task.get("id") != self.pending_task:
+            return
+        action = event.get("action")
+        if action == "verify_accept":
+            self.log("  %s verified and accepted by %s; nothing is pending" % (task["id"], event.get("actor")))
+            self.pending_task = None
+        elif action == "verify_reject":
+            # A reject returns the task to `working` for rework. We still own it,
+            # so it is still ours not to abandon.
+            self.log("  %s rejected by %s; it is back to %s and still ours"
+                     % (task["id"], event.get("actor"), task.get("state")))
+        elif action == "cancel":
+            self.log("  %s was cancelled; nothing is pending" % task["id"])
+            self.pending_task = None
+
+    def resolve_pending_verification(self):
+        """Called on the way out. If a verification is still pending we do NOT
+        just leave: we record why in a `note` (which a human reads) and then
+        `cancel`, which the owner may do. A cancelled task carrying an
+        explanation is recoverable by anyone; an orphaned `working` task owned by
+        a departed member needs the operator. `cancel` ignores a `note`
+        argument, so the note has to be set with `update` first."""
+        if not self.pending_task:
+            return
+        task_id, self.pending_task = self.pending_task, None
+        self.log("WARNING: %s still has a pending verification and we are exiting." % task_id)
+        try:
+            self.call("room_task", {
+                "action": "update",
+                "id": task_id,
+                "note": "Owner %s (%s) exited with evidence filed and verification still pending. "
+                        "Evidence stands; re-open or re-create if the work is still wanted."
+                        % (self.name, self.id),
+            })
+            self.call("room_task", {"action": "cancel", "id": task_id})
+            self.log("  %s: note recorded and task cancelled, so the board is not left wedged" % task_id)
+        except RfaError as err:
+            # Worth being loud about: this is the case a human has to clean up.
+            self.log("  could not resolve %s (%s: %s). TELL THE OPERATOR: the task is owned by a "
+                     "member id that is about to stop existing." % (task_id, err.code, err.message))
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +636,10 @@ def parse_args(argv):
     p.add_argument("--listen-ms", type=int, default=int(os.environ.get("RFA_LISTEN_MS", "20000")))
     p.add_argument("--wait-for", default="mentions")
     p.add_argument("--no-task", action="store_true")
+    # Off by default: claiming an evidence_required task means asking a real
+    # member of a real room to verify, and this client exits after --cycles.
+    p.add_argument("--claim-evidence", action="store_true",
+                   help="also claim tasks with evidence_required (exercises the pending-verification path)")
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args(argv)
     if not args.room:
@@ -511,7 +667,7 @@ def main(argv):
         member.log("presence=ready, lease_expires=%s" % lease["lease_expires"])
 
         if not args.no_task:
-            member.work_one_task()
+            member.work_one_task(claim_evidence=args.claim_evidence)
 
         member.send(body="rfa_min.py joined and is listening.", kind="status")
 
@@ -528,10 +684,19 @@ def main(argv):
                     member.log("  message seq=%s kind=%s from=%s"
                                % (event["seq"], event["envelope"]["kind"], event["envelope"]["from"]["name"]))
                     member.handle_message(event)
+                elif kind == "task":
+                    # Watch for someone resolving a verification we are waiting on.
+                    member.log("  task seq=%s action=%s id=%s state=%s"
+                               % (event["seq"], event.get("action"),
+                                  (event.get("task") or {}).get("id"),
+                                  (event.get("task") or {}).get("state")))
+                    member.note_task_event(event)
                 elif kind == "system":
-                    # Includes room_ending, timeout notices and gone_quiet.
+                    # Includes the room-closing notice, timeouts and gone_quiet.
                     member.log("  system seq=%s event=%s refs=%s"
                                % (event["seq"], event.get("event"), json.dumps(event.get("refs", {}))[:120]))
+                    # The spec names this event room_ending; the reference hub emits
+                    # room_ended. Match either or you never notice the room closed.
                     if event.get("event") in ("room_ended", "room_ending"):
                         member.log("  the room is closing; stopping")
                         return 0

@@ -1077,7 +1077,6 @@ export class RoomHub {
         refs: { message_id: args.message_id, seq: event.seq, member: member.id, check: gateVerdict.checkId, reason: gateVerdict.reason, score: gateVerdict.score ?? null },
       });
     }
-    envelope.seq = event.seq;
     envelope.ts = event.ts;
     member.sentIds.add(args.message_id);
     if (member.sentIds.size > 500) member.sentIds.delete(member.sentIds.values().next().value as string);
@@ -1294,7 +1293,6 @@ export class RoomHub {
     room.heldMessages.delete(held.envelope.message_id);
     const sender = room.members.get(held.senderId);
     const event = this.appendEvent(room, { type: "message", envelope: held.envelope });
-    held.envelope.seq = event.seq;
     held.envelope.ts = event.ts;
     if (sender) {
       sender.sentIds.add(held.envelope.message_id);
@@ -1511,9 +1509,7 @@ export class RoomHub {
           ext: { "io.github.pbeneteau/injected": true },
         };
         intervene(null, { message_id: envelope.message_id });
-        const event = this.appendEvent(room, { type: "message", envelope });
-        envelope.seq = event.seq;
-        envelope.ts = event.ts;
+        const event = this.appendEvent(room, { type: "message", envelope }); // stamps envelope.seq/ts
         member.sentIds.add(envelope.message_id);
         this.wakeWaiters(room, [event]);
         this.notifyWatchers(room, [event]);
@@ -2345,6 +2341,16 @@ export class RoomHub {
   private appendEvent(room: Room, partial: EventInput): RfaEvent {
     room.seq += 1;
     const event = { ...partial, seq: room.seq, ts: iso(this.cfg.now()), prev_hash: room.chainHead } as RfaEvent;
+    // Stamp the envelope BEFORE hashing and persisting. Callers used to fill
+    // `envelope.seq` after the append, which meant the bytes on disk carried 0
+    // while the in-memory copy carried the real value: the same message read
+    // live and read again after a restart disagreed, and a chain verifier had
+    // to know to zero the field to reproduce the hash. Found by an outside
+    // integrator reverse-engineering the chain.
+    if (event.type === "message") {
+      event.envelope.seq = event.seq;
+      event.envelope.ts = event.ts;
+    }
     room.chainHead = sha256hex(canonicalize(event as unknown as Record<string, unknown>));
     room.events.push(event);
     this.appendToDisk(room, event);

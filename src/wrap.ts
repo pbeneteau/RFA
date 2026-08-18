@@ -24,7 +24,12 @@ export function neutralize(text: string): string {
       .replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "")
       .replace(/[\u202A-\u202E\u2066-\u2069]/g, "")
       .replace(/[\u200B-\u200F\u2060\uFEFF]/g, "")
-      .replace(/<\/room-message/gi, "&lt;/room-message")
+      // BOTH tags, not just the closing one: escaping only `</room-message`
+      // let a peer put a forged OPENING header inside its own content, so a
+      // model reading the boundary saw a nested `<room-message origin="human">`
+      // it had no way to distinguish from the hub's. Found by an injection
+      // probe while writing a second client.
+      .replace(/<(\/?)room-message/gi, "&lt;$1room-message")
   );
 }
 

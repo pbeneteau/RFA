@@ -134,3 +134,42 @@ test("the nightly backup captures commits still living in the WAL file", async (
   fs.rmSync(root, { recursive: true, force: true });
   fs.rmSync(dest, { recursive: true, force: true });
 });
+
+test("an envelope's seq and ts survive a restart, and the chain verifies over what is served", async () => {
+  // The stamping used to happen AFTER the event was serialized, so the bytes on
+  // disk carried seq 0 while the in-memory copy carried the real value: the
+  // same message read live and read again after a restart disagreed, and a
+  // chain verifier had to know to zero the field to reproduce the hash.
+  const { canonicalize, sha256hex } = await import("../src/jcs.js");
+  const dir = tmpdir();
+  let hub = new RoomHub({ dataDir: dir, sweepIntervalMs: 0 });
+  const a = hub.createRoom({ topic: "chain", name: "host", card: card("host") });
+  const tok = a.contract.you.membership_token;
+  const sent = await hub.send({ room: a.room, membership_token: tok, message_id: "msg_stamped", body: [{ type: "text", text: "stamp me" }] });
+  const live = (await hub.listen({ room: a.room, membership_token: tok, since: 0, timeout_ms: 0, wait_for: "all" })) as { events: any[] };
+  const liveMsg = live.events.find((e) => e.type === "message");
+  assert.equal(liveMsg.envelope.seq, sent.seq, "served live with the real seq");
+  hub.close();
+
+  hub = new RoomHub({ dataDir: dir, sweepIntervalMs: 0 });
+  const back = hub.join({ room: a.room, join_secret: a.join_secret!, name: "reader", card: card("reader") });
+  const replayed = (await hub.listen({
+    room: a.room, membership_token: back.you.membership_token, since: 0, timeout_ms: 0, wait_for: "all",
+  })) as { events: any[] };
+  const all = replayed.events;
+  const afterRestart = all.find((e) => e.type === "message");
+  if (afterRestart) assert.equal(afterRestart.envelope.seq, sent.seq, "and identically after a restart");
+
+  // And the chain verifies over exactly what the hub serves, with only the
+  // derived `wrapped` removed (spec 13). No field zeroing required.
+  const strip = (e: any) => {
+    const { wrapped, ...rest } = e;
+    return rest as Record<string, unknown>;
+  };
+  for (let i = 1; i < all.length; i++) {
+    if (!all[i].prev_hash) continue;
+    assert.equal(all[i].prev_hash, sha256hex(canonicalize(strip(all[i - 1]))), `event ${all[i].seq} chains to ${all[i - 1].seq}`);
+  }
+  hub.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
