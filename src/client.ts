@@ -671,7 +671,14 @@ async function rawCall(
  * static Authorization header into a registered server is unmeasured. If it
  * cannot, the credential moves into tool arguments and this changes shape.
  */
-const RFA_TOKEN = process.env.RFA_TOKEN?.trim();
+/**
+ * Read per call, NOT captured at module load: a static `import` is evaluated
+ * before any statement in the importing module, so a tool that resolves the
+ * token from a secrets file and then sets the variable would have been too late
+ * and every call went out unauthenticated. Found by running `npm run ask`
+ * against an authenticated hub.
+ */
+const rfaToken = (): string | undefined => process.env.RFA_TOKEN?.trim() || undefined;
 
 async function rawCallOnce(
   hubUrl: string,
@@ -686,7 +693,7 @@ async function rawCallOnce(
       accept: "application/json, text/event-stream",
       "Mcp-Method": "tools/call",
       "Mcp-Name": tool,
-      ...(RFA_TOKEN ? { authorization: `Bearer ${RFA_TOKEN}` } : {}),
+      ...((): Record<string, string> => { const t = rfaToken(); return t ? { authorization: `Bearer ${t}` } : {}; })(),
     },
     body: JSON.stringify({
       jsonrpc: "2.0",

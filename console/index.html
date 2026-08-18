@@ -312,12 +312,17 @@ async function rpc(method, params, opts = {}) {
       accept: "application/json, text/event-stream",
       "Mcp-Method": method,
       ...(typeof params.name === "string" ? { "Mcp-Name": params.name } : {}),
+      // Present the session token when we have one: a hub configured with
+      // --mcp-token accepts it as a transport credential, which is how this
+      // page can speak MCP at all on an authenticated hub. Harmless when the
+      // hub requires nothing.
+      ...(WB.token ? { authorization: "Bearer " + WB.token } : {}),
     },
     body: JSON.stringify({ jsonrpc: "2.0", id: ++rpcId, method, params: { ...params, _meta: META } }),
   });
   const text = await res.text();
-  const payload = text.startsWith("event:") || text.includes("\ndata: ")
-    ? JSON.parse(text.split("\n").find((l) => l.startsWith("data: ")).slice(6))
+  const payload = (res.headers.get("content-type") ?? "").includes("text/event-stream")
+    ? JSON.parse(text.split("\n").filter((l) => l.startsWith("data: ")).map((l) => l.slice(6)).join("") || "{}")
     : JSON.parse(text);
   if (payload.error) throw new Error(payload.error.message);
   return payload.result;

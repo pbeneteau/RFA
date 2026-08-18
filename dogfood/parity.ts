@@ -12,9 +12,17 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { RoomMember } from "../src/client.js";
 import { ObsStore } from "../src/obs.js";
+import { transportToken } from "../src/secrets.js";
 
 const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
 const FIXTURES = path.join(ROOT, "dogfood", "state", "parity.json");
+
+// Same reason as scripts/ask.ts: the gate must keep running against a hub that
+// requires a transport credential.
+{
+  const tok = transportToken(path.join(ROOT, "data", "secrets.json"));
+  if (tok && !process.env.RFA_TOKEN) process.env.RFA_TOKEN = tok;
+}
 const ROOM_MD = fs.readFileSync(path.join(ROOT, "dogfood", "ROOM.md"), "utf8");
 const room = /Room: `(r_\w+)`/.exec(ROOM_MD)![1];
 const secret = /Join secret: `([^`]+)`/.exec(ROOM_MD)![1];

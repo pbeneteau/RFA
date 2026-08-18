@@ -19,6 +19,8 @@ sandbox:
   isolation: none
   permission_mode: default
   network: none
+# The hub requires a transport credential (spec 4.2); the supervisor injects it.
+secrets: [RFA_JOIN_SECRET, RFA_TOKEN]
 budgets:
   max_turns: 8
   per_task_usd: 0.25

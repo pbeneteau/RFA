@@ -35,3 +35,21 @@ export function pickSecrets(
   }
   return { env, missing };
 }
+
+/**
+ * The transport credential for a hub that requires one (spec 4.2), resolved for
+ * LOCAL tools (the ask CLI, the parity gate, the eval harness). Residents get it
+ * injected by the supervisor from their declared `secrets`, so they never call
+ * this. Reads the environment first so a one-off run can override, then the
+ * secrets file, so `npm run ask` keeps working on an authenticated hub without
+ * the operator exporting anything.
+ */
+export function transportToken(secretsFile: string): string | null {
+  const fromEnv = process.env.RFA_TOKEN?.trim();
+  if (fromEnv) return fromEnv;
+  try {
+    return loadSecrets(secretsFile).RFA_TOKEN?.trim() || null;
+  } catch {
+    return null;
+  }
+}

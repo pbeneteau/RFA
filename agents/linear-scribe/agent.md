@@ -16,7 +16,7 @@ sandbox:
   isolation: none
   permission_mode: default
   network: none
-secrets: [RFA_JOIN_SECRET, LINEAR_API_KEY]
+secrets: [RFA_JOIN_SECRET, LINEAR_API_KEY, RFA_TOKEN]
 budgets:
   max_turns: 20
   per_task_usd: 1.00

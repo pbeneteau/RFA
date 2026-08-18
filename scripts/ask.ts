@@ -31,6 +31,13 @@ const timeoutS = Number(flag("--timeout") ?? 1800);
 const roomMd = fs.readFileSync(path.join(ROOT, "dogfood", "ROOM.md"), "utf8");
 const room = flag("--room") ?? /Room: `(r_\w+)`/.exec(roomMd)![1];
 const secret = /Join secret: `([^`]+)`/.exec(roomMd)![1];
+// A hub configured with --mcp-token refuses an unauthenticated /mcp call, so
+// resolve the transport credential before the client reads the environment.
+// Keeps `npm run ask` working on an authenticated hub with nothing exported.
+const { transportToken } = await import("../src/secrets.js");
+const tok = transportToken(path.join(ROOT, "data", "secrets.json"));
+if (tok && !process.env.RFA_TOKEN) process.env.RFA_TOKEN = tok;
+
 const humanKeyFile = path.join(ROOT, "dogfood", "state", "human-key.txt");
 const humanKey = fs.existsSync(humanKeyFile) ? fs.readFileSync(humanKeyFile, "utf8").trim() : undefined;
 

@@ -290,6 +290,16 @@ function watchCards(): void {
   }, 5_000).unref?.();
 }
 
+/**
+ * Is this a live workbench session token? Unlike `authed()` this does NOT slide
+ * the expiry: a long-poll stream reconnecting every 20 seconds would otherwise
+ * keep a session alive indefinitely, which is the opposite of a 12-hour cap.
+ */
+function sessionValid(token: string): boolean {
+  const exp = sessions.get(token);
+  return exp !== undefined && exp >= Date.now();
+}
+
 function authed(req: http.IncomingMessage): boolean {
   const m = /^Bearer (.+)$/.exec(req.headers.authorization ?? "");
   if (!m) return false;
@@ -546,42 +556,68 @@ process.on("exit", () => flushAuthWindow());
  * cannot lock the operator out of the console and console typos cannot lock out
  * a peer.
  */
-function mcpAuthorized(req: http.IncomingMessage, res: http.ServerResponse): boolean {
+async function mcpAuthorized(req: http.IncomingMessage, res: http.ServerResponse): Promise<boolean> {
   if (mcpTokens.length === 0) return true; // the default: no header expected, nothing audited, behavior unchanged
   // Answer without the MCP handler running. Drains the request first: Node
   // closes the socket on an unread body, and a client must read the 401 rather
   // than a connection reset.
-  const refuse = (status: number, data: unknown, headers: Record<string, string>): false => {
+  const now = Date.now();
+  const source = authSource(req);
+  const key = `mcp:${source}`;
+  // NO hard lockout on /mcp, deliberately, and this was learned the hard way:
+  // a handful of bad-token probes from this machine locked out 127.0.0.1 and
+  // took every resident offline at once. The limiter keys on the source
+  // address, and under the reach design of section 17 a proxy terminates at
+  // loopback, so EVERY request (the phone included) arrives as 127.0.0.1. A
+  // per-source lock is therefore either global, which is a self-inflicted
+  // outage, or exempted for loopback, which is no limiter at all.
+  //
+  // So /mcp slows a guesser down instead of locking anyone out: a small delay
+  // that grows with recent failures makes brute force impractical (a 32-char
+  // token at even one attempt per 2s is unreachable) while a misconfigured
+  // agent recovers the moment its token is fixed. The human-key endpoint keeps
+  // its lockout: it is human-paced, and being locked out of the console for 15
+  // minutes is survivable in a way that stopping every agent is not.
+  const record = authAttempts.get(key);
+  const recentFailures = record && now - record.windowStart < AUTH_FAIL_WINDOW_MS ? record.failures : 0;
+  const penaltyMs = recentFailures > 0 ? Math.min(2_000, 250 * recentFailures) : 0;
+    const refuse = async (status: number, data: unknown, headers: Record<string, string>): Promise<false> => {
+    // The penalty is paid on refusal, so a legitimate client with a good token
+    // is never slowed by someone else's failures.
+    if (penaltyMs > 0) await new Promise((r) => setTimeout(r, penaltyMs));
     req.resume();
     send(res, status, data, headers);
     return false;
   };
-  const now = Date.now();
-  const source = authSource(req);
-  const key = `mcp:${source}`;
-  const locked = authLockoutMs(key, now);
-  if (locked > 0) {
-    authAudit("mcp_failure", source, now); // refused by the lock still counts as volume
-    const retryS = Math.ceil(locked / 1000);
-    return refuse(429, { error: "too many attempts", retry_after_s: retryS }, { "retry-after": String(retryS) });
+const presented = /^Bearer (.+)$/.exec(req.headers.authorization ?? "")?.[1];
+  // A live workbench session token is also a valid transport credential. It
+  // chains to a provisioned human key and is short-lived, so it is a STRONGER
+  // credential than the static operator token, and without this the browser
+  // console cannot speak MCP at all once tokens are on: it has nowhere safe to
+  // hold a static bearer, so turning tokens on would have meant choosing
+  // between an authenticated /mcp and a usable console.
+  if (presented !== undefined && sessionValid(presented)) {
+    authAttempts.delete(key);
+    authAudit("mcp_success", source, now);
+    return true;
   }
-  const presented = /^Bearer (.+)$/.exec(req.headers.authorization ?? "")?.[1];
   if (presented !== undefined && constantTimeMatch(presented, mcpTokens)) {
     authAttempts.delete(key); // a good token clears the source's record, exactly as a good human_key does
     authAudit("mcp_success", source, now);
     return true;
   }
-  const tripped = authFailed(key, now);
-  authAudit("mcp_failure", source, now);
-  if (tripped) {
+  // Counted for the audit log and for the delay above, but NEVER converted into
+  // a lockout on this endpoint: /mcp answers 401 no matter how many failures a
+  // source has, because a lock here stops the agents (see the comment above).
+  // One stderr line when a source crosses the threshold, so a real guessing
+  // attempt is still visible to the operator.
+  if (authFailed(key, now)) {
     authAudit("mcp_lockout", source, now);
-    // One stderr line per trip, never per attempt.
     console.error(
-      `rfa-hub http: locked out ${source} from ${req.method} ${(req.url ?? "/").split("?")[0]} for ${AUTH_LOCKOUT_MS / 1000}s after ${AUTH_MAX_FAILURES} bearer failures`,
+      `rfa-hub http: ${source} has now failed ${AUTH_MAX_FAILURES} bearer checks on /mcp. Not locked out by design (a lock here would stop every local agent); refusals are delayed up to 2s instead. Investigate if this is not a misconfigured client.`,
     );
-    const retryS = AUTH_LOCKOUT_MS / 1000;
-    return refuse(429, { error: "too many attempts", retry_after_s: retryS }, { "retry-after": String(retryS) });
   }
+  authAudit("mcp_failure", source, now);
   return refuse(
     401,
     { error: presented === undefined ? "Authorization: Bearer <token> required" : "invalid bearer token" },
@@ -871,7 +907,7 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
       // POST /auth and the private-network posture of v0.5 sect. 17.1. Two
       // audiences, two proxies, two credentials (sect. 4.5), and a browser
       // cannot put a bearer on a document load in any case.
-      if (!mcpAuthorized(req, res)) return;
+      if (!(await mcpAuthorized(req, res))) return;
       const url = `http://${req.headers.host ?? `localhost:${port}`}${req.url ?? "/"}`;
       const headers = new Headers();
       for (const [k, v] of Object.entries(req.headers)) {

@@ -256,26 +256,30 @@ test("with tokens configured, /mcp refuses 401 without a valid bearer and serves
   assert.equal(authRes.status, 200, "POST /auth must not require the transport bearer: it is a different credential");
   assert.equal((await fetch(`${tokenHub.base}/console`)).status, 200, "the console page is still served");
 
-  // Failures are rate-limited on the same machinery as POST /auth: enough
-  // refusals inside the window trip a lock that answers 429 with Retry-After.
-  let tripped: McpReply | null = null;
-  for (let i = 0; i < MAX_FAILURES && !tripped; i++) {
+  // /mcp is DELIBERATELY not lockable, and this assertion exists to stop anyone
+  // restoring the lock. The limiter keys on the source address, and the reach
+  // design terminates a proxy at loopback, so every request (a phone included)
+  // arrives as 127.0.0.1: a per-source lock is therefore either global, which
+  // takes every resident offline at once, or exempted for loopback, which is no
+  // limiter at all. Learned live: a handful of probes from this machine locked
+  // out 127.0.0.1 and stopped both agents. Guessing is slowed by a delay that
+  // grows with recent failures, never by a refusal to serve.
+  for (let i = 0; i < MAX_FAILURES + 4; i++) {
     const r = await tokenMcp("room_create", roomArgs(`guess ${i}`), "mt_" + "d".repeat(43));
-    if (r.status === 429) tripped = r;
-    else assert.equal(r.status, 401, `guess ${i} is below the limit`);
+    assert.equal(r.status, 401, `guess ${i} must be refused with 401, never locked out with 429`);
   }
-  assert.ok(tripped, `${MAX_FAILURES} bearer failures inside the window must trip the lock`);
-  const retryS = Number(tripped.retryAfter);
-  assert.ok(Number.isInteger(retryS) && retryS > 0, `Retry-After must be a positive integer (got ${tripped.retryAfter})`);
-  assert.equal((JSON.parse(tripped.text) as Record<string, unknown>).retry_after_s, retryS);
+  // The point of the whole design: a legitimate client is served immediately
+  // after someone else's failures, with no waiting period.
+  const good = await tokenMcp("room_create", roomArgs("after the failures"), MCP_TOKEN);
+  assert.equal(good.status, 200, "a valid credential is served immediately after a run of failures");
 
-  // The attempt key is namespaced, so guessing at /mcp must not lock the operator out of the console.
-  const authAfterLock = await fetch(`${tokenHub.base}/auth`, {
+  // And the operator can still reach the console: the keys are namespaced.
+  const authAfterFailures = await fetch(`${tokenHub.base}/auth`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ human_key: HK }),
   });
-  assert.equal(authAfterLock.status, 200, "a /mcp lockout must not gate POST /auth");
+  assert.equal(authAfterFailures.status, 200, "/mcp failures must not gate POST /auth");
 });
 
 test("the window row carries the /mcp counters in the same aggregated log", async () => {
