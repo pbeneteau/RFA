@@ -10,3 +10,6 @@ dogfood/ROOM.md
 agents/*/knowledge/
 agents/*/state/
 agents/*/evals/cases/
+
+# Tracked knowledge clones (spec 19.1): read locally, never vendored.
+agents/*/knowledge/handbook-clone/

@@ -248,6 +248,38 @@ export class FactStore {
         INSERT INTO facts_fts(rowid, text) VALUES (new.id, new.text);
       END;
     `);
+    this.migrate();
+  }
+
+  /**
+   * Schema migrations (spec 19.2). Each agent owns its own database, so a
+   * schema change has to be applied per file at open time; `user_version` is
+   * the only durable record of where a given file stands. Before this the
+   * project contained no ALTER TABLE anywhere, which is why the columns below
+   * needed a mechanism and not just a statement.
+   *
+   * Migrations MUST be additive and idempotent: a resident may be running an
+   * older build against a newer file after a partial rollback.
+   */
+  private migrate(): void {
+    const current = (this.db.pragma("user_version", { simple: true }) as number) ?? 0;
+    if (current < 1) {
+      // Provenance for facts extracted from a source FILE (spec 19.2). All
+      // nullable, and NULL means "no provenance", never "unverified": every
+      // fact that exists today is an agent's own consolidation of room
+      // episodes and legitimately has none.
+      const cols = this.db.prepare("PRAGMA table_info(facts)").all() as { name: string }[];
+      const have = new Set(cols.map((c) => c.name));
+      for (const [name, type] of [
+        ["source_uri", "TEXT"], // path within the tracked clone, not a URL to fetch
+        ["source_author", "TEXT"], // from `git log -1 --format=%an <%ae>` on that file
+        ["observed_at", "TEXT"], // extraction time, ISO 8601, same convention as the other columns
+        ["revalidate_after", "TEXT"], // an absolute instant, so no consumer needs to know what it is relative to
+      ] as const) {
+        if (!have.has(name)) this.db.exec(`ALTER TABLE facts ADD COLUMN ${name} ${type}`);
+      }
+      this.db.pragma("user_version = 1");
+    }
   }
 
   close(): void {
@@ -284,7 +316,11 @@ export class FactStore {
       .filter((t) => t.length > 2)
       .slice(0, 12);
     if (terms.length === 0) return [];
-    const match = terms.map((t) => `"${t}"`).join(" OR ");
+    // Prefix match per term (spec 19.3): FTS5 here has no stemmer, so "frais"
+  // would not reach "frai" and "gestion" would not reach "gestionnaire". One
+  // character, no migration. A tokenizer change is NOT the same size and is
+  // deliberately not attempted here (19.3 second bullet).
+  const match = terms.map((t) => `"${t}"*`).join(" OR ");
     const rows = this.db
       .prepare(
         `SELECT f.*, bm25(facts_fts) AS rank FROM facts_fts

@@ -6,6 +6,16 @@ model: haiku
 tools:
   allow: [Read, Grep, Glob]
 knowledge:
+  # The handbook is attached as a TRACKED CLONE (spec 19.1), so provenance comes
+  # from git and a push is visible immediately. `npm run sync-handbook` pulls it.
+  # The .mdx glob matters: the handbook's index and several pages are .mdx, and a
+  # .md-only glob silently dropped them.
+  - "knowledge/handbook-clone/src/content/docs/**/*.md"
+  - "knowledge/handbook-clone/src/content/docs/**/*.mdx"
+  # Snapshot fallback, used only until the clone exists. Each file carries a
+  # provenance header saying it is a snapshot with a fetch date, not a commit.
+  - "knowledge/handbook/**/*.md"
+  - "knowledge/handbook/**/*.mdx"
   - "knowledge/**/*.md"
   - "../../spec/RFA-0.1.md"
   - "../../README.md"
@@ -44,6 +54,13 @@ general knowledge. Rules:
   `agents/pm-agent/knowledge/goodvest/goodlife-fonds.md`), plus the section. A
   document title or a handbook chapter name is not a citation: the reader must
   be able to open what you read.
+- The knowledge spans SEVERAL sources (the handbook and the RFA spec, and within
+  the handbook several sections). When two of them disagree on the same fact,
+  say so explicitly: give both values, name both files, and state that a human
+  must arbitrate. Do not silently pick the one that looks newer, more precise or
+  more convenient, and do not average them. A quiet choice between contradictory
+  sources is the failure mode that costs the most later, because the reader
+  cannot tell a resolved disagreement from an unnoticed one.
 - A `<consolidated-memory>` block is your own earlier conclusion, not a source.
   It may be stale. Use it to know where to look, then confirm the number in the
   knowledge file and cite THAT file. Never cite memory as the source, and if the

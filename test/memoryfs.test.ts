@@ -5,7 +5,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { MemoryGate } from "../src/client.js";
-import { EpisodeLog, GatedMemory, parseBlock } from "../src/memoryfs.js";
+import { EpisodeLog, FactStore, GatedMemory, parseBlock } from "../src/memoryfs.js";
 
 const SELF = "m_self";
 const WORM =
@@ -83,5 +83,61 @@ test("episodes: inbound with verdict + own answers, durable across reopen", () =
   assert.equal(rows[1].gate_similarity, 0.93);
   assert.equal(rows[0].kind, "response");
   log2.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.5.3 migration: provenance columns land behind user_version, idempotently", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-migrate-"));
+  const dbPath = path.join(dir, "memory.db");
+  const { default: Database } = await import("better-sqlite3");
+
+  // A pre-migration database: the v0.4 shape, user_version 0.
+  const old = new Database(dbPath);
+  old.exec(`
+    CREATE TABLE facts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, hash TEXT NOT NULL,
+      importance REAL NOT NULL DEFAULT 0.5,
+      source_origin TEXT NOT NULL DEFAULT 'agent' CHECK (source_origin IN ('human','self','agent')),
+      episode_ids TEXT NOT NULL DEFAULT '[]', supersedes INTEGER, created_at TEXT NOT NULL,
+      expired_at TEXT, valid_at TEXT, invalid_at TEXT
+    );
+  `);
+  old.prepare("INSERT INTO facts (text, hash, created_at) VALUES (?, ?, ?)").run("an existing fact", "h1", new Date().toISOString());
+  old.close();
+
+  // Opening a FactStore migrates it in place, without touching the row.
+  const store = new FactStore(dbPath);
+  store.close();
+  const after = new Database(dbPath);
+  const cols = new Set((after.prepare("PRAGMA table_info(facts)").all() as { name: string }[]).map((c) => c.name));
+  for (const c of ["source_uri", "source_author", "observed_at", "revalidate_after"]) {
+    assert.ok(cols.has(c), `${c} was added`);
+  }
+  assert.equal(after.pragma("user_version", { simple: true }), 1, "the version records that it ran");
+  const row = after.prepare("SELECT text, source_uri FROM facts").get() as { text: string; source_uri: string | null };
+  assert.equal(row.text, "an existing fact", "existing rows survive");
+  assert.equal(row.source_uri, null, "and NULL means no provenance, not unverified");
+  after.close();
+
+  // Re-opening is a no-op rather than an error: a resident may run an older
+  // build against a newer file after a partial rollback.
+  const again = new FactStore(dbPath);
+  again.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.5.3 retrieval: the prefix operator reaches inflected French forms", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-prefix-"));
+  const store = new FactStore(path.join(dir, "memory.db"));
+  store.apply({ text: "Les frais de gestion annuels sur Goodvie sont 1,5 pour cent", event: "ADD", importance: 0.9 }, [1], "human");
+  store.apply({ text: "Le versement initial minimum sur Goodlife Basique est 500 EUR", event: "ADD", importance: 0.9 }, [2], "human");
+
+  // "gestionnaires" and "versements" are inflections the FTS5 table has no
+  // stemmer for: without the prefix operator neither query reached its fact.
+  const fees = store.retrieve("quels sont les frais de gestionnaires ?", 3);
+  assert.ok(fees.some((f) => /1,5/.test(f.text)), "a longer inflection still matches");
+  const deposits = store.retrieve("versements initiaux minimum", 3);
+  assert.ok(deposits.some((f) => /500 EUR/.test(f.text)), "plural query reaches the singular fact");
+  store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });

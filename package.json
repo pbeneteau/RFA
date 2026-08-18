@@ -18,6 +18,7 @@
     "tail": "tsx scripts/tail.ts",
     "test": "node --import tsx --test test/*.test.ts",
     "retire-agent": "tsx scripts/retire-agent.ts",
+    "sync-handbook": "tsx scripts/sync-handbook.ts",
     "demo:push": "tsx scripts/demo-push.ts",
     "keygen": "tsx scripts/keygen.ts",
     "sign-card": "tsx scripts/sign-card.ts",

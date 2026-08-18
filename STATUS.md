@@ -18,10 +18,25 @@ RFA (Rooms for Agents): a communication protocol where AI agents join rooms, dis
 | Hub (`rfa-hub`) | v0.6.0 on MCP v2 SDK, dual-era, 12 tools + console at /console + OTel spans (`--otel`) + **policy gate (`--gate deploy/gate.json`)** + hash-chained event log |
 | Client SDK | [src/client.ts](src/client.ts): RoomMember (ask/serve/projectTools/admin/task) + MemoryGate (inspect + inspectText) |
 | Platform | [src/agentdef.ts](src/agentdef.ts) packs · [src/resident.ts](src/resident.ts) SDK runner · [src/supervisor.ts](src/supervisor.ts) + secrets injection · [src/engine.ts](src/engine.ts) durable runs/steps/schedules · [src/memoryfs.ts](src/memoryfs.ts) gated memory + episodes · [src/execbackend.ts](src/execbackend.ts) srt sandbox seam |
-| Tests | `npm test` 122/122 (glob over `test/*.test.ts`, so a new file is in the gate the moment it exists) · `npm run e2e` 9/9 fast ~4s · `e2e:full` 10/10 ~46s · parity gate `npx tsx dogfood/parity.ts` |
+| Tests | `npm test` 124/124 (glob over `test/*.test.ts`, so a new file is in the gate the moment it exists) · `npm run e2e` 9/9 fast ~4s · `e2e:full` 10/10 ~46s · parity gate `npx tsx dogfood/parity.ts` |
 | Repo | github.com/pbeneteau/agent-com (PRIVATE, personal account, Apache-2.0) |
 | Dogfood | LIVE: `pm-agent` (Agent SDK brain, haiku, pack at agents/pm-agent/) under the supervisor in room `r_9a25e48c0e`; ~10-20s answers with citations, cost and run_id recorded per answer |
 | Artifacts (claude.ai) | Research report + spec published; same URLs redeploy |
+
+## Knowledge: the handbook is a tracked clone, not a copy (v0.5.3, needs one command from Paul)
+
+The pack answered from **7 hand-copied files** while the handbook has **46 pages**, so whole sections were unanswerable: everything under `conformite/` (agrements, analyse-reglementaire, bonnes-pratiques, modes operatoires) and most of `tech/`. The fix per spec 19.1 is a tracked clone, because a clone gives per-file provenance for free (`git log` on the exact file a fact came from), is fresh the moment someone pushes, and needs no credential at answer time.
+
+**ONE COMMAND, needs your GitLab credentials (mine cannot reach it):**
+
+```bash
+git clone --depth 50 git@gitlab.com:goodvest/handbook.git agents/pm-agent/knowledge/handbook-clone
+npm run sync-handbook            # then this pulls it and reports provenance
+npm run sync-handbook -- --status # what is attached, from where, how stale
+npm run sync-handbook -- --pin    # record the sha as the eval corpus_version
+```
+
+The pack's globs already point at the clone (`.md` AND `.mdx`: a .md-only glob silently dropped the handbook's index pages). Deliberately NOT done, per spec 19.1: binding the pack to the account-managed handbook MCP connector. That would inject every connector on a personal account into an agent pack, assembling private data, untrusted content and egress in one process. The handbook's MCP server is also a poor pipeline source regardless: interactive Google OAuth, and docs baked into a container image so it lags a commit until redeploy.
 
 ## Reaching the hub from a phone (v0.5.1, partially shipped)
 
