@@ -234,10 +234,26 @@ Room console: `http://localhost:8790/console#r_9a25e48c0e`. Observer = read-only
 
 **The ladder itself lives in [spec/RFA-0.5-platform.md](spec/RFA-0.5-platform.md) section 22**: one ordered table for v0.5 and v0.6 with prerequisites and per-rung status. Wire [Appendix F](spec/RFA-0.1.md) is the single implementation-status table for the protocol. Read those two before starting anything; what follows is only what is outstanding and why.
 
-### Waiting on Paul (both block real work)
+### ANSWERED 2026-08-19: the repository stays PRIVATE
 
-1. **Does this repo go public, with CI, `SECURITY.md` and a supported-versions statement?** RFA-0.6-remote section 8.9 makes all three a precondition for admitting any external peer, and STATUS still records CI as explicitly declined. **This gates the entire remote-agent half.** Even "not yet" is useful: it parks v0.6.0b cleanly instead of leaving it ambiguous.
-2. **The handbook clone**, one command with his GitLab credentials (see the knowledge section above). Upgrades provenance from a fetch date to real `git log` history and lets `--pin` record a `corpus_version`, which the eval gate currently reports as unpinned on every verdict.
+Owner decision, in his words: "keep it private". This is the exposure question of RFA-0.6-remote section 8.9, and it resolves the remote half rather than deferring it, so read the consequences before planning any v0.6 work.
+
+- **8.9 makes `SECURITY.md`, a supported-version line and CI preconditions for admitting any peer outside the operator's organization.** They are not going to exist, so **admitting an external peer is now parked by DECISION, not merely by the absence of a counterparty.** v0.6.0b (the admission half) previously waited on "a named counterparty existing"; it now waits on that AND on this decision being reversed. Do not build it, and do not treat a counterparty appearing as sufficient on its own.
+- **The three artifacts are not what privacy forbids** (a private repo can carry a `SECURITY.md` and run CI). What 8.9 is really about is its first sentence: an organization cannot reasonably be told to point its agents at a hub whose implementation it cannot read. That is the part privacy settles.
+- **CI stays declined** and is not to be re-offered (recorded twice now). The honest cost, stated once as a fact rather than a proposal: 178 tests and 9 e2e scenarios only ever run when somebody is at the keyboard, so a regression can sit in `main` until the next session looks.
+- **v0.6.5's sixty-day decision now has a strong prior.** If no peer is named within sixty days of the cold-start guest test passing (it passed 2026-08-18, so **the mark is 2026-10-17**), the answer was "deepen local" and the remaining remote recommendations stay parked for good. Privacy plus no counterparty points that way already.
+
+**What this does NOT park**, because none of it needs a public repo or a peer, and it is where v0.6 work should go next:
+
+- v0.6.3b's local items: `room_admin redact` with `content_hash`, retention plus the plaintext disclosure in the join contract `instructions`, `npm run verify-log`, and `/healthz` whose public body is only `{"ok":true}`.
+- v0.6.4's **per-human `principal_id`** with constant-time comparison and per-principal console memberships. RFA-0.6 says outright that this "needs only rung 1 and is locally correct, so it should not wait for a peer".
+- v0.6.4's `usd_per_day` enforced at pickup: a budget ceiling is locally useful, and today's ledger incident is the argument for it.
+- Docker and compose stay deferred for their OWN reason (the exposure posture of RFA-0.6 sect. 4.5, plus 8.2 rejecting every hosted target such a container would run on), not because of this decision. Note STATUS previously mis-cited 8.2 as the exposure section; 4.5 is.
+- `member_rpm` keyed per `(sender, recipient home)` is the one v0.6.4 item that IS effectively parked: it only means anything once a member's `home` is not local.
+
+### Still waiting on Paul (one item)
+
+1. **The handbook clone**, one command with his GitLab credentials (see the knowledge section above). Upgrades provenance from a fetch date to real `git log` history and lets `--pin` record a `corpus_version`, which the eval gate currently reports as unpinned on every verdict.
 
 Minor: `agents/test-agent` was created before `new-agent` scaffolded the full pack, so it only has `knowledge/`. Retire and recreate it for the current shape, or leave it as a deliberate example of the old one.
 
@@ -267,9 +283,11 @@ Note the ledger, because it bit twice today: pm-agent's `per_day_usd` is 8, spen
 - ~~The structured approval extension~~ **DONE 2026-08-19**, with `src/bridge.ts` in the same change as required, plus the four other producers the spec did not count (see the ledger).
 - ~~Console rendering for guests~~ **DONE 2026-08-19** (RFA-0.6 sect. 7.6 items 1-3), browser-verified. Items 4-6 (per-peer spend, task lease state, self-report styling) still move with the admission half; item 5 in particular (`attempt`, `lease_expires`, `task_released` in the console) is locally useful today and does not need a peer.
 
-### v0.6.3b
+### v0.6.3b (split by the privacy decision)
 
-`room_admin redact` with `content_hash`; retention plus the plaintext disclosure in the join contract `instructions`; `npm run verify-log`; `/healthz` whose public body is only `{"ok":true}`; Docker and compose (waiting on the exposure answer of RFA-0.6 section 8.2); `SECURITY.md`, supported versions and CI (decision 1 above).
+**Buildable now, none of it needing a peer or a public repo**: `room_admin redact` with `content_hash`; retention plus the plaintext disclosure in the join contract `instructions`; `npm run verify-log`; `/healthz` whose public body is only `{"ok":true}`.
+
+**Not happening**: `SECURITY.md`, supported versions and CI, per the answered decision above. **Still deferred for its own reason**: Docker and compose, on the exposure posture of RFA-0.6 sect. 4.5 (not 8.2, which is storage).
 
 ### v0.6.4
 
@@ -277,7 +295,7 @@ Note the ledger, because it bit twice today: pm-agent's `per_day_usd` is 8, spen
 
 ### Parked with a trigger
 
-- **v0.6.0b, the admission half** (`deploy/peers.json`, `room_admin invite`, membership expiry tied to `expires_at`, quarantine keyed on `peer_id`, the transport-principal linkage rule, the `admitted` event, `invite_invalid`): gated on **a named counterparty existing**, not scheduled. None of it fixes a defect in an all-local hub.
+- **v0.6.0b, the admission half** (`deploy/peers.json`, `room_admin invite`, membership expiry tied to `expires_at`, quarantine keyed on `peer_id`, the transport-principal linkage rule, the `admitted` event, `invite_invalid`): now gated on **TWO** things, a named counterparty existing AND the privacy decision of 2026-08-19 being reversed, because RFA-0.6 sect. 8.9 makes the release obligations a precondition for admitting any external peer. Not scheduled. None of it fixes a defect in an all-local hub.
 - **v0.6.5**: the sixty-day decision. If no peer is named sixty days after the cold-start guest test passes, the answer was "deepen local" and the remaining recommendations stay parked. One line in this file when the time comes.
 - Per-message signing narrowed to claim-and-result, demand-gated. Federation, MLS, tool passthrough (a MUST NOT), the REST binding, registries, contract-net verbs, Postgres, embeddings: each with its trigger in RFA-0.5 section 23 and RFA-0.6 section 12.
 
