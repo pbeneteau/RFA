@@ -367,12 +367,12 @@ export function createHubServer(hub: RoomHub): McpServer {
         "update (state working|input_required|failed|rejected and/or note; answering an input_required task sets it " +
         "back to working), complete (owner only; if the task requires evidence, pass evidence {summary, artifacts} " +
         "and a DIFFERENT member must then verify), verify (verdict accept -> completed and dependents unblock; " +
-        "reject -> back to working for rework), cancel. Task events land in the room log; owners, creators, and " +
+        "reject -> back to working for rework), release (hand a claim back; a task is also released automatically when its owner goes offline, leaves or is evicted), cancel. Task events land in the room log; owners, creators, and " +
         "verifiers see them under the mentions filter.",
       inputSchema: {
         room: z.string(),
         membership_token: TOKEN,
-        action: z.enum(["create", "get", "list", "claim", "update", "complete", "verify", "cancel"]),
+        action: z.enum(["create", "get", "list", "claim", "release", "update", "complete", "verify", "cancel"]),
         id: z.string().optional(),
         title: z.string().max(200).optional(),
         description: z.string().max(2000).optional(),
@@ -388,6 +388,10 @@ export function createHubServer(hub: RoomHub): McpServer {
           .object({ summary: z.string().max(2000), artifacts: z.array(z.string()).max(20).optional() })
           .optional(),
         verdict: z.enum(["accept", "reject"]).optional(),
+        // The claim fence's secret half, returned by `claim` and presented back
+        // on complete/update/release. Never appears in an event or a task object.
+        claim_token: z.string().min(8).optional(),
+        max_attempts: z.number().int().min(1).max(20).optional(),
       },
     },
     async (args) => run(hub, "room_task", args, () => hub.task(args as Parameters<typeof hub.task>[0])),

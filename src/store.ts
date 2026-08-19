@@ -318,6 +318,26 @@ const NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N} _.\-]*$/u;
  * authoritative as `console`.
  */
 /** How long an expired approval stays visible in the operator's inbox (spec 16.3). */
+/**
+ * Claims allowed before a task becomes pickup-only for its creator, the host or
+ * a human principal (spec 10.3). One by default: a task that has been attempted
+ * and abandoned once deserves a human's attention, not an automatic retry loop.
+ */
+const DEFAULT_MAX_ATTEMPTS = 1;
+
+/** Rejections allowed per (task, attempt) before a human must intervene (spec 10.4). */
+const DEFAULT_MAX_REJECTIONS = 3;
+
+/**
+ * The secret half of the claim fence, keyed by (room, task, attempt) and held
+ * OUT of the task object on purpose (spec 10.3): a fence carried inside the task
+ * is broadcast to every member and observer on first legitimate use, at which
+ * point "a valid fence re-binds ownership" becomes a privilege-escalation
+ * primitive. Process-local, which is honest: a restart invalidates outstanding
+ * tokens, and release-on-offline is what actually recovers a dead worker's task.
+ */
+const claimTokens = new Map<string, { token: string; memberId: string }>();
+
 /** Lock liveness: stamped this often, considered abandoned after this long. */
 const LOCK_HEARTBEAT_MS = 10_000;
 const LOCK_STALE_MS = 60_000;
@@ -716,8 +736,43 @@ export class RoomHub {
     return Math.max(60_000, deadline - now - 30_000);
   }
 
+  /**
+   * Release a claimed task back to the board (spec 10.3). Before this, nothing
+   * ever set `owner` back to null: a worker that died, left or was evicted left
+   * its task `working` forever, and because `complete` requires the original
+   * owner id, even the worker itself could not finish it after reconnecting.
+   * An outside integrator hit exactly that, following the documented happy path,
+   * and an operator had to unstick the board by hand.
+   */
+  private releaseTask(room: Room, task: RfaTask, reason: "offline" | "leave" | "evicted" | "released"): void {
+    const owner = task.owner;
+    // `input_required` is preserved: the task is waiting on an answer, and
+    // returning it to `submitted` would lose the fact that someone asked.
+    if (task.state !== "input_required") task.state = "submitted";
+    task.owner = null;
+    task.lease_expires = null;
+    task.released_at = iso(this.cfg.now());
+    task.updated_at = task.released_at;
+    claimTokens.delete(`${room.handle}:${task.id}:${task.attempt ?? 0}`);
+    this.appendEvent(room, {
+      type: "system",
+      event: "task_released",
+      refs: { task_id: task.id, attempt: task.attempt ?? 0, reason, owner, asker: task.created_by },
+    });
+  }
+
+  /** Every non-terminal task this member owns, released with one reason. */
+  private releaseTasksOf(room: Room, memberId: string, reason: "offline" | "leave" | "evicted"): void {
+    for (const task of room.tasks.values()) {
+      if (task.owner === memberId && !TERMINAL_TASK_STATES.has(task.state)) this.releaseTask(room, task, reason);
+    }
+  }
+
   /** Shared removal core for leave and evict: token revocation is immediate (spec 14.8). */
   private removeMembership(room: Room, member: Member, reason: "leave" | "evict"): void {
+    // Before the membership disappears: anything it claimed goes back on the
+    // board, or it is stranded with an owner that no longer exists.
+    this.releaseTasksOf(room, member.id, reason === "evict" ? "evicted" : "leave");
     member.present = false;
     member.leftAt = this.cfg.now();
     this.tokens.delete(member.token);
@@ -1790,7 +1845,7 @@ export class RoomHub {
   task(args: {
     room: string;
     membership_token: string;
-    action: "create" | "get" | "list" | "claim" | "update" | "complete" | "verify" | "cancel";
+    action: "create" | "get" | "list" | "claim" | "release" | "update" | "complete" | "verify" | "cancel";
     id?: string;
     title?: string;
     description?: string;
@@ -1804,7 +1859,10 @@ export class RoomHub {
     note?: string;
     evidence?: TaskEvidence;
     verdict?: "accept" | "reject";
-  }): RfaTask | { tasks: RfaTask[] } {
+    /** The claim fence's secret half (spec 10.3); accepted by complete, update and release. */
+    claim_token?: string;
+    max_attempts?: number;
+  }): RfaTask | { tasks: RfaTask[] } | (RfaTask & { claim_token: string }) {
     const { room, member } = this.auth(args.room, args.membership_token, { allowEnded: args.action === "get" || args.action === "list" });
     if (member.role === "observer" && args.action !== "get" && args.action !== "list") {
       throw new RfaError("unauthorized", "observers cannot act on tasks");
@@ -1885,15 +1943,71 @@ export class RoomHub {
         if (blockers.length > 0) {
           throw new RfaError("task_conflict", `task ${task.id} is blocked by ${blockers.join(", ")}`, null, { blocked_by: blockers });
         }
+        // Attempts are bounded (spec 10.3). A task at the cap stays `submitted`
+        // and becomes pickup-only for its creator, the host or a human: it does
+        // NOT move to `failed`, because a released task may already have filed a
+        // document or moved money in infrastructure this hub cannot see, and a
+        // terminal `failed` would assert that it did not.
+        const attempt = (task.attempt ?? 0) + 1;
+        const maxAttempts = task.max_attempts ?? DEFAULT_MAX_ATTEMPTS;
+        if (attempt > maxAttempts) {
+          const privileged = member.id === task.created_by || member.isHost || member.origin === "human";
+          if (!privileged) {
+            throw new RfaError(
+              "task_conflict",
+              `task ${task.id} has used all ${maxAttempts} attempt(s); its creator, the host or a human principal must reopen it`,
+              null,
+              { attempt: task.attempt ?? 0, max_attempts: maxAttempts },
+            );
+          }
+        }
         task.owner = member.id;
         task.state = "working";
-        return emit("claim", task);
+        task.attempt = attempt;
+        task.released_at = null;
+        // The claim lasts as long as the owner's presence lease: a worker that
+        // stops calling in goes offline, and an offline owner releases the task.
+        task.lease_expires = iso(member.leaseExpires);
+        // Evidence cannot be required at creation for a guest, because the flag
+        // is fixed before any owner exists (spec 10.4). Force it at claim time.
+        if ((member.home ?? "local") !== "local") task.evidence_required = true;
+        // The fence's secret half: the claim RESULT only, never an event, a task
+        // object, a roster snapshot or an error.
+        const claimToken = `ct_${randomBytes(24).toString("base64url")}`;
+        claimTokens.set(`${room.handle}:${task.id}:${attempt}`, { token: claimToken, memberId: member.id });
+        const claimed = emit("claim", task) as RfaTask;
+        return { ...claimed, claim_token: claimToken };
+      }
+      case "release": {
+        const task = get(args.id);
+        const holdsToken =
+          typeof args.claim_token === "string" &&
+          claimTokens.get(`${room.handle}:${task.id}:${task.attempt ?? 0}`)?.token === args.claim_token;
+        if (task.owner !== member.id && !holdsToken) {
+          throw new RfaError("unauthorized", "only the owner, or a valid claim_token holder, can release a task");
+        }
+        if (TERMINAL_TASK_STATES.has(task.state)) {
+          throw new RfaError("task_conflict", `task ${task.id} is terminal (${task.state})`);
+        }
+        this.releaseTask(room, task, "released");
+        return emit("release", task);
       }
       case "update": {
         const task = get(args.id);
         if (TERMINAL_TASK_STATES.has(task.state)) throw new RfaError("task_conflict", `task ${task.id} is terminal (${task.state})`);
         const isOwner = task.owner === member.id;
         const isCreator = task.created_by === member.id;
+        const privileged = isCreator || member.isHost || member.origin === "human";
+        // Reopening a used-up task, and clearing a rejection counter, are both
+        // privileged updates (spec 10.3, 10.4): an ordinary member cannot grant
+        // itself more attempts or wipe the record of being rejected.
+        if (args.max_attempts !== undefined) {
+          if (!privileged) throw new RfaError("unauthorized", "only the creator, the host or a human principal can change max_attempts");
+          task.max_attempts = args.max_attempts;
+        }
+        if (args.note && privileged && (task.verification.rejections ?? 0) > 0) {
+          task.verification = { ...task.verification, rejections: 0 };
+        }
         if (args.state) {
           if (args.state === "rejected" && !(isCreator || member.isHost)) {
             throw new RfaError("unauthorized", "only the creator or host can reject a task");
@@ -1907,9 +2021,9 @@ export class RoomHub {
           } else {
             task.state = args.state as TaskState;
           }
-          if (task.verification.pending) task.verification = { pending: false, verifier: null, verdict: null, note: null };
-        } else if (!args.note) {
-          throw new RfaError("bad_request", "update requires state and/or note");
+          if (task.verification.pending) task.verification = { pending: false, verifier: null, verifier_home: null, verdict: null, note: null, rejections: task.verification.rejections ?? 0 };
+        } else if (!args.note && args.max_attempts === undefined) {
+          throw new RfaError("bad_request", "update requires state, note and/or max_attempts");
         }
         if (args.note !== undefined) task.note = args.note;
         return emit("update", task);
@@ -1923,7 +2037,7 @@ export class RoomHub {
             throw new RfaError("bad_request", "this task requires evidence ({summary, artifacts?}) to complete");
           }
           task.evidence = args.evidence;
-          task.verification = { pending: true, verifier: null, verdict: null, note: null };
+          task.verification = { pending: true, verifier: null, verifier_home: null, verdict: null, note: null, rejections: task.verification.rejections ?? 0 };
           // State stays working until a verifier other than the owner accepts (anti phantom-delivery).
           return emit("complete_submitted", task);
         }
@@ -1937,7 +2051,52 @@ export class RoomHub {
         if (!task.verification.pending) throw new RfaError("task_conflict", `task ${task.id} has no pending verification`);
         if (task.owner === member.id) throw new RfaError("unauthorized", "the verifier must differ from the owner");
         if (!args.verdict) throw new RfaError("bad_request", "verify requires verdict accept|reject");
-        task.verification = { pending: false, verifier: member.id, verdict: args.verdict, note: args.note ?? null };
+        // Verification authority (spec 10.4). "Not the owner" was the whole
+        // check, so a party holding two memberships accepted its own evidence:
+        // a different member id is not a different party. A verifier must be a
+        // local member, the task's creator, or a human principal.
+        const isLocal = (member.home ?? "local") === "local";
+        if (!isLocal && member.id !== task.created_by && member.origin !== "human") {
+          throw new RfaError(
+            "unauthorized",
+            "a verifier must be a local member, the task's creator, or a human principal",
+            null,
+            { verifier_home: member.home ?? "local" },
+          );
+        }
+        // Honest residue, carried from the spec rather than hidden: two
+        // memberships admitted on a shared join_secret carry no principal, so
+        // this hub cannot tell them apart. Where a principal exists, use it.
+        const ownerMember = task.owner ? room.members.get(task.owner) : null;
+        const samePrincipal =
+          ownerMember != null &&
+          ownerMember.id !== member.id &&
+          ownerMember.origin === "human" &&
+          member.origin === "human" &&
+          ownerMember.home === member.home;
+        if (samePrincipal) {
+          throw new RfaError("unauthorized", "self-verification through a second membership of the same principal is refused");
+        }
+        // Rejection is bounded per (task, attempt): an unbounded reject loop
+        // wedges a board just as effectively as a stuck claim.
+        const rejections = task.verification.rejections ?? 0;
+        const maxRejections = room.policies.max_rejections ?? DEFAULT_MAX_REJECTIONS;
+        if (args.verdict === "reject" && rejections >= maxRejections) {
+          throw new RfaError(
+            "task_conflict",
+            `task ${task.id} has been rejected ${rejections} time(s) on attempt ${task.attempt ?? 1}; its creator, the host or a human principal must clear the counter with update`,
+            null,
+            { rejections, max_rejections: maxRejections, attempt: task.attempt ?? 1 },
+          );
+        }
+        task.verification = {
+          pending: false,
+          verifier: member.id,
+          verifier_home: member.home ?? "local",
+          verdict: args.verdict,
+          note: args.note ?? null,
+          rejections: args.verdict === "reject" ? rejections + 1 : rejections,
+        };
         if (args.verdict === "accept") {
           task.state = "completed";
           this.unblockDependents(room, member.id, task);
@@ -2126,6 +2285,8 @@ export class RoomHub {
         if (!member.present || member.state === "offline") continue;
         if (now > member.leaseExpires + this.cfg.flapWindowS * 1000) {
           this.setPresence(room, member, "offline");
+          // An offline owner cannot finish its work: hand the task back (10.3).
+          this.releaseTasksOf(room, member.id, "offline");
           // An offline holder frees the floor (queued members are skipped by advance).
           if (room.floor.holder === member.id) this.releaseFloor(room);
           const owedTo = room.pendingReplies

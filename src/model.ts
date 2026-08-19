@@ -115,7 +115,29 @@ export interface RfaTask {
   reply_by: string | null;
   evidence_required: boolean;
   evidence: TaskEvidence | null;
-  verification: { pending: boolean; verifier: string | null; verdict: "accept" | "reject" | null; note: string | null };
+  verification: {
+    pending: boolean;
+    verifier: string | null;
+    /** Which organization accepted the evidence (spec 10.4); "local" for a hub-hosted member. */
+    verifier_home?: string | null;
+    verdict: "accept" | "reject" | null;
+    note: string | null;
+    /** Rejections for the CURRENT attempt; bounded by policies.max_rejections (spec 10.4). */
+    rejections?: number;
+  };
+  /**
+   * Claim generation (spec 10.3). Public because it must be orderable and
+   * auditable; the secret half (`claim_token`) never appears in a task object,
+   * an event or a roster snapshot, because a fence that is broadcast on first
+   * legitimate use is a privilege-escalation primitive.
+   */
+  attempt?: number;
+  /** When the current claim lapses, tracking the owner's presence lease; null when unclaimed. */
+  lease_expires?: string | null;
+  /** When the last claim was released, whatever the reason. */
+  released_at?: string | null;
+  /** Claims allowed before the task becomes pickup-only for its creator, the host, or a human. */
+  max_attempts?: number;
   note: string | null;
   created_at: string;
   updated_at: string;
@@ -165,6 +187,10 @@ export interface RoomPolicies {
   max_members: number;
   /** Per-member sends/minute; null falls back to the hub-wide default (v0.4.2 rate budgets). */
   member_rpm?: number | null;
+  /** Rejections allowed per (task, attempt) before a creator, host or human must clear the counter (spec 10.4). */
+  max_rejections?: number;
+  /** Claims allowed per task before it becomes pickup-only for its creator, the host or a human (spec 10.3). */
+  max_attempts_default?: number;
   /** Max unanswered outbound requests per member; null = unlimited. */
   max_pending_requests?: number | null;
 }
