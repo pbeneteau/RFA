@@ -13,7 +13,7 @@ import { RfaError } from "./errors.js";
 import { canonicalize, digestCard, sha256hex } from "./jcs.js";
 import { verifyCard, type Jwk, type VerificationDetail } from "./signing.js";
 import { TERMINAL_TASK_STATES } from "./model.js";
-import { neutralize, renderWrapped } from "./wrap.js";
+import { foldWhitespace, neutralize, renderWrapped } from "./wrap.js";
 import type {
   AgentCard,
   EventInput,
@@ -389,7 +389,10 @@ const APPROVAL_ACTION_CHARS = 64;
  * because a preview is rendered to a human who is one click from a side effect.
  */
 function previewOf(raw: string): string {
-  const clean = neutralize(raw);
+  // Fold BEFORE capping (wire 14.11's second SHOULD): a sender that pads with a
+  // thousand spaces or blank lines otherwise pushes the real input past the cap, so
+  // a human reads an empty-looking preview and approves whatever was underneath.
+  const clean = foldWhitespace(neutralize(raw)).trim();
   if (clean.length <= APPROVAL_PREVIEW_CHARS) return clean;
   const elided = clean.length - APPROVAL_PREVIEW_CHARS;
   return `${clean.slice(0, APPROVAL_PREVIEW_CHARS)} … [+${elided} chars elided]`;
