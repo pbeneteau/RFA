@@ -4,7 +4,7 @@ import { test } from "node:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ObsStore, dottedSegment, evaluateAlerts } from "../src/obs.js";
+import { ObsStore, dottedSegment, evaluateAlerts, formatReviewDigest } from "../src/obs.js";
 
 function fresh() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-obs-"));
@@ -85,4 +85,80 @@ test("retention: prune drops old runs but keeps feedback-bearing and needs_revie
   assert.ok(obs.get("recent"));
   obs.close();
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("review queues (20.5): queue 1 is flagged or negatively-scored runs, over the same population as the summary", () => {
+  const { dir, obs } = fresh();
+  const now = Date.now();
+  const at = (i: number, ms = 1_000, cost = 0.01) =>
+    obs.record({
+      id: `run${i}`, name: "serve", run_type: "agent_span",
+      start_time: now - 60_000, end_time: now - 60_000 + ms, cost_usd: cost,
+    });
+  for (let i = 0; i < 12; i++) at(i);
+  // A tool span must NOT count: the digest's two numbers have to be over one population.
+  obs.record({ id: "tool1", name: "grep", run_type: "tool", start_time: now - 60_000, end_time: now - 59_000 });
+
+  obs.markReview("run3", true);
+  obs.feedback({ run_id: "run4", key: "judge", score: 0, source_type: "model", rubric_hash: "abc" });
+  obs.feedback({ run_id: "run5", key: "human", score: -1, source_type: "human" });
+  // A passing score is not a review item.
+  obs.feedback({ run_id: "run6", key: "judge", score: 1, source_type: "model", rubric_hash: "abc" });
+
+  const q = obs.reviewQueues(3_600_000, now);
+  assert.equal(q.runs, 12, "tool spans are excluded, as in summary()");
+  assert.equal(q.flagged, 3, "needs_review, score 0 and score -1; a score of 1 is not review work");
+  assert.deepEqual(q.flagged_run_ids.slice(0, 3).sort(), ["run3", "run4", "run5"]);
+  obs.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("review queues: p90 needs ten runs to rank, and above-p90 is a top decile, not an anomaly", () => {
+  const { dir, obs } = fresh();
+  const now = Date.now();
+  const add = (i: number, ms: number, cost: number) =>
+    obs.record({
+      id: `r${i}`, name: "serve", run_type: "agent_span",
+      start_time: now - 30_000, end_time: now - 30_000 + ms, cost_usd: cost,
+    });
+
+  // Under ten runs there is no decile to speak of: reporting the largest run as
+  // "above p90" would make every quiet window look anomalous.
+  for (let i = 0; i < 9; i++) add(i, 1_000 + i, 0.01);
+  let q = obs.reviewQueues(3_600_000, now);
+  assert.equal(q.p90_latency_ms, null, "fewer than 10 runs: unranked");
+  assert.equal(q.top_decile, 0, "and therefore an empty queue, not a spurious one");
+
+  add(9, 60_000, 0.5); // one slow and expensive run makes ten
+  q = obs.reviewQueues(3_600_000, now);
+  assert.notEqual(q.p90_latency_ms, null, "ten runs can be ranked");
+  assert.ok(q.top_decile >= 1 && q.top_decile <= 2, `the tail, not the population (got ${q.top_decile})`);
+  assert.ok(q.top_decile < q.runs, "a percentile queue can never be everything");
+  obs.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("the digest names an empty queue rather than saying nothing", () => {
+  // A silent channel and a dead channel look identical, and this project's #ops
+  // channel WAS dead for a day without anyone noticing.
+  const quiet = formatReviewDigest({
+    window_ms: 24 * 3_600_000, runs: 0, flagged: 0, flagged_run_ids: [], top_decile: 0,
+    p90_cost_usd: null, p90_latency_ms: null,
+  });
+  assert.match(quiet, /nothing to review/, "an idle day still produces a line");
+
+  const busy = formatReviewDigest({
+    window_ms: 24 * 3_600_000, runs: 40, flagged: 2, flagged_run_ids: ["a", "b"], top_decile: 4,
+    p90_cost_usd: 0.0812, p90_latency_ms: 24_500,
+  });
+  assert.match(busy, /review queue: 2 runs \(a, b\)/);
+  assert.match(busy, /top decile: 4 above p90/, "named as a decile, never as anomalies");
+  assert.ok(!/anomal/i.test(busy), "the digest must not overstate what queue 2 is");
+  assert.match(busy, /24\.5s/, "p90 latency in seconds, the unit an operator reads");
+
+  const unranked = formatReviewDigest({
+    window_ms: 3_600_000, runs: 4, flagged: 0, flagged_run_ids: [], top_decile: 0,
+    p90_cost_usd: null, p90_latency_ms: null,
+  });
+  assert.match(unranked, /not ranked \(under 10 runs/, "says why the decile is absent instead of printing a 0");
 });

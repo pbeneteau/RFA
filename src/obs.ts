@@ -249,6 +249,68 @@ export class ObsStore {
     };
   }
 
+  /**
+   * The two review queues of spec 20.5, as counts.
+   *
+   * Queue 1 is work a human should look at: a run flagged `needs_review`, or one
+   * carrying feedback at or below zero. Queue 2 is the expensive-or-slow tail,
+   * cost or latency above the window's own p90.
+   *
+   * Note what queue 2 IS, because the digest must not overstate it: p90 taken
+   * over the same window it filters makes the count mechanically about a tenth
+   * of the runs, so it is a top-decile review lane and NOT an anomaly detector.
+   * It also means the queue cannot be empty once the window holds ten runs, so
+   * section 23's "non-empty for three consecutive weeks" trigger for a console
+   * review lane can only ever rest on queue 1.
+   *
+   * `run_type` is filtered to the two span kinds `summary` uses, so the two
+   * numbers in one digest are over the same population.
+   */
+  reviewQueues(windowMs: number, now: number = Date.now()): ReviewQueues {
+    const since = now - windowMs;
+    const rows = this.db
+      .prepare(
+        `SELECT id, cost_usd, (end_time - start_time) AS latency_ms, needs_review
+         FROM runs WHERE end_time >= ? AND run_type IN ('agent_span', 'generation_span')`,
+      )
+      .all(since) as { id: string; cost_usd: number | null; latency_ms: number; needs_review: 0 | 1 }[];
+
+    const negative = new Set(
+      (
+        this.db
+          .prepare(
+            `SELECT DISTINCT run_id FROM feedback WHERE created_at >= ? AND score IS NOT NULL AND score <= 0`,
+          )
+          .all(since) as { run_id: string }[]
+      ).map((r) => r.run_id),
+    );
+    const flagged = rows.filter((r) => r.needs_review === 1 || negative.has(r.id));
+
+    // p90 by nearest-rank on the sorted sample. Under ten runs there is no tenth
+    // decile to speak of, so the queue is reported as empty rather than as the
+    // single largest run, which would make any quiet window look anomalous.
+    const p90 = (values: number[]): number | null => {
+      const v = values.filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
+      if (v.length < 10) return null;
+      return v[Math.min(v.length - 1, Math.ceil(0.9 * v.length) - 1)];
+    };
+    const p90Cost = p90(rows.map((r) => r.cost_usd ?? 0));
+    const p90Latency = p90(rows.map((r) => r.latency_ms));
+    const topDecile = rows.filter(
+      (r) => (p90Cost !== null && (r.cost_usd ?? 0) > p90Cost) || (p90Latency !== null && r.latency_ms > p90Latency),
+    );
+
+    return {
+      window_ms: windowMs,
+      runs: rows.length,
+      flagged: flagged.length,
+      flagged_run_ids: flagged.slice(0, 5).map((r) => r.id),
+      top_decile: topDecile.length,
+      p90_cost_usd: p90Cost,
+      p90_latency_ms: p90Latency,
+    };
+  }
+
   /** Retention (v0.4 3.9): prune old runs UNLESS they carry feedback or need review. Returns pruned count. */
   prune(keepDays: number, now: number = Date.now()): number {
     const cutoff = now - keepDays * 86_400_000;
@@ -330,3 +392,45 @@ function hydrate(r: RunRow): ObsRun {
 
 const json = (v: unknown) => (v === undefined ? null : JSON.stringify(v));
 const parse = (s: string | null) => (s === null ? null : (JSON.parse(s) as unknown));
+
+/** The counts behind an `#ops` review digest (spec 20.5). */
+export interface ReviewQueues {
+  window_ms: number;
+  runs: number;
+  /** Queue 1: flagged `needs_review`, or carrying feedback at or below zero. */
+  flagged: number;
+  /** A few ids so the digest points somewhere, not just at a number. */
+  flagged_run_ids: string[];
+  /** Queue 2: cost or latency above the window's own p90. Null p90s mean too few runs to rank. */
+  top_decile: number;
+  p90_cost_usd: number | null;
+  p90_latency_ms: number | null;
+}
+
+/**
+ * One line per queue, as a digest rather than an alert.
+ *
+ * It says "top decile" and not "anomalies" on purpose: queue 2 is a percentile
+ * lane whose size is a property of the window, and a digest that dressed it up
+ * as anomaly detection would be the same defect the spec calls out for the
+ * third, inexpressible queue. When there is nothing to review the digest says so
+ * in one line, because a silent channel and a dead channel look identical (the
+ * #ops channel WAS dead for a day, unnoticed, in exactly that way).
+ */
+export function formatReviewDigest(q: ReviewQueues): string {
+  const hours = Math.round(q.window_ms / 3_600_000);
+  const head = `#ops digest (${hours}h): ${q.runs} run${q.runs === 1 ? "" : "s"}`;
+  if (q.runs === 0) return `${head}, nothing to review`;
+  const lines = [head];
+  lines.push(
+    q.flagged === 0
+      ? "  review queue: empty (no needs_review, no feedback at or below zero)"
+      : `  review queue: ${q.flagged} run${q.flagged === 1 ? "" : "s"} (${q.flagged_run_ids.join(", ")}${q.flagged > q.flagged_run_ids.length ? ", ..." : ""})`,
+  );
+  lines.push(
+    q.p90_latency_ms === null
+      ? `  top decile: not ranked (under 10 runs in the window)`
+      : `  top decile: ${q.top_decile} above p90 (cost $${(q.p90_cost_usd ?? 0).toFixed(4)}, latency ${(q.p90_latency_ms / 1000).toFixed(1)}s)`,
+  );
+  return lines.join("\n");
+}

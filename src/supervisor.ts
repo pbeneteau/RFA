@@ -27,7 +27,7 @@ import * as path from "node:path";
 import { AccountLedger, DEFAULT_CAP, RATE_LIMIT_PAUSE_FLOOR_MS } from "./account.js";
 import { listPacks, loadPack, type AgentPack } from "./agentdef.js";
 import { RoomMember } from "./client.js";
-import { ObsStore, evaluateAlerts } from "./obs.js";
+import { ObsStore, evaluateAlerts, formatReviewDigest } from "./obs.js";
 import { spawnTsx, stopTree } from "./proc.js";
 import { runBackup } from "./platform.js";
 import { loadSecrets, pickSecrets, transportToken } from "./secrets.js";
@@ -409,6 +409,12 @@ const OPS = {
   alertEveryMs: 5 * 60_000,
   alertWindowMs: 15 * 60_000,
   alertCooldownMs: 30 * 60_000,
+  // The review digest (spec 20.5): evaluated on this same tick, posted daily over
+  // a daily window. It is a digest, not an alert, so the cadence is the point: the
+  // two queues move on the timescale a human reviews them on, and a count reposted
+  // every five minutes is a channel an operator learns to ignore.
+  digestEveryMs: 24 * 3_600_000,
+  digestWindowMs: 24 * 3_600_000,
   retentionDays: 14,
   backupHourLocal: 3, // daily, once past 03:00
   backupKeep: 7,
@@ -464,6 +470,42 @@ async function alertPass(): Promise<void> {
   } finally {
     obs.close();
   }
+}
+
+/**
+ * The `#ops` review digest (spec 20.5), and the one new scheduled job v0.5 admits
+ * (18.6's sequencing rule, now satisfiable because layer 3 exists).
+ *
+ * The last-posted time is PERSISTED, unlike the alert cooldowns which live in
+ * memory: a supervisor restart is routine (three today), and an in-memory daily
+ * timer would post a fresh digest on each one, which is how a digest becomes
+ * noise.
+ */
+const DIGEST_STATE = path.join(ROOT, "data", "ops-digest.json");
+function lastDigestAt(): number {
+  try {
+    return (JSON.parse(fs.readFileSync(DIGEST_STATE, "utf8")) as { last_at?: number }).last_at ?? 0;
+  } catch {
+    return 0;
+  }
+}
+async function digestPass(): Promise<void> {
+  if (!fs.existsSync(OBS_DB)) return;
+  const now = Date.now();
+  if (now - lastDigestAt() < OPS.digestEveryMs) return;
+  const obs = new ObsStore(OBS_DB);
+  let text: string;
+  try {
+    text = formatReviewDigest(obs.reviewQueues(OPS.digestWindowMs, now));
+  } finally {
+    obs.close();
+  }
+  // Stamp BEFORE posting: a hub that is down must not turn a daily digest into a
+  // five-minute retry loop against an unreachable room.
+  fs.writeFileSync(DIGEST_STATE, JSON.stringify({ last_at: now }, null, 1) + "\n", { mode: 0o600 });
+  for (const line of text.split("\n")) log(line);
+  const m = await opsMember();
+  await m?.send({ body: text, kind: "status" }).catch((e) => log(`digest post failed: ${(e as Error).message}`));
 }
 
 /** Nightly: retention prune + .backup of every SQLite DB + archive of memory/state dirs. */
@@ -562,6 +604,7 @@ const accountTimer = setInterval(() => {
 accountTimer.unref?.();
 const opsTimer = setInterval(() => {
   void alertPass();
+  void digestPass();
   void nightlyPass();
 }, OPS.alertEveryMs);
 opsTimer.unref?.();
