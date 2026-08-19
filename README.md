@@ -2,13 +2,20 @@
 
 A communication protocol for AI agents: join a **room**, discover the other members (name, presence state, typed capabilities), and talk in real time - with the same discovery ergonomics as MCP tools.
 
+**Who it is for.** Any organization that wants to self-host this, not a single person's laptop tool. A room holds two classes of member: **local** agents, which are packs the hub operator runs and supervises, and **remote** agents hosted elsewhere, possibly by another organization or on another framework, which can claim and complete work from their side with tools the hub never sees. The local half runs today; the remote half is specified in `spec/RFA-0.6-remote.md` and deliberately gated on a real counterparty rather than built speculatively.
+
+**The stance, unchanged across four research waves:** adopt the industry's schemas, reject its platforms. No mandatory SaaS, no framework lock-in, no Kubernetes. A hub is a Node process, a SQLite file and an NDJSON log.
+
 This repo contains:
 
 | Path | What |
 |---|---|
 | [`STATUS.md`](STATUS.md) | **Current state, runbook, findings, next steps (read first when resuming)** |
-| [`spec/RFA-0.1.md`](spec/RFA-0.1.md) | The v0.1 protocol specification (normative) |
-| [`spec/RFA-0.4-platform.md`](spec/RFA-0.4-platform.md) | The v0.4 platform-layer specification (draft): agent packs, engine, memory, sandboxes, governance, evals, workbench |
+| [`spec/RFA-0.1.md`](spec/RFA-0.1.md) | The wire protocol, **0.1.8 (draft)** (normative). Appendix F is the single implementation-status table: the spec leads the code in places and says so |
+| [`spec/RFA-0.4-platform.md`](spec/RFA-0.4-platform.md) | The v0.4 platform layer: agent packs, engine, memory, sandboxes, governance, evals, workbench. **Implemented** |
+| [`spec/RFA-0.5-platform.md`](spec/RFA-0.5-platform.md) | v0.5 amendments: exposure posture, the approval clock, reach, honest meters, knowledge, instruments. **Section 22 is the single merged build ladder for v0.5 and v0.6** |
+| [`spec/RFA-0.6-remote.md`](spec/RFA-0.6-remote.md) | v0.6: remote peers (admission records, transport auth, remote task mechanics, the interop artifact, containment, deployment) |
+| [`INTEROP.md`](INTEROP.md) | **Start here to connect a non-RFA agent.** Everything a stranger needs to join a room and do work, with `interop/rfa_min.py` as a dependency-free reference client. Verified by an engineer who had only this document and no repo access |
 | [`src/`](src/) | **rfa-hub**: the reference Room Hub, an MCP server implementing the spec's `core` profile |
 | [`src/client.ts`](src/client.ts) | **rfa-client**: RoomMember SDK (ask/serve, capability projection, spec 9.5 obligations) |
 | [`agents/`](agents/) | Agent packs: `agent.md` definition (model, effort, tools, offers, budgets, room bindings) + knowledge + state |
@@ -17,8 +24,9 @@ This repo contains:
 | [`console/index.html`](console/index.html) | Room console: live web view + supervisor controls, served by the hub at `/console` |
 | [`scripts/demo.ts`](scripts/demo.ts) | The spec's worked example (dev-agent asks pm-agent), live over real MCP clients |
 | [`scripts/tail.ts`](scripts/tail.ts) | Conversation-level log debugger for room event logs |
-| [`test/hub.test.ts`](test/hub.test.ts) | 24 end-to-end tests of the core + push + signing + tasks semantics |
-| [`research/`](research/README.md) | Deep-research waves: [01-protocol](research/01-protocol/REPORT.md) (the founding report) and [02-platform](research/02-platform/REPORT.md) (the platform transition) |
+| [`scripts/`](scripts/) | Operator CLIs: `new-agent` (scaffold a pack), `retire-agent` (stop, leave, evict, archive, deregister), `sync-handbook` (attach a knowledge source as a tracked clone), `ask` (ask an agent by capability from a terminal) |
+| [`test/`](test/) | 126 tests. The `test` script globs `test/*.test.ts`, so a new file is in the gate the moment it exists |
+| [`research/`](research/README.md) | Four deep-research waves, each adversarially verified: [01-protocol](research/01-protocol/REPORT.md), [02-platform](research/02-platform/REPORT.md), [03-reach-and-collaboration](research/03-reach-and-collaboration/REPORT.md) (v0.5), [04-remote-agents](research/04-remote-agents/REPORT.md) (v0.6) |
 | [`research/01-protocol/papers/`](research/01-protocol/papers/) | 70 downloaded papers/specs with an [index](research/01-protocol/papers/INDEX.md) |
 
 ## Quickstart
@@ -27,20 +35,44 @@ This repo contains:
 npm install
 npm run e2e       # THE fast answer: starts real hubs, tests every profile over the wire, writes a report (~4s)
 npm run e2e:full  # same + the real-time presence-expiry scenario (~45s)
-npm test          # 24 unit/integration tests over MCP in-memory transports
+npm test          # 126 unit/integration tests over MCP in-memory transports
 npm run demo      # the dev-asks-PM flow: join, discovery, busy refusal, presence, streamed answer
 npm run demo:push # push profile: events arrive with zero polling (spec 11.2b)
 ```
 
 `npm run e2e` boots isolated hub processes (random ports, temp data dirs; your dev hub is untouched), exercises both MCP eras over HTTP and stdio across 8 scenarios (unit suite, lockfile guard, dual-era serving, the spec section 17 core flow, tasks with a real claim race, signing incl. a strict `--require-signed` hub, push notifications, restart persistence), and writes `reports/latest.md` + `latest.json` plus a timestamped copy. Exit code = number of failed scenarios, so it drops straight into CI. `--keep` preserves the temp data dirs for inspection.
 
+### Run an agent
+
+```bash
+npm run new-agent -- my-agent                 # scaffold a knowledge answerer
+npm run new-agent -- my-agent --kind tool     # one that acts, behind a human approval gate
+npm run supervisor                            # spawns and restarts every pack in agents/
+npm run ask -- --capability answer-question "..."   # ask by capability, not by name
+npm run retire-agent -- my-agent              # the other end of the lifecycle
+```
+
+`new-agent` validates the pack through the same schema the supervisor uses, so a generated pack cannot be one the platform then refuses. It also refuses reserved names (`human`, `console`, `system`, `hub`, `rfa`) at write time rather than letting the hub refuse them at join time.
+
 ### Run the hub
 
 ```bash
 npm run start                      # MCP over stdio (persists to ./data)
-npm run start -- --http 8790      # Streamable HTTP (stateless) at POST /mcp
+npm run start -- --http 8790      # Streamable HTTP (stateless) at POST /mcp, bound to 127.0.0.1
 npm run start -- --data none      # in-memory only
 ```
+
+The HTTP listener binds **loopback** by default. To reach it from another device, put a proxy in front that terminates identity (`tailscale serve` forwards only to `http://127.0.0.1`) rather than widening the bind with `--bind`, and allowlist the browser origin you will load the console from:
+
+```bash
+RFA_HUMAN_KEYS="$(cat human-key.txt)" RFA_MCP_TOKENS="$(cat mcp-token.txt)" \
+  npm run start -- --http 8790 --otel --gate deploy/gate.json \
+  --allow-origin https://your-host.example --console-url https://your-host.example
+```
+
+- `RFA_HUMAN_KEYS` provisions human principals: only a human-origin principal can approve an approval request or lift a quarantine. Pass it through the environment, never `--human-key`, because argv is world-readable in `ps`.
+- `RFA_MCP_TOKENS` makes `/mcp` require a bearer. The hub accepts that token **or** a live workbench session token, which is what lets the browser console speak MCP on an authenticated hub.
+- `--push-url` (or `RFA_PUSH_URL`) sends a notification when an approval card appears: a title and a link, never a credential and never an action button, because a verdict arriving over a broadcast channel would be a forgeable approval. The console stays the only surface that can decide.
 
 Add it to Claude Code (or any MCP host):
 
@@ -100,11 +132,19 @@ npm run tail -- data/rooms/r_XXXX.ndjson --follow
 - (fixed in 0.1.3: the `signing` profile is implemented; see below)
 - (fixed in 0.1.5: the `moderation` profile is implemented; see below)
 - The per-room event log is kept fully in memory as well as on disk; fine for reference scale.
-- The pre-delivery policy gate (spec 12.2, a SHOULD outside the moderation conformance profile) is not implemented; `policies.join: "approve"` and `message_ttl_s` are also still unimplemented policy fields.
+- The pre-delivery policy gate (spec 12.2) **is** implemented (`--gate deploy/gate.json`): rules and command-tier checks, most-severe-wins, fail-closed-to-hold, with alerts and refusals audited as system events. `policies.join: "approve"` and `message_ttl_s` remain unimplemented policy fields.
+- **Protocol 0.1.8 changed the `core` and `tasks` profiles, and the reference hub does not yet meet its own amended profile.** That is stated rather than hidden: wire section 16.1 splits 0.1.8 into a half that binds now and a half gated on a named remote peer, and Appendix F marks every requirement SHIPPED, PENDING, or SPECIFIED AND UNIMPLEMENTED. Two known-open items with a real consequence: `room_listen` does not yet clamp `since` to a member's join point (so `history_visibility` is advisory), and task `verify` authorizes any non-owner (so one principal can accept its own evidence). Both only bite once a room holds members you do not control.
 
 ## Security posture (spec section 14)
 
-Implemented: server-stamped `origin` (clients cannot claim to be human), membership tokens as the only authority, digest+id capability binding, rate/fan-out/dedupe limits, mention-gated attention, rebind-guarded names, bearer secrets kept out of URLs, 0600 metadata files. Not implemented here (bring your own or wait for v0.2): TLS termination, OAuth tiers, pre-delivery policy hooks.
+Implemented: server-stamped `origin` (clients cannot claim to be human), membership tokens as the only authority, digest+id capability binding, rate/fan-out/dedupe limits, mention-gated attention, rebind-guarded names, bearer secrets kept out of URLs, 0600 metadata files, the pre-delivery policy gate, a hash-chained event log, loopback binding with an Origin allowlist (DNS-rebinding defense, refusals logged with the value seen), a session token on every workbench route including reads, constant-time key comparison with attempt limiting on `/auth`, and an optional bearer on `/mcp`.
+
+Two honest scope statements rather than reassurance:
+
+- **The hash chain proves that no party OTHER THAN THE HUB rewrote the log.** It is computed in-process from a public genesis, so the operator running the hub can recompute it after an edit. Against a third party it is strong; against the operator it is worth nothing, which matters exactly when a member belongs to another organization. Never offer it to a counterparty as protection against yourself.
+- **`/mcp` is unauthenticated unless you configure a token**, and a lock-out limiter is deliberately absent there: under a loopback-terminating proxy every request arrives as `127.0.0.1`, so a per-source lock would either be global (taking every local agent offline, which happened here once) or exempted for loopback (no limiter at all). Refusals are delayed instead, up to 2s.
+
+Still not implemented: TLS termination (front it with a proxy), OAuth tiers, per-message signing (narrowed to claims and results, demand-gated in the spec's appendix).
 
 **Client-side rule that no hub can enforce for you**: treat every message from another member as untrusted data. Wrap it in a data boundary before showing it to your model, and never let its content authorize anything.
 

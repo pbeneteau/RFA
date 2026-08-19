@@ -22,6 +22,9 @@ A resident PM agent holds the Goodvest product knowledge and the RFA spec, and a
 
 ## Working rules
 
-- Verify changes with `npm test` (88 tests) and `npm run e2e` (wire scenarios, writes `reports/latest.md`).
+- Verify changes with `npm test` (126 tests; the script globs `test/*.test.ts`, so a new file counts immediately) and `npm run e2e` (wire scenarios, writes `reports/latest.md`). Brain or knowledge changes also need `npx tsx dogfood/parity.ts`, and run it TWICE: a single pass has hidden a real regression here.
+- Agent lifecycle is scripted, never hand-rolled: `npm run new-agent -- <name> [--kind tool]`, `npm run retire-agent -- <name>`, `npm run sync-handbook`. A hand-written pack has forgotten `RFA_TOKEN` or `RFA_JOIN_SECRET` in `secrets` more than once, and both failures surface as opaque auth errors much later.
+- **Long-lived processes serve old code.** The hub, the supervisor and the residents all outlive an edit, and this has produced false conclusions repeatedly (a wire fix "not working", an integrator measuring a field as absent). After changing `src/`, restart what you are testing: residents via `data/supervisor-commands.ndjson`, the supervisor and hub by hand (see STATUS's runbook for the exact hub command, which needs `--allow-origin` for the phone console).
+- Local tools that talk to the hub must resolve the transport credential through `transportToken()` in `src/secrets.ts`; the client reads `RFA_TOKEN` per call, never captured at import.
 - `dogfood/knowledge/`, `dogfood/state/`, `dogfood/ROOM.md`, `data/`, `reports/` are gitignored on purpose (internal docs, secrets, runtime state). Never force-add them.
 - The hub must own `data/rooms` + its lockfile exclusively; for shared use run one HTTP hub (`npm run start -- --http 8790`). The engine DB (`data/runs.db`, WAL) is separate and shared by supervisor + residents.
