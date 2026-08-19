@@ -4,11 +4,11 @@
  */
 import { strict as assert } from "node:assert";
 import { after, before, test } from "node:test";
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
-import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { startHub as spawnTestHub, stopAllHubs, type TestHub } from "./hubproc.js";
 
 const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -22,41 +22,17 @@ let dataDir: string;
 /** What the aggregated auth-log row must add up to: every /auth response, counted once. */
 const expected = { successes: 0, failures: 0 };
 
-type HubProc = { proc: ChildProcess; base: string; dataDir: string };
+type HubProc = TestHub & { dataDir: string };
 const spawned: HubProc[] = [];
-
-async function freePort(): Promise<number> {
-  return new Promise<number>((resolve) => {
-    const srv = net.createServer();
-    srv.listen(0, "127.0.0.1", () => {
-      const p = (srv.address() as net.AddressInfo).port;
-      srv.close(() => resolve(p));
-    });
-  });
-}
 
 /** A hub on its own port with its own data dir: the auth log is asserted on disk and the hub must own its lockfile exclusively. */
 async function startHub(extraArgs: string[]): Promise<HubProc> {
-  const port = await freePort();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-auth-"));
-  const proc = spawn(
-    "npx",
-    ["-y", "tsx", "src/main.ts", "--http", String(port), "--data", dir, "--human-key", HK, ...extraArgs],
-    { cwd: ROOT, stdio: "ignore" },
-  );
-  const h: HubProc = { proc, base: `http://127.0.0.1:${port}`, dataDir: dir };
+  // The shared helper owns the spawn and the readiness probe (an unauthenticated
+  // 401 on /api/agents, which costs no /auth attempt); this wrapper adds the data
+  // dir the log assertions read.
+  const h: HubProc = { ...(await spawnTestHub(["--data", dir, "--human-key", HK, ...extraArgs])), dataDir: dir };
   spawned.push(h);
-  for (let i = 0; ; i++) {
-    if (i >= 100) throw new Error("hub did not come up");
-    try {
-      // 401 proves the listener is up without spending an /auth attempt. This route is
-      // gated by the session token whatever /mcp requires, so it works in both modes.
-      if ((await fetch(`${h.base}/api/agents`)).status === 401) break;
-    } catch {
-      /* not listening yet */
-    }
-    await sleep(100);
-  }
   return h;
 }
 
@@ -130,11 +106,11 @@ before(async () => {
   dataDir = h.dataDir;
 });
 
-after(() => {
-  for (const h of spawned) {
-    h.proc.kill("SIGKILL");
-    fs.rmSync(h.dataDir, { recursive: true, force: true });
-  }
+after(async () => {
+  // stopAllHubs reaps the process TREE; killing the pid left the real hub alive
+  // on its port (src/proc.ts, and 119 orphans found on 2026-08-19).
+  await stopAllHubs();
+  for (const h of spawned) fs.rmSync(h.dataDir, { recursive: true, force: true });
 });
 
 test("a provisioned key authenticates; a wrong key is refused whatever its length", async () => {

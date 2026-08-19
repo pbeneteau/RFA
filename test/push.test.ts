@@ -7,28 +7,16 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import * as http from "node:http";
-import * as net from "node:net";
-import { spawn } from "node:child_process";
-import * as path from "node:path";
 import { RoomHub } from "../src/store.js";
 import type { AgentCard } from "../src/model.js";
+import { freePort, startHub, stopHub } from "./hubproc.js";
 
-const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
 const HK = "hk_push_test";
 const card = (name: string): AgentCard => ({
   name,
   description: `${name} does things.`,
   skills: [{ id: `${name}-skill`, description: `${name}'s skill.` }],
 });
-const freePort = async (): Promise<number> =>
-  new Promise((resolve) => {
-    const srv = net.createServer();
-    srv.listen(0, "127.0.0.1", () => {
-      const p = (srv.address() as net.AddressInfo).port;
-      srv.close(() => resolve(p));
-    });
-  });
-
 test("an approval card pushes a title and a link, and nothing that could decide it", async () => {
   const received: { headers: http.IncomingHttpHeaders; body: string }[] = [];
   const sink = http.createServer((req, res) => {
@@ -42,24 +30,13 @@ test("an approval card pushes a title and a link, and nothing that could decide 
   });
   const sinkPort = await freePort();
   await new Promise<void>((r) => sink.listen(sinkPort, "127.0.0.1", () => r()));
-  const hubPort = await freePort();
-
-  const hub = spawn(
-    "npx",
-    ["-y", "tsx", "src/main.ts", "--http", String(hubPort), "--data", "none", "--human-key", HK,
-     "--push-url", `http://127.0.0.1:${sinkPort}/topic`, "--console-url", "https://example.ts.net"],
-    { cwd: ROOT, stdio: "ignore" },
-  );
+  const hub = await startHub([
+    "--human-key", HK,
+    "--push-url", `http://127.0.0.1:${sinkPort}/topic`,
+    "--console-url", "https://example.ts.net",
+  ]);
+  const hubPort = hub.port;
   try {
-    // Wait for the listener.
-    for (let i = 0; i < 100; i++) {
-      try {
-        const r = await fetch(`http://127.0.0.1:${hubPort}/api/agents`);
-        if (r.status === 401) break;
-      } catch {
-        await new Promise((r) => setTimeout(r, 100));
-      }
-    }
     // A room with a pending approval card, over the real wire.
     const localHub = new RoomHub({ dataDir: null, sweepIntervalMs: 0 });
     void localHub; // the spawned hub owns the room; this is only for types
@@ -103,7 +80,7 @@ test("an approval card pushes a title and a link, and nothing that could decide 
     }
     assert.match(body, /console/i, "the body tells the operator where the decision happens");
   } finally {
-    hub.kill("SIGKILL");
+    await stopHub(hub);
     sink.close();
   }
 });

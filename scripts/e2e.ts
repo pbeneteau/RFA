@@ -14,6 +14,7 @@ import * as path from "node:path";
 import * as net from "node:net";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { spawnTsx, stopTree } from "../src/proc.js";
 import { generateSigningKey, signCard } from "../src/signing.js";
 
 const FULL = process.argv.includes("--full");
@@ -89,7 +90,7 @@ interface Hub {
 async function startHub(opts: { dataDir?: string; extraArgs?: string[] } = {}): Promise<Hub> {
   const port = await freePort();
   const dataDir = opts.dataDir ?? tmpDir("hub");
-  const proc = spawn("npx", ["-y", "tsx", "src/main.ts", "--http", String(port), "--data", dataDir, ...(opts.extraArgs ?? [])], {
+  const proc = spawnTsx(path.join(ROOT, "src", "main.ts"), ["--http", String(port), "--data", dataDir, ...(opts.extraArgs ?? [])], {
     cwd: ROOT,
     stdio: ["ignore", "ignore", "pipe"],
   });
@@ -111,11 +112,9 @@ async function startHub(opts: { dataDir?: string; extraArgs?: string[] } = {}): 
 }
 
 async function stopHub(hub: Hub): Promise<void> {
-  if (hub.proc.exitCode === null) {
-    hub.proc.kill("SIGTERM");
-    for (let i = 0; i < 50 && hub.proc.exitCode === null; i++) await sleep(50);
-    if (hub.proc.exitCode === null) hub.proc.kill("SIGKILL");
-  }
+  // stopTree, not proc.kill: signalling the pid leaves descendants holding the
+  // port (src/proc.ts has the measurement).
+  await stopTree(hub.proc, 2_500);
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -201,7 +200,7 @@ await scenario("hub boot + exclusive-store lockfile", async () => {
   mainHub = await startHub({ extraArgs: ["--human-key", E2E_HUMAN_KEY] });
   // A second hub over the SAME data dir must fail loudly.
   const port2 = await freePort();
-  const clash = spawn("npx", ["-y", "tsx", "src/main.ts", "--http", String(port2), "--data", mainHub.dataDir], {
+  const clash = spawnTsx(path.join(ROOT, "src", "main.ts"), ["--http", String(port2), "--data", mainHub.dataDir], {
     cwd: ROOT, stdio: ["ignore", "ignore", "pipe"],
   });
   children.push(clash);
@@ -539,7 +538,7 @@ console.log(dim(`report: reports/e2e-${stamp}.md (+ reports/latest.md, latest.js
 // ---------------------------------------------------------------- cleanup
 
 for (const hub of []) void hub;
-await Promise.all(children.map(async (c) => { if (c.exitCode === null) { c.kill("SIGTERM"); await sleep(200); if (c.exitCode === null) c.kill("SIGKILL"); } }));
+await Promise.all(children.map((c) => stopTree(c, 1_500)));
 if (!KEEP) for (const d of tmpDirs) fs.rmSync(d, { recursive: true, force: true });
 else console.log(dim(`kept temp dirs:\n  ${tmpDirs.join("\n  ")}`));
 

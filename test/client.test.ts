@@ -1,45 +1,23 @@
 /** rfa-client SDK tests against a real hub process over the real wire. */
 import { strict as assert } from "node:assert";
 import { after, before, test } from "node:test";
-import { spawn, type ChildProcess } from "node:child_process";
 import * as http from "node:http";
-import * as net from "node:net";
-import * as path from "node:path";
 import { RoomMember, RfaClientError } from "../src/client.js";
 import type { Envelope } from "../src/model.js";
+import { startHub, stopAllHubs, type TestHub } from "./hubproc.js";
 
-const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-let hub: ChildProcess;
+let hub: TestHub;
 let hubUrl: string;
 
 before(async () => {
-  const port = await new Promise<number>((resolve) => {
-    const srv = net.createServer();
-    srv.listen(0, "127.0.0.1", () => {
-      const p = (srv.address() as net.AddressInfo).port;
-      srv.close(() => resolve(p));
-    });
-  });
-  hubUrl = `http://127.0.0.1:${port}/mcp`;
-  hub = spawn("npx", ["-y", "tsx", "src/main.ts", "--http", String(port), "--data", "none"], { cwd: ROOT, stdio: "ignore" });
-  for (let i = 0; i < 100; i++) {
-    try {
-      const r = await fetch(hubUrl, {
-        method: "POST",
-        headers: { "content-type": "application/json", accept: "application/json, text/event-stream", "Mcp-Method": "server/discover" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "server/discover", params: { _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {}, "io.modelcontextprotocol/clientInfo": { name: "t", version: "0" } } } }),
-      });
-      if (r.ok) break;
-    } catch {
-      await sleep(100);
-    }
-  }
+  hub = await startHub();
+  hubUrl = hub.mcp;
 });
 
-after(() => {
-  hub.kill("SIGKILL");
+after(async () => {
+  await stopAllHubs();
 });
 
 const card = (name: string, skillId: string, skillDesc: string) => ({

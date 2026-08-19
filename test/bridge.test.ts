@@ -1,9 +1,6 @@
 /** v0.4.6 approval bridge: interrupt matching + the room-side approve/reject/expire wait, over the real wire. */
 import { strict as assert } from "node:assert";
 import { after, before, test } from "node:test";
-import { spawn, type ChildProcess } from "node:child_process";
-import * as net from "node:net";
-import * as path from "node:path";
 import {
   approvalWindowMs,
   DEFAULT_APPROVAL_WINDOW_MS,
@@ -13,12 +10,12 @@ import {
   requestApproval,
 } from "../src/bridge.js";
 import { RoomMember, ServeRefusal } from "../src/client.js";
+import { sessionToken, startHub, stopAllHubs, type TestHub } from "./hubproc.js";
 
-const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const HK = "hk_bridge_test";
 
-let hub: ChildProcess;
+let hub: TestHub;
 let hubUrl: string;
 /** Session token for the workbench API: reads are operator-only since v0.5.0. */
 let wbToken: string;
@@ -28,39 +25,14 @@ async function wbGet(route: string, token: string = wbToken): Promise<Response> 
 }
 
 before(async () => {
-  const port = await new Promise<number>((resolve) => {
-    const srv = net.createServer();
-    srv.listen(0, "127.0.0.1", () => {
-      const p = (srv.address() as net.AddressInfo).port;
-      srv.close(() => resolve(p));
-    });
-  });
-  hubUrl = `http://127.0.0.1:${port}/mcp`;
-  hub = spawn("npx", ["-y", "tsx", "src/main.ts", "--http", String(port), "--data", "none", "--human-key", HK], {
-    cwd: ROOT,
-    stdio: "ignore",
-  });
-  for (let i = 0; i < 100; i++) {
-    try {
-      // Unauthenticated: 401 proves the listener is up AND that reads are gated.
-      const r = await fetch(hubUrl.replace("/mcp", "/api/agents"));
-      if (r.status === 401) break;
-      if (r.ok) throw new Error("workbench reads must require a session token");
-    } catch (err) {
-      if ((err as Error).message.includes("must require")) throw err;
-      await sleep(100);
-    }
-  }
-  const auth = await fetch(hubUrl.replace("/mcp", "/auth"), {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ human_key: HK }),
-  });
-  wbToken = ((await auth.json()) as { session_token: string }).session_token;
+  // startHub's readiness probe is itself the assertion that workbench reads are gated.
+  hub = await startHub(["--human-key", HK]);
+  hubUrl = hub.mcp;
+  wbToken = await sessionToken(hub, HK);
 });
 
-after(() => {
-  hub.kill("SIGKILL");
+after(async () => {
+  await stopAllHubs();
 });
 
 test("interruptMatch: exact, glob, false-disables, decision passthrough", () => {

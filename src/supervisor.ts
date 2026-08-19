@@ -21,15 +21,16 @@
  *   pause after a provider rate limit. The shared state is `src/account.ts` over
  *   `data/runs.db`; residents consult it, the supervisor governs it.
  */
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { AccountLedger, DEFAULT_CAP, RATE_LIMIT_PAUSE_FLOOR_MS } from "./account.js";
 import { listPacks, loadPack, type AgentPack } from "./agentdef.js";
 import { RoomMember } from "./client.js";
 import { ObsStore, evaluateAlerts } from "./obs.js";
+import { spawnTsx, stopTree } from "./proc.js";
 import { runBackup } from "./platform.js";
-import { loadSecrets, pickSecrets } from "./secrets.js";
+import { loadSecrets, pickSecrets, transportToken } from "./secrets.js";
 
 const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
 const AGENTS = path.join(ROOT, "agents");
@@ -171,10 +172,15 @@ function start(child: Child): void {
     if (missing.length > 0) log(`${child.pack.name}: missing secrets [${missing.join(", ")}] (declare them in data/secrets.json)`);
     env = { ...process.env, ...picked };
   }
-  const proc = spawn("npx", ["tsx", RESIDENT, "--agent", child.pack.name], {
+  // `node --import tsx` and its own process group, NOT `npx tsx` (src/proc.ts):
+  // the wrapper stack cannot forward the SIGKILL that `drain` escalates to, so a
+  // resident that missed its drain deadline used to survive as an unsupervised
+  // process still serving its membership while this supervisor recorded it as
+  // dead and started a replacement. The group also covers the Agent SDK's
+  // `claude` child, which a pid-directed kill would orphan mid-answer.
+  const proc = spawnTsx(RESIDENT, ["--agent", child.pack.name], {
     cwd: ROOT,
     stdio: ["ignore", fd, fd],
-    detached: false,
     env,
   });
   child.proc = proc;
@@ -210,18 +216,10 @@ async function drain(child: Child): Promise<void> {
   const proc = child.proc;
   if (!proc) return;
   child.draining = true;
-  proc.kill("SIGTERM");
-  await new Promise<void>((resolve) => {
-    const t = setTimeout(() => {
-      log(`${child.pack.name} did not drain in ${POLICY.killTimeoutMs}ms; SIGKILL`);
-      proc.kill("SIGKILL");
-      resolve();
-    }, POLICY.killTimeoutMs);
-    proc.once("exit", () => {
-      clearTimeout(t);
-      resolve();
-    });
-  });
+  await stopTree(proc, POLICY.killTimeoutMs);
+  if (proc.exitCode === null && proc.signalCode === null) {
+    log(`${child.pack.name} did not drain in ${POLICY.killTimeoutMs}ms; SIGKILL`);
+  }
   // A SIGKILLed resident cannot release its own slot, and a slot nobody is using
   // is a slot the account has lost until the sweep notices.
   const freed = account.releaseAgent(child.pack.name);
@@ -394,6 +392,17 @@ try {
 // ---------------------------------------------------------------- platform duties (v0.4.3): #ops alerts, retention, backup
 
 const HUB = process.env.RFA_HUB_URL ?? "http://localhost:8790/mcp";
+
+// The supervisor is a hub CLIENT as well as a process manager, and it had no
+// transport credential: since /mcp started requiring one (2026-08-18) every #ops
+// post failed with 401 and the alert triad quietly degraded to this log file.
+// The residents were unaffected because their token is INJECTED from their pack's
+// declared `secrets`, which is exactly why nobody noticed for a day. Resolved the
+// same way `npm run ask` and the retire script do it, and set on the environment
+// because src/client.ts reads it per call (a module-level capture was its own bug).
+const supervisorToken = transportToken(path.join(ROOT, "data", "secrets.json"));
+if (supervisorToken && !process.env.RFA_TOKEN) process.env.RFA_TOKEN = supervisorToken;
+
 const OPS_STATE = path.join(ROOT, "data", "ops-room.json");
 const OBS_DB = path.join(ROOT, "data", "obs.db");
 const OPS = {
