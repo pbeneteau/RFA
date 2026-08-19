@@ -463,6 +463,8 @@ export class RoomHub {
    * loudly instead and point at the shared-topology fix (one --http hub).
    */
   private lockPath: string | null = null;
+  /** Set when another hub took this store's lock over; read by `serving()`. */
+  private storeLost = false;
   private lockNonce = randomBytes(8).toString("hex");
   private lockHeartbeat: NodeJS.Timeout | null = null;
 
@@ -510,11 +512,36 @@ export class RoomHub {
     if (!this.lockPath) return;
     try {
       const existing = JSON.parse(fs.readFileSync(this.lockPath, "utf8")) as { nonce: string };
-      if (existing.nonce !== this.lockNonce) return; // someone took it over; do not stamp theirs
+      if (existing.nonce !== this.lockNonce) {
+        // Someone took the store over. Do not stamp theirs, and stop claiming to
+        // be able to serve it: from here on our writes are not authoritative.
+        this.storeLost = true;
+        return;
+      }
+      this.storeLost = false;
       fs.writeFileSync(this.lockPath, JSON.stringify({ pid: process.pid, nonce: this.lockNonce, heartbeat: this.cfg.now() }), { mode: 0o600 });
     } catch {
-      // a missing lock is not worth crashing a serving hub over
+      // a missing lock is not worth crashing a serving hub over, and it is not
+      // evidence that anyone else owns the store either (an operator may simply
+      // have deleted the file), so it deliberately does NOT set storeLost
     }
+  }
+
+  /**
+   * Can this hub serve? The predicate behind `GET /healthz` (RFA-0.6 sect. 8.7).
+   *
+   * O(1) and syscall-free on purpose: a health endpoint that stats a file is a
+   * health endpoint an attacker can use to generate disk load, and one that can
+   * block is worse than none during the incident it exists to report. The truth is
+   * already observed by the lock heartbeat every 10s; this only reads the flag.
+   *
+   * A hub with NO data dir (`--data none`, which is every test hub and the stdio
+   * default) is always able to serve: there is no store to lose. Getting that
+   * backwards would have made "healthy" mean "holds a lockfile" and reported every
+   * in-memory hub as sick.
+   */
+  serving(): boolean {
+    return !this.storeLost;
   }
 
   private releaseLock(): void {

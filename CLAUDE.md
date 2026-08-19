@@ -22,7 +22,7 @@ A resident PM agent holds the Goodvest product knowledge and the RFA spec, and a
 
 ## Working rules
 
-- Verify changes with `npm test` (139 tests; the script globs `test/*.test.ts`, so a new file counts immediately) and `npm run e2e` (wire scenarios, writes `reports/latest.md`). Brain or knowledge changes also need `npx tsx dogfood/parity.ts`, and run it TWICE: a single pass has hidden a real regression here.
+- Verify changes with `npm test` (186 tests; the script globs `test/*.test.ts`, so a new file counts immediately) and `npm run e2e` (wire scenarios, writes `reports/latest.md`). Brain or knowledge changes also need `npx tsx dogfood/parity.ts`, and run it TWICE: a single pass has hidden a real regression here.
 - One knowledge fact must live in exactly ONE file. Attaching a new source without removing what it superseded produced duplicate pages, and the agent then honestly reported a fact as missing while it sat in the other copy (cost: a day of chasing a phantom eval flake). Check for duplicates before adding a source.
 - `npm run evals` is the reliability gate (pass^4, band 0.15, prints its measured flake rate). One run is ~32 live trials and about 2 dollars, so budget one per day. A baseline captured while the stack was unhealthy is VACUOUS, since nothing can drop below zero: re-baseline after any incident.
 - Agent lifecycle is scripted, never hand-rolled: `npm run new-agent -- <name> [--kind tool]`, `npm run retire-agent -- <name>`, `npm run sync-handbook`. A hand-written pack has forgotten `RFA_TOKEN` or `RFA_JOIN_SECRET` in `secrets` more than once, and both failures surface as opaque auth errors much later.

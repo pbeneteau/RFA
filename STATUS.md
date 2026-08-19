@@ -1,6 +1,6 @@
 # Project status and handoff
 
-Last updated: 2026-08-19 (evening). **Read this first when resuming work.** State: protocol 0.1.8 (draft) plus three specs in force; v0.4 complete; v0.5 rungs 1-4 and 6 shipped, rung 7 (v0.5.4) complete except its two human/calendar items; **v0.6.0a, v0.6.1, v0.6.2 and v0.6.3a shipped**. Tests 178/178, e2e 9/9, parity 4/4 twice. **The eval gate fired for real**: the confirming no-change run measured 6.3% flake and a regression on `pm-live-03`, the cause is now identified and fixed at the mechanism (a retrieval hint that threw away the file's own description), and ONE gate run is owed to put a number on it.
+Last updated: 2026-08-19 (evening). **Read this first when resuming work.** State: protocol 0.1.8 (draft) plus three specs in force; v0.4 complete; v0.5 rungs 1-4 and 6 shipped, rung 7 (v0.5.4) complete except its two human/calendar items; **v0.6.0a, v0.6.1, v0.6.2 and v0.6.3a shipped**. Tests 186/186, e2e 9/9, parity 4/4 twice. **The eval gate fired for real**: the confirming no-change run measured 6.3% flake and a regression on `pm-live-03`, the cause is now identified and fixed at the mechanism (a retrieval hint that threw away the file's own description), and ONE gate run is owed to put a number on it.
 
 ## What this is
 
@@ -18,7 +18,7 @@ RFA (Rooms for Agents): a communication protocol where AI agents join rooms, dis
 | Hub (`rfa-hub`) | v0.6.0 on MCP v2 SDK, dual-era, 12 tools + console at /console + OTel spans (`--otel`) + **policy gate (`--gate deploy/gate.json`)** + hash-chained event log |
 | Client SDK | [src/client.ts](src/client.ts): RoomMember (ask/serve/projectTools/admin/task) + MemoryGate (inspect + inspectText) |
 | Platform | [src/agentdef.ts](src/agentdef.ts) packs · [src/resident.ts](src/resident.ts) SDK runner · [src/supervisor.ts](src/supervisor.ts) + secrets injection · [src/engine.ts](src/engine.ts) durable runs/steps/schedules · [src/memoryfs.ts](src/memoryfs.ts) gated memory + episodes · [src/execbackend.ts](src/execbackend.ts) srt sandbox seam |
-| Tests | `npm test` 178/178 · `npm run evals` 4/5 at pass^4 k=4 band 0.15, **6.3% measured flake, `pm-live-03` regressed** and its cause is fixed but unmeasured (glob over `test/*.test.ts`, so a new file is in the gate the moment it exists) · `npm run e2e` 9/9 fast ~3s · `e2e:full` 10/10 ~46s · parity gate `npx tsx dogfood/parity.ts` 4/4 twice |
+| Tests | `npm test` 186/186 · `npm run evals` 4/5 at pass^4 k=4 band 0.15, **6.3% measured flake, `pm-live-03` regressed** and its cause is fixed but unmeasured (glob over `test/*.test.ts`, so a new file is in the gate the moment it exists) · `npm run e2e` 9/9 fast ~3s · `e2e:full` 10/10 ~46s · parity gate `npx tsx dogfood/parity.ts` 4/4 twice |
 | Repo | github.com/pbeneteau/agent-com (PRIVATE, personal account, Apache-2.0) |
 | Dogfood | LIVE in room `r_9a25e48c0e` under the supervisor: `pm-agent` (haiku, 38 knowledge files incl. the 46-page handbook snapshot), `linear-scribe` (sonnet, real Linear writes behind a human approval), `test-agent` (scaffold example). ~10-20s answers with citations, cost and run_id per answer. Reachable from the iPhone over `tailscale serve`; approvals push to ntfy, decided in the console |
 | Artifacts (claude.ai) | Research report + spec published; same URLs redeploy |
@@ -78,6 +78,8 @@ RFA_HUMAN_KEYS="$(cat dogfood/state/human-key.txt)" npm run start -- --http 8790
   --allow-origin https://macbook-pro-de-paul.tailb95b2d.ts.net --console-url https://macbook-pro-de-paul.tailb95b2d.ts.net
 npm run supervisor                # spawns + restarts every resident from agents/*/agent.md (v0.4.0)
 ```
+
+Health check, now that there is one: `curl -s http://127.0.0.1:8790/healthz` answers `{"ok":true}` and needs no credential (RFA-0.6 sect. 8.7). It returns 503 with `Retry-After` while the hub is draining or if another hub has taken its store lock, so it is the right thing for a monitor or a container healthcheck to poll. Do NOT read a 200 from `/console` as health, which is what this runbook used to do: that only proves a file could be read.
 
 `--allow-origin` is REQUIRED for the phone console: the page is loaded from the tailnet name, so the browser sends that as `Origin` and the DNS-rebinding allowlist refuses it with 403 without this flag. Leaving it out looks exactly like a wrong credential (see the findings ledger).
 
@@ -285,7 +287,7 @@ Note the ledger, because it bit twice today: pm-agent's `per_day_usd` is 8, spen
 
 ### v0.6.3b (split by the privacy decision)
 
-**Buildable now, none of it needing a peer or a public repo**: `room_admin redact` with `content_hash`; retention plus the plaintext disclosure in the join contract `instructions`; `npm run verify-log`; `/healthz` whose public body is only `{"ok":true}`.
+**Buildable now, none of it needing a peer or a public repo**: `room_admin redact` with `content_hash`; retention plus the plaintext disclosure in the join contract `instructions`; `npm run verify-log`. ~~`/healthz`~~ **DONE 2026-08-19.**
 
 **Not happening**: `SECURITY.md`, supported versions and CI, per the answered decision above. **Still deferred for its own reason**: Docker and compose, on the exposure posture of RFA-0.6 sect. 4.5 (not 8.2, which is storage).
 

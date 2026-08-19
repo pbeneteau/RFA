@@ -145,14 +145,36 @@ if (process.argv.includes("--otel")) {
   console.error(`rfa-hub: otel span logging on (stderr)${obsStore ? " + obs.db bridge" : ""}`);
 }
 
-process.on("SIGINT", () => {
-  hub.close();
-  process.exit(0);
-});
-process.on("SIGTERM", () => {
-  hub.close();
-  process.exit(0);
-});
+/**
+ * Draining (RFA-0.6 sect. 8.6, wire 9.5): between the signal and the exit,
+ * `GET /healthz` answers 503 with `Retry-After` rather than letting a monitor see
+ * a reset connection and guess.
+ *
+ * The grace is small and fixed because nothing needs a long one yet: it exists so
+ * an in-flight health check gets an answer, not to hold the door open for parked
+ * long-polls (which `hub.close()` resolves anyway). Every restart in the runbook
+ * pays this, so it is measured in milliseconds.
+ *
+ * `/mcp` deliberately does NOT answer 503 here. A code review of this change found
+ * the reason: `src/client.ts` decides retry on the TOOL NAME alone, `room_task` is
+ * in the idempotent set, and every mutating task action travels as `room_task`. So
+ * a 503 returned after a task mutation had already applied would be retried by a
+ * well-behaved client and could apply twice. Draining `/mcp` needs per-action retry
+ * classification first, and that is a wire change, not a flag.
+ */
+let draining = false;
+const DRAIN_GRACE_MS = 250;
+function beginDrain(sig: string): void {
+  if (draining) return;
+  draining = true;
+  console.error(`rfa-hub: ${sig} received; /healthz now answers 503 while draining`);
+  setTimeout(() => {
+    hub.close();
+    process.exit(0);
+  }, DRAIN_GRACE_MS).unref?.();
+}
+process.on("SIGINT", () => beginDrain("SIGINT"));
+process.on("SIGTERM", () => beginDrain("SIGTERM"));
 
 if (httpPort) {
   const port = parseInt(httpPort, 10);
@@ -876,6 +898,40 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
       // passes; a present-but-unlisted one is refused and logged, because
       // whether a proxy rewrites Host or Origin is deployment-specific and a
       // silent 403 on the first phone request is impossible to diagnose.
+      // GET /healthz (RFA-0.6 sect. 8.7), placed AHEAD of both the Origin
+      // allowlist and the transport-credential gate, deliberately:
+      //
+      //   - sect. 4.5 forwards exactly two paths on the public side, `POST /mcp`
+      //     and `GET /healthz`, so this is the one route that must answer without
+      //     a credential. Behind `mcpAuthorized` it would 401 for the proxy that
+      //     needs it.
+      //   - the Origin allowlist exists to stop DNS rebinding from reaching the
+      //     WORKBENCH, whose responses carry agent definitions and approval
+      //     bodies. This response carries eleven bytes and no secret, so refusing
+      //     it cross-origin would break monitoring to protect nothing.
+      //
+      // The body is written literally rather than through `send()`: sect. 8.7 says
+      // "exactly the unauthenticated body {"ok":true}", and `send()` is free to
+      // pretty-print or add keys later.
+      if (pathname === "/healthz" && (req.method === "GET" || req.method === "HEAD")) {
+        const ok = !draining && hub.serving();
+        const body = ok ? '{"ok":true}' : '{"ok":false}';
+        res.writeHead(ok ? 200 : 503, {
+          "content-type": "application/json",
+          "content-length": String(Buffer.byteLength(body)),
+          "cache-control": "no-store",
+          // Sect. 8.7 requires Retry-After on the 503 so a client's bounded-jitter
+          // retry has a number to obey instead of a guess.
+          ...(ok ? {} : { "retry-after": "5" }),
+        });
+        // No version, no room or member counts, no uptime, no queue depth, no
+        // config: on a hub other organizations dial into, a detailed body is a
+        // version banner and an internal-state oracle (sect. 8.7). The 503 body is
+        // information-free for the same reason, and the reason WHY it is unhealthy
+        // goes to this process's stderr, where only the operator reads it.
+        res.end(req.method === "HEAD" ? undefined : body);
+        return;
+      }
       if (!originAllowed(req)) {
         console.error(
           `rfa-hub http: refused cross-origin ${req.method} ${pathname} (origin=${req.headers.origin ?? "-"} host=${req.headers.host ?? "-"}); allow it with --allow-origin`,

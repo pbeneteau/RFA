@@ -495,7 +495,8 @@ Two windows, both pre-existing, both cheap:
 
 - `GET /healthz` MUST return status 200 with **exactly the unauthenticated body** `{"ok":true}` when the hub can serve, and MUST return **503** with `Retry-After` during drain (matching sect. 8.6) or when the store is unavailable.
 - The unauthenticated body MUST NOT carry version, room counts, member counts, uptime, queue depths or configuration. On a hub other organizations dial into, a detailed body is a version banner and an internal-state oracle. Detail MAY be served on the same path behind the workbench session token; "exactly" above constrains the unauthenticated response only.
-- Implementation status: **not implemented.** `src/main.ts` has no `/healthz` route; anything not `/auth`, `/api/*`, `/` or `/console` currently falls through to the MCP handler.
+- Implementation status: **SHIPPED 2026-08-19.** The route sits AHEAD of both the Origin allowlist and the transport-credential gate, deliberately: behind `mcpAuthorized` it would 401 for the proxy of sect. 4.5 that is the only caller it has, and the Origin allowlist exists to stop DNS rebinding reaching the WORKBENCH, whose responses carry agent definitions and approval bodies, whereas this response is eleven bytes with no secret. The body is written literally rather than through the JSON helper, because "exactly" is a byte contract and a shared helper is free to add a key later. `serving()` on the hub is the store predicate: O(1) and syscall-free (a health endpoint that stats a file is one an attacker can use to generate disk load), reading a flag the lock heartbeat already maintains, and **a hub with no data dir is always healthy** because there is no store to lose. The 503 body is information-free for the same reason as the 200 one; why it is unhealthy goes to stderr, where only the operator reads it.
+- **`/mcp` deliberately does NOT answer 503 while draining**, and the reason is a defect this section would otherwise have introduced: `src/client.ts` decides retry on the TOOL NAME alone, `room_task` is in the idempotent set, and every mutating task action travels as `room_task`. A 503 returned after a task mutation had already applied would be retried by a well-behaved client and could apply twice. Draining `/mcp` needs per-action retry classification first, which is a wire change and not a flag. Sect. 8.6's drain rule is therefore satisfied for `/healthz` only, and this is the honest scope.
 
 ### 8.8 Packaging
 
@@ -597,7 +598,7 @@ Nothing in sections 3 through 8 is implemented today except where noted. Explici
 | `npm run verify-log` (sect. 7.7) | Not implemented. Same; it is a v0.6.3b deliverable. |
 | Public reverse-proxy exposure (sect. 4.5) | Not implemented, and unmeasured: whether a public proxy carries a 20-second `room_listen` POST without buffering has not been tested. |
 | Transport authentication on `/mcp`; credentialed `room_create` | Not implemented (`src/main.ts:327`, `:341`). Client sends no `Authorization` header (`src/client.ts:609-628`). |
-| `/healthz` | Not implemented. |
+| `/healthz` | **SHIPPED 2026-08-19**: 200 with exactly `{"ok":true}` unauthenticated, 503 with `Retry-After` while draining or when another hub has taken the store's lock. Drain verified live (200 to 503 to gone). `/mcp` is deliberately not drained; see sect. 8.7 |
 | Claim lease, release, `claim_token`, `lease_expired` | Not implemented. `lease_expired` is declared in spec 15 and thrown nowhere. |
 | Gate over task actions | Not implemented; one call site inside `send` (`src/store.ts:846`). |
 | `since` clamped to the join point | Not implemented (`src/store.ts:1516`); `joinSeq` is a local variable (`:530`). |
