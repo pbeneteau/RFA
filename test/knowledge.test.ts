@@ -19,7 +19,7 @@ function write(dir: string, name: string, body: string): string {
   return f;
 }
 
-test("a hint skips a provenance header and prefers the page's own title", () => {
+test("a hint skips a provenance header and carries the page's title AND description", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-hint-"));
   const withHeader = write(
     dir,
@@ -39,7 +39,19 @@ test("a hint skips a provenance header and prefers the page's own title", () => 
       "Du contenu.",
     ].join("\n"),
   );
-  assert.equal(fileHint(withHeader), "SCPI et parts de SCPI", "frontmatter title wins: it is the author's own description");
+  // Both halves, in that order. The title alone was the 6.3% flake: it says what
+  // the page is CALLED, and a question about a fee needs to know what is IN it.
+  assert.equal(fileHint(withHeader), "SCPI et parts de SCPI - whatever");
+
+  const blockScalar = write(
+    dir,
+    "block.md",
+    ["---", "title: Une page", "description: >", "  du texte replie", "---", "", "corps"].join("\n"),
+  );
+  assert.equal(fileHint(blockScalar), "Une page", "a YAML block indicator must not become the hint");
+
+  const descOnly = write(dir, "desconly.md", ["---", 'description: "Ce que contient la page."', "---", "", "corps"].join("\n"));
+  assert.equal(fileHint(descOnly), "Ce que contient la page.", "a description with no title still beats the filename");
 
   const noTitle = write(dir, "b.md", ["<!-- rfa-provenance", "page: x", "-->", "", "# Le vrai titre", "", "corps"].join("\n"));
   assert.equal(fileHint(noTitle), "Le vrai titre", "falls back to the first heading, not the comment");
@@ -69,6 +81,7 @@ test("over the real corpus, hints are distinct and none is a header fragment", (
   const hints = files.map((f) => ({ file: path.relative(corpus, f), hint: fileHint(f) }));
   for (const { file, hint } of hints) {
     assert.ok(hint.length > 0, `${file} produced an empty hint`);
+    assert.ok(!/^\s*[>|]-?\s*$/.test(hint), `${file} produced a bare YAML block indicator: ${hint}`);
     assert.ok(!hint.includes("rfa-provenance"), `${file} leaked its provenance header into the hint`);
     assert.notEqual(hint.trim(), "---", `${file} leaked a frontmatter fence`);
     assert.ok(!/^(source|page|fetched_at|upstream|note):/.test(hint), `${file} leaked a provenance field: ${hint}`);
