@@ -247,9 +247,9 @@ Owner decision, in his words: "keep it private". This is the exposure question o
 
 - v0.6.3b's local items: `room_admin redact` with `content_hash`, retention plus the plaintext disclosure in the join contract `instructions`, `npm run verify-log`, and `/healthz` whose public body is only `{"ok":true}`.
 - v0.6.4's **per-human `principal_id`** with constant-time comparison and per-principal console memberships. RFA-0.6 says outright that this "needs only rung 1 and is locally correct, so it should not wait for a peer".
-- v0.6.4's `usd_per_day` enforced at pickup: a budget ceiling is locally useful, and today's ledger incident is the argument for it.
+- **CORRECTION to my own first pass at this list:** `usd_per_day` is NOT locally buildable. It is the ADMISSION RECORD's per-peer budget (RFA-0.6 sect. 7.1: checked "at the start of every run attributable to a non-local requester"), so with no admission records and every `home` local there is no requester it applies to. It parks with the admission half. Note also that the ladder row still says "enforced at pickup", which sect. 7.1 has since superseded in its own text: pickup-only "leaves the threat it opens with wide open, because a guest that only sends `request` envelopes to a local resident never claims a task". The row and the section disagree; the section is newer.
 - Docker and compose stay deferred for their OWN reason (the exposure posture of RFA-0.6 sect. 4.5, plus 8.2 rejecting every hosted target such a container would run on), not because of this decision. Note STATUS previously mis-cited 8.2 as the exposure section; 4.5 is.
-- `member_rpm` keyed per `(sender, recipient home)` is the one v0.6.4 item that IS effectively parked: it only means anything once a member's `home` is not local.
+- `member_rpm` keyed per `(sender, recipient home)` parks for the same reason: it only means anything once a member's `home` is not local. **So of v0.6.4's three items, only the per-human `principal_id` half is buildable now** and it is the one the spec already singles out as not needing a peer.
 
 ### Still waiting on Paul (one item)
 
