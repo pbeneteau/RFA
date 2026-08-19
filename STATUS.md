@@ -1,6 +1,6 @@
 # Project status and handoff
 
-Last updated: 2026-08-18 (protocol 0.1.8 draft plus the v0.5 and v0.6 platform specifications integrated after review; v0.4.0-v0.4.6 and memory v2 shipped; v0.5.0's exposure half shipped). **Read this first when resuming work.**
+Last updated: 2026-08-19. **Read this first when resuming work.** State: protocol 0.1.8 (draft) plus three specs in force; v0.4 complete; v0.5 rungs 1-4, 6 and 7's instruments shipped; v0.6.0a, v0.6.1 and v0.6.3a shipped; the eval gate is measured and clean at 0.0% flake. Tests 136/136, e2e 9/9, parity 4/4, evals 5/5 at pass^4.
 
 ## What this is
 
@@ -14,13 +14,13 @@ RFA (Rooms for Agents): a communication protocol where AI agents join rooms, dis
 
 | Piece | State |
 |---|---|
-| Spec | **Protocol v0.1.8 (draft)**: the remote-member surface (`home`, admission records and invites, the `since` clamp, claim leases, verification authority, `wrapped`, the approval-ext shape, `redact`, key resolution over time, three new system events, `invite_invalid` / `lease_expired` / `bad_request`). It changed the **core** and **tasks** conformance profiles, so the hub at 0.6.0 no longer meets its own core profile; wire sect. 16.1 states what an 0.1.7 hub must do and splits 0.1.8 into a half that binds now and a half gated on a named peer. Wire Appendix F is the single implementation-status table. Platform: [spec/RFA-0.4-platform.md](spec/RFA-0.4-platform.md) (v0.4.0-v0.4.6, **all implemented**, plus memory v2) + **[spec/RFA-0.5-platform.md](spec/RFA-0.5-platform.md)** (exposure, the card clock, reach, honest meters, knowledge, instruments; rung v0.5.0's exposure half shipped, the rest pending) + **[spec/RFA-0.6-remote.md](spec/RFA-0.6-remote.md)** (remote peers: admission records, transport auth, the claim lease as operator mechanics, the interop artifact, containment, deployment; nothing implemented). **One merged ladder for v0.5 and v0.6 lives in RFA-0.5-platform.md section 22** |
+| Spec | **Protocol v0.1.8 (draft)**: the remote-member surface (`home`, admission records and invites, the `since` clamp, claim leases, verification authority, `wrapped`, the approval-ext shape, `redact`, key resolution over time, three new system events, `invite_invalid` / `lease_expired` / `bad_request`). It changed the **core** and **tasks** conformance profiles, so the hub at 0.6.0 no longer meets its own core profile; wire sect. 16.1 states what an 0.1.7 hub must do and splits 0.1.8 into a half that binds now and a half gated on a named peer. Wire Appendix F is the single implementation-status table. Platform: [spec/RFA-0.4-platform.md](spec/RFA-0.4-platform.md) (v0.4.0-v0.4.6, **all implemented**, plus memory v2) + **[spec/RFA-0.5-platform.md](spec/RFA-0.5-platform.md)** (exposure, the card clock, reach, honest meters, knowledge, instruments; rungs 1-4, 6 and 7's instruments SHIPPED, the #ops digest and watchdog invariants pending) + **[spec/RFA-0.6-remote.md](spec/RFA-0.6-remote.md)** (remote peers: admission records, transport auth, the claim lease as operator mechanics, the interop artifact, containment, deployment; v0.6.0a, v0.6.1 and v0.6.3a SHIPPED, the admission half PARKED on a named peer). **One merged ladder for v0.5 and v0.6 lives in RFA-0.5-platform.md section 22** |
 | Hub (`rfa-hub`) | v0.6.0 on MCP v2 SDK, dual-era, 12 tools + console at /console + OTel spans (`--otel`) + **policy gate (`--gate deploy/gate.json`)** + hash-chained event log |
 | Client SDK | [src/client.ts](src/client.ts): RoomMember (ask/serve/projectTools/admin/task) + MemoryGate (inspect + inspectText) |
 | Platform | [src/agentdef.ts](src/agentdef.ts) packs · [src/resident.ts](src/resident.ts) SDK runner · [src/supervisor.ts](src/supervisor.ts) + secrets injection · [src/engine.ts](src/engine.ts) durable runs/steps/schedules · [src/memoryfs.ts](src/memoryfs.ts) gated memory + episodes · [src/execbackend.ts](src/execbackend.ts) srt sandbox seam |
-| Tests | `npm test` 136/136 (glob over `test/*.test.ts`, so a new file is in the gate the moment it exists) · `npm run e2e` 9/9 fast ~4s · `e2e:full` 10/10 ~46s · parity gate `npx tsx dogfood/parity.ts` |
+| Tests | `npm test` 136/136 · `npm run evals` 5/5 at pass^4 k=4 band 0.15, 0.0% measured flake (glob over `test/*.test.ts`, so a new file is in the gate the moment it exists) · `npm run e2e` 9/9 fast ~4s · `e2e:full` 10/10 ~46s · parity gate `npx tsx dogfood/parity.ts` |
 | Repo | github.com/pbeneteau/agent-com (PRIVATE, personal account, Apache-2.0) |
-| Dogfood | LIVE: `pm-agent` (Agent SDK brain, haiku, pack at agents/pm-agent/) under the supervisor in room `r_9a25e48c0e`; ~10-20s answers with citations, cost and run_id recorded per answer |
+| Dogfood | LIVE in room `r_9a25e48c0e` under the supervisor: `pm-agent` (haiku, 38 knowledge files incl. the 46-page handbook snapshot), `linear-scribe` (sonnet, real Linear writes behind a human approval), `test-agent` (scaffold example). ~10-20s answers with citations, cost and run_id per answer. Reachable from the iPhone over `tailscale serve`; approvals push to ntfy, decided in the console |
 | Artifacts (claude.ai) | Research report + spec published; same URLs redeploy |
 
 ## Knowledge: the handbook is a tracked clone, not a copy (v0.5.3, needs one command from Paul)
@@ -180,18 +180,55 @@ Room console: `http://localhost:8790/console#r_9a25e48c0e`. Observer = read-only
 - `ask()` cannot run inside the same member's `serve()` loop (single loop owner; use a second member).
 - Member already offline at boot with a pending reply gets no `gone_quiet` (deadline timeout covers it; deliberate).
 
-## What's next: v0.5 and v0.6, one merged ladder
+## What's next (2026-08-19 handoff)
 
-**Start here: [spec/RFA-0.5-platform.md](spec/RFA-0.5-platform.md) section 22 is the single ordered ladder** for both releases, with prerequisites and per-rung status. The two specifications each detail their own rungs ([spec/RFA-0.5-platform.md](spec/RFA-0.5-platform.md) sections 15-21 for v0.5, [spec/RFA-0.6-remote.md](spec/RFA-0.6-remote.md) sections 3-8 and 11 for v0.6) and the research ladders behind them are [research/03-reach-and-collaboration/REPORT.md](research/03-reach-and-collaboration/REPORT.md) section 10 and [research/04-remote-agents/REPORT.md](research/04-remote-agents/REPORT.md) section 12.
+**The ladder itself lives in [spec/RFA-0.5-platform.md](spec/RFA-0.5-platform.md) section 22**: one ordered table for v0.5 and v0.6 with prerequisites and per-rung status. Wire [Appendix F](spec/RFA-0.1.md) is the single implementation-status table for the protocol. Read those two before starting anything; what follows is only what is outstanding and why.
 
-The near end of the merged ladder, in order:
+### Waiting on Paul (both block real work)
 
-1. **v0.5.0 (partly shipped)**: exposure half done; still pending are the clocks (`expired` resolution, `deadline_expired`, the deleted ten-minute ceiling with a 30-minute fallback, the derived hold TTL), mandatory `/auth` attempt limiting, the separate auth log, and the reserved-prefix guard landed together with the exact-name console fix.
-2. **v0.6.3a, pulled forward**: the durability set (snapshot fsync plus rebuild-from-log, the claim-revert ordering bug, restart-durable send idempotency, `O_EXCL` plus heartbeat in the store lock, `db.backup()`). Every item can lose data today, with zero peers.
-3. **v0.5.1** reach, **v0.5.2** the honest meters and layer 3 (this one blocks the per-peer spend ceiling), then **v0.6.0a** the locally-correct half of the remote work (transport auth on `/mcp`, the `since` clamp, `home`, `wrapped`, `bad_request` wrapping, `server/discover` extensions, `INTEROP.md`).
-4. **Gated on a named counterparty, not scheduled**: v0.6.0b, the admission machinery (`deploy/peers.json`, invites, membership expiry, `peer_id` quarantine, the linkage rule, the public-proxy exposure). None of it fixes a defect in an all-local hub. The sixty-day decision of RFA-0.6 section 9 lands here as one line in this file: the peer's name, or "no peer named, parked".
+1. **Does this repo go public, with CI, `SECURITY.md` and a supported-versions statement?** RFA-0.6-remote section 8.9 makes all three a precondition for admitting any external peer, and STATUS still records CI as explicitly declined. **This gates the entire remote-agent half.** Even "not yet" is useful: it parks v0.6.0b cleanly instead of leaving it ambiguous.
+2. **The handbook clone**, one command with his GitLab credentials (see the knowledge section above). Upgrades provenance from a fetch date to real `git log` history and lets `--pin` record a `corpus_version`, which the eval gate currently reports as unpinned on every verdict.
 
-**Open decisions a human owns**, carried here so they are not rediscovered: whether to reopen CI (item 5 below says it was declined; RFA-0.6 section 8.9 makes it a release obligation before any external peer), whether the repository goes public, and which reverse proxy the public `/mcp` path uses (RFA-0.6 section 4.5, with the long-poll buffering question still unmeasured).
+Minor: `agents/test-agent` was created before `new-agent` scaffolded the full pack, so it only has `knowledge/`. Retire and recreate it for the current shape, or leave it as a deliberate example of the old one.
+
+### First thing next session (cheap, 8 minutes)
+
+**Run `npm run evals` once with no changes.** Today's post-fix baseline measured 0.0% flake over 32 trials, but the confirming no-change run hit `spend=7.98` against pm-agent's `$8` ceiling and measured the budget instead of the agent. If tomorrow's run is clean, the 0.15 band is trustworthy for the first time and that belongs in the findings ledger. Note the cost shape: one 32-trial gate run is about 2 dollars, so budget one per day or raise the ceiling for measurement days.
+
+### v0.5.4 remainder (the instruments are in; these are not)
+
+- **The `#ops` digest**: the two expressible review queues (feedback at or below zero or flagged `needs_review`; cost or latency above p90) posted as counts on the existing supervisor tick. This is the one new scheduled job v0.5 admits (spec 20.5, 18.6).
+- **Case provenance stamped at promotion** (spec 20.2): five keys written by `scripts/promote-case.ts` when a case is cut from a real room log.
+- **Watchdog invariants** (spec 20.6), and the rule is strict: an invariant ships only after replay against at least two weeks of logs plus `obs.db`, firing on known incidents and nothing else. The one real anomaly measured in live state is **engine runs stuck in `running`** and it must be included; the proposed observer invariant false-fires against the 24-hour prune and must be read as "expired longer than the prune window".
+- **One labelling sitting** (spec 20.4): one pass over the same traces producing the binary label, the gold source reference and the promotion together. The corpus has one human label; the judge has no anchors until this happens, which is why `evals/rubric.md` says its anchor section is deliberately empty.
+- **Then a week of deliberate use**, with the findings ledger as the deliverable. Every instrument here is starved: this is the rung's actual product.
+
+### v0.6.2 remainder
+
+- The policy gate over **mutating task actions** (task `title`, `description`, `note`, `evidence.summary` reach a human's approval card and a resident's prompt uninspected today, because the gate has exactly one call site in `send`), plus task field size caps and the widened sanitizer set.
+- **The structured approval extension** (`tool_name`, `input_preview`, hub-stamped `requester_id`/`origin`/`home`/`room`). **`src/bridge.ts` MUST land in the same change**: it registers only `{request_id, action, allowed_decisions, expires_at}`, so a hub enforcing spec 12.5 rejects every approval the shipped bridge raises. This is written into wire Appendix F.
+- Console rendering for guests (origin and `home` next to every name).
+
+### v0.6.3b
+
+`room_admin redact` with `content_hash`; retention plus the plaintext disclosure in the join contract `instructions`; `npm run verify-log`; `/healthz` whose public body is only `{"ok":true}`; Docker and compose (waiting on the exposure answer of RFA-0.6 section 8.2); `SECURITY.md`, supported versions and CI (decision 1 above).
+
+### v0.6.4
+
+`usd_per_day` enforced at pickup; `member_rpm` keyed per `(sender, recipient home)`; per-human `principal_id` with constant-time comparison and per-principal console memberships. The per-human half needs only rung 1 and is locally correct, so it should not wait for a peer.
+
+### Parked with a trigger
+
+- **v0.6.0b, the admission half** (`deploy/peers.json`, `room_admin invite`, membership expiry tied to `expires_at`, quarantine keyed on `peer_id`, the transport-principal linkage rule, the `admitted` event, `invite_invalid`): gated on **a named counterparty existing**, not scheduled. None of it fixes a defect in an all-local hub.
+- **v0.6.5**: the sixty-day decision. If no peer is named sixty days after the cold-start guest test passes, the answer was "deepen local" and the remaining recommendations stay parked. One line in this file when the time comes.
+- Per-message signing narrowed to claim-and-result, demand-gated. Federation, MLS, tool passthrough (a MUST NOT), the REST binding, registries, contract-net verbs, Postgres, embeddings: each with its trigger in RFA-0.5 section 23 and RFA-0.6 section 12.
+
+### Specified but unimplemented, with the reason (see wire Appendix F for the full table)
+
+- **Claim re-binding from a new member id on a matching principal** (spec 10.3): needs per-member principals that the shared-secret join path does not have, and building it without them would be an escalation path rather than a fix. Also pending: the restart grace, `requeue`, `task_actions_per_min`.
+- **`bad_request` for argument validation**: the MCP SDK validates a tool's schema before the hub's handler runs, so a bad argument still returns the SDK's plain text. Needs an SDK-level hook.
+- **Same-principal self-verification refusal across two memberships** (spec 10.4): needs the principals of 4.3.
+- The hub at 0.6.0 does not meet its own amended core profile; wire 16.1 splits 0.1.8 into a half that binds now and a half gated on a peer, and it binds from hub 0.7.0.
 
 ## The v0.4 platform build, complete ([spec/RFA-0.4-platform.md](spec/RFA-0.4-platform.md) section 13 was the ladder)
 
