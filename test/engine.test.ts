@@ -122,3 +122,42 @@ test("schedules: delayed, interval advance, cron next-fire, one-shot deletion, c
   engine.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test("reconcileOrphans frees the threads a dead process left busy, and only that agent's", () => {
+  // The failure this reverses: a run only leaves `running` when its own process
+  // settles it, so a SIGKILLed or crashed resident leaves the row behind and its
+  // thread `busy` forever. Under the default `enqueue` strategy the gate only
+  // looks at `busy`, so every later run on that conversation is created `pending`
+  // and waits for a drain that can only come from the settle that never happens.
+  // Measured live before the fix: 4 threads busy, the oldest for two and a half
+  // days.
+  const { engine, dir } = fresh();
+
+  const dead = engine.createRun({ agent: "pm-agent", threadId: "c_dead", kind: "serve" });
+  assert.equal(dead.action, "start");
+  // A second conversation of the same agent, and one belonging to another agent.
+  const alsoDead = engine.createRun({ agent: "pm-agent", threadId: "c_dead2", kind: "serve" });
+  const other = engine.createRun({ agent: "linear-scribe", threadId: "c_other", kind: "serve" });
+
+  // The queued run behind the wedged thread: this is the part that stays stuck.
+  const queued = engine.createRun({ agent: "pm-agent", threadId: "c_dead", kind: "serve" });
+  assert.equal(queued.action, "enqueued", "the thread is busy, so this one waits");
+  assert.equal(engine.get(queued.runId)!.status, "pending");
+  assert.equal(engine.nextPending("c_dead"), null, "and nothing can pick it up while the thread is busy");
+
+  const res = engine.reconcileOrphans("pm-agent");
+  assert.deepEqual(res.runs.sort(), [dead.runId, alsoDead.runId].sort(), "both of this agent's orphans");
+  assert.deepEqual(res.threads.sort(), ["c_dead", "c_dead2"], "and the threads they held");
+
+  assert.equal(engine.get(dead.runId)!.status, "interrupted", "an orphan is interrupted, not success and not error");
+  assert.match(String(engine.get(dead.runId)!.error), /never settled it/, "and says why, for whoever reads the row later");
+  assert.equal(engine.get(other.runId)!.status, "running", "another agent's live run must be untouched");
+
+  // The property that matters: the conversation is servable again.
+  const picked = engine.nextPending("c_dead");
+  assert.equal(picked?.run_id, queued.runId, "the queued run can finally be picked up");
+
+  assert.deepEqual(engine.reconcileOrphans("pm-agent").runs, [picked!.run_id], "idempotent in shape: it reconciles whatever is running now");
+  engine.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});

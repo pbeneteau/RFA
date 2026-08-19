@@ -27,6 +27,7 @@ import * as path from "node:path";
 import { AccountLedger, DEFAULT_CAP, RATE_LIMIT_PAUSE_FLOOR_MS } from "./account.js";
 import { listPacks, loadPack, type AgentPack } from "./agentdef.js";
 import { RoomMember } from "./client.js";
+import { Engine } from "./engine.js";
 import { ObsStore, evaluateAlerts, formatReviewDigest } from "./obs.js";
 import { spawnTsx, stopTree } from "./proc.js";
 import { runBackup } from "./platform.js";
@@ -89,6 +90,10 @@ function configuredCap(): number {
 }
 
 const account = new AccountLedger(path.join(ROOT, "data", "runs.db"));
+// The same database the residents journal into (WAL, so a second connection in
+// this process is fine). The supervisor needs it for exactly one thing: clearing
+// the runs a dead resident left `running` before it starts a fresh one.
+const engine = new Engine(path.join(ROOT, "data", "runs.db"));
 let pauseStreak = 0;
 let lastPauseAt = 0;
 let announcedPauseUntil = 0;
@@ -162,6 +167,19 @@ function start(child: Child): void {
         `\`npm run retire-agent -- ${child.pack.name}\` if it is stale.`,
     );
     return;
+  }
+  // Past the duplicate guard, so nothing else owns this pack: any run still
+  // `running` for it belongs to a process that is gone, and it holds its thread
+  // `busy` forever, which makes that conversation permanently unservable under the
+  // default `enqueue` strategy. This is the moment the fact is knowable, and the
+  // only one: a 30-minute approval wait is a legitimately long run, so no timeout
+  // heuristic could tell a corpse from a live turn.
+  const orphaned = engine.reconcileOrphans(child.pack.name);
+  if (orphaned.runs.length > 0) {
+    log(
+      `${child.pack.name}: reconciled ${orphaned.runs.length} orphaned run(s) left 'running' by a dead process, ` +
+        `freeing ${orphaned.threads.length} wedged thread(s): ${orphaned.threads.join(", ")}`,
+    );
   }
   const fd = residentLog(child.pack);
   // Secrets: the pack declares NAMES; only those values are injected (6.3).
@@ -616,6 +634,7 @@ async function shutdown(sig: string): Promise<void> {
   clearInterval(accountTimer);
   await Promise.all([...children.values()].map((c) => drain(c)));
   account.close();
+  engine.close();
   process.exit(0);
 }
 process.on("SIGINT", () => void shutdown("SIGINT"));

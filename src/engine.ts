@@ -175,6 +175,49 @@ export class Engine {
   }
 
   /** Pop the oldest pending run on an idle thread (the enqueue drain). */
+  /**
+   * Runs left `running` by a process that is gone, and the threads they wedge.
+   *
+   * A run only leaves `running` when its own process settles it, so a resident
+   * that is SIGKILLed, crashes, or is drained mid-turn leaves the row behind and
+   * its thread `busy` forever. The default multitask strategy is `enqueue`, and
+   * the gate only looks at `busy`, so every later run on that conversation is
+   * created `pending` and waits for a drain that can only be triggered by the
+   * settle that will never come. The conversation is then permanently unservable.
+   *
+   * Measured on this machine before the fix: 4 threads `busy`, the oldest since
+   * 2026-08-17T09:17Z, which is two and a half days. No pending runs had queued
+   * behind them yet, so the leak was latent rather than visible, and it is the one
+   * anomaly spec 20.6 requires a watchdog invariant to cover.
+   *
+   * Only the SUPERVISOR may call this, and only as it starts a resident: that is
+   * the one moment something knows no other process owns this pack (it refuses to
+   * start a duplicate). A resident calling this for itself could not tell its own
+   * previous corpse from a live sibling, and a 30-minute approval wait is a
+   * legitimately long-running run, so no timeout heuristic is safe either.
+   */
+  reconcileOrphans(agent: string): { runs: string[]; threads: string[] } {
+    return this.db.transaction(() => {
+      const orphans = this.db
+        .prepare(`SELECT run_id, thread_id FROM runs WHERE agent = ? AND status = 'running'`)
+        .all(agent) as { run_id: string; thread_id: string }[];
+      if (orphans.length === 0) return { runs: [], threads: [] };
+      const now = iso();
+      const markRun = this.db.prepare(
+        `UPDATE runs SET status = 'interrupted', ended_at = ?, error = COALESCE(error, ?) WHERE run_id = ?`,
+      );
+      // The thread goes to `idle`, not `interrupted`: idle is what lets a queued
+      // `pending` run be picked up, and the point of reconciling is to make the
+      // conversation servable again.
+      const freeThread = this.db.prepare(`UPDATE threads SET status = 'idle', updated_at = ? WHERE thread_id = ?`);
+      for (const o of orphans) {
+        markRun.run(now, "orphaned: the process running this never settled it", o.run_id);
+        freeThread.run(now, o.thread_id);
+      }
+      return { runs: orphans.map((o) => o.run_id), threads: [...new Set(orphans.map((o) => o.thread_id))] };
+    })();
+  }
+
   nextPending(threadId: string): Run | null {
     return this.db.transaction(() => {
       const thread = this.db.prepare(`SELECT status FROM threads WHERE thread_id = ?`).get(threadId) as
