@@ -79,6 +79,25 @@ class BudgetStop extends Error {
 }
 
 /**
+ * Does this error mean "I cannot authenticate", rather than "try again later"?
+ *
+ * Matched on the message because the Agent SDK surfaces provider auth failures as
+ * a result subtype plus prose rather than a typed error. Deliberately narrow: a
+ * false positive here would turn a transient blip into a refusal the asker never
+ * retries, which is the opposite failure and just as bad.
+ */
+function isAuthError(err: unknown): boolean {
+  const m = (err as Error | undefined)?.message ?? "";
+  return (
+    /OAuth session expired/i.test(m) ||
+    /could not be refreshed/i.test(m) ||
+    /failed to authenticate/i.test(m) ||
+    /invalid[_ ]api[_ ]key/i.test(m) ||
+    /authentication[_ ]error/i.test(m)
+  );
+}
+
+/**
  * The account has no slot, or pickup is paused account-wide after a provider
  * rate limit. Like BudgetStop this is a ceiling rather than a crash, so it
  * reaches the asker as `overloaded` with the numbers (spec 18.3).
@@ -869,6 +888,20 @@ await member.serve(
         const detail = accountStop.retryAfterS ? `${accountStop.message} (retry in ${accountStop.retryAfterS}s)` : accountStop.message;
         log(`account stop: ${detail}`);
         return new ServeRefusal("overloaded", detail);
+      }
+      // An expired or missing credential is NOT overload, and calling it that is
+      // actively harmful: `overloaded` carries `retry_after_s` and the client SDK
+      // treats it as transient, so every asker retries forever against a condition
+      // no amount of waiting fixes. Found live 2026-08-19: the SDK returned "OAuth
+      // session expired and could not be refreshed" and the asker was told
+      // "overloaded, retry shortly".
+      //
+      // `unauthorized` is in the refusal registry (wire Appendix A) for exactly
+      // this, and it deliberately carries no retry hint: the operator has to act.
+      if (isAuthError(err)) {
+        const detail = `this agent cannot authenticate to its model provider: ${(err as Error).message.slice(0, 120)}`;
+        log(`AUTH FAILURE: ${detail} -- no answer is possible until the operator re-authenticates`);
+        return new ServeRefusal("unauthorized", detail);
       }
       // A provider rate limit is an account-wide condition, not this run's
       // fault: park it and let the supervisor hold pickup for everyone, rather
