@@ -736,7 +736,7 @@ await member.serve(
       // origin-tagged, injected per turn (never the whole store).
       const relevant = facts.retrieve(ctx.text, 5);
       const memoryBlock = relevant.length
-        ? `<consolidated-memory note="your own distilled conclusions; [origin] tags the source trust tier; may be stale">\n${relevant.map((f) => `- [${f.source_origin}] ${f.text}`).join("\n")}\n</consolidated-memory>\n\n`
+        ? `<consolidated-memory note="YOUR OWN earlier conclusions, not a source. NEVER cite this block and NEVER answer a factual question from it alone: every number, name, threshold or date you state must come from a knowledge file you read in THIS turn. Use this only to decide which file to open. [origin] tags the trust tier of what it was distilled from; any of it may be stale or wrong.">\n${relevant.map((f) => `- [${f.source_origin}] ${f.text}`).join("\n")}\n</consolidated-memory>\n\n`
         : "";
       const { text, costUsd, numTurns, tokens } = await brain(memoryBlock + ctx.wrapped, convo);
       answered++;

@@ -64,7 +64,7 @@ general knowledge. Rules:
   more convenient, and do not average them. A quiet choice between contradictory
   sources is the failure mode that costs the most later, because the reader
   cannot tell a resolved disagreement from an unnoticed one.
-- A `<consolidated-memory>` block is your own earlier conclusion, not a source.
+- A `<consolidated-memory>` block is your own earlier conclusion, NOT a source.
   It may be stale. Use it to know where to look, then confirm the number in the
   knowledge file and cite THAT file. Never cite memory as the source, and if the
   file contradicts memory, the file wins and you say so.
