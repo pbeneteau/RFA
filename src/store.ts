@@ -96,13 +96,49 @@ export interface GateCheck {
   };
   /** rules tier: the outcome when match hits. */
   outcome?: "allow" | "alert" | "hold" | "refuse";
-  /** command tier: argv (the envelope arrives as JSON on stdin). */
+  /** command tier: argv (the versioned check input arrives as JSON on stdin). */
   command?: string[];
   timeout_ms?: number;
 }
 
 type GateOutcome = "allow" | "alert" | "hold" | "refuse";
 const GATE_SEVERITY: Record<GateOutcome, number> = { allow: 0, alert: 1, hold: 2, refuse: 3 };
+
+/**
+ * What a rules-tier check matches against, normalized across shapes.
+ *
+ * `kind` is null for anything that is not a message, and a null kind never
+ * satisfies a `match.kind`: absence is not a wildcard. Without that rule, every
+ * kind-scoped rule an operator already has would have started firing on task
+ * actions the moment the gate gained its second call site.
+ */
+interface GateMatchable {
+  kind: MessageKind | null;
+  origin: "human" | "agent";
+  extKeys: string[];
+  /** The joined text a `text_regex` runs against, whatever the shape (RFA-0.6 sect. 7.2). */
+  text: string;
+}
+
+/**
+ * One thing to gate: how a rule matches it, and what a command-tier check is
+ * handed. The payload carries `check_input_version` (1 = envelope, 2 = task
+ * action), which is the discriminant an operator's own program reads.
+ */
+interface GateInput {
+  matchable: GateMatchable;
+  payload: unknown;
+}
+
+/**
+ * Total cap on the text a single task action may carry (RFA-0.6 sect. 7.1: task
+ * text was unbounded because `maxInlineBytes` is checked against `args.body`
+ * only). It reuses the message body's cap rather than inventing a second number,
+ * and it caps the SUM rather than each field: per-field limits are a spec question
+ * (7.1 says "size-capped" without naming a figure) and guessing four numbers here
+ * would embed an unreviewed policy in the hub.
+ */
+const TASK_TEXT_FIELDS = ["title", "description", "note", "evidence.summary"] as const;
 
 export const DEFAULT_CONFIG: HubConfig = {
   dataDir: null,
@@ -1072,7 +1108,7 @@ export class RoomHub {
     // Pre-delivery policy gate (spec 12.2, v0.4.2): most severe outcome wins.
     // refuse blocks with an audit event; hold parks the envelope behind a
     // human-only approval; alert appends normally and emits the alert after.
-    const gateVerdict = this.cfg.gateChecks.length > 0 ? await this.evaluateGate(envelope) : null;
+    const gateVerdict = this.cfg.gateChecks.length > 0 ? await this.evaluateGate(this.envelopeGateInput(envelope)) : null;
     if (gateVerdict?.outcome === "refuse") {
       this.appendEvent(room, {
         type: "system",
@@ -1287,18 +1323,32 @@ export class RoomHub {
   // ---------------------------------------------------------------- policy gate (spec 12.2, v0.4.2)
 
   /** Evaluate all matching checks; the most severe outcome wins; null = allow. */
+  /**
+   * Evaluate the gate over one thing, whatever shape it is (RFA-0.6 sect. 7.2).
+   *
+   * The gate had exactly one call site, inside `send`, so task `title`,
+   * `description`, `note` and `evidence.summary` reached a human's approval card
+   * and a resident's prompt uninspected. Adding a second call site meant
+   * separating two things this function used to conflate: WHAT a check matches on,
+   * which differs by shape, and WHAT is handed to a command-tier check, which is
+   * the versioned payload the operator's program parses.
+   *
+   * `matchable` is the normalized view a rules-tier check matches against;
+   * `payload` is the JSON piped to a command-tier check, carrying
+   * `check_input_version` so an operator's program can tell the shapes apart.
+   */
   private async evaluateGate(
-    envelope: Envelope,
+    input: GateInput,
   ): Promise<{ outcome: GateOutcome; checkId: string; reason: string; score?: number } | null> {
     let worst: { outcome: GateOutcome; checkId: string; reason: string; score?: number } | null = null;
     for (const check of this.cfg.gateChecks) {
-      if (!this.matchesCheck(check, envelope)) continue;
+      if (!this.matchesCheck(check, input.matchable)) continue;
       let res: { outcome: GateOutcome; reason: string; score?: number };
       if (check.tier === "rules") {
         res = { outcome: check.outcome ?? "alert", reason: `rule ${check.id} matched` };
       } else {
         try {
-          res = await this.execCheck(check, envelope);
+          res = await this.execCheck(check, input.payload);
         } catch (err) {
           // Fail closed to hold (spec 7.2): a broken check must not silently allow, nor hard-refuse.
           res = { outcome: "hold", reason: `check ${check.id} failed closed: ${(err as Error).message.slice(0, 120)}` };
@@ -1311,24 +1361,137 @@ export class RoomHub {
     return worst && worst.outcome !== "allow" ? worst : null;
   }
 
-  private matchesCheck(check: GateCheck, env: Envelope): boolean {
+  /**
+   * Does this check apply?
+   *
+   * `kind` and `ext_key` are message concepts, so a check scoped to either never
+   * matches a task action: absent is not a wildcard. That is deliberately
+   * conservative, because the alternative (treating absence as a match) would have
+   * every existing kind-scoped rule suddenly firing on tasks the day the second
+   * call site landed. `origin` and `text_regex` apply to both shapes, which is what
+   * RFA-0.6 sect. 7.2 requires of an existing `text_regex` rule.
+   *
+   * Known limitation, stated rather than papered over: a rules-tier check cannot
+   * target task actions SPECIFICALLY (there is no `match.shape` or `match.action`),
+   * so a task-only rule has to be expressed through its text or moved to the
+   * command tier, where `check_input_version` and `action` are both in the payload.
+   */
+  private matchesCheck(check: GateCheck, m2: GateMatchable): boolean {
     const m = check.match;
     if (!m) return true;
-    if (m.kind && !m.kind.includes(env.kind)) return false;
-    if (m.origin && !m.origin.includes(env.from.origin as "human" | "agent")) return false;
-    if (m.ext_key && !(m.ext_key in env.ext)) return false;
-    if (m.text_regex) {
-      const text = env.body
-        .filter((p): p is Extract<Part, { type: "text" }> => p.type === "text")
-        .map((p) => p.text)
-        .join("\n");
-      if (!new RegExp(m.text_regex, "i").test(text)) return false;
-    }
+    if (m.kind && (m2.kind === null || !m.kind.includes(m2.kind))) return false;
+    if (m.origin && !m.origin.includes(m2.origin)) return false;
+    if (m.ext_key && !m2.extKeys.includes(m.ext_key)) return false;
+    if (m.text_regex && !new RegExp(m.text_regex, "i").test(m2.text)) return false;
     return true;
   }
 
-  /** command tier: envelope JSON on stdin, {decision, reason?, score?} on stdout; exit 2 = refuse; timeout throws (fails closed). */
-  private execCheck(check: GateCheck, env: Envelope): Promise<{ outcome: GateOutcome; reason: string; score?: number }> {
+  /** The normalized match view plus the versioned payload, for an envelope (check_input_version 1). */
+  private envelopeGateInput(env: Envelope): GateInput {
+    const text = env.body
+      .filter((p): p is Extract<Part, { type: "text" }> => p.type === "text")
+      .map((p) => p.text)
+      .join("\n");
+    return {
+      matchable: { kind: env.kind, origin: env.from.origin as "human" | "agent", extKeys: Object.keys(env.ext), text },
+      // Spread, never mutate: the envelope IS the hashed wire object, and adding a
+      // field to it would change its hash for every reader.
+      payload: { check_input_version: 1, ...env },
+    };
+  }
+
+  /**
+   * The same, for a mutating task action (check_input_version 2, the discriminated
+   * form of RFA-0.6 sect. 7.2).
+   *
+   * Fields in scope are exactly `title`, `description`, `note` and
+   * `evidence.summary` (7.2). `artifacts[]` are deliberately excluded: they are
+   * references the hub never dereferences (spec 14.4), so inspecting them would
+   * imply a fetch this hub must not perform.
+   */
+  private taskGateInput(
+    room: Room,
+    member: Member,
+    action: string,
+    taskId: string | null,
+    fields: { title?: string; description?: string; note?: string; evidence_summary?: string },
+  ): GateInput {
+    const present = [fields.title, fields.description, fields.note, fields.evidence_summary].filter(
+      (v): v is string => typeof v === "string" && v.length > 0,
+    );
+    return {
+      matchable: { kind: null, origin: member.origin, extKeys: [], text: present.join("\n") },
+      payload: {
+        check_input_version: 2,
+        shape: "task_action",
+        room: room.handle,
+        actor: { id: member.id, origin: member.origin, home: member.home },
+        action,
+        task_id: taskId,
+        fields: {
+          title: fields.title ?? null,
+          description: fields.description ?? null,
+          note: fields.note ?? null,
+          evidence_summary: fields.evidence_summary ?? null,
+        },
+        text: present,
+      },
+    };
+  }
+
+  /**
+   * The gate over a mutating task action, with 7.2's degradation rule.
+   *
+   * A `hold` MUST degrade to `refuse` here: a task has no parked state and no
+   * `request_id` to hang an approval on, so a hold verdict would otherwise leave
+   * the task in an undefined state. `deploy/gate.json`'s shipped `hold-marker` rule
+   * matches on `text_regex` alone, so this is reachable with the default config
+   * rather than being a hypothetical. An operator who wants a task held holds the
+   * member (`hold_member`), which is a state that exists.
+   */
+  private async gateTaskAction(
+    room: Room,
+    member: Member,
+    action: string,
+    taskId: string | null,
+    fields: { title?: string; description?: string; note?: string; evidence_summary?: string },
+  ): Promise<void> {
+    if (this.cfg.gateChecks.length === 0) return;
+    const verdict = await this.evaluateGate(this.taskGateInput(room, member, action, taskId, fields));
+    if (!verdict) return;
+    if (verdict.outcome === "alert") {
+      this.appendEvent(room, {
+        type: "system",
+        event: "gate_alert",
+        refs: { task: taskId, action, member: member.id, check: verdict.checkId, reason: verdict.reason, score: verdict.score ?? null },
+      });
+      return;
+    }
+    const degraded = verdict.outcome === "hold";
+    this.appendEvent(room, {
+      type: "system",
+      event: "gate_refused",
+      refs: {
+        task: taskId,
+        action,
+        member: member.id,
+        check: verdict.checkId,
+        reason: verdict.reason,
+        ...(degraded ? { degraded_from: "hold" } : {}),
+      },
+    });
+    this.writeMeta(room);
+    throw new RfaError(
+      "policy_refused",
+      `refused by policy check ${verdict.checkId}: ${verdict.reason}` +
+        (degraded ? " (a hold on a task action degrades to refuse: a task has no parked state)" : ""),
+      null,
+      { check_id: verdict.checkId },
+    );
+  }
+
+  /** command tier: the versioned check input on stdin, {decision, reason?, score?} on stdout; exit 2 = refuse; timeout throws (fails closed). */
+  private execCheck(check: GateCheck, payload: unknown): Promise<{ outcome: GateOutcome; reason: string; score?: number }> {
     return new Promise((resolve, reject) => {
       const [cmd, ...argv] = check.command ?? [];
       if (!cmd) return reject(new Error("command check without command"));
@@ -1347,7 +1510,7 @@ export class RoomHub {
           reject(e as Error);
         }
       });
-      child.stdin?.write(JSON.stringify(env));
+      child.stdin?.write(JSON.stringify(payload));
       child.stdin?.end();
     });
   }
@@ -1851,7 +2014,7 @@ export class RoomHub {
 
   // ---------------------------------------------------------------- tasks (optional profile, spec 10.2)
 
-  task(args: {
+  async task(args: {
     room: string;
     membership_token: string;
     action: "create" | "get" | "list" | "claim" | "release" | "update" | "complete" | "verify" | "cancel";
@@ -1871,13 +2034,43 @@ export class RoomHub {
     /** The claim fence's secret half (spec 10.3); accepted by complete, update and release. */
     claim_token?: string;
     max_attempts?: number;
-  }): RfaTask | { tasks: RfaTask[] } | (RfaTask & { claim_token: string }) {
+    // ASYNC since v0.6.2: the policy gate is async and it MUST cover task actions
+    // (RFA-0.6 sect. 7.2). The alternative was gating in the caller, which would
+    // have made a MUST depend on every call site remembering it.
+  }): Promise<RfaTask | { tasks: RfaTask[] } | (RfaTask & { claim_token: string })> {
     const { room, member } = this.auth(args.room, args.membership_token, { allowEnded: args.action === "get" || args.action === "list" });
-    if (member.role === "observer" && args.action !== "get" && args.action !== "list") {
+    const reads = args.action === "get" || args.action === "list";
+    if (member.role === "observer" && !reads) {
       throw new RfaError("unauthorized", "observers cannot act on tasks");
     }
-    if (member.held && args.action !== "get" && args.action !== "list") {
+    if (member.held && !reads) {
       throw new RfaError("held", "a supervisor holds you; keep listening for the release_member intervention");
+    }
+    if (!reads) {
+      // Size cap before anything else, including the gate: an unbounded field is a
+      // cost on every downstream reader (the gate's own regex, a human's approval
+      // card, a resident's prompt), so it is refused at the door and not inspected.
+      const texts: [string, string | undefined][] = [
+        ["title", args.title],
+        ["description", args.description],
+        ["note", args.note],
+        ["evidence.summary", args.evidence?.summary],
+      ];
+      const bytes = texts.reduce((n, [, v]) => n + (v ? Buffer.byteLength(v, "utf8") : 0), 0);
+      if (bytes > this.cfg.maxInlineBytes) {
+        // `payload_too_large` is the wire's existing code for this (spec 9.4), and a
+        // new code for the same condition would be a wire change nobody asked for.
+        throw new RfaError(
+          "payload_too_large",
+          `task text is ${bytes} bytes across ${TASK_TEXT_FIELDS.join(", ")}; the cap is ${this.cfg.maxInlineBytes}`,
+        );
+      }
+      await this.gateTaskAction(room, member, args.action, args.id ?? null, {
+        title: args.title,
+        description: args.description,
+        note: args.note,
+        evidence_summary: args.evidence?.summary,
+      });
     }
     const now = this.cfg.now();
 

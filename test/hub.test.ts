@@ -685,10 +685,10 @@ test("tasks: events reach owner and creator under the mentions filter; overdue t
   const hub = new RoomHub({ dataDir: null, sweepIntervalMs: 0, now: () => now });
   const a = hub.createRoom({ topic: "t", name: "creator", card: pmCard });
   const b = hub.join({ room: a.room, join_secret: a.join_secret!, name: "worker", card: devCard });
-  const t = hub.task({
+  const t = (await hub.task({
     room: a.room, membership_token: a.contract.you.membership_token, action: "create",
     title: "overdue soon", owner: b.you.id, reply_by: new Date(now + 5_000).toISOString(),
-  }) as any;
+  })) as any;
   // Worker (owner) sees the create event under mentions.
   const got = hub.listen({
     room: a.room, membership_token: b.you.membership_token, since: 0, timeout_ms: 0, wait_for: "mentions",
@@ -713,10 +713,10 @@ test("tasks: survive a hub restart", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-tasks-"));
   const hub1 = new RoomHub({ dataDir: dir, sweepIntervalMs: 0 });
   const a = hub1.createRoom({ topic: "durable tasks", name: "pm-agent", card: pmCard });
-  hub1.task({ room: a.room, membership_token: a.contract.you.membership_token, action: "create", title: "persisted" });
+  await hub1.task({ room: a.room, membership_token: a.contract.you.membership_token, action: "create", title: "persisted" });
   hub1.close();
   const hub2 = new RoomHub({ dataDir: dir, sweepIntervalMs: 0 });
-  const listed = hub2.task({ room: a.room, membership_token: a.contract.you.membership_token, action: "list" }) as any;
+  const listed = (await hub2.task({ room: a.room, membership_token: a.contract.you.membership_token, action: "list" })) as any;
   assert.equal(listed.tasks.length, 1);
   assert.equal(listed.tasks[0].title, "persisted");
   assert.equal(listed.tasks[0].id, "t_1");
