@@ -1,7 +1,33 @@
 {
-  "pm-live-01": 1,
-  "pm-live-02": 1,
-  "pm-live-03": 1,
-  "pm-live-04": 1,
-  "protocol-ask-cycle": 1
+ "gate": {
+  "k": 4,
+  "band": 0.15
+ },
+ "cases": {
+  "pm-live-01": {
+   "passk": 0,
+   "k": 4,
+   "definition_hash": "sha256:tY4DTu19f3XCYXI75IpljZxmRns2C5rQwokbFDhjVvE"
+  },
+  "pm-live-02": {
+   "passk": 0,
+   "k": 4,
+   "definition_hash": "sha256:tY4DTu19f3XCYXI75IpljZxmRns2C5rQwokbFDhjVvE"
+  },
+  "pm-live-03": {
+   "passk": 0,
+   "k": 4,
+   "definition_hash": "sha256:tY4DTu19f3XCYXI75IpljZxmRns2C5rQwokbFDhjVvE"
+  },
+  "pm-live-04": {
+   "passk": 0,
+   "k": 4,
+   "definition_hash": null
+  },
+  "protocol-ask-cycle": {
+   "passk": 1,
+   "k": 4,
+   "definition_hash": null
+  }
+ }
 }

@@ -54,6 +54,8 @@ export interface Feedback {
   comment?: string | null;
   correction?: string | null;
   source_type: "api" | "app" | "evaluator" | "model" | "human";
+  /** REQUIRED when source_type is "model" (spec 20.1): the rubric the verdict was made against. */
+  rubric_hash?: string | null;
 }
 
 export interface ObsSummary {
@@ -124,10 +126,17 @@ export class ObsStore {
         comment TEXT,
         correction TEXT,
         source_type TEXT NOT NULL CHECK (source_type IN ('api','app','evaluator','model','human')),
+        -- SHA-256 of evals/rubric.md as read at judge time (spec 20.1). REQUIRED
+        -- when source_type = 'model', NULL otherwise: without it a rubric edit
+        -- is indistinguishable from a movement in agent quality.
+        rubric_hash TEXT,
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_fb_run ON feedback(run_id);
     `);
+    // Additive migration for databases created before 0.5.4.
+    const fbCols = new Set((this.db.prepare("PRAGMA table_info(feedback)").all() as { name: string }[]).map((c) => c.name));
+    if (!fbCols.has("rubric_hash")) this.db.exec("ALTER TABLE feedback ADD COLUMN rubric_hash TEXT");
   }
 
   close(): void {
@@ -200,13 +209,20 @@ export class ObsStore {
   }
 
   feedback(f: Feedback): void {
+    if (f.source_type === "model" && !f.rubric_hash) {
+      throw new Error("a model-sourced feedback row requires rubric_hash (spec 20.1): without it a rubric edit reads as a quality change");
+    }
     this.db
-      .prepare(`INSERT INTO feedback (run_id, key, score, value, comment, correction, source_type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(f.run_id, f.key, f.score, f.value ?? null, f.comment ?? null, f.correction ?? null, f.source_type, Date.now());
+      .prepare(
+        `INSERT INTO feedback (run_id, key, score, value, comment, correction, source_type, rubric_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(f.run_id, f.key, f.score, f.value ?? null, f.comment ?? null, f.correction ?? null, f.source_type, f.rubric_hash ?? null, Date.now());
   }
 
   feedbackFor(runId: string): (Feedback & { created_at: number })[] {
-    return this.db.prepare(`SELECT run_id, key, score, value, comment, correction, source_type, created_at FROM feedback WHERE run_id = ?`).all(runId) as never;
+    return this.db
+      .prepare(`SELECT run_id, key, score, value, comment, correction, source_type, rubric_hash, created_at FROM feedback WHERE run_id = ?`)
+      .all(runId) as never;
   }
 
   /** The three-alert summary window (agent/generation runs only: tool spans would drown the signal). */

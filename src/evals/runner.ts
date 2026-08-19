@@ -19,9 +19,36 @@ import { RoomMember } from "../client.js";
 import type { Envelope, RfaEvent } from "../model.js";
 import { ObsStore } from "../obs.js";
 import { claudeJudge } from "./judge.js";
+import { loadPack } from "../agentdef.js";
 import { computeReward, passHatK, rfaLogToTrajectory, type ExpectBlock } from "./trajectory.js";
 
+/**
+ * The gate's k and band (spec 20.3). Both are CHOSEN, not measured: k=4 is the
+ * value the pass^k estimator was already run at, and 0.15 absolute is a guess at
+ * a band wide enough to swallow the observed flake. Neither may be tightened
+ * before the gate's own false-positive rate has been measured by repeated
+ * no-change runs, which is why every verdict prints the flake rate beside it.
+ */
+const GATE_K = 4;
+const GATE_BAND = 0.15;
+
+interface CaseBaseline {
+  passk: number;
+  k: number;
+  /** The agent definition this baseline was measured against, so a definition change is not read as a quality change. */
+  definition_hash: string | null;
+}
+
 const ROOT = path.resolve(import.meta.dirname ?? ".", "..", "..");
+
+// A hub with tokens configured refuses an unauthenticated /mcp, and this harness
+// joins rooms like any other client. Without this the whole gate reported
+// regressions whose real cause was a 401 (observed).
+{
+  const { transportToken } = await import("../secrets.js");
+  const tok = transportToken(path.join(ROOT, "data", "secrets.json"));
+  if (tok && !process.env.RFA_TOKEN) process.env.RFA_TOKEN = tok;
+}
 
 interface CaseDef {
   id: string;
@@ -42,12 +69,40 @@ interface CaseResult {
   passk: { k: number; value: number } | null;
   comments: string[];
   judge?: { score: number; comment: string };
+  /** The subject's definition hash at run time (spec 20.3): a definition change must not read as a quality change. */
+  definition_hash?: string | null;
+}
+
+/**
+ * The subject's model tier, read from its pack, so the judge can pick a
+ * different one (spec 20.1). Null when the subject is not a local pack, in which
+ * case the judge falls back to its own default tier.
+ */
+function subjectModel(memberName: string): string | null {
+  try {
+    const dir = path.join(ROOT, "agents", memberName);
+    if (!fs.existsSync(path.join(dir, "agent.md"))) return null;
+    return loadPack(dir).def.model ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cases under agents/<name>/evals/ belong to that pack. A retired pack keeps its
+ * directory (retirement archives the definition, memory and membership, and
+ * deliberately does not delete an operator's data), so without this check a
+ * retired agent's cases keep running forever and failing forever.
+ */
+function packIsLive(caseRoot: string): boolean {
+  const marker = path.join(path.dirname(path.dirname(caseRoot)), "agent.md");
+  return !marker.includes(`${path.sep}agents${path.sep}`) || fs.existsSync(marker);
 }
 
 function discoverCases(): { dir: string; def: CaseDef }[] {
   const roots = [path.join(ROOT, "evals", "cases"), ...fs.existsSync(path.join(ROOT, "agents")) ? fs.readdirSync(path.join(ROOT, "agents")).map((a) => path.join(ROOT, "agents", a, "evals", "cases")) : []];
   const out: { dir: string; def: CaseDef }[] = [];
-  for (const root of roots.filter((r) => fs.existsSync(r))) {
+  for (const root of roots.filter((r) => fs.existsSync(r) && packIsLive(r))) {
     for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
       const file = path.join(root, entry.name, "case.yaml");
       if (entry.isDirectory() && fs.existsSync(file)) {
@@ -103,10 +158,22 @@ function liveEnv(): LiveEnv {
 }
 
 async function runLive(def: CaseDef, env: LiveEnv, obs: ObsStore | null, judged: boolean): Promise<CaseResult> {
-  const probe = await RoomMember.create({
-    hubUrl: env.hubUrl, room: env.room, joinSecret: env.secret, name: `eval-${def.id.slice(0, 20)}`,
-    card: { name: "eval-probe", description: "eval harness probe", skills: [{ id: "eval", description: "runs eval cases" }] },
-  });
+  // A FRESH membership per trial. Duplicate suppression is per sender, so
+  // asking the same question four times from one member is refused as a
+  // duplicate after the first (measured: every multi-trial case failed with
+  // "identical body suppressed"). The alternatives were worse: altering the
+  // question per trial stops measuring the same thing, and sleeping past the
+  // 30s window adds minutes per case for nothing.
+  const probes: RoomMember[] = [];
+  const newProbe = async (n: number): Promise<RoomMember> => {
+    const p = await RoomMember.create({
+      hubUrl: env.hubUrl, room: env.room, joinSecret: env.secret, name: `eval-${def.id.slice(0, 16)}-t${n}`,
+      card: { name: "eval-probe", description: "eval harness probe", skills: [{ id: "eval", description: "runs eval cases" }] },
+    });
+    probes.push(p);
+    return p;
+  };
+  const probe = await newProbe(1);
   try {
     const subjectRec = probe.roster.find((r) => def.subject_capability && r.card_summary.skill_ids.includes(def.subject_capability));
     if (!subjectRec) throw new Error(`no roster member offers ${def.subject_capability}`);
@@ -114,11 +181,12 @@ async function runLive(def: CaseDef, env: LiveEnv, obs: ObsStore | null, judged:
     const comments: string[] = [];
     let judge: CaseResult["judge"];
     for (let i = 0; i < (def.trials ?? 1); i++) {
-      const answer = await probe.ask(subjectRec.id, def.ask!, { timeoutMs: def.timeout_ms ?? 120_000 });
+      const asker = i === 0 ? probe : await newProbe(i + 1);
+      const answer = await asker.ask(subjectRec.id, def.ask!, { timeoutMs: def.timeout_ms ?? 120_000 });
       // Reconstruct the exchange as an event slice (live Q&A cases score messages, not board state).
       const asked: RfaEvent = {
         seq: 1, ts: new Date().toISOString(), type: "message",
-        envelope: { ...answer.envelope, message_id: "eval_q", seq: 0, from: { id: probe.memberId, name: probe.name, origin: "agent" }, kind: "request", body: [{ type: "text", text: def.ask! }], refusal: null } as Envelope,
+        envelope: { ...answer.envelope, message_id: "eval_q", seq: 0, from: { id: asker.memberId, name: asker.name, origin: "agent" }, kind: "request", body: [{ type: "text", text: def.ask! }], refusal: null } as Envelope,
       } as never;
       const answered: RfaEvent = { seq: 2, ts: answer.envelope.ts, type: "message", envelope: answer.envelope } as never;
       const events = [asked, answered];
@@ -131,22 +199,37 @@ async function runLive(def: CaseDef, env: LiveEnv, obs: ObsStore | null, judged:
         if (reward.score === 0) obs.markReview(runId, true);
       }
       if (judged && i === 0) {
-        const j = await claudeJudge(ROOT, rfaLogToTrajectory(events, { subject: subjectRec.id }));
+        // Cross-tier (spec 20.1): pass the subject's own model so the judge
+        // picks a different one. Judging haiku with haiku is self-preference.
+        const j = await claudeJudge(ROOT, rfaLogToTrajectory(events, { subject: subjectRec.id }), {
+          subjectModel: subjectModel(subjectRec.name),
+        });
         if (j.score >= 0) {
           judge = { score: j.score, comment: j.comment };
-          if (runId && obs) obs.feedback({ run_id: runId, key: "judge", score: j.score, comment: j.comment, source_type: "model" });
+          if (runId && obs) {
+            obs.feedback({
+              run_id: runId, key: "judge", score: j.score,
+              comment: `${j.comment}${j.judge_model ? ` [judged by ${j.judge_model}]` : ""}`,
+              source_type: "model", rubric_hash: j.rubric_hash ?? null,
+            });
+          }
         }
       }
     }
     const k = Math.min(4, trials.length);
     return {
       id: def.id, kind: "live", trials,
+      // The capability digest identifies the definition this was measured
+      // against: without it a "regression" cannot be told from a pack edit.
+      definition_hash: subjectRec.digest ?? null,
       score: trials.filter(Boolean).length / trials.length,
       passk: trials.length >= 2 ? { k, value: passHatK([trials], k) } : null,
       comments, judge,
     };
   } finally {
-    await probe.leave().catch(() => {});
+    // Leave every probe, or the roster fills with eval corpses (this is how the
+    // zombie-membership finding started).
+    for (const p of probes) await p.leave().catch(() => {});
   }
 }
 
@@ -192,19 +275,86 @@ async function main(): Promise<void> {
   ].join("\n");
   fs.writeFileSync(path.join(reportDir, "latest.md"), md);
 
+  // ---- the gate (spec 20.3) ----------------------------------------------
+  // The old gate compared a point estimate against a stored 1 at trials: 1.
+  // With a measured per-question flake around 5%, a no-change run of five cases
+  // had roughly a one-in-five chance of reporting a regression, and raising
+  // trials against a hard 1.0 target makes that WORSE rather than better. The
+  // normative gate is pass^k with a stated band, and both numbers below are
+  // CHOSEN rather than measured, which is why the gate prints its own flake rate
+  // and must not be tightened until that rate has been measured by repeated
+  // no-change runs.
   const baselineFile = path.join(ROOT, "evals", "baseline.json");
-  const baseline: Record<string, number> = fs.existsSync(baselineFile) ? JSON.parse(fs.readFileSync(baselineFile, "utf8")) : {};
-  const regressions = results.filter((r) => baseline[r.id] !== undefined && r.score < baseline[r.id]);
+  const stored: Record<string, unknown> = fs.existsSync(baselineFile) ? JSON.parse(fs.readFileSync(baselineFile, "utf8")) : {};
+  const corpusVersion = typeof stored.corpus_version === "string" ? stored.corpus_version : null;
+  const baseCases: Record<string, CaseBaseline> = (stored.cases as Record<string, CaseBaseline>) ?? {};
+  // Migrate the flat {id: score} shape written before 0.5.4 without losing it.
+  for (const [id, value] of Object.entries(stored) as [string, unknown][]) {
+    if (typeof value === "number" && baseCases[id] === undefined) baseCases[id] = { passk: value, k: GATE_K, definition_hash: null };
+  }
+
+  /** pass^k at the gate's k, or the point score when a case ran too few trials to estimate one. */
+  const gateValue = (r: CaseResult): { value: number; estimated: boolean } =>
+    r.trials.length >= GATE_K
+      ? { value: passHatK([r.trials], GATE_K), estimated: true }
+      : { value: r.score, estimated: false };
+
+  const rows = results.map((r) => {
+    const { value, estimated } = gateValue(r);
+    const base = baseCases[r.id];
+    const drop = base ? base.passk - value : 0;
+    const definitionChanged = base?.definition_hash != null && r.definition_hash != null && base.definition_hash !== r.definition_hash;
+    return { r, value, estimated, base, drop, regressed: base !== undefined && drop > GATE_BAND, definitionChanged };
+  });
+
+  // The measured flake rate, printed beside every verdict (spec 20.3): the
+  // fraction of trials that failed on cases that did not fail outright. Without
+  // it a reader cannot tell a regression from the noise floor.
+  const multiTrial = results.filter((r) => r.trials.length >= 2 && r.trials.some(Boolean));
+  const flakeTrials = multiTrial.flatMap((r) => r.trials);
+  const flakeRate = flakeTrials.length > 0 ? flakeTrials.filter((t) => !t).length / flakeTrials.length : null;
+  const flakeNote =
+    flakeRate === null
+      ? `flake rate UNMEASURED (every case ran ${Math.max(1, ...results.map((r) => r.trials.length))} trial(s); the gate's own false-positive rate is therefore unknown)`
+      : `measured flake rate ${(flakeRate * 100).toFixed(1)}% over ${flakeTrials.length} trials`;
+
   if (updateBaseline) {
-    for (const r of results) baseline[r.id] = r.score;
-    fs.writeFileSync(baselineFile, JSON.stringify(baseline, null, 2));
-    console.log(`baseline updated: ${results.length} cases -> ${path.relative(ROOT, baselineFile)}`);
-  } else if (regressions.length > 0) {
-    console.error(`REGRESSION vs baseline: ${regressions.map((r) => `${r.id} (${baseline[r.id]} -> ${r.score.toFixed(2)})`).join(", ")}`);
-    process.exit(1);
+    const next: Record<string, CaseBaseline> = {};
+    for (const r of results) {
+      next[r.id] = { passk: gateValue(r).value, k: GATE_K, definition_hash: r.definition_hash ?? null };
+    }
+    fs.writeFileSync(
+      baselineFile,
+      JSON.stringify({ ...(corpusVersion ? { corpus_version: corpusVersion } : {}), gate: { k: GATE_K, band: GATE_BAND }, cases: next }, null, 1) + "\n",
+    );
+    console.log(`baseline updated: ${results.length} cases at pass^${GATE_K} -> ${path.relative(ROOT, baselineFile)}`);
+    console.log(`  ${flakeNote}`);
+  } else {
+    for (const row of rows) {
+      if (!row.regressed) continue;
+      const why = row.definitionChanged
+        ? "the agent DEFINITION also changed, so this is not necessarily a quality movement"
+        : corpusVersion
+          ? `corpus ${corpusVersion.slice(0, 12)}`
+          : "corpus version not pinned, so a knowledge edit is indistinguishable from a quality change";
+      console.error(
+        `REGRESSION ${row.r.id}: pass^${GATE_K} ${row.base!.passk.toFixed(2)} -> ${row.value.toFixed(2)} ` +
+          `(drop ${row.drop.toFixed(2)} > band ${GATE_BAND}${row.estimated ? "" : ", point estimate: too few trials for pass^k"}); ${why}`,
+      );
+    }
+    if (rows.some((row) => row.regressed)) {
+      console.error(`  ${flakeNote}`);
+      process.exit(1);
+    }
   }
   const pass = results.filter((r) => r.score === 1).length;
-  console.log(`evals: ${pass}/${results.length} clean · report: reports/evals/latest.md`);
+  console.log(`evals: ${pass}/${results.length} clean at pass^${GATE_K} band ${GATE_BAND} · ${flakeNote} · report: reports/evals/latest.md`);
+  if (pass === results.length) {
+    // Anti-ossification (spec 20.4): a clean sweep is only meaningful if someone
+    // writes down that it was reviewed. The instrument cannot tell whether it
+    // has finished or gone blind; only the ledger entry can.
+    console.log(`  100% clean: log "reviewed ${results.length} cases, no new failure modes" in STATUS.md, or this run is an unaudited instrument`);
+  }
 }
 
 await main();

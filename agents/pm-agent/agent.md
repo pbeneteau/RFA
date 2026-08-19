@@ -34,7 +34,10 @@ secrets: [RFA_JOIN_SECRET, RFA_TOKEN]
 budgets:
   max_turns: 8
   per_task_usd: 0.25
-  per_day_usd: 3
+  # 8 was 3: one eval gate run is 32 live trials at roughly 4 cents, so a day
+  # with two baseline runs plus ordinary use exhausted a 3 dollar ceiling and the
+  # agent stopped answering mid-measurement.
+  per_day_usd: 8
 rooms:
   - room: r_9a25e48c0e
     role: participant

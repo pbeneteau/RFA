@@ -1020,7 +1020,16 @@ export class RoomHub {
     }
     const bodyHash = sha256hex(canonicalize(args.body as unknown as Record<string, unknown>[]));
     member.bodyHashes = member.bodyHashes.filter((b) => now - b.ts < this.cfg.dupWindowS * 1000);
-    if (kind !== "status" && member.bodyHashes.some((b) => b.hash === bodyHash)) {
+    // Duplicate suppression exists to stop repeated identical CHAT, not to
+    // silence correlated replies. An envelope carrying `in_reply_to` is
+    // answering one specific message, and identical text is expected: the same
+    // question twice gets the same answer, and a budget refusal reads the same
+    // every time. Suppressing those turned a clear refusal into a TIMEOUT for
+    // the asker (measured: a resident hit its daily budget, refused correctly
+    // four times, and every refusal was eaten here while the askers waited the
+    // full 120s and reported no reply).
+    const correlated = typeof args.in_reply_to === "string" && args.in_reply_to.length > 0;
+    if (kind !== "status" && !correlated && member.bodyHashes.some((b) => b.hash === bodyHash)) {
       throw new RfaError("rate_limited", "identical body suppressed (duplicate within window)", this.cfg.dupWindowS);
     }
 

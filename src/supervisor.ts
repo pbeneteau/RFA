@@ -21,7 +21,7 @@
  *   pause after a provider rate limit. The shared state is `src/account.ts` over
  *   `data/runs.db`; residents consult it, the supervisor governs it.
  */
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { AccountLedger, DEFAULT_CAP, RATE_LIMIT_PAUSE_FLOOR_MS } from "./account.js";
@@ -117,7 +117,51 @@ function residentLog(pack: AgentPack): number {
   return fs.openSync(path.join(dir, "resident.log"), "a");
 }
 
+/**
+ * Is a resident process for this pack already running that this supervisor does
+ * not own? Found the hard way: when the supervisor died (an unhandled throw in a
+ * file watcher), its children kept serving. Restarting the supervisor then
+ * spawned SECOND residents, and two processes served the same membership: they
+ * competed for one room cursor, one held a stale definition and a stale spend
+ * ledger, and an eval run spent an hour producing failures whose real cause was
+ * duplicate agents. Two residents on one membership is the same identity
+ * collision this project already fixed once at the state-file level.
+ */
+function foreignResident(name: string): number | null {
+  try {
+    const out = execFileSync("ps", ["ax", "-o", "pid=,ppid=,command="], { encoding: "utf8" });
+    for (const line of out.split("\n")) {
+      if (!line.includes("resident.ts")) continue;
+      if (!new RegExp(`--agent\\s+${name}(\\s|$)`).test(line)) continue;
+      const [pid, ppid] = line.trim().split(/\s+/, 2).map(Number);
+      if (!Number.isFinite(pid)) continue;
+      // Ours, or a descendant of ours, is not a stray.
+      if (ppid === process.pid || pid === process.pid) continue;
+      if ([...children.values()].some((c) => c.proc?.pid === pid || c.proc?.pid === ppid)) continue;
+      return pid;
+    }
+  } catch {
+    /* cannot enumerate: proceed rather than refuse to supervise */
+  }
+  return null;
+}
+
 function start(child: Child): void {
+  // Never a second resident for the same pack. Two processes serving one
+  // membership compete for the same room cursor, and one of them holds a stale
+  // definition and a stale spend ledger. This happened for real: the supervisor
+  // died from an unhandled throw, its children kept serving, and the restarted
+  // supervisor spawned duplicates that spent an hour producing eval failures
+  // whose true cause was two agents answering as one.
+  const stray = foreignResident(child.pack.name);
+  if (stray !== null) {
+    log(
+      `${child.pack.name}: a resident is ALREADY running as pid ${stray} and this supervisor does not own it ` +
+        `(usually an orphan from a supervisor that died). NOT starting a second one. Stop that process, or ` +
+        `\`npm run retire-agent -- ${child.pack.name}\` if it is stale.`,
+    );
+    return;
+  }
   const fd = residentLog(child.pack);
   // Secrets: the pack declares NAMES; only those values are injected (6.3).
   let env = process.env;
