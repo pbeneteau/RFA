@@ -13,6 +13,7 @@ import { RfaError } from "./errors.js";
 import { canonicalize, digestCard, sha256hex } from "./jcs.js";
 import { verifyCard, type Jwk, type VerificationDetail } from "./signing.js";
 import { TERMINAL_TASK_STATES } from "./model.js";
+import { consoleNameFor, matchPrincipal } from "./principals.js";
 import { foldWhitespace, neutralize, renderWrapped } from "./wrap.js";
 import type {
   AgentCard,
@@ -208,6 +209,14 @@ interface Member {
    * upgrading hub does not lock out its own residents.
    */
   home: string;
+  /**
+   * WHICH human, when `origin` is human: a domain-separated hash of the key that
+   * authenticated, never the key (RFA-0.6 sect. 4.4). Null for every agent.
+   *
+   * Without it the chain could prove an approval happened and not who gave it,
+   * because every provisioned human key was interchangeable.
+   */
+  principal: string | null;
   sentIds: Set<string>;
   rateWindow: number[];
   bodyHashes: { hash: string; ts: number }[];
@@ -609,7 +618,7 @@ export class RoomHub {
       name: args.name,
       card: args.card,
       role: "participant",
-      origin: this.resolveOrigin(args.human_key),
+      ...this.resolvePrincipal(args.human_key),
       historyLimit: 0,
       isHost: true,
     });
@@ -635,7 +644,7 @@ export class RoomHub {
     if (room.quarantinedNames.has(args.name) || room.quarantinedDigests.has(digestCard(args.card))) {
       throw new RfaError("join_denied", "this identity is quarantined pending human review (room_admin release_member)");
     }
-    const origin = this.resolveOrigin(args.human_key);
+    const { origin, principal } = this.resolvePrincipal(args.human_key);
     const role = args.role ?? "participant";
     // Agents can never self-assign supervisor authority (spec 5.2/14): join as
     // supervisor needs a provisioned human key; agents get promoted via set_role.
@@ -651,6 +660,7 @@ export class RoomHub {
       card: args.card,
       role,
       origin,
+      principal,
       historyLimit: args.history_limit ?? this.cfg.historyDefault,
       isHost: false,
     });
@@ -658,18 +668,39 @@ export class RoomHub {
     return contract;
   }
 
-  /** A provisioned human key is the only path to a human principal; a wrong key fails loudly, never downgrades. */
-  private resolveOrigin(humanKey: string | undefined): Origin {
-    if (humanKey === undefined) return "agent";
-    if (!this.cfg.humanKeys.includes(humanKey)) {
+  /**
+   * A provisioned human key is the only path to a human principal; a wrong key
+   * fails loudly, never downgrades.
+   *
+   * Constant-time, and it now returns WHICH human (RFA-0.6 sect. 4.4). This path
+   * used `Array.includes` and was documented as PENDING on the reasoning that it
+   * sits behind a room handle and a join secret; `/mcp` now takes a transport
+   * credential every resident holds and the join secret is a file on the same
+   * machine, so that reasoning had thinned. `src/principals.ts` is the single
+   * implementation shared with `POST /auth`.
+   */
+  private resolvePrincipal(humanKey: string | undefined): { origin: Origin; principal: string | null } {
+    if (humanKey === undefined) return { origin: "agent", principal: null };
+    const principal = matchPrincipal(humanKey, this.cfg.humanKeys);
+    if (principal === null) {
       throw new RfaError("join_denied", "invalid human_key");
     }
-    return "human";
+    return { origin: "human", principal };
   }
 
   private doJoin(
     room: Room,
-    args: { name: string; card: AgentCard; role: Role; origin: Origin; historyLimit: number; isHost: boolean; home?: string },
+    args: {
+      name: string;
+      card: AgentCard;
+      role: Role;
+      origin: Origin;
+      /** Which human, when origin is human (RFA-0.6 sect. 4.4). Null for an agent. */
+      principal?: string | null;
+      historyLimit: number;
+      isHost: boolean;
+      home?: string;
+    },
   ): JoinContract {
     if (!NAME_RE.test(args.name) || args.name.length > 64) {
       throw new RfaError("bad_request", "name must match the RFA name grammar (section 4.1)");
@@ -726,6 +757,7 @@ export class RoomHub {
       leftAt: null,
       joinSeq: room.seq + 1, // the roster event this join is about to emit
       home: args.home ?? "local",
+      principal: args.principal ?? null,
       sentIds: new Set(),
       rateWindow: [],
       bodyHashes: [],
@@ -1775,20 +1807,32 @@ export class RoomHub {
     return { membership_token: contract.you.membership_token, member_id: contract.you.id };
   }
 
-  consoleMembership(roomHandle: string): { membership_token: string; member_id: string } {
+  consoleMembership(roomHandle: string, principal?: string | null): { membership_token: string; member_id: string } {
     const room = this.getRoom(roomHandle);
+    // PER PRINCIPAL (RFA-0.6 sect. 4.4). One shared `console` membership meant every
+    // decision made through the console was attributed to the same member, whoever
+    // was holding the phone, so the log could prove an approval happened and not who
+    // gave it. The name now carries which human, and `principal` is recorded on the
+    // membership so interventions name it too.
+    //
+    // Omitting `principal` keeps the legacy single `console` membership rather than
+    // minting an anonymous authority: a caller that cannot say which human it is
+    // should not get a fresh supervisor identity out of the deal.
+    const name = principal ? consoleNameFor(principal) : "console";
     for (const m of room.members.values()) {
-      // Exact name, never a prefix: `startsWith` would hand the console's
-      // membership to anything called `console-something`.
-      if (m.present && m.origin === "human" && m.role === "supervisor" && m.name === "console") {
+      // Exact name, never a prefix: `startsWith` would hand this membership to
+      // anything called `console-something`, which is now the shape of every
+      // per-principal name and so exactly the collision to avoid.
+      if (m.present && m.origin === "human" && m.role === "supervisor" && m.name === name) {
         return { membership_token: m.token, member_id: m.id };
       }
     }
     const contract = this.doJoin(room, {
-      name: "console",
-      card: { name: "console", description: "the workbench console (human operator)" },
+      name,
+      card: { name, description: "the workbench console (human operator)" },
       role: "supervisor",
       origin: "human",
+      principal: principal ?? null,
       historyLimit: 0,
       isHost: false,
     });
@@ -1823,7 +1867,12 @@ export class RoomHub {
         actor: member.id,
         target,
         reason: args.reason ?? null,
-        refs,
+        // WHICH human, on every human-origin intervention (RFA-0.6 sect. 4.4). The
+        // member id alone was not enough: one shared `console` membership meant
+        // every console decision, from whoever was holding the phone, was attributed
+        // to the same member. Absent for an agent-origin intervention, where there
+        // is no principal to name.
+        refs: member.principal ? { ...refs, principal: member.principal } : refs,
       });
     };
     const targetMember = (): Member => {
@@ -2411,18 +2460,36 @@ export class RoomHub {
             { verifier_home: member.home ?? "local" },
           );
         }
-        // Honest residue, carried from the spec rather than hidden: two
-        // memberships admitted on a shared join_secret carry no principal, so
-        // this hub cannot tell them apart. Where a principal exists, use it.
+        // Spec 10.4: a verifier MUST NOT share the owner's authenticated principal,
+        // because a different member id is not a different party.
+        //
+        // Exact where it can be, conservative where it cannot. Both memberships
+        // carrying a principal (RFA-0.6 sect. 4.4) is now the common case and the
+        // comparison is then precise. This also FIXES an over-refusal that shipped
+        // with the rule: the previous approximation compared `home`, and since every
+        // local member's home is `"local"`, two DIFFERENT human operators on one hub
+        // were treated as the same party and could not verify each other's work.
+        //
+        // Where a principal is missing (an agent, or a membership written before
+        // principals existed, or two joins on one shared join_secret) the hub still
+        // cannot tell the parties apart, so it falls back to the old home heuristic
+        // and refuses. That is the honest direction for a rule about self-approval.
         const ownerMember = task.owner ? room.members.get(task.owner) : null;
+        const bothHuman = ownerMember != null && ownerMember.origin === "human" && member.origin === "human";
+        const distinctMembers = ownerMember != null && ownerMember.id !== member.id;
         const samePrincipal =
-          ownerMember != null &&
-          ownerMember.id !== member.id &&
-          ownerMember.origin === "human" &&
-          member.origin === "human" &&
-          ownerMember.home === member.home;
+          distinctMembers &&
+          bothHuman &&
+          (ownerMember!.principal !== null && member.principal !== null
+            ? ownerMember!.principal === member.principal
+            : ownerMember!.home === member.home);
         if (samePrincipal) {
-          throw new RfaError("unauthorized", "self-verification through a second membership of the same principal is refused");
+          throw new RfaError(
+            "unauthorized",
+            ownerMember!.principal !== null && member.principal !== null
+              ? "self-verification through a second membership of the same principal is refused"
+              : "one of these memberships carries no principal, so this hub cannot tell the parties apart; verification is refused",
+          );
         }
         // Rejection is bounded per (task, attempt): an unbounded reject loop
         // wedges a board just as effectively as a stuck claim.
@@ -2943,6 +3010,10 @@ export class RoomHub {
         ttlS: m.ttlS,
         joinSeq: m.joinSeq,
         home: m.home,
+        // Persisted, or the attribution the whole feature exists for is lost on the
+        // first restart: the log would still carry `principal` on past interventions
+        // while the live membership could no longer say which human it belongs to.
+        principal: m.principal,
       })),
       names: [...room.names.entries()],
       nameHistory: [...room.nameHistory.entries()],
@@ -3033,6 +3104,10 @@ export class RoomHub {
             // retroactively hiding history from them.
             joinSeq: m.joinSeq ?? 0,
             home: m.home ?? "local",
+            // Null for a membership written before principals existed, which is
+            // honest: that member's human is genuinely unknown, and inventing one
+            // would put a fabricated attribution in an audit trail.
+            principal: m.principal ?? null,
             cardVerified: verification.verified,
             cardVerification: verification.details,
             state: m.present ? "offline" : m.declaredState, // everyone is offline after a restart until they call in

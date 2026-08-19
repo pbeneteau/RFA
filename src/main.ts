@@ -33,7 +33,7 @@
  *                                   allowed; a request with NO Origin header, i.e. any non-browser
  *                                   client, is unaffected). Rejections are logged with the value seen.
  */
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
@@ -44,6 +44,7 @@ import { createHubServer } from "./hub.js";
 import { sha256hex } from "./jcs.js";
 import { ObsStore } from "./obs.js";
 import { RoomHub } from "./store.js";
+import { constantTimeMatch, matchPrincipal } from "./principals.js";
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(name);
@@ -198,7 +199,15 @@ if (httpPort) {
 
 const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
 const AGENTS_DIR = path.join(ROOT, "agents");
-const sessions = new Map<string, number>(); // token -> expires (ms)
+/**
+ * Live workbench sessions: token -> { expires, principal }.
+ *
+ * The principal is what makes a console decision attributable (RFA-0.6 sect. 4.4).
+ * It used to be an expiry alone, so every session was interchangeable and every
+ * console intervention landed as the same shared `console` member whoever had
+ * authenticated.
+ */
+const sessions = new Map<string, { expires: number; principal: string }>();
 const SESSION_TTL_MS = 12 * 3600_000;
 let obsStore: ObsStore | null = null;
 function obs(): ObsStore | null {
@@ -318,17 +327,28 @@ function watchCards(): void {
  * keep a session alive indefinitely, which is the opposite of a 12-hour cap.
  */
 function sessionValid(token: string): boolean {
-  const exp = sessions.get(token);
-  return exp !== undefined && exp >= Date.now();
+  const rec = sessions.get(token);
+  return rec !== undefined && rec.expires >= Date.now();
 }
 
 function authed(req: http.IncomingMessage): boolean {
+  return sessionPrincipal(req) !== null;
+}
+
+/**
+ * The principal behind this request, or null if it is not a live session.
+ *
+ * Doubles as the `authed` check so there is one place that decides a session is
+ * good: two predicates over the same map is how one of them ends up sliding the
+ * expiry and the other not.
+ */
+function sessionPrincipal(req: http.IncomingMessage): string | null {
   const m = /^Bearer (.+)$/.exec(req.headers.authorization ?? "");
-  if (!m) return false;
-  const exp = sessions.get(m[1]);
-  if (!exp || exp < Date.now()) return false;
-  sessions.set(m[1], Date.now() + SESSION_TTL_MS); // sliding
-  return true;
+  if (!m) return null;
+  const rec = sessions.get(m[1]);
+  if (!rec || rec.expires < Date.now()) return null;
+  sessions.set(m[1], { ...rec, expires: Date.now() + SESSION_TTL_MS }); // sliding
+  return rec.principal;
 }
 
 // ------------------------------------------------- POST /auth hardening (spec 15.5)
@@ -345,33 +365,12 @@ const AUTH_SOURCE_CAP = 4096; // an unauthenticated caller must not grow the per
 const AUTH_LOG_WINDOW_MS = 5 * 60_000; // one aggregated auth-log row per window, whatever the attempt volume
 
 /**
- * Constant-time membership test for a presented secret. timingSafeEqual throws
- * on a length mismatch, so a wrong-length candidate is compared against a
- * same-length zero filler instead of short-circuiting: every configured secret
- * costs exactly one comparison of its own length whatever arrives, and the
- * length check that decides the verdict runs after the comparison, never
- * instead of it.
- *
- * Both credentials this hub validates go through here, the human_key on
- * POST /auth and the transport bearer on /mcp, because a second copy of this
- * loop is a second chance to get it wrong.
- */
-function constantTimeMatch(presented: string, configured: readonly string[]): boolean {
-  const p = Buffer.from(presented, "utf8");
-  let ok = false;
-  for (const secret of configured) {
-    const k = Buffer.from(secret, "utf8");
-    const sameLength = k.length === p.length;
-    const candidate = sameLength ? p : Buffer.alloc(k.length);
-    ok = (timingSafeEqual(k, candidate) && sameLength) || ok;
-  }
-  return ok;
-}
-
-/**
- * The join path (src/store.ts) still uses includes() and stays PENDING per
- * 15.5; it is guarded by a room handle and a join secret, not by this
- * endpoint's reach.
+ * The human-key check. `constantTimeMatch` now lives in `src/principals.ts` and is
+ * shared with the WIRE join path, which used `Array.includes` until 2026-08-19 and
+ * was documented here as PENDING on the reasoning that it sat behind a room handle
+ * and a join secret. That reasoning had thinned (`/mcp` takes a credential every
+ * resident holds; the join secret is a file on this machine), and one
+ * implementation was the stated intent anyway.
  */
 function humanKeyMatches(presented: string): boolean {
   return constantTimeMatch(presented, hub.cfg.humanKeys);
@@ -709,8 +708,12 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
       authAttempts.delete(source); // a good key clears the source's record
       authAudit("success", source, now);
       const token = "st_" + randomBytes(24).toString("base64url");
-      sessions.set(token, Date.now() + SESSION_TTL_MS);
-      return send(res, 200, { session_token: token, ttl_s: SESSION_TTL_MS / 1000 });
+      // Which human authenticated, carried for the life of the session so every
+      // decision made through it is attributable (RFA-0.6 sect. 4.4). The principal
+      // id is a domain-separated hash, never the key, so it is safe in a log.
+      const principal = matchPrincipal(String(b.human_key), hub.cfg.humanKeys);
+      sessions.set(token, { expires: Date.now() + SESSION_TTL_MS, principal: principal ?? "hp_unknown" });
+      return send(res, 200, { session_token: token, ttl_s: SESSION_TTL_MS / 1000, principal_id: principal });
     }
     // Every route below this line is operator-only: reads included.
     if (!authed(req)) return send(res, 401, { error: "session token required (POST /auth)" });
@@ -870,7 +873,8 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
       if (typeof b.room !== "string" || typeof b.request_id !== "string" || !["approve", "reject"].includes(String(b.verb))) {
         return send(res, 400, { error: "room, request_id, verb: approve|reject required" });
       }
-      const membership = hub.consoleMembership(b.room);
+      // Per-principal, so the intervention names which human decided.
+      const membership = hub.consoleMembership(b.room, sessionPrincipal(req));
       const result = await hub.admin({
         room: b.room,
         membership_token: membership.membership_token,
