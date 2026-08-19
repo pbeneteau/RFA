@@ -56,7 +56,20 @@ interface Child {
 }
 
 const children = new Map<string, Child>();
+/** Definition watchers, closed when a pack leaves the registry so a retirement cannot fire into a dead child. */
+const watchers = new Map<string, fs.FSWatcher>();
 const manualStopped = new Set<string>();
+// A supervisor that dies takes restarts, drains, health checks and #ops alerts
+// with it while every resident keeps running, so the room looks healthy and is
+// unsupervised. That happened once, from an unhandled throw inside an fs.watch
+// callback, so the process refuses to die quietly.
+process.on("uncaughtException", (err) => {
+  console.error(`${new Date().toISOString().slice(11, 19)} [supervisor] UNCAUGHT (staying up): ${err.stack ?? err.message}`);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error(`${new Date().toISOString().slice(11, 19)} [supervisor] UNHANDLED REJECTION (staying up): ${String(reason)}`);
+});
+
 const log = (...a: unknown[]) => console.log(new Date().toISOString().slice(11, 19), "[supervisor]", ...a);
 
 // ---------------------------------------------------------------- account layer (v0.5.2, spec 18.6)
@@ -213,7 +226,23 @@ async function reconcile(): Promise<void> {
       const child: Child = { pack, proc: null, startedAt: 0, restarts: [], backoffMs: POLICY.backoffBaseMs, draining: false };
       children.set(pack.name, child);
       if (!manualStopped.has(pack.name)) start(child);
-      fs.watch(path.join(pack.dir, "agent.md"), () => void redeploy(children.get(pack.name)!));
+      // The watcher outlives the child: a retirement moves agent.md aside, which
+      // fires this AFTER the registry scan has dropped the pack, and the `!`
+      // assertion here used to throw inside an fs.watch callback, which is
+      // unhandled and killed the whole supervisor. Every resident kept running
+      // (separate processes), so the room looked healthy while nothing was
+      // supervising it any more: no restarts, no drains, no alerts. Retiring an
+      // agent could therefore take down supervision of every other agent.
+      const watcher = fs.watch(path.join(pack.dir, "agent.md"), () => {
+        const current = children.get(pack.name);
+        if (!current) {
+          watcher.close(); // the pack is gone; stop watching a path nobody owns
+          return;
+        }
+        void redeploy(current).catch((err) => log(`${pack.name}: redeploy failed (${(err as Error).message})`));
+      });
+      watcher.on("error", (err) => log(`${pack.name}: definition watcher error (${err.message}); relying on the 30s registry scan`));
+      watchers.set(pack.name, watcher);
       continue;
     }
     if (existing.proc && heartbeatStale(existing)) {
@@ -232,6 +261,10 @@ async function reconcile(): Promise<void> {
       log(`${name} removed from the registry; draining`);
       await drain(child);
       children.delete(name);
+      // Close the definition watcher with the child, or a later write to that
+      // path fires a callback whose child no longer exists.
+      watchers.get(name)?.close();
+      watchers.delete(name);
     }
   }
 }

@@ -197,13 +197,102 @@ try {
     console.error(`\n(dry run) valid: ${parsed.def.name}, definition ${parsed.definitionHash.slice(0, 15)}`);
     process.exit(0);
   }
+  // The pack's whole shape (spec 3.1), not just its definition. Each directory
+  // is a pillar the runtime actually reads, and an empty one teaches nothing,
+  // so each gets a valid starter file: a core memory block the resident renders
+  // into its prompt, a MEMORY.md index it loads at session start, a skill
+  // folder in the SKILL.md shape, and one eval case in the real schema.
   fs.mkdirSync(path.join(dir, "knowledge"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "memory", "blocks"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "memory", "notes"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "skills"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "evals", "cases", `${name}-01`), { recursive: true });
   fs.writeFileSync(path.join(dir, "agent.md"), content);
+  fs.writeFileSync(path.join(dir, "knowledge", ".gitkeep"), "");
+
+  // L1 core memory: rendered into the system prompt every turn, so it is the
+  // one place a durable fact about the agent ITSELF belongs. Keep it short: the
+  // limit is a budget, not a suggestion.
   fs.writeFileSync(
-    path.join(dir, "knowledge", ".gitkeep"),
-    "",
+    path.join(dir, "memory", "blocks", "persona.md"),
+    `---
+label: persona
+description: who this agent is and how it answers
+limit: 600
+---
+${kind === "tool" ? `Acts on requests in the room. States what it is about to do in one line, calls its tool once with the complete result, and reports a human's rejection or edit plainly rather than working around it.` : `Answers from its knowledge pack, citing the file and section. Says plainly when the knowledge does not cover a question, and names both sources when two disagree.`}
+`,
+  );
+
+  // The index protocol: the resident loads the HEAD of this file at session
+  // start, so it is a table of contents for everything the agent knows how to
+  // look up, not a place to store facts.
+  fs.writeFileSync(
+    path.join(dir, "memory", "MEMORY.md"),
+    `# ${name} memory index
+
+The first 40 lines of this file are loaded at every session start. Keep it an
+INDEX: one line per durable thing, pointing at where the detail lives. Facts go
+in \`notes/\`, or into the fact store through consolidation; identity and
+standing instructions go in \`blocks/\`.
+
+- \`blocks/persona.md\` - who this agent is (rendered into the prompt every turn)
+- \`notes/\` - longer notes the agent writes and re-reads on demand
+`,
+  );
+  fs.writeFileSync(path.join(dir, "memory", "notes", ".gitkeep"), "");
+
+  // Skills are the "detailed procedure" pillar: a folder with a SKILL.md that
+  // the agent reads when the task matches, instead of carrying the procedure in
+  // its prompt forever.
+  fs.mkdirSync(path.join(dir, "skills", "example-procedure"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "skills", "example-procedure", "SKILL.md"),
+    `---
+name: example-procedure
+description: Replace this with the trigger for a real procedure. One sentence, written so the agent can tell whether THIS task needs it.
+---
+
+# Example procedure
+
+Delete this folder or make it real. A skill earns its place when a procedure is
+long enough that carrying it in the system prompt every turn is waste, and
+specific enough that the agent should follow it exactly rather than improvise.
+
+## Steps
+
+1. State the trigger precisely in the description above: that is what the agent matches on.
+2. Keep the body imperative and checkable.
+3. Say what to do when a step fails, since that is the half a prompt usually omits.
+`,
+  );
+
+  // One eval case in the real schema, so the harness has something to run and
+  // the operator has a template. `kind: live` runs it against the live room.
+  fs.writeFileSync(
+    path.join(dir, "evals", "cases", `${name}-01`, "case.yaml"),
+    `id: ${name}-01
+kind: live
+subject_capability: ${skillId}
+ask: "Replace this with a question whose right answer you can assert."
+trials: 1
+timeout_ms: 120000
+expect:
+  output:
+    must_mention: ["something the correct answer must contain"]
+${kind === "tool" ? "" : "  protocol: [citations_present]\n"}`,
   );
   console.log(`wrote agents/${name}/agent.md (definition ${parsed.definitionHash.slice(0, 15)})`);
+  console.log("");
+  console.log("The pack (spec 3.1):");
+  console.log(`  agent.md            the definition above plus the system prompt`);
+  console.log(`  knowledge/          markdown reached with Read and Grep, never prompt-stuffed`);
+  console.log(`  memory/blocks/      core memory rendered into the prompt every turn (persona.md written)`);
+  console.log(`  memory/notes/       longer notes the agent writes and re-reads on demand`);
+  console.log(`  memory/MEMORY.md    the index whose head loads at session start`);
+  console.log(`  skills/             SKILL.md procedures, read when the task matches (one example written)`);
+  console.log(`  evals/cases/        per-agent cases in the harness schema (one stub written)`);
+  console.log(`  state/              runtime, created by the resident: membership, memory.db, logs`);
   console.log("");
   console.log("Next:");
   console.log(`  1. Put knowledge in agents/${name}/knowledge/ (gitignored), or point a glob elsewhere.`);
