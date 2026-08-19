@@ -395,7 +395,16 @@ await scenario("moderation: human supervisor, inject, floor control, approval, q
   await call(u, "room_send", {
     room: host.room, membership_token: alice.you.membership_token, message_id: "e2e_mod_apr", kind: "request",
     mentions: [eve.you.id], body: [{ type: "text", text: "permission to deploy?" }],
-    ext: { "io.github.pbeneteau/approval": { request_id: "apr_e2e_1", action: "deploy" } },
+    // tool_name and input_preview are REQUIRED as of 0.1.8 (spec 12.5): a hub
+    // enforcing it refuses an ext without them, which is the point of the rule.
+    ext: {
+      "io.github.pbeneteau/approval": {
+        request_id: "apr_e2e_1",
+        action: "deploy to prod",
+        tool_name: "ops__deploy_prod",
+        input_preview: "env: prod\nrelease: 1.0",
+      },
+    },
   });
   const verdict = await call(u, "room_admin", { room: host.room, membership_token: eve.you.membership_token, verb: "approve", target: "apr_e2e_1" });
   assert(verdict.status === "approved", "human approve should succeed");

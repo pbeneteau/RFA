@@ -60,7 +60,7 @@ test("an approval card pushes a title and a link, and nothing that could decide 
       message_id: "msg_needs_approval",
       kind: "request",
       body: [{ type: "text", text: "may I write to the world?" }],
-      ext: { "io.github.pbeneteau/approval": { request_id: "apr_push_1", action: "mcp__linear__save_document", allowed_decisions: ["approve", "reject"] } },
+      ext: { "io.github.pbeneteau/approval": { request_id: "apr_push_1", action: "save a document", tool_name: "mcp__linear__save_document", input_preview: "title: TEST", allowed_decisions: ["approve", "reject"] } },
     });
     // The watcher polls every 5s.
     for (let i = 0; i < 40 && received.length === 0; i++) await new Promise((r) => setTimeout(r, 250));

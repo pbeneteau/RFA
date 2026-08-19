@@ -73,6 +73,44 @@ export function refusalForOutcome(outcome: ApprovalOutcome): "deadline_expired" 
 let approvalSeq = 0;
 
 /**
+ * A short human-readable label for a tool call (spec 12.5's `action`), derived
+ * from the tool name HERE rather than in the hub, which is forbidden from deriving
+ * it and could not do so honestly anyway: only the caller knows what its own
+ * namespaced identifier means.
+ *
+ * `mcp__linear__save_document` becomes "save document". The identifier still
+ * travels, untouched, as `tool_name`.
+ */
+export function humanAction(toolName: string): string {
+  const tail = toolName.split("__").filter(Boolean).pop() ?? toolName;
+  const words = tail.replace(/[_-]+/g, " ").trim();
+  return words.length > 0 ? words.slice(0, 64) : toolName.slice(0, 64);
+}
+
+/**
+ * The requester's preview of its own input: one `key: value` line per field, most
+ * informative first, so the first 512 characters the hub keeps are the ones a
+ * decider needs.
+ *
+ * Not `JSON.stringify`, which spends its first characters on braces and quoting
+ * and then gets truncated mid-token. A human deciding whether to authorize a
+ * document write wants to see the title, not `{"content":"# Spec produ`.
+ */
+export function previewLines(input: Record<string, unknown>): string {
+  const render = (v: unknown): string => {
+    if (typeof v === "string") return v;
+    if (v === null || v === undefined) return String(v);
+    if (Array.isArray(v)) return `[${v.length} item(s)]`;
+    if (typeof v === "object") return JSON.stringify(v);
+    return String(v);
+  };
+  // Short scalars first: they are the identifying fields (title, project, id), and
+  // a long body would otherwise consume the whole preview before naming what it is.
+  const entries = Object.entries(input).sort(([, a], [, b]) => render(a).length - render(b).length);
+  return entries.map(([k, v]) => `${k}: ${render(v)}`).join("\n");
+}
+
+/**
  * Publish an approval request for a pending tool call and block until a
  * human-origin decision, the expiry, or the timeout. The request is sent by
  * the MAIN member (we are inside its serve handler, so no send races); the
@@ -91,17 +129,33 @@ export async function requestApproval(
 ): Promise<ApprovalOutcome> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_APPROVAL_WINDOW_MS;
   const requestId = `apr_${opts.runId ?? "run"}_${++approvalSeq}_${Date.now().toString(36)}`;
-  const inputPreview = JSON.stringify(opts.input);
+  const serialized = JSON.stringify(opts.input);
   const send = await member.send({
     kind: "request",
     body:
       `APPROVAL NEEDED: I want to call ${opts.toolName}.\n` +
-      `Input: ${inputPreview.slice(0, 1500)}${inputPreview.length > 1500 ? "... (truncated)" : ""}\n` +
+      `Input: ${serialized.slice(0, 1500)}${serialized.length > 1500 ? "... (truncated)" : ""}\n` +
       `Decide in the console Inbox (request ${requestId}).`,
     ext: {
+      // Spec 12.5, and this half MUST ship with the hub-side enforcement: a hub
+      // that enforces 12.5 rejects an ext missing `tool_name` or `input_preview`
+      // with `bad_request`, which would be every approval this bridge raises, that
+      // is the whole human-in-the-loop path.
       "io.github.pbeneteau/approval": {
         request_id: requestId,
-        action: opts.toolName,
+        // `action` and `tool_name` are DIFFERENT required fields and a hub may not
+        // derive one from the other: a decider UI keys on the identifier and
+        // displays the label. This used to send the tool name as the label, which
+        // is why an operator's inbox read `mcp__linear__save_document` where a
+        // heading belongs.
+        action: humanAction(opts.toolName),
+        tool_name: opts.toolName,
+        // The requester's own preview. The hub neutralizes it and caps it at 512
+        // with a counted elision marker, so what is sent here is the full readable
+        // form and the hub decides what fits.
+        input_preview: previewLines(opts.input),
+        // The decider's client gets the full input; the hub never inspects it.
+        params: opts.input,
         allowed_decisions: opts.allowedDecisions ?? ["approve", "edit", "reject"],
         expires_at: new Date(Date.now() + timeoutMs).toISOString(),
       },

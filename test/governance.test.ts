@@ -150,7 +150,7 @@ test("approval upgrades: allowed_decisions constrain verbs, expiry sweeps to rej
   // reject-only approval: approve must be refused even for a human.
   await send(s.aliceC, s.room, s.t.alice, "may I?", {
     kind: "request",
-    ext: { "io.github.pbeneteau/approval": { request_id: "apr_ro_1", action: "x", allowed_decisions: ["reject"] } },
+    ext: { "io.github.pbeneteau/approval": { request_id: "apr_ro_1", action: "do x", tool_name: "svc__x", input_preview: "target: x", allowed_decisions: ["reject"] } },
   });
   assert.equal(await code(call(s.eveC, "room_admin", { room: s.room, membership_token: s.t.eve, verb: "approve", target: "apr_ro_1" })), "unauthorized");
   await call(s.eveC, "room_admin", { room: s.room, membership_token: s.t.eve, verb: "reject", target: "apr_ro_1" });
@@ -158,7 +158,7 @@ test("approval upgrades: allowed_decisions constrain verbs, expiry sweeps to rej
   // human refusal (spec 12.4). A clock is not a decision.
   await send(s.aliceC, s.room, s.t.alice, "expiring ask", {
     kind: "request",
-    ext: { "io.github.pbeneteau/approval": { request_id: "apr_exp_1", action: "y", expires_at: new Date(now + 30_000).toISOString() } },
+    ext: { "io.github.pbeneteau/approval": { request_id: "apr_exp_1", action: "do y", tool_name: "svc__y", input_preview: "target: y", expires_at: new Date(now + 30_000).toISOString() } },
   });
   now += 31_000;
   s.hub.sweep();
@@ -172,7 +172,7 @@ test("approval upgrades: allowed_decisions constrain verbs, expiry sweeps to rej
   // edit-before-approve: params override recorded and surfaced.
   await send(s.aliceC, s.room, s.t.alice, "deploy widget v2?", {
     kind: "request",
-    ext: { "io.github.pbeneteau/approval": { request_id: "apr_edit_1", action: "deploy", allowed_decisions: ["approve", "edit", "reject"] } },
+    ext: { "io.github.pbeneteau/approval": { request_id: "apr_edit_1", action: "deploy", tool_name: "ops__deploy", input_preview: "env: prod", allowed_decisions: ["approve", "edit", "reject"] } },
   });
   const decided = await call(s.eveC, "room_admin", {
     room: s.room, membership_token: s.t.eve, verb: "approve", target: "apr_edit_1", params: { version: "v2.1", canary: true },

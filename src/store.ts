@@ -13,7 +13,7 @@ import { RfaError } from "./errors.js";
 import { canonicalize, digestCard, sha256hex } from "./jcs.js";
 import { verifyCard, type Jwk, type VerificationDetail } from "./signing.js";
 import { TERMINAL_TASK_STATES } from "./model.js";
-import { renderWrapped } from "./wrap.js";
+import { neutralize, renderWrapped } from "./wrap.js";
 import type {
   AgentCard,
   EventInput,
@@ -282,7 +282,23 @@ interface Approval {
   requestId: string;
   messageId: string;
   requester: string;
+  /** A short human-readable label for the decision, at most 64 chars ("save a document"). */
   action: string;
+  /**
+   * The exact machine identifier the requester intends to call, in the
+   * requester's own namespace (`linear__save_document`). Spec 12.5 makes this a
+   * DIFFERENT field from `action` and both required, and forbids a hub from
+   * deriving one from the other: a decider UI keys on `tool_name` and displays
+   * `action`, so collapsing them leaves the UI keying on prose.
+   */
+  toolName: string;
+  /**
+   * The requester's own preview of the input, neutralized by the hub and capped
+   * at 512 characters with a counted elision marker. Requester-supplied and
+   * therefore untrusted data (spec 14.2); the marker exists so a decider can
+   * never mistake a truncated preview for the whole input.
+   */
+  inputPreview: string;
   /**
    * `expired` is deliberately distinct from `rejected` (spec 12.4): a clock is
    * not a decision, and a log that cannot tell them apart is worse than no log.
@@ -353,6 +369,32 @@ const NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N} _.\-]*$/u;
  * Auto-suffixing is not an acceptable resolution: `console-2` reads just as
  * authoritative as `console`.
  */
+/**
+ * `input_preview` cap (spec 12.5, RECOMMENDED 512): chosen there so a preview fits
+ * a phone screen without scrolling, which is where approvals are actually decided
+ * here. Truncation always carries a counted elision marker.
+ */
+const APPROVAL_PREVIEW_CHARS = 512;
+/** `action` is a heading, not a document (spec 12.5). */
+const APPROVAL_ACTION_CHARS = 64;
+
+/**
+ * An `input_preview` as spec 12.5 requires it: neutralized, capped, and truncated
+ * with a COUNTED elision marker.
+ *
+ * The count is the load-bearing part. A preview that silently ends mid-sentence
+ * lets a decider believe they have read the whole input, which on an approval card
+ * is the difference between authorizing what they saw and authorizing what they
+ * did not. Neutralization is the same 14.11 pass the model-facing boundary uses,
+ * because a preview is rendered to a human who is one click from a side effect.
+ */
+function previewOf(raw: string): string {
+  const clean = neutralize(raw);
+  if (clean.length <= APPROVAL_PREVIEW_CHARS) return clean;
+  const elided = clean.length - APPROVAL_PREVIEW_CHARS;
+  return `${clean.slice(0, APPROVAL_PREVIEW_CHARS)} … [+${elided} chars elided]`;
+}
+
 /** How long an expired approval stays visible in the operator's inbox (spec 16.3). */
 /**
  * Claims allowed before a task becomes pickup-only for its creator, the host or
@@ -1004,12 +1046,57 @@ export class RoomHub {
     let pendingApproval: Approval | null = null;
     const approvalExt = (args.ext ?? {})["io.github.pbeneteau/approval"];
     if (approvalExt !== undefined) {
-      const a = approvalExt as { request_id?: unknown; action?: unknown; allowed_decisions?: unknown; expires_at?: unknown };
+      const a = approvalExt as {
+        request_id?: unknown; action?: unknown; tool_name?: unknown; input_preview?: unknown;
+        allowed_decisions?: unknown; expires_at?: unknown;
+      };
       if (typeof a !== "object" || a === null || typeof a.request_id !== "string" || a.request_id.length < 4) {
         throw new RfaError("bad_request", "ext['io.github.pbeneteau/approval'] requires a request_id string (>= 4 chars)");
       }
+      // WHO may register one (spec 12.5, a MUST since 0.1.8). Registering an
+      // approval is the ability to put arbitrary text in front of a human with an
+      // approve button, so this was the inbound severity item ranked fifth in wave
+      // 04: any member could do it, with no role or origin check at all.
+      // Only the `home` half needs a check here: `send` already refuses anything
+      // that is not a participant, so 12.5's RECOMMENDED set ("participants whose
+      // home is local") reduces to this one condition at this point in the path.
+      if (member.home !== "local") {
+        throw new RfaError(
+          "unauthorized",
+          `only local members may register approval requests (you are home=${member.home}); ` +
+            "putting text in front of a human with an approve button is not a guest capability",
+        );
+      }
       if (room.approvals.has(a.request_id)) {
         throw new RfaError("task_conflict", `approval request_id ${a.request_id} already exists`);
+      }
+      // Pending approvals per member, bounded by the existing room policy (12.5).
+      const maxPending = room.policies.max_pending_requests;
+      if (maxPending !== undefined && maxPending !== null) {
+        const mine = [...room.approvals.values()].filter((x) => x.requester === member.id && x.status === "pending").length;
+        if (mine >= maxPending) {
+          throw new RfaError("rate_limited", `you already hold ${mine} pending approval request(s); the room's limit is ${maxPending}`, 30, {
+            limit: maxPending,
+            window_s: 0,
+          });
+        }
+      }
+      // `tool_name` and `input_preview` are REQUIRED from the requester (12.5) and
+      // a hub MUST NOT synthesize them: the ext is opaque to a hub that executes
+      // nothing and cannot know what the requester intends to call. `action` is a
+      // separate REQUIRED field and must not be derived from `tool_name` either,
+      // because a decider UI keys on the identifier and displays the label.
+      if (typeof a.tool_name !== "string" || a.tool_name.trim().length === 0) {
+        throw new RfaError("bad_request", "approval registration requires tool_name (spec 12.5); a hub cannot synthesize it");
+      }
+      if (typeof a.input_preview !== "string") {
+        throw new RfaError("bad_request", "approval registration requires input_preview (spec 12.5); a hub cannot synthesize it");
+      }
+      if (typeof a.action !== "string" || a.action.trim().length === 0) {
+        throw new RfaError(
+          "bad_request",
+          "approval registration requires action, a short human-readable label distinct from tool_name (spec 12.5)",
+        );
       }
       const DECISIONS = ["approve", "edit", "reject", "respond"] as const;
       const allowed = Array.isArray(a.allowed_decisions)
@@ -1025,11 +1112,26 @@ export class RoomHub {
         requestId: a.request_id,
         messageId: args.message_id,
         requester: member.id,
-        action: typeof a.action === "string" ? a.action : "",
+        action: neutralize(a.action).slice(0, APPROVAL_ACTION_CHARS),
+        toolName: neutralize(a.tool_name).slice(0, 200),
+        inputPreview: previewOf(a.input_preview),
         status: "pending",
         decidedBy: null,
         allowedDecisions: allowed,
         expiresAt,
+      };
+      // Hub-stamped, overwriting anything the client supplied, exactly like `from`
+      // and `origin` on an envelope (12.5). This is what lets a decider see which
+      // organization is asking, and it must not be forgeable by the asker.
+      (args.ext as Record<string, unknown>)["io.github.pbeneteau/approval"] = {
+        ...(approvalExt as Record<string, unknown>),
+        action: pendingApproval.action,
+        tool_name: pendingApproval.toolName,
+        input_preview: pendingApproval.inputPreview,
+        requester_id: member.id,
+        origin: member.origin,
+        home: member.home,
+        room: room.handle,
       };
     }
 
@@ -1135,7 +1237,18 @@ export class RoomHub {
           requestId,
           messageId: args.message_id,
           requester: member.id,
-          action: "release_held_message",
+          action: "release a held message",
+          // This card is raised by the HUB, not by a requester, so it is the one
+          // place a hub may fill 12.5's requester fields: the tool is the hub's own
+          // release, and the preview is the parked text a human is about to let
+          // through, neutralized and capped like any other.
+          toolName: "rfa__release_held_message",
+          inputPreview: previewOf(
+            envelope.body
+              .filter((p): p is Extract<Part, { type: "text" }> => p.type === "text")
+              .map((p) => p.text)
+              .join("\n"),
+          ),
           status: "pending",
           decidedBy: null,
           allowedDecisions: ["approve", "reject"],
@@ -1545,7 +1658,11 @@ export class RoomHub {
     request_id: string;
     requester: string;
     requester_name: string;
+    /** Hub-stamped, so the console can show which organization is asking (spec 12.5, RFA-0.6 sect. 7.6). */
+    requester_origin: Origin;
+    requester_home: string;
     action: string;
+    tool_name: string;
     allowed_decisions: string[] | null;
     expires_at: string | null;
     held: boolean;
@@ -1562,29 +1679,27 @@ export class RoomHub {
         const recentlyExpired =
           a.status === "expired" && a.expiresAt != null && this.cfg.now() - a.expiresAt < EXPIRED_VISIBLE_MS;
         if (a.status !== "pending" && !recentlyExpired) continue;
-        const held = room.heldMessages.get(a.messageId);
-        const preview = held
-          ? held.envelope.body
-              .filter((p): p is Extract<Part, { type: "text" }> => p.type === "text")
-              .map((p) => p.text)
-              .join(" ")
-              .slice(0, 200)
-          : this.findMessage(room, a.messageId)?.body
-              .filter((p): p is Extract<Part, { type: "text" }> => p.type === "text")
-              .map((p) => p.text)
-              .join(" ")
-              .slice(0, 200) ?? null;
+        // The ext's `input_preview` IS the preview (spec 12.5, RFA-0.6 sect. 7.4).
+        // This used to re-derive one from the message body, which made two sources
+        // of truth for the text a human decides on: the requester's own preview and
+        // a raw 200-character slice with no neutralization. Two previews of one
+        // input is a way for the card and the client to disagree about what is
+        // being approved.
+        const requester = room.members.get(a.requester);
         out.push({
           room: room.handle,
           topic: room.topic,
           request_id: a.requestId,
           requester: a.requester,
-          requester_name: room.members.get(a.requester)?.name ?? a.requester,
+          requester_name: requester?.name ?? a.requester,
+          requester_origin: requester?.origin ?? "agent",
+          requester_home: requester?.home ?? "unknown",
           action: a.action,
+          tool_name: a.toolName,
           allowed_decisions: a.allowedDecisions ?? null,
           expires_at: a.expiresAt ? iso(a.expiresAt) : null,
           held: !!a.held,
-          message_preview: preview,
+          message_preview: a.inputPreview,
           status: a.status === "expired" ? "expired" : "pending",
         });
       }

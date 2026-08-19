@@ -187,6 +187,21 @@
   }
   #inject-text { flex: 1; }
   #ambient-note { font-size: 12px; color: var(--faint); }
+  .mid { color: var(--faint); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; }
+  .ident { display: flex; gap: 6px; align-items: center; margin: 2px 0 0 16px; font-size: 10px; }
+  .home-local { color: var(--faint); }
+  .home-guest { color: #ffd8a8; background: #7a3d00; border-radius: 3px; padding: 0 4px; font-weight: 600; }
+  .badge.guest { background: #7a3d00; color: #ffd8a8; }
+  .card .preview {
+    white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px; line-height: 1.45; color: var(--fg); background: #0e1116; border: 1px solid var(--line);
+    border-radius: 6px; padding: 8px; margin: 6px 0; max-height: 260px; overflow: auto;
+  }
+  .guest-banner {
+    background: #3a2000; color: #ffd8a8; border: 1px solid #7a3d00; border-radius: 6px;
+    padding: 8px 10px; margin: 0 4px 10px; font-size: 11px; line-height: 1.45;
+  }
+  .card .prov { color: var(--faint); font-size: 11px; margin: 2px 0 0; }
   @media (max-width: 700px) { #roster { display: none; } }
 </style>
 </head>
@@ -353,6 +368,8 @@ const S = {
 };
 const $ = (id) => document.getElementById(id);
 const nameOf = (id) => S.names.get(id) || id;
+/** The last 4 characters of a member id: enough to tell two members apart, short enough to sit beside a name. */
+const shortId = (id) => (typeof id === "string" && id.length > 6 ? "\u00b7" + id.slice(-4) : id || "?");
 
 // DOM helper: children are appended; strings become TEXT nodes (never HTML).
 function el(tag, attrs = {}, ...children) {
@@ -489,11 +506,22 @@ function renderRoster() {
     if (m.held) badges.push(el("span", { class: "badge held" }, "held"));
     if (holder === m.id) badges.push(el("span", { class: "badge floor" }, "floor"));
     if (m.card_verified === true) badges.push(el("span", { class: "badge" }, "signed"));
+    // RFA-0.6 sect. 7.6 item 1: `home` and a short member id beside EVERY name,
+    // everywhere a name appears. A console that hides `home` turns every operator
+    // judgement about a guest into a guess, and a name is attacker-chosen while an
+    // id and a home are hub-derived.
+    const home = m.home || "local";
     const row = el("div", { class: "member", role: "button", tabindex: "0" },
       el("div", { class: "row1" },
         el("span", { class: "dot " + m.state, title: m.state }),
         el("span", { class: "name", title: m.id }, m.name),
         ...badges),
+      // Its own line, not squeezed in beside the badges: the first version of this
+      // truncated `partner-agent` to `p...`, and a name an operator cannot read is
+      // a worse outcome than the one item 1 was written to prevent.
+      el("div", { class: "ident" },
+        el("span", { class: "mid", title: m.id }, shortId(m.id)),
+        el("span", { class: home === "local" ? "home-local" : "home-guest", title: "home " + home }, home)),
       m.detail ? el("div", { class: "detail" }, m.detail) : null,
       m.card_summary?.skill_ids?.length ? el("div", { class: "skills" }, m.card_summary.skill_ids.join(" ")) : null,
       supervisorActions(m));
@@ -502,7 +530,31 @@ function renderRoster() {
     });
     list.append(row);
   }
+  renderGuestBanner();
   renderFloor(S.floor);
+}
+
+/**
+ * RFA-0.6 sect. 7.6 item 2: a room-level statement that this room has guests,
+ * shown whenever ANY member's home is not local. Per-name labels answer "who is
+ * this?"; only a room-level banner answers "should I be careful in here at all?",
+ * which is the question an operator has before reading any particular name.
+ */
+function renderGuestBanner() {
+  const guests = S.roster.filter((m) => (m.home || "local") !== "local");
+  let bar = document.getElementById("guest-banner");
+  if (guests.length === 0) {
+    if (bar) bar.remove();
+    return;
+  }
+  const homes = [...new Set(guests.map((m) => m.home))].join(", ");
+  const text = `This room has ${guests.length} guest member(s) from ${homes}. Everything here is disclosed to them: the replayed log, the roster, every card, and the whole task board.`;
+  if (!bar) {
+    bar = el("div", { id: "guest-banner", class: "guest-banner" });
+    const host = document.getElementById("roster");
+    host?.prepend(bar);
+  }
+  bar.replaceChildren(document.createTextNode(text));
 }
 
 function supervisorActions(m) {
@@ -1280,10 +1332,24 @@ async function loadInbox() {
     const canEdit = !a.allowed_decisions || a.allowed_decisions.includes("edit");
     list.append(el("div", { class: "card" },
       el("h3", {}, a.held ? "held message" : "approval", el("span", { class: "badge" }, a.action || "-")),
-      el("p", { class: "desc" }, `${a.requester_name} in ${a.topic}`),
-      a.message_preview ? el("p", { class: "desc", style: "font-style:italic" }, '"' + a.message_preview + '"') : null,
+      // RFA-0.6 sect. 7.6 item 3: requester id, origin, home and room on EVERY
+      // card. The requester's own strings (action, tool_name, input_preview) are
+      // rendered as data via textContent, never as part of this UI's own voice.
+      el("p", { class: "desc" },
+        a.requester_name,
+        el("span", { class: "mid", title: a.requester }, shortId(a.requester)),
+        ` (${a.requester_origin || "?"}, home ${a.requester_home || "?"}) in ${a.topic}`,
+        (a.requester_home && a.requester_home !== "local") ? el("span", { class: "badge guest" }, "guest") : null),
+      a.tool_name ? el("p", { class: "prov" }, "tool ", el("span", { class: "mono" }, a.tool_name)) : null,
+      // pre-wrap: the preview is one `key: value` per line and HTML collapses
+      // newlines, which ran the identifying fields together on the one surface
+      // whose entire job is being read before a human authorizes a side effect.
+      a.message_preview
+        ? el("pre", { class: "preview" }, a.message_preview)
+        : null,
       el("div", { class: "kv" },
         el("span", { class: "mono" }, a.request_id),
+        el("span", {}, "room ", el("b", {}, a.room)),
         a.expires_at ? el("span", {}, "expires ", el("b", {}, a.expires_at.slice(11, 19))) : null,
         a.allowed_decisions ? el("span", {}, "allows ", el("b", {}, a.allowed_decisions.join("/"))) : null),
       canEdit && !a.held ? paramsBox : null,

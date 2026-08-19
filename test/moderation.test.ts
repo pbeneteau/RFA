@@ -243,7 +243,7 @@ test("approval flow: only a human-origin approve satisfies; agents approving is 
     kind: "request",
     body: [{ type: "text", text: "requesting permission to deploy to prod" }],
     mentions: [s.id.eve],
-    ext: { "io.github.pbeneteau/approval": { request_id: "apr_deploy_1", action: "deploy_prod" } },
+    ext: { "io.github.pbeneteau/approval": { request_id: "apr_deploy_1", action: "deploy to prod", tool_name: "ops__deploy_prod", input_preview: "env: prod" } },
   });
   // Agent-origin supervisor: refused. Reject would be allowed, approve is not.
   assert.equal(
@@ -275,7 +275,7 @@ test("approval flow: only a human-origin approve satisfies; agents approving is 
         message_id: mid(),
         kind: "request",
         body: [{ type: "text", text: "again" }],
-        ext: { "io.github.pbeneteau/approval": { request_id: "apr_deploy_1", action: "deploy_prod" } },
+        ext: { "io.github.pbeneteau/approval": { request_id: "apr_deploy_1", action: "deploy to prod", tool_name: "ops__deploy_prod", input_preview: "env: prod" } },
       }),
     ),
     "task_conflict",
@@ -393,7 +393,7 @@ test("moderation state survives a restart: quarantine, held, origin, approvals",
     message_id: mid(),
     kind: "request",
     body: [{ type: "text", text: "may I?" }],
-    ext: { "io.github.pbeneteau/approval": { request_id: "apr_persist_1", action: "ship" } },
+    ext: { "io.github.pbeneteau/approval": { request_id: "apr_persist_1", action: "ship it", tool_name: "ops__ship", input_preview: "release: 1.0" } },
   });
   await call(eveC, "room_admin", { room: created.room, membership_token: eve.you.membership_token, verb: "hold_member", target: alice.you.id });
   const bobC = await connectAgent(hub1, "bob-conn");
