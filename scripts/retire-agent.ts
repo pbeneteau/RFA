@@ -20,14 +20,25 @@
  * ends injection; dropping the names from `data/secrets.json` afterwards is
  * hygiene, not control.
  */
+import { execFileSync } from "node:child_process";
 import Database from "better-sqlite3";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { AccountLedger } from "../src/account.js";
 import { RoomMember } from "../src/client.js";
+import { transportToken } from "../src/secrets.js";
 import type { AgentCard } from "../src/model.js";
 
 const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
+
+// A hub with tokens configured refuses an unauthenticated /mcp, and this script
+// both leaves rooms and evicts remnants. Without this the retirement half-ran:
+// it stopped the resident and archived its state, then failed to remove the
+// membership, leaving a ghost in the roster (observed on the first real run).
+{
+  const tok = transportToken(path.join(ROOT, "data", "secrets.json"));
+  if (tok && !process.env.RFA_TOKEN) process.env.RFA_TOKEN = tok;
+}
 const HUB = process.env.RFA_HUB_URL ?? "http://localhost:8790/mcp";
 
 function flag(name: string): string | undefined {
@@ -103,14 +114,35 @@ function heartbeatAgeMs(): number | null {
   return Number.isFinite(ts) ? Date.now() - ts : null;
 }
 
+/**
+ * Is a resident process for this pack actually alive? The heartbeat FILE
+ * survives the process that wrote it, so a fresh heartbeat alone cannot tell
+ * "running outside the supervisor" from "exited ten seconds ago". Asking the
+ * process table can (found by running the script twice: the second run refused
+ * to proceed against a corpse).
+ */
+function residentAlive(): boolean {
+  try {
+    const out = execFileSync("ps", ["ax", "-o", "pid=,command="], { encoding: "utf8" });
+    return out
+      .split("\n")
+      .some((line) => line.includes("resident.ts") && new RegExp(`--agent\\s+${name}(\\s|$)`).test(line));
+  } catch {
+    return false; // cannot enumerate: fall back to the heartbeat's own verdict
+  }
+}
+
 say(`stop ${name} through the supervisor command channel`);
 const before = readSupState();
 if (!before || stoppedIn(before)) {
   const age = heartbeatAgeMs();
   if (age !== null && age < 90_000 && !dryRun) {
-    console.error(`   the supervisor does not own a running ${name}, but its heartbeat is ${Math.round(age / 1000)}s old:`);
-    console.error(`   something is running this resident outside the supervisor. Stop it, then re-run this script.`);
-    process.exit(1);
+    if (residentAlive()) {
+      console.error(`   the supervisor does not own a running ${name}, but a process is: its heartbeat is ${Math.round(age / 1000)}s old.`);
+      console.error(`   Something started this resident outside the supervisor. Stop it, then re-run this script.`);
+      process.exit(1);
+    }
+    note(`heartbeat is ${Math.round(age / 1000)}s old but no process is running: residue from the resident that just exited`);
   }
 }
 if (!before) {
@@ -302,6 +334,26 @@ if (!fs.existsSync(memoryDb)) {
 }
 
 // ---------------------------------------------------------------- 6. keep the observability rows
+
+say("archive state/member.json so the identity cannot be resumed");
+{
+  const memberFile = path.join(packDir, "state", "member.json");
+  if (!fs.existsSync(memberFile)) {
+    note("no member.json: this pack never joined a room");
+  } else if (dryRun) {
+    would(`move ${path.relative(ROOT, memberFile)} into the archive`);
+  } else {
+    // This is a safety property, not tidiness. member.json holds a membership
+    // token and member id, and a resident resumes from it by name. Leaving it
+    // behind means a LATER pack created with the same name inherits a retired
+    // agent's identity and speaks as it. That exact failure happened in this
+    // repo when a legacy state file was shared: one resident resumed another's
+    // membership and answered questions as it for forty seconds.
+    fs.mkdirSync(archive, { recursive: true });
+    fs.renameSync(memberFile, path.join(archive, "member.json"));
+    note(`moved to ${path.relative(ROOT, path.join(archive, "member.json"))}; a future pack of this name starts as a new member`);
+  }
+}
 
 say("keep the observability rows in data/obs.db");
 const obsDb = path.join(ROOT, "data", "obs.db");

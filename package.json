@@ -17,6 +17,7 @@
     "demo": "tsx scripts/demo.ts",
     "tail": "tsx scripts/tail.ts",
     "test": "node --import tsx --test test/*.test.ts",
+    "new-agent": "tsx scripts/new-agent.ts",
     "retire-agent": "tsx scripts/retire-agent.ts",
     "sync-handbook": "tsx scripts/sync-handbook.ts",
     "demo:push": "tsx scripts/demo-push.ts",
