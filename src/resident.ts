@@ -58,6 +58,19 @@ class BudgetStop extends Error {
     message: string,
     readonly spendUsd: number,
     readonly budgetUsd: number,
+    /**
+     * What THIS run cost, which is not the day ledger.
+     *
+     * Both were `spendUsd` until 2026-08-19, and the observability record wrote
+     * that as the run's `cost_usd`: eleven refusals that made no model call at
+     * all were each recorded as costing $7.9831, the day's running total, and the
+     * `agent_span` costs summed to $372.91 against a real spend in the tens. The
+     * cost half of the p90 review queue was reading those, so the first digest
+     * over real data reported a p90 cost of $2.96 per run and that is how this
+     * was found. A pre-flight refusal really is free; a turn stopped by the SDK
+     * really did spend its own turn.
+     */
+    readonly runCostUsd: number = 0,
   ) {
     super(message);
     this.name = "BudgetStop";
@@ -520,10 +533,21 @@ async function brain(prompt: string, convoKey: string, lane: Lane = "serve"): Pr
         // The SDK's own budget and turn stops (spec 18.3) carry the numbers so
         // the asker learns a ceiling was hit rather than "something broke".
         if (msg.subtype === "error_max_budget_usd" || msg.subtype === "error_max_turns") {
+          // Name the ceiling that actually bit. `error_max_turns (spend=6.15
+          // budget=0.25)` paired the DAY spend with the per-TASK dollar ceiling,
+          // so it read as 6 dollars against a 25-cent budget when the limit hit
+          // was the turn count and the run had cost 7 cents. A refusal whose
+          // numbers describe a different limit sends the reader after the wrong
+          // thing (it cost an hour here).
+          const ceiling =
+            msg.subtype === "error_max_turns"
+              ? `the ${budgets.max_turns ?? 10}-turn ceiling`
+              : `its $${Number.isFinite(taskCeiling) ? taskCeiling.toFixed(2) : "unbounded"} task ceiling`;
           throw new BudgetStop(
-            `${msg.subtype} (spend=${spend.usd.toFixed(2)} budget=${Number.isFinite(taskCeiling) ? taskCeiling.toFixed(2) : "none"})`,
+            `${msg.subtype}: this task hit ${ceiling} after $${costUsd.toFixed(4)} (day now $${spend.usd.toFixed(2)})`,
             spend.usd,
             Number.isFinite(taskCeiling) ? taskCeiling : 0,
+            costUsd,
           );
         }
         throw new Error(`brain error: ${msg.subtype}${"result" in msg ? `: ${String(msg.result).slice(0, 200)}` : ""}`);
@@ -798,9 +822,10 @@ await member.serve(
         end_time: Date.now(),
         group_id: member.room,
         inputs: { from: ctx.from.name, seq: ctx.envelope.seq, text: ctx.text.slice(0, 300) },
-        // A failed run still spent money (spec 18.2). Writing NULL here made
-        // every error look free, which is how a day total ends up low.
-        cost_usd: budgetStop ? budgetStop.spendUsd : undefined,
+        // A failed run still spent money (spec 18.2), but what it spent is the
+        // RUN's cost and never the day ledger: writing the ledger here inflated
+        // this table by an order of magnitude and poisoned the p90 cost queue.
+        cost_usd: budgetStop ? budgetStop.runCostUsd : undefined,
         extra: { "gen_ai.request.model": pack.def.model ?? "inherit", conversation: convo },
       });
       // A ceiling is not a crash: the asker gets the spec 18.3 refusal with the
