@@ -5,6 +5,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { RoomHub } from "../src/store.js";
+import { verifyChain } from "../src/chain.js";
 import type { AgentCard } from "../src/model.js";
 
 const card = (name: string): AgentCard => ({
@@ -140,7 +141,6 @@ test("an envelope's seq and ts survive a restart, and the chain verifies over wh
   // disk carried seq 0 while the in-memory copy carried the real value: the
   // same message read live and read again after a restart disagreed, and a
   // chain verifier had to know to zero the field to reproduce the hash.
-  const { canonicalize, sha256hex } = await import("../src/jcs.js");
   const dir = tmpdir();
   let hub = new RoomHub({ dataDir: dir, sweepIntervalMs: 0 });
   const a = hub.createRoom({ topic: "chain", name: "host", card: card("host") });
@@ -162,14 +162,14 @@ test("an envelope's seq and ts survive a restart, and the chain verifies over wh
 
   // And the chain verifies over exactly what the hub serves, with only the
   // derived `wrapped` removed (spec 13). No field zeroing required.
-  const strip = (e: any) => {
-    const { wrapped, ...rest } = e;
-    return rest as Record<string, unknown>;
-  };
-  for (let i = 1; i < all.length; i++) {
-    if (!all[i].prev_hash) continue;
-    assert.equal(all[i].prev_hash, sha256hex(canonicalize(strip(all[i - 1]))), `event ${all[i].seq} chains to ${all[i - 1].seq}`);
-  }
+  //
+  // Through src/chain.ts, not a private copy of the loop: this file and
+  // governance.test.ts each carried their own, which made three implementations of
+  // one construction and no way for the operator to run any of them. The shipped
+  // verifier is the one under test here.
+  const chain = verifyChain(all as unknown as Record<string, unknown>[]);
+  assert.equal(chain.ok, true, JSON.stringify(chain.divergences, null, 1));
+  assert.ok(chain.linksChecked > 0, "a chain assertion that checked no links asserts nothing");
   hub.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });

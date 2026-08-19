@@ -3,7 +3,7 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { createHubServer } from "../src/hub.js";
-import { canonicalize, sha256hex } from "../src/jcs.js";
+import { genesisFor, verifyChain } from "../src/chain.js";
 import { RoomHub, type GateCheck } from "../src/store.js";
 import type { AgentCard } from "../src/model.js";
 
@@ -204,17 +204,6 @@ test("rate budgets: room-policy member_rpm and max_pending_requests bite with ra
   s.hub.close();
 });
 
-/**
- * `wrapped` (spec 9.6) is a derived RESULT field: the hub attaches it to the
- * message events it returns and it was never in the hashed form, so spec 13
- * requires a verifier to strip it before canonicalizing. Implementing 9.6 broke
- * this test, which is how the underspecification was found.
- */
-const stored = (e: any): Record<string, unknown> => {
-  const { wrapped, ...rest } = e;
-  return rest;
-};
-
 test("hash chain: every event links to the previous via JCS-SHA256, across restarts too", async () => {
   const fs = await import("node:fs");
   const os = await import("node:os");
@@ -232,10 +221,13 @@ test("hash chain: every event links to the previous via JCS-SHA256, across resta
   const all = await call(c2, "room_listen", { room: created.room, membership_token: created.you.membership_token, since: 0, timeout_ms: 0, wait_for: "all" });
   const events = all.events as Record<string, unknown>[];
   assert.ok(events.length >= 4);
-  assert.equal(events[0].prev_hash, sha256hex(created.room), "genesis links to the room handle");
-  for (let i = 1; i < events.length; i++) {
-    assert.equal(events[i].prev_hash, sha256hex(canonicalize(stored(events[i - 1]))), `event ${i} chains to ${i - 1}`);
-  }
+  // Through the SHIPPED verifier (src/chain.ts), not a private copy of the loop:
+  // one construction should have one implementation, and until this rung the
+  // operator had no way to run any of them over a real log.
+  const chain = verifyChain(events, { genesis: genesisFor(created.room) });
+  assert.equal(chain.ok, true, JSON.stringify(chain.divergences, null, 1));
+  assert.equal(chain.genesisOk, true, "genesis links to the room handle");
+  assert.equal(chain.linksChecked, events.length - 1, "every link, across the restart");
   hub2.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });

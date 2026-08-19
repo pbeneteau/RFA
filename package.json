@@ -29,7 +29,8 @@
     "supervisor": "tsx src/supervisor.ts",
     "evals": "tsx src/evals/runner.ts",
     "evals:judged": "tsx src/evals/runner.ts --judged",
-    "ask": "tsx scripts/ask.ts"
+    "ask": "tsx scripts/ask.ts",
+    "verify-log": "tsx scripts/verify-log.ts"
   },
   "engines": {
     "node": ">=20"
