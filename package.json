@@ -30,7 +30,8 @@
     "evals": "tsx src/evals/runner.ts",
     "evals:judged": "tsx src/evals/runner.ts --judged",
     "ask": "tsx scripts/ask.ts",
-    "verify-log": "tsx scripts/verify-log.ts"
+    "verify-log": "tsx scripts/verify-log.ts",
+    "init": "tsx scripts/init.ts"
   },
   "engines": {
     "node": ">=20"

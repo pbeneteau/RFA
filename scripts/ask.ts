@@ -22,19 +22,57 @@ if (!question) {
   console.error('usage: npm run ask -- [--capability answer-product-question] [--room r_x] [--timeout 1800] "question"');
   process.exit(2);
 }
-const capability = flag("--capability") ?? "answer-product-question";
+/**
+ * Which capability to ask for.
+ *
+ * `--capability` when you know it. Otherwise: the roster's SOLE capability if there
+ * is exactly one, and only then the historical default. A fresh environment used to
+ * fail here for a reason that had nothing to do with the operator: `new-agent`
+ * scaffolds a pack offering `answer-question` while this tool defaulted to
+ * `answer-product-question`, so the first ask against a correctly configured setup
+ * reported "nobody offers answer-product-question" and listed an agent that plainly
+ * could have answered.
+ */
+function chooseCapability(roster: { card_summary: { skill_ids: string[] } }[]): string {
+  const explicit = flag("--capability");
+  if (explicit) return explicit;
+  const offered = [...new Set(roster.flatMap((r) => r.card_summary.skill_ids))];
+  if (offered.length === 1) return offered[0];
+  return "answer-product-question";
+}
 // 30 minutes (spec 16.1): the asker's deadline governs the resident's approval
 // window, so this is what buys "I stepped away". One clock, not two: reply_by
 // equals the wait below, so the card dies a margin before the asker gives up.
 const timeoutS = Number(flag("--timeout") ?? 1800);
 
-const roomMd = fs.readFileSync(path.join(ROOT, "dogfood", "ROOM.md"), "utf8");
+const roomMd = readRoomMd(ROOT);
 const room = flag("--room") ?? /Room: `(r_\w+)`/.exec(roomMd)![1];
 const secret = /Join secret: `([^`]+)`/.exec(roomMd)![1];
 // A hub configured with --mcp-token refuses an unauthenticated /mcp call, so
 // resolve the transport credential before the client reads the environment.
 // Keeps `npm run ask` working on an authenticated hub with nothing exported.
 const { transportToken } = await import("../src/secrets.js");
+
+/**
+ * The standing room's join info, or a readable failure.
+ *
+ * `dogfood/ROOM.md` is gitignored (it holds a join secret), so in a fresh checkout it
+ * does not exist and a bare readFileSync here died with an unhandled ENOENT stack
+ * trace: the wrong first experience for a tool an operator has just cloned.
+ */
+function readRoomMd(root: string): string {
+  const file = path.join(root, "dogfood", "ROOM.md");
+  if (!fs.existsSync(file)) {
+    console.error(
+      `no dogfood/ROOM.md, so there is no room to talk to yet.\n` +
+        `  New checkout?  npm run init        then start the hub and the supervisor\n` +
+        `  Already set up? the first resident with no \`rooms:\` binding writes this file when it creates the room;\n` +
+        `                  check dogfood/state/*.log, or pass --room <handle> explicitly.`,
+    );
+    process.exit(2);
+  }
+  return fs.readFileSync(file, "utf8");
+}
 const tok = transportToken(path.join(ROOT, "data", "secrets.json"));
 if (tok && !process.env.RFA_TOKEN) process.env.RFA_TOKEN = tok;
 
@@ -50,6 +88,7 @@ const me = await RoomMember.create({
   card: { name: "paul-cli", description: "the operator, from the terminal", skills: [{ id: "operate", description: "asks and decides" }] },
 });
 try {
+  const capability = chooseCapability(me.roster);
   const target = me.roster.find((r) => r.card_summary.skill_ids.includes(capability));
   if (!target) {
     console.error(`nobody in ${room} offers "${capability}". Roster: ${me.roster.map((r) => `${r.name} [${r.card_summary.skill_ids.join(",")}]`).join(" · ")}`);

@@ -23,6 +23,27 @@ import { loadPack } from "../agentdef.js";
 import { computeReward, passHatK, rfaLogToTrajectory, type ExpectBlock } from "./trajectory.js";
 
 /**
+ * The standing room's join info, or a readable failure.
+ *
+ * `dogfood/ROOM.md` is gitignored (it holds a join secret), so in a fresh checkout it
+ * does not exist and a bare readFileSync here died with an unhandled ENOENT stack
+ * trace: the wrong first experience for a tool an operator has just cloned.
+ */
+function readRoomMd(root: string): string {
+  const file = path.join(root, "dogfood", "ROOM.md");
+  if (!fs.existsSync(file)) {
+    console.error(
+      `no dogfood/ROOM.md, so there is no room to talk to yet.\n` +
+        `  New checkout?  npm run init        then start the hub and the supervisor\n` +
+        `  Already set up? the first resident with no \`rooms:\` binding writes this file when it creates the room;\n` +
+        `                  check dogfood/state/*.log, or pass --room <handle> explicitly.`,
+    );
+    process.exit(2);
+  }
+  return fs.readFileSync(file, "utf8");
+}
+
+/**
  * The gate's k and band (spec 20.3). Both are CHOSEN, not measured: k=4 is the
  * value the pass^k estimator was already run at, and 0.15 absolute is a guess at
  * a band wide enough to swallow the observed flake. Neither may be tightened
@@ -149,7 +170,7 @@ interface LiveEnv {
 }
 
 function liveEnv(): LiveEnv {
-  const roomMd = fs.readFileSync(path.join(ROOT, "dogfood", "ROOM.md"), "utf8");
+  const roomMd = readRoomMd(ROOT);
   return {
     hubUrl: process.env.RFA_HUB_URL ?? "http://localhost:8790/mcp",
     room: /Room: `(r_\w+)`/.exec(roomMd)![1],

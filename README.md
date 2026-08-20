@@ -29,6 +29,37 @@ This repo contains:
 | [`research/`](research/README.md) | Four deep-research waves, each adversarially verified: [01-protocol](research/01-protocol/REPORT.md), [02-platform](research/02-platform/REPORT.md), [03-reach-and-collaboration](research/03-reach-and-collaboration/REPORT.md) (v0.5), [04-remote-agents](research/04-remote-agents/REPORT.md) (v0.6) |
 | [`research/01-protocol/papers/`](research/01-protocol/papers/) | 70 downloaded papers/specs with an [index](research/01-protocol/papers/INDEX.md) |
 
+## Setting up a new environment
+
+```bash
+npm install
+npm run init -- --agent my-agent        # credentials + the first pack; prints the next 3 commands
+```
+
+`init` writes `data/secrets.json` and a human key (both 0600) and then gets out of the
+way: it starts nothing, and it creates no room. The first resident with no `rooms:`
+binding creates the room and publishes its handle and join secret to
+`dogfood/ROOM.md`, which is what `npm run ask`, the parity gate and the eval runner
+read. Re-running `init` never rotates an existing credential (that would lock out
+every resident holding it); `--force` does.
+
+**A second, isolated environment is a separate checkout, not another room.** The hub
+takes an exclusive lock on its data dir, and `data/secrets.json`, the engine database
+and the console are shared by every pack in one checkout:
+
+```bash
+git clone <this repo> ../rfa-other && cd ../rfa-other
+npm install && npm run init -- --port 8791
+```
+
+`RFA_HUB_URL` is not optional. A resident's hub URL defaults to `localhost:8790`, so
+an environment on another port will point its agents at whatever is on 8790 unless
+told otherwise; `init` prints it into the supervisor command for that reason.
+
+The three packs shipped in `agents/` are reference/dogfood packs whose knowledge globs
+point at directories a fresh clone does not have. Retire what you do not want:
+`npm run retire-agent -- <name>`.
+
 ## Quickstart
 
 ```bash

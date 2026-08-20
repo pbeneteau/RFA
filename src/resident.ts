@@ -146,7 +146,7 @@ const facts = new FactStore(path.join(STATE_DIR, "memory.db"), gate, "self");
 const sessions = new Map<string, string>();
 let spend = { day: new Date().toISOString().slice(0, 10), usd: 0 };
 
-async function boot(): Promise<{ member: RoomMember; joinSecret: string | null; prevHash: string | null }> {
+async function boot(): Promise<{ member: RoomMember; joinSecret: string | null; prevHash: string | null; created: boolean }> {
   const binding = (pack.def.rooms ?? []).find((r) => r.serve) ?? pack.def.rooms?.[0];
   const card = deriveCard(pack);
   const saved = readState();
@@ -166,7 +166,7 @@ async function boot(): Promise<{ member: RoomMember; joinSecret: string | null; 
       if (saved.spend?.day === new Date().toISOString().slice(0, 10)) spend = saved.spend;
       await member.setPresence("ready", { card });
       log(`resumed room ${member.room} as ${member.name} (${member.memberId}), epoch ${member.epoch}`);
-      return { member, joinSecret: saved.join_secret, prevHash: saved.definition_hash ?? null };
+      return { member, joinSecret: saved.join_secret, prevHash: saved.definition_hash ?? null, created: false };
     } catch (err) {
       log(`saved membership unusable (${(err as Error).message}); starting fresh`);
     }
@@ -186,7 +186,9 @@ async function boot(): Promise<{ member: RoomMember; joinSecret: string | null; 
   // future resumes need it (found live: the scribe's sidekick got null and the
   // whole approval bridge answered join_denied).
   const effectiveSecret = member.joinSecret ?? (binding?.room ? process.env.RFA_JOIN_SECRET ?? null : null);
-  return { member, joinSecret: effectiveSecret, prevHash: null };
+  // `created` is what decides who publishes dogfood/ROOM.md: no binding means this
+  // pack made the room and holds its join secret first-hand.
+  return { member, joinSecret: effectiveSecret, prevHash: null, created: !binding?.room };
 }
 
 /**
@@ -223,7 +225,7 @@ async function bootWithRetry(): Promise<Awaited<ReturnType<typeof boot>>> {
   }
 }
 
-const { member, joinSecret, prevHash } = await bootWithRetry();
+const { member, joinSecret, prevHash, created: createdRoom } = await bootWithRetry();
 const memory = new GatedMemory(path.join(pack.dir, "memory"), gate, member.memberId);
 
 // ---------------------------------------------------------------- in-process MCP tools
@@ -672,8 +674,30 @@ function traceFrom(meta: Record<string, unknown>): { trace_id?: string; parent_r
 
 // ---------------------------------------------------------------- room doc + state
 
+/**
+ * Publish this room's join info where the human tools look for it.
+ *
+ * Written by the pack that CREATED the room, which is the one that knows the join
+ * secret first-hand. It used to be written by whichever pack was literally named
+ * `pm-agent`, a leftover of the original dogfood setup that made a fresh
+ * environment unusable: six tools read this file (`npm run ask`, the parity gate,
+ * the eval runner, `new-agent`, and two skills) and in a new project nothing ever
+ * created it.
+ *
+ * Never clobbers another room's file. A second project's first agent would
+ * otherwise overwrite the first project's join info on boot, and the tools would
+ * quietly start talking to the wrong room.
+ */
 function writeRoomMd(): void {
-  if (pack.name !== "pm-agent") return;
+  if (createdRoom !== true) return;
+  if (fs.existsSync(ROOM_MD)) {
+    const existing = fs.readFileSync(ROOM_MD, "utf8");
+    const other = /Room: `(r_\w+)`/.exec(existing);
+    if (other && other[1] !== member.room) {
+      log(`not overwriting ${path.relative(ROOT, ROOM_MD)}: it describes room ${other[1]}, not mine (${member.room})`);
+      return;
+    }
+  }
   fs.writeFileSync(
     ROOM_MD,
     [

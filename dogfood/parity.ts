@@ -14,6 +14,27 @@ import { RoomMember } from "../src/client.js";
 import { ObsStore } from "../src/obs.js";
 import { transportToken } from "../src/secrets.js";
 
+/**
+ * The standing room's join info, or a readable failure.
+ *
+ * `dogfood/ROOM.md` is gitignored (it holds a join secret), so in a fresh checkout it
+ * does not exist and a bare readFileSync here died with an unhandled ENOENT stack
+ * trace: the wrong first experience for a tool an operator has just cloned.
+ */
+function readRoomMd(root: string): string {
+  const file = path.join(root, "dogfood", "ROOM.md");
+  if (!fs.existsSync(file)) {
+    console.error(
+      `no dogfood/ROOM.md, so there is no room to talk to yet.\n` +
+        `  New checkout?  npm run init        then start the hub and the supervisor\n` +
+        `  Already set up? the first resident with no \`rooms:\` binding writes this file when it creates the room;\n` +
+        `                  check dogfood/state/*.log, or pass --room <handle> explicitly.`,
+    );
+    process.exit(2);
+  }
+  return fs.readFileSync(file, "utf8");
+}
+
 const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
 const FIXTURES = path.join(ROOT, "dogfood", "state", "parity.json");
 
@@ -23,7 +44,7 @@ const FIXTURES = path.join(ROOT, "dogfood", "state", "parity.json");
   const tok = transportToken(path.join(ROOT, "data", "secrets.json"));
   if (tok && !process.env.RFA_TOKEN) process.env.RFA_TOKEN = tok;
 }
-const ROOM_MD = fs.readFileSync(path.join(ROOT, "dogfood", "ROOM.md"), "utf8");
+const ROOM_MD = readRoomMd(ROOT);
 const room = /Room: `(r_\w+)`/.exec(ROOM_MD)![1];
 const secret = /Join secret: `([^`]+)`/.exec(ROOM_MD)![1];
 const HUB = process.env.RFA_HUB_URL ?? "http://localhost:8790/mcp";
