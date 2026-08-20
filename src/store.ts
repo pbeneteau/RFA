@@ -5,6 +5,7 @@
  * an append-only event log (seq), a roster (epoch), and a policy object.
  * Persistence is an NDJSON event log plus a meta.json snapshot per room.
  */
+import { trace } from "@opentelemetry/api";
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
@@ -1273,6 +1274,23 @@ export class RoomHub {
     // refuse blocks with an audit event; hold parks the envelope behind a
     // human-only approval; alert appends normally and emits the alert after.
     const gateVerdict = this.cfg.gateChecks.length > 0 ? await this.evaluateGate(this.envelopeGateInput(envelope)) : null;
+    // The gate verdict, recorded per message for forensics (rung v0.6.4).
+    //
+    // On the ACTIVE SPAN rather than in the result, because the verdict belongs to
+    // the hub and adding it to `SendResult` would be a wire change nobody asked for
+    // (sect. 10 parks hub receipts). The existing `--otel` bridge already lands
+    // every tool span in obs.db, so this makes the verdict queryable per message
+    // with no new plumbing, and it is a no-op when no OTel provider is registered.
+    //
+    // Why it is needed at all: a gate REFUSAL was already visible, because the call
+    // throws and the span records `policy_refused`. An ALERT was not, because the
+    // message is delivered normally and the only trace was a system event in the
+    // room log. So the interesting half of the gate's opinion was the invisible one.
+    if (gateVerdict) {
+      const span = trace.getActiveSpan();
+      span?.setAttribute("rfa.gate_verdict", gateVerdict.outcome);
+      span?.setAttribute("rfa.gate_check", gateVerdict.checkId);
+    }
     if (gateVerdict?.outcome === "refuse") {
       this.appendEvent(room, {
         type: "system",

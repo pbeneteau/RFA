@@ -452,7 +452,55 @@ function systemPrompt(): string {
     .join("\n\n");
 }
 
-async function brain(prompt: string, convoKey: string, lane: Lane = "serve"): Promise<{ text: string; costUsd: number; numTurns: number; tokens: { input: number | null; output: number | null } }> {
+/**
+ * The knowledge target of one tool call, or null if the call reads nothing.
+ *
+ * Records the ARGUMENT, never the result: a retrieval set answers "what did it look
+ * at", and storing what came back would put knowledge CONTENT into the
+ * observability store, which is a different database with a different retention
+ * policy and no business holding it.
+ *
+ * Paths are made repo-relative so records are comparable across machines, and a
+ * `Grep` carries its pattern too, because "grepped the handbook for frais" and
+ * "grepped it for versement" are different events and that distinction is exactly
+ * what an investigation needs.
+ */
+function retrievalTarget(tool: string, input: unknown): string | null {
+  const a = (input ?? {}) as { file_path?: unknown; path?: unknown; pattern?: unknown };
+  const rel = (v: unknown): string | null => {
+    if (typeof v !== "string" || v.length === 0) return null;
+    return v.startsWith(ROOT) ? path.relative(ROOT, v) : v;
+  };
+  switch (tool) {
+    case "Read":
+      return rel(a.file_path);
+    case "Glob": {
+      const where = rel(a.path);
+      return typeof a.pattern === "string" ? `glob:${where ? where + "/" : ""}${a.pattern}` : null;
+    }
+    case "Grep": {
+      const where = rel(a.path);
+      return typeof a.pattern === "string" ? `grep:${String(a.pattern).slice(0, 60)}${where ? ` in ${where}` : ""}` : null;
+    }
+    default:
+      // Every other tool (memory, roster, task_read) is deliberately out of scope:
+      // this field answers "which KNOWLEDGE did this answer come from".
+      return null;
+  }
+}
+
+async function brain(
+  prompt: string,
+  convoKey: string,
+  lane: Lane = "serve",
+): Promise<{
+  text: string;
+  costUsd: number;
+  numTurns: number;
+  tokens: { input: number | null; output: number | null };
+  /** What the model opened, in the order it opened it (rung v0.6.4, forensics only). */
+  retrieved: string[];
+}> {
   const budgets = pack.def.budgets ?? {};
   const today = new Date().toISOString().slice(0, 10);
   if (spend.day !== today) spend = { day: today, usd: 0 };
@@ -545,6 +593,8 @@ async function brain(prompt: string, convoKey: string, lane: Lane = "serve"): Pr
     },
   });
   let text = "";
+  /** Insertion-ordered and deduped: the same file read twice is one retrieval, and the ORDER is the diagnostic (which file it opened first). */
+  const retrieved = new Set<string>();
   let costUsd = 0;
   let numTurns = 0;
   let tokens: { input: number | null; output: number | null } = { input: null, output: null };
@@ -552,6 +602,21 @@ async function brain(prompt: string, convoKey: string, lane: Lane = "serve"): Pr
   for await (const msg of q) {
     if (msg.type === "system" && msg.subtype === "init") {
       sessions.set(convoKey, msg.session_id);
+    } else if (msg.type === "assistant") {
+      // The retrieval set (RFA-0.6 sect. 4.4, rung v0.6.4): WHICH knowledge the
+      // model actually opened to produce this answer. Forensics only, and the spec
+      // is emphatic about that: it supports no detector claim, it is there so an
+      // investigation is a query instead of an inference.
+      //
+      // Earned its place the hard way. Diagnosing the 6.3% eval flake meant reading
+      // answer PROSE to work out that the agent had opened `offre/goodvie.md`
+      // instead of `offre/enveloppes.md`. That took hours and it should have been a
+      // lookup.
+      for (const block of (msg.message.content ?? []) as { type?: string; name?: string; input?: unknown }[]) {
+        if (block.type !== "tool_use" || typeof block.name !== "string") continue;
+        const target = retrievalTarget(block.name, block.input);
+        if (target) retrieved.add(target);
+      }
     } else if (msg.type === "result") {
       // Hoisted above the guard (spec 18.2): a run that ends in error still
       // spent money, and the guard used to throw before the ledger was touched,
@@ -589,7 +654,7 @@ async function brain(prompt: string, convoKey: string, lane: Lane = "serve"): Pr
   }
   if (!text) throw new Error("brain returned an empty result");
   spend.usd += costUsd;
-  return { text, costUsd, numTurns, tokens };
+  return { text, costUsd, numTurns, tokens, retrieved: [...retrieved] };
   } finally {
     // Always: a lease held by a dead run blocks every other resident until the
     // supervisor's sweep reclaims it.
@@ -791,7 +856,7 @@ await member.serve(
       const memoryBlock = relevant.length
         ? `<consolidated-memory note="YOUR OWN earlier conclusions, not a source. NEVER cite this block and NEVER answer a factual question from it alone: every number, name, threshold or date you state must come from a knowledge file you read in THIS turn. Use this only to decide which file to open. [origin] tags the trust tier of what it was distilled from; any of it may be stale or wrong.">\n${relevant.map((f) => `- [${f.source_origin}] ${f.text}`).join("\n")}\n</consolidated-memory>\n\n`
         : "";
-      const { text, costUsd, numTurns, tokens } = await brain(memoryBlock + ctx.wrapped, convo);
+      const { text, costUsd, numTurns, tokens, retrieved } = await brain(memoryBlock + ctx.wrapped, convo);
       answered++;
       episodes.recordOwn(member.room, member.memberId, member.name, text);
       engine.completeRun(runId, {
@@ -813,7 +878,16 @@ await member.serve(
         input_tokens: tokens.input,
         output_tokens: tokens.output,
         cost_usd: costUsd,
-        extra: { "gen_ai.request.model": pack.def.model ?? "inherit", num_turns: numTurns, definition: pack.definitionHash.slice(0, 15), conversation: convo },
+        extra: {
+          "gen_ai.request.model": pack.def.model ?? "inherit",
+          num_turns: numTurns,
+          definition: pack.definitionHash.slice(0, 15),
+          conversation: convo,
+          // The retrieval set (rung v0.6.4). Observability only, never the wire: the
+          // answer's own json part is read by the asker, and a guest has no business
+          // learning this pack's file layout from a reply.
+          retrieved,
+        },
       });
       serving = false;
       sinceConsolidation++;

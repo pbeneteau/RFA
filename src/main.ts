@@ -110,7 +110,7 @@ if (process.argv.includes("--otel")) {
       for (const s of spans) {
         const ms = (s.duration[0] * 1e3 + s.duration[1] / 1e6).toFixed(1);
         const a = s.attributes ?? {};
-        const extras = ["rfa.room", "rfa.member", "rfa.seq", "rfa.error_code"]
+        const extras = ["rfa.room", "rfa.member", "rfa.seq", "rfa.error_code", "rfa.gate_verdict", "rfa.gate_check"]
           .filter((k) => a[k] !== undefined)
           .map((k) => `${k.slice(4)}=${a[k]}`)
           .join(" ");
@@ -129,7 +129,15 @@ if (process.argv.includes("--otel")) {
               start_time: hr(s.startTime),
               end_time: hr(s.endTime),
               group_id: a["rfa.room"] ? String(a["rfa.room"]) : null,
-              extra: { member: a["rfa.member"] ?? null, seq: a["rfa.seq"] ?? null, "mcp.tool.name": a["mcp.tool.name"] },
+              extra: {
+                member: a["rfa.member"] ?? null,
+                seq: a["rfa.seq"] ?? null,
+                "mcp.tool.name": a["mcp.tool.name"],
+                // The gate's opinion on this call (rung v0.6.4). Absent when the
+                // gate said nothing, which is the common case and should not cost a
+                // column of nulls to read.
+                ...(a["rfa.gate_verdict"] ? { gate_verdict: a["rfa.gate_verdict"], gate_check: a["rfa.gate_check"] } : {}),
+              },
             });
           } catch {
             /* observability must never break serving */
@@ -143,6 +151,25 @@ if (process.argv.includes("--otel")) {
   };
   const provider = new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter as never)] });
   trace.setGlobalTracerProvider(provider);
+  // The context manager, without which the OTel context does not survive an
+  // `await`, so `trace.getActiveSpan()` from deeper code returns nothing.
+  //
+  // Concretely: rung v0.6.4 records the policy-gate verdict by annotating the
+  // active span from inside `store.send`, which is several awaits below the
+  // `startActiveSpan` in `hub.ts`. Without this line that annotation silently did
+  // nothing, verified both ways (no verdict recorded before, `gate_verdict=alert`
+  // recorded after).
+  //
+  // NOT the explanation for parentless spans, and worth saying so because the
+  // measurement is suggestive and the inference is wrong: of 4,410 hub tool spans
+  // only one carried a parent, but hub spans take their parent from the CALLER's
+  // `traceparent` in `_meta`, and `src/client.ts` never sends one. That is a
+  // separate gap, recorded in STATUS, and this line does not close it.
+  const { context } = await import("@opentelemetry/api");
+  const { AsyncLocalStorageContextManager } = await import("@opentelemetry/context-async-hooks");
+  const contextManager = new AsyncLocalStorageContextManager();
+  contextManager.enable();
+  context.setGlobalContextManager(contextManager);
   console.error(`rfa-hub: otel span logging on (stderr)${obsStore ? " + obs.db bridge" : ""}`);
 }
 
