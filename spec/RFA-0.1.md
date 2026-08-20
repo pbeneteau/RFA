@@ -212,7 +212,7 @@ Each member presents a card at join. The card is a subset-compatible A2A Agent C
   "name": "pm-agent",
   "description": "Product manager for the checkout squad. Answers spec and priority questions.",
   "version": "1.4.0",
-  "provider": { "organization": "Goodvest" },
+  "provider": { "organization": "Example Org" },
   "skills": [
     {
       "id": "answer-spec-question",

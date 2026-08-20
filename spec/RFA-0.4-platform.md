@@ -217,7 +217,7 @@ Write surfaces (stages 2/4/6) ship WITH auth, not after: the operator presents t
 
 ## 11. First workload (validates everything above)
 
-- **`linear-scribe`**: drafts Goodvest Linear documents (expression de besoin, spec produit, spec design) from pasted transcripts, reusing the existing goodvest-linear-* skill packs. Tools: `mcp__linear__*` + Read/Grep; Tier 0; the Linear token is a supervisor-injected secret; every `mcp__linear__save_*` call pauses on an approve/edit/reject card, so nothing lands in Linear unreviewed.
+- **`linear-scribe`**: drafts the operator's own Linear documents (whatever templates the pack carries) from pasted transcripts, reusing whatever `linear-*` skill packs the operator already has. Tools: `mcp__linear__*` + Read/Grep; Tier 0; the Linear token is a supervisor-injected secret; every `mcp__linear__save_*` call pauses on an approve/edit/reject card, so nothing lands in Linear unreviewed.
 - **Channels**: (a) `rfa ask <room> <question>` CLI joining with the operator's human_key (human-origin requests); (b) a Slack adapter on the channels flow (verify + normalize -> resolve principal + thread -> room -> answer back to the SAME Slack thread); (c) schedules, starting with a weekday morning digest.
 - **Flywheel**: every verified linear-scribe run is promote-case material; its computed reward (right team, required sections, citations to source) is the first real `r_state x r_output x r_protocol` instance; pass^k over it measures the consistency a daily tool needs (R 3.10).
 

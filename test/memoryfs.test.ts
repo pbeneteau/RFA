@@ -46,7 +46,7 @@ test("the gate holds at the memory door: persisting recent peer content is rejec
 
 test("blocks: limit and read_only enforced; compilation renders the Letta XML shape", () => {
   const { dir, mem } = fresh();
-  mem.create("/memories/blocks/persona.md", "---\nlabel: persona\ndescription: who I am\nlimit: 120\n---\nThe PM agent for Goodvest product questions.");
+  mem.create("/memories/blocks/persona.md", "---\nlabel: persona\ndescription: who I am\nlimit: 120\n---\nThe PM agent for the operator's product questions.");
   assert.throws(
     () => mem.strReplace("/memories/blocks/persona.md", "The PM agent", "The PM agent".padEnd(300, " x")),
     /limit/,
@@ -129,8 +129,12 @@ test("v0.5.3 migration: provenance columns land behind user_version, idempotentl
 test("v0.5.3 retrieval: the prefix operator reaches inflected French forms", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-prefix-"));
   const store = new FactStore(path.join(dir, "memory.db"));
-  store.apply({ text: "Les frais de gestion annuels sur Goodvie sont 1,5 pour cent", event: "ADD", importance: 0.9 }, [1], "human");
-  store.apply({ text: "Le versement initial minimum sur Goodlife Basique est 500 EUR", event: "ADD", importance: 0.9 }, [2], "human");
+  // The facts stay in FRENCH: this test's subject is inflection matching in an FTS5
+  // table with no French stemmer, so translating them would delete the thing under
+  // test. Only the product names are generic (a tenant name has no place in a
+  // protocol's test suite; the language does, because the bug was language-shaped).
+  store.apply({ text: "Les frais de gestion annuels sur le plan A sont 1,5 pour cent", event: "ADD", importance: 0.9 }, [1], "human");
+  store.apply({ text: "Le versement initial minimum sur le plan B basique est 500 EUR", event: "ADD", importance: 0.9 }, [2], "human");
 
   // "gestionnaires" and "versements" are inflections the FTS5 table has no
   // stemmer for: without the prefix operator neither query reached its fact.

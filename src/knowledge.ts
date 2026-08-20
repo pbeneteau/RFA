@@ -17,7 +17,7 @@ import * as path from "node:path";
  * The description is the half that does the work, and leaving it out cost a
  * measured 6.3% answer flake for a month. A title is what the author CALLS the
  * page; a description is what the author says is IN it. Asked for the annual
- * management fee on Goodvie, the agent opened `offre/goodvie.md`, whose title
+ * management fee on plan A, the agent opened `offre/plan-a.md`, whose title
  * matches the question exactly and which holds a fund table with no fee, then
  * hunted: the fee is a table row in `offre/enveloppes.md`, whose title is the
  * single word "Enveloppes" and whose description names the contracts, their

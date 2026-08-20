@@ -219,7 +219,7 @@ if (httpPort) {
 // interventions through the ordinary room machinery.
 //
 // Reads are tokened too (v0.5.0). They were not, and the same release found the
-// server binding every interface: agent definitions (the Goodvest system
+// server binding every interface: agent definitions (a resident's system
 // prompt), run payloads, and pending approval cards (whole draft documents)
 // were readable by anything on the laptop's network. Read routes are cheap to
 // gate because the console already sends the bearer and re-prompts on 401.

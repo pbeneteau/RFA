@@ -14,13 +14,13 @@ function fresh(gate?: MemoryGate) {
 
 test("ADD dedupes by normalized hash; UPDATE expires and links supersedes; DELETE invalidates, never removes", () => {
   const { dir, store } = fresh();
-  assert.equal(store.apply({ text: "Goodlife Basique minimum initial deposit is 500 EUR", event: "ADD", importance: 0.8 }, [1, 2], "agent"), "added");
-  assert.equal(store.apply({ text: "goodlife basique  MINIMUM initial deposit is 500 eur", event: "ADD" }, [3], "agent"), "skipped", "hash dedupe");
+  assert.equal(store.apply({ text: "Plan B Basic minimum initial deposit is 500 EUR", event: "ADD", importance: 0.8 }, [1, 2], "agent"), "added");
+  assert.equal(store.apply({ text: "plan b basic  MINIMUM initial deposit is 500 eur", event: "ADD" }, [3], "agent"), "skipped", "hash dedupe");
   const v1 = store.live()[0];
   assert.equal(v1.importance, 0.8);
   assert.deepEqual(v1.episode_ids, [1, 2]);
 
-  assert.equal(store.apply({ id: v1.id, text: "Goodlife Basique minimum initial deposit is 500 EUR (1000 without VLP)", event: "UPDATE" }, [4], "agent"), "updated");
+  assert.equal(store.apply({ id: v1.id, text: "Plan B Basic minimum initial deposit is 500 EUR (1000 without a standing order)", event: "UPDATE" }, [4], "agent"), "updated");
   const live = store.live();
   assert.equal(live.length, 1, "old version expired");
   assert.equal(live[0].supersedes, v1.id, "lineage kept");
@@ -49,7 +49,7 @@ test("retrieve: FTS match, live-only, recency x importance rerank", () => {
   const { dir, store } = fresh();
   store.apply({ text: "SCPI entry minimum is 5000 EUR for Alpha and 300 EUR per share for Beta", event: "ADD", importance: 0.9 }, [1], "human");
   store.apply({ text: "SCPI handbook has an inconsistency about the gestion privee threshold", event: "ADD", importance: 0.3 }, [2], "self");
-  store.apply({ text: "Goodvie management fee is 1 percent per year", event: "ADD", importance: 0.5 }, [3], "agent");
+  store.apply({ text: "Plan A management fee is 1 percent per year", event: "ADD", importance: 0.5 }, [3], "agent");
   const hits = store.retrieve("what is the SCPI minimum?", 2);
   assert.equal(hits.length, 2);
   assert.match(hits[0].text, /5000/, "high-importance exact match ranks first");

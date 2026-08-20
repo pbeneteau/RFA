@@ -57,7 +57,7 @@ test("one worksheet produces the label, the gold source and a failure mode toget
 
   // The sitting itself: three fields, one pass.
   doc.traces[0].label = "fail";
-  doc.traces[0].gold_source = "offre/enveloppes.md#Goodvie";
+  doc.traces[0].gold_source = "offre/plans.md#PlanA";
   doc.traces[0].failure_mode = "retrieval-wrong-file";
   fs.writeFileSync(sheet, YAML.stringify(doc));
 
@@ -75,7 +75,7 @@ test("one worksheet produces the label, the gold source and a failure mode toget
   assert.equal(label.rubric_hash, null, "a human row carries no rubric hash, which is how it is told from a model's");
   assert.equal(label.comment, "retrieval-wrong-file");
   const gold = rows.find((r) => r.key === "gold_source")!;
-  assert.equal(gold.correction, "offre/enveloppes.md#Goodvie", "the gold source is a correction: here is what it should have cited");
+  assert.equal(gold.correction, "offre/plans.md#PlanA", "the gold source is a correction: here is what it should have cited");
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

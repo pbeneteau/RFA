@@ -609,7 +609,7 @@ async function brain(
       // investigation is a query instead of an inference.
       //
       // Earned its place the hard way. Diagnosing the 6.3% eval flake meant reading
-      // answer PROSE to work out that the agent had opened `offre/goodvie.md`
+      // answer PROSE to work out that the agent had opened `offre/plan-a.md`
       // instead of `offre/enveloppes.md`. That took hours and it should have been a
       // lookup.
       for (const block of (msg.message.content ?? []) as { type?: string; name?: string; input?: unknown }[]) {

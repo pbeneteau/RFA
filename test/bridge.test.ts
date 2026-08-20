@@ -177,7 +177,7 @@ test("v0.5.0 card clock: a serve handler answers a refusal on the wire, not pros
 });
 
 test("v0.5.0 exposure: every workbench read is operator-only, and a bad token is refused", async () => {
-  // The routes that leaked before this release: the Goodvest system prompt,
+  // The routes that leaked before this release: a resident's system prompt,
   // run payloads, and pending approval cards (whole draft documents).
   for (const route of ["/api/agents", "/api/agents/pm-agent/definition", "/api/runs", "/api/summary", "/api/approvals"]) {
     const anon = await fetch(hubUrl.replace("/mcp", route));

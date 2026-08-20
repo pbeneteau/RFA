@@ -3,7 +3,7 @@
  * gate verdict, recorded per answer, FORENSICS ONLY and no detector claim.
  *
  * It earned its place the hard way. Diagnosing the 6.3% eval flake meant reading
- * answer PROSE to work out that the agent had opened `offre/goodvie.md` instead of
+ * answer PROSE to work out that the agent had opened `offre/plan-a.md` instead of
  * `offre/enveloppes.md`. That took hours and should have been a lookup.
  *
  * The retrieval extractor is exercised through the store's records rather than
@@ -27,7 +27,7 @@ test("a run's retrieval set survives a round trip and keeps its order", () => {
   const { dir, obs } = fresh();
   const now = Date.now();
   const retrieved = [
-    "agents/pm-agent/knowledge/handbook/offre/goodvie.md",
+    "agents/pm-agent/knowledge/handbook/offre/plan-a.md",
     "grep:frais de gestion in agents/pm-agent/knowledge",
     "agents/pm-agent/knowledge/handbook/offre/enveloppes.md",
   ];
@@ -41,7 +41,7 @@ test("a run's retrieval set survives a round trip and keeps its order", () => {
   const back = obs.get("run_r1")!;
   const extra = back.extra as { retrieved: string[] };
   assert.deepEqual(extra.retrieved, retrieved, "same set, same order");
-  assert.equal(extra.retrieved[0], "agents/pm-agent/knowledge/handbook/offre/goodvie.md", "the decoy is visibly first");
+  assert.equal(extra.retrieved[0], "agents/pm-agent/knowledge/handbook/offre/plan-a.md", "the decoy is visibly first");
   obs.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -52,7 +52,7 @@ test("the flake investigation becomes a query", () => {
   const { dir, obs } = fresh();
   const now = Date.now();
   const FEE_FILE = "agents/pm-agent/knowledge/handbook/offre/enveloppes.md";
-  const DECOY = "agents/pm-agent/knowledge/handbook/offre/goodvie.md";
+  const DECOY = "agents/pm-agent/knowledge/handbook/offre/plan-a.md";
   const runs: [string, string[]][] = [
     ["run_good1", [FEE_FILE]],
     ["run_bad1", [DECOY, "grep:frais in agents/pm-agent/knowledge"]],

@@ -168,7 +168,7 @@ It is also the only new **spend-triggering** write endpoint in the release, on a
 // request
 { "room": "r_9a25e48c0e",
   "capability": "answer-spec-question",
-  "question": "Quel est le ticket minimum SCPI sur le contrat Goodvie ?",
+  "question": "What is the minimum ticket on plan A?",
   "reply_by_s": 1800 }
 
 // 202 response

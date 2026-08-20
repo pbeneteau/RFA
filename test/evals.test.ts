@@ -36,7 +36,7 @@ test("rfaLogToTrajectory: subject-centric roles, task actions as tool_calls", ()
   const events = [
     msg("m_dev", "dev", "request", "what is the minimum?"),
     taskEv(SUBJ, "claim", { state: "working", owner: SUBJ }),
-    msg(SUBJ, "pm", "response", "500 EUR, see goodlife-fonds.md"),
+    msg(SUBJ, "pm", "response", "500 EUR, see plan-b-funds.md"),
     taskEv("m_dev", "verify_accept", { state: "completed", owner: SUBJ }),
   ];
   const traj = rfaLogToTrajectory(events, { subject: SUBJ });
@@ -71,7 +71,7 @@ test("computeReward: r = r_state x r_output x r_protocol, components reported", 
   const events = [
     msg("m_dev", "dev", "request", "minimum for Basique?"),
     taskEv(SUBJ, "claim", { state: "working", owner: SUBJ }),
-    msg(SUBJ, "pm", "response", "500 EUR (1000 sans VLP), source goodlife-fonds.md"),
+    msg(SUBJ, "pm", "response", "500 EUR (1000 without a standing order), source plan-b-funds.md"),
     taskEv(SUBJ, "complete", { state: "completed", owner: SUBJ }),
   ];
   const full = computeReward(events, SUBJ, {
