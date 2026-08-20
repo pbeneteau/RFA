@@ -97,6 +97,28 @@ export function isRateLimitError(err: unknown): boolean {
   return RATE_LIMIT_RE.test(text);
 }
 
+/**
+ * A credential failure: the agent cannot authenticate to its model provider.
+ *
+ * A different class of thing from a rate limit, and the distinction is the whole
+ * point. A rate limit is a clock, so waiting fixes it; this is a state, and no
+ * amount of retrying touches it. It lives beside `isRateLimitError` because one
+ * module should own "what kind of provider failure is this": the resident needs it
+ * to choose a refusal reason, and the observability alerts need it to notice an
+ * outage that produces no statistical signal.
+ *
+ * Deliberately narrow. A false positive turns a transient blip into a refusal
+ * nobody retries and an alert nobody can clear, which is the opposite failure and
+ * just as bad, so it matches only phrasings a provider actually emits for a bad or
+ * expired credential.
+ */
+const AUTH_FAILURE_RE = /OAuth session expired|could not be refreshed|failed to authenticate|invalid[_ ]api[_ ]key|authentication[_ ]error/i;
+
+export function isAuthError(err: unknown): boolean {
+  const text = err instanceof Error ? `${err.message} ${String((err as { code?: unknown }).code ?? "")}` : String(err);
+  return AUTH_FAILURE_RE.test(text);
+}
+
 /** PID liveness beats a TTL for a local sweep; EPERM is a live process we do not own. */
 function pidAlive(pid: number): boolean {
   try {

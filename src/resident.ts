@@ -24,7 +24,7 @@ import { wrapTaskText } from "./wrap.js";
 import { approvalWindowMs, interruptMatch, joinSidekick, refusalForOutcome, requestApproval } from "./bridge.js";
 import { MemoryGate, RoomMember, ServeRefusal, type ServeContext } from "./client.js";
 import { Engine } from "./engine.js";
-import { AccountLedger, isRateLimitError, type Lane } from "./account.js";
+import { AccountLedger, isAuthError, isRateLimitError, type Lane } from "./account.js";
 import { ObsStore } from "./obs.js";
 import { consolidate } from "./consolidate.js";
 import { EpisodeLog, FactStore, GatedMemory } from "./memoryfs.js";
@@ -76,25 +76,6 @@ class BudgetStop extends Error {
     super(message);
     this.name = "BudgetStop";
   }
-}
-
-/**
- * Does this error mean "I cannot authenticate", rather than "try again later"?
- *
- * Matched on the message because the Agent SDK surfaces provider auth failures as
- * a result subtype plus prose rather than a typed error. Deliberately narrow: a
- * false positive here would turn a transient blip into a refusal the asker never
- * retries, which is the opposite failure and just as bad.
- */
-function isAuthError(err: unknown): boolean {
-  const m = (err as Error | undefined)?.message ?? "";
-  return (
-    /OAuth session expired/i.test(m) ||
-    /could not be refreshed/i.test(m) ||
-    /failed to authenticate/i.test(m) ||
-    /invalid[_ ]api[_ ]key/i.test(m) ||
-    /authentication[_ ]error/i.test(m)
-  );
 }
 
 /**

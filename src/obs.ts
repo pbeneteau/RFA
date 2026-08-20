@@ -67,10 +67,16 @@ export interface ObsSummary {
   feedback_count: number;
   avg_feedback: number | null;
   cost_usd: number;
+  /**
+   * Runs in the window that failed because an agent could not authenticate to its
+   * model provider. Counted separately from `errors` because it is not a rate: see
+   * `evaluateAlerts`.
+   */
+  auth_errors: number;
 }
 
 export interface Alert {
-  kind: "error_pct" | "latency" | "feedback";
+  kind: "error_pct" | "latency" | "feedback" | "credential";
   message: string;
 }
 
@@ -237,6 +243,21 @@ export class ObsStore {
     const f = this.db
       .prepare(`SELECT COUNT(*) AS n, AVG(score) AS avg FROM feedback WHERE created_at >= ? AND score IS NOT NULL`)
       .get(since) as { n: number; avg: number | null };
+    // Matched in SQL rather than by pulling every error row into JS, and kept in
+    // step with `isAuthError` in src/account.ts by the test that runs both over the
+    // same strings: two classifiers over one condition is how they drift apart.
+    const authErrors = (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM runs
+           WHERE end_time >= ? AND status = 'error' AND error IS NOT NULL
+             AND run_type IN ('agent_span', 'generation_span')
+             AND (error LIKE '%OAuth session expired%' OR error LIKE '%could not be refreshed%'
+                  OR error LIKE '%ailed to authenticate%' OR error LIKE '%invalid_api_key%'
+                  OR error LIKE '%authentication_error%')`,
+        )
+        .get(since) as { n: number }
+    ).n;
     return {
       window_ms: windowMs,
       runs: r.runs,
@@ -246,6 +267,7 @@ export class ObsStore {
       feedback_count: f.n,
       avg_feedback: f.n > 0 ? f.avg : null,
       cost_usd: r.cost ?? 0,
+      auth_errors: authErrors,
     };
   }
 
@@ -338,6 +360,24 @@ export function evaluateAlerts(
   }
   if (s.feedback_count >= thresholds.min_feedback && (s.avg_feedback ?? 1) < thresholds.feedback_score) {
     alerts.push({ kind: "feedback", message: `avg feedback ${(s.avg_feedback ?? 0).toFixed(2)} over ${s.feedback_count} records` });
+  }
+  // NO minimum-volume guard, and that is the point.
+  //
+  // The three checks above are RATES, so a minimum run count stops one unlucky
+  // failure from paging an operator. A credential failure is a STATE: the agent
+  // cannot work at all and no amount of retrying changes that, so a single
+  // occurrence is complete evidence. Applying the volume guard to it produced
+  // exactly the silence it was supposed to prevent: measured 2026-08-19, an expired
+  // OAuth session gave `runs=1 errors=1 error_pct=100%` in the supervisor's
+  // 15-minute window and raised NOTHING, because 1 < min_runs. A quiet room is
+  // where an outage is least likely to be noticed and most likely to persist.
+  if (s.auth_errors > 0) {
+    alerts.push({
+      kind: "credential",
+      message:
+        `${s.auth_errors} run(s) failed to authenticate to the model provider in the last ` +
+        `${Math.round(s.window_ms / 60000)}m: no agent can answer until the operator re-authenticates. Retrying does not help`,
+    });
   }
   return alerts;
 }

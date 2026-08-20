@@ -162,3 +162,78 @@ test("the digest names an empty queue rather than saying nothing", () => {
   });
   assert.match(unranked, /not ranked \(under 10 runs/, "says why the decile is absent instead of printing a 0");
 });
+
+test("a credential failure alerts with NO minimum-volume guard, because it is a state not a rate", () => {
+  // Measured 2026-08-19: an expired OAuth session produced runs=1, errors=1,
+  // error_pct=100% in the supervisor's 15-minute window and raised NOTHING, because
+  // the rate checks require 5 runs. A quiet room is where an outage is least likely
+  // to be noticed and most likely to persist, so the volume guard produced exactly
+  // the silence it exists to prevent.
+  const { dir, obs } = fresh();
+  const now = Date.now();
+  obs.record({
+    id: "run_auth1", name: "serve:pm-agent", run_type: "agent_span",
+    start_time: now - 2000, end_time: now - 500, status: "error",
+    error: "brain error: success: Failed to authenticate: OAuth session expired and could not be refreshed",
+  });
+
+  const s = obs.summary(15 * 60_000, now);
+  assert.equal(s.runs, 1, "one run is below every rate check's minimum");
+  assert.equal(s.auth_errors, 1);
+  const alerts = evaluateAlerts(s);
+  assert.deepEqual(alerts.map((a) => a.kind), ["credential"], "the rate checks stay silent; this one does not");
+  assert.match(alerts[0].message, /no agent can answer/);
+  assert.match(alerts[0].message, /Retrying does not help/, "the operator is told waiting is not the fix");
+  obs.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("an ordinary error does NOT raise a credential alert", () => {
+  const { dir, obs } = fresh();
+  const now = Date.now();
+  for (const [i, err] of ["brain error: error_max_turns", "429 rate_limited", "socket hang up"].entries()) {
+    obs.record({
+      id: `run_other${i}`, name: "serve:pm-agent", run_type: "agent_span",
+      start_time: now - 2000, end_time: now - 500, status: "error", error: err,
+    });
+  }
+  const s = obs.summary(15 * 60_000, now);
+  assert.equal(s.auth_errors, 0, "a turn ceiling, a rate limit and a dropped socket are not credential failures");
+  assert.equal(evaluateAlerts(s).length, 0, "and three runs is still below the rate checks' minimum");
+  obs.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("the SQL classifier and isAuthError agree, so they cannot drift apart", async () => {
+  // The same condition is decided in two languages: SQL inside summary(), and a
+  // regex in src/account.ts that the resident uses to choose a refusal reason. This
+  // pins them to each other rather than each to a hand-written expectation.
+  const { isAuthError } = await import("../src/account.js");
+  const { dir, obs } = fresh();
+  const now = Date.now();
+  const cases = [
+    "brain error: success: Failed to authenticate: OAuth session expired and could not be refreshed",
+    "Failed to authenticate: OAuth session expired",
+    "invalid_api_key: your key is not valid",
+    "authentication_error",
+    "could not be refreshed",
+    "brain error: error_max_turns",
+    "429 rate_limited: too many requests",
+    "socket hang up",
+    "fetch failed",
+    "overloaded_error: the model is overloaded",
+  ];
+  for (const [i, err] of cases.entries()) {
+    const { dir: d2, obs: o2 } = fresh();
+    o2.record({
+      id: `run_${i}`, name: "serve:x", run_type: "agent_span",
+      start_time: now - 1000, end_time: now - 100, status: "error", error: err,
+    });
+    const sqlSaysAuth = o2.summary(60_000, now).auth_errors === 1;
+    assert.equal(sqlSaysAuth, isAuthError(new Error(err)), `disagreement on ${JSON.stringify(err)}`);
+    o2.close();
+    fs.rmSync(d2, { recursive: true, force: true });
+  }
+  obs.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
