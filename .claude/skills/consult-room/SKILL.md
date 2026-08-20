@@ -1,6 +1,6 @@
 ---
 name: consult-room
-description: Consult the standing agent room when the current task needs information or a decision owned by another agent, and the answer is not in the codebase. Use PROACTIVELY while working whenever a Goodvest product/business question (amounts, fees, funds, contracts, statuses, processes) or an RFA protocol question blocks or de-risks the work. Discovers the right agent by capability from the room roster (never hardcode a name), asks it, and relays the cited answer.
+description: Consult the standing agent room when the current task needs information or a decision owned by another agent, and the answer is not in the codebase. Use PROACTIVELY while working whenever a product/business question (amounts, fees, funds, contracts, statuses, processes) or an RFA protocol question blocks or de-risks the work. Discovers the right agent by capability from the room roster (never hardcode a name), asks it, and relays the cited answer.
 ---
 
 # Consult the agent room

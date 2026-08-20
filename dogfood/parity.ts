@@ -5,7 +5,7 @@
  *   npx tsx dogfood/parity.ts             ask again, check must_mention + citation parity
  *
  * Questions and expectations live in dogfood/state/parity.json (gitignored:
- * they contain Goodvest facts). Parity = every must_mention substring present
+ * they contain the operator's product facts). Parity = every must_mention substring present
  * (case/space-insensitive) and a knowledge source cited; LLM wording may vary.
  */
 import * as fs from "node:fs";
