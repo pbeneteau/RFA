@@ -108,7 +108,6 @@ export class RoomMember {
   roster: PresenceRecord[];
   private clientInfo: { name: string; version: string };
   private cardCache = new Map<string, AgentCard>();
-  private looping = false;
 
   private constructor(init: {
     hubUrl: string;
@@ -293,9 +292,6 @@ export class RoomMember {
     text: string,
     opts: { timeoutMs?: number; conversationId?: string; extraParts?: Part[]; replyByMs?: number } = {},
   ): Promise<AskResult> {
-    if (this.looping) {
-      throw new RfaClientError("busy_loop", "this member's listen loop is owned by serve(); use a second member to ask");
-    }
     const timeoutMs = opts.timeoutMs ?? 120_000;
     const messageId = mid("msg_ask_" + this.name.replace(/[^a-zA-Z0-9]/g, "").slice(0, 8));
     const sent = await this.call("room_send", {
@@ -306,16 +302,25 @@ export class RoomMember {
       reply_by: new Date(Date.now() + (opts.replyByMs ?? timeoutMs)).toISOString(),
       body: [{ type: "text", text }, ...(opts.extraParts ?? [])],
     });
-    // Do NOT advance the cursor to our own send: anything appended between the
-    // previous cursor and this seq would be skipped unread. Skip our own
-    // traffic by sender id in the loop below instead. (Found by an integrator
-    // copying this pattern: it silently swallowed a task event.)
+    // This wait runs on its OWN cursor, starting at our send's seq, and never
+    // touches `this.cursor`. Two things follow. First, ask() is now legal from
+    // a serving member (this used to throw busy_loop): the log is replayable,
+    // so two concurrent listens cannot steal each other's events, and serve()'s
+    // own filters already skip response kinds and our own traffic; only a
+    // SHARED cursor made concurrency unsafe. Second, the old bug class is gone
+    // by construction: advancing the shared cursor to our own send silently
+    // swallowed anything appended in between (an integrator hit that), and an
+    // isolated cursor has nothing to swallow from.
 
     const deadline = Date.now() + timeoutMs;
     const chunks: Envelope[] = [];
+    let since = sent.seq as number;
     while (Date.now() < deadline) {
       const window = Math.max(1_000, Math.min(25_000, deadline - Date.now()));
-      const events = await this.listenOnce({ timeoutMs: window, waitFor: "mentions" });
+      const res = await this.call("room_listen", { since, timeout_ms: window, wait_for: "mentions" });
+      since = res.cursor as number;
+      if (res.epoch !== this.epoch) await this.refreshRoster();
+      const events = res.events as RfaEvent[];
       for (const event of events) {
         if (event.type === "system" && event.refs?.message_id === messageId && event.event === "timeout") {
           throw new RfaClientError("reply_timeout", `no reply to ${messageId} before its reply_by`, { target });
@@ -356,11 +361,24 @@ export class RoomMember {
    */
   async serve(
     handler: (ctx: ServeContext) => Promise<string | Part[] | ServeRefusal>,
-    opts: { signal?: AbortSignal; presence?: "ready" | "busy" | "away"; onCycle?: (cursor: number) => void; onError?: (err: Error) => void } = {},
+    opts: {
+      signal?: AbortSignal;
+      presence?: "ready" | "busy" | "away";
+      onCycle?: (cursor: number) => void;
+      onError?: (err: Error) => void;
+      /**
+       * Task events reaching this member (the hub routes them to a task's
+       * owner, creator and verifier under the mentions filter). Without this
+       * hook they were DELIVERED and silently dropped here, so an executor
+       * could never notice an assignment: the hub spent effort routing the
+       * event to exactly the right member and the client threw it away with
+       * no refusal and no log (found 2026-08-21). Throwing inside the hook is
+       * reported through onError and never kills the loop.
+       */
+      onTask?: (event: { task: Record<string, unknown>; action: string; actor: string | null }) => Promise<void>;
+    } = {},
   ): Promise<void> {
-    this.looping = true;
-    try {
-      while (!opts.signal?.aborted) {
+    while (!opts.signal?.aborted) {
         let events: RfaEvent[];
         try {
           events = await this.listenOnce({ timeoutMs: 25_000, waitFor: "mentions", presence: opts.presence ?? "ready" });
@@ -374,6 +392,15 @@ export class RoomMember {
         for (const event of events) {
           if (opts.signal?.aborted) return;
           if (event.type === "system" && event.event === "room_ended") return;
+          if (event.type === "task" && opts.onTask) {
+            const t = event as unknown as { task: Record<string, unknown>; action: string; actor: string | null };
+            try {
+              await opts.onTask(t);
+            } catch (err) {
+              opts.onError?.(err as Error);
+            }
+            continue;
+          }
           if (event.type !== "message") continue;
           const env = event.envelope;
           if (env.from.id === this.memberId) continue;
@@ -413,9 +440,6 @@ export class RoomMember {
           }
         }
       }
-    } finally {
-      this.looping = false;
-    }
   }
 
   /**

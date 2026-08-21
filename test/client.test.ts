@@ -194,3 +194,69 @@ test("client: a transport refusal is named, not swallowed as 'rpc error'", async
     srv.close();
   }
 });
+
+test("client: a serving member can ask a peer mid-turn (the ask cursor is isolated)", async () => {
+  // This used to throw busy_loop: ask() shared the serve loop's cursor, so a
+  // concurrent listen would have swallowed events. ask() now waits on its own
+  // cursor starting at its send's seq, which is what makes an agent-to-agent
+  // consultation possible while serving.
+  const expert = await RoomMember.create({ hubUrl, name: "expert", topic: "relay test", card: card("expert", "facts", "knows facts") });
+  const relay = await RoomMember.create({ hubUrl, name: "relay", room: expert.room, joinSecret: expert.joinSecret!, card: card("relay", "relay", "consults the expert") });
+  const asker = await RoomMember.create({ hubUrl, name: "asker2", room: expert.room, joinSecret: expert.joinSecret!, card: card("asker2", "ask", "asks") });
+
+  const abort = new AbortController();
+  const servingExpert = expert.serve(async (ctx) => `fact: ${ctx.text}`, { signal: abort.signal });
+  const servingRelay = relay.serve(
+    async (ctx) => {
+      const consulted = await relay.ask(expert.memberId, ctx.text, { timeoutMs: 15_000 });
+      return `relayed ${consulted.envelope.from.name}'s answer: ${consulted.text}`;
+    },
+    { signal: abort.signal },
+  );
+  await sleep(200);
+
+  const reply = await asker.ask(relay.memberId, "what is the answer", { timeoutMs: 25_000 });
+  assert.equal(reply.kind, "response");
+  assert.equal(reply.text, "relayed expert's answer: fact: what is the answer");
+
+  abort.abort();
+  await Promise.race([Promise.all([servingExpert, servingRelay]), sleep(30_000)]);
+});
+
+test("client: serve onTask wakes on a task event instead of discarding it", async () => {
+  // The hub routes task events to the task's owner under the mentions filter;
+  // without the hook the client dropped them unread, so an assigned executor
+  // never noticed its assignment (found 2026-08-21).
+  const boss = await RoomMember.create({ hubUrl, name: "boss", topic: "wake test", card: card("boss", "assign", "assigns work") });
+  const worker = await RoomMember.create({ hubUrl, name: "worker", room: boss.room, joinSecret: boss.joinSecret!, card: card("worker", "work", "does assigned work") });
+
+  const woken: { action: string; taskId: unknown; owner: unknown }[] = [];
+  const abort = new AbortController();
+  const serving = worker.serve(async () => "unused", {
+    signal: abort.signal,
+    onTask: async (t) => {
+      woken.push({ action: t.action, taskId: t.task.id, owner: t.task.owner });
+      if (t.action === "create" && t.task.owner === worker.memberId) {
+        await worker.task({ action: "complete", id: t.task.id, evidence: { summary: "done on wake" } });
+      }
+    },
+  });
+  await sleep(200);
+
+  const created = await boss.task({ action: "create", title: "assigned at birth", owner: worker.memberId });
+  assert.equal(created.owner, worker.memberId);
+
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const now = await boss.task({ action: "get", id: created.id });
+    if (now.state === "completed") break;
+    await sleep(250);
+  }
+  const done = await boss.task({ action: "get", id: created.id });
+  assert.equal(done.state, "completed", "the worker woke on the assignment event and completed it");
+  assert.equal(done.evidence?.summary, "done on wake");
+  assert.ok(woken.some((w) => w.action === "create" && w.taskId === created.id), "the hook saw the assignment");
+
+  abort.abort();
+  await Promise.race([serving, sleep(30_000)]);
+});

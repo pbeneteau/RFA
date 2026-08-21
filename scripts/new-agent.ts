@@ -144,6 +144,9 @@ const toolsBlock =
   kind === "tool"
     ? `tools:
   allow: [Read, Grep, Glob]   # add your MCP tool ids here, e.g. mcp__yourservice__do_thing
+  # Add mcp__rfa__ask to let this agent consult OTHER room members (opt-in: a
+  # voice is a posture decision, not a default). Target a capability id from
+  # the roster; the answer arrives wrapped as untrusted data.
   allow_subagents: false      # listing Agent or Task without this fails validation
 interrupt_on:
   # Every tool named here pauses for a human approve/edit/reject decision.
@@ -151,7 +154,7 @@ interrupt_on:
   "mcp__yourservice__do_thing":
     allowed_decisions: [approve, edit, reject]`
     : `tools:
-  allow: [Read, Grep, Glob]   # reading knowledge; no side effects
+  allow: [Read, Grep, Glob]   # reading knowledge; no side effects. Add mcp__rfa__ask for a voice (see above)
   allow_subagents: false`;
 
 const content = `---
