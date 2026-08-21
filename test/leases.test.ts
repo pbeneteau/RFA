@@ -162,3 +162,63 @@ test("verification authority: the same party cannot accept its own evidence, and
   assert.equal(atCap.data?.max_rejections, 3);
   hub.close();
 });
+
+test("a reconnected worker finishes its own task through the claim_token, not its lost member id", async () => {
+  const { hub, handle, creator, join } = await room();
+  const worker = join("worker");
+  const t = (await hub.task({
+    room: handle, membership_token: creator.membership_token, action: "create", title: "survive a worker restart",
+  })) as RfaTask;
+  const claimed = (await hub.task({ room: handle, membership_token: worker.you.membership_token, action: "claim", id: t.id })) as RfaTask & { claim_token: string };
+
+  // The worker's process restarts: same party, new membership, new member id.
+  const reborn = join("worker-reborn");
+  assert.notEqual(reborn.you.id, worker.you.id);
+
+  // Without the token, the new membership is a stranger to the task.
+  const denied = await fails(() => hub.task({ room: handle, membership_token: reborn.you.membership_token, action: "complete", id: t.id }));
+  assert.equal(denied.code, "unauthorized");
+
+  // With it, update and complete both work: the fence is the identity that survives.
+  await hub.task({
+    room: handle, membership_token: reborn.you.membership_token, action: "update", id: t.id, state: "working",
+    note: "resumed after restart", claim_token: claimed.claim_token,
+  });
+  const done = (await hub.task({
+    room: handle, membership_token: reborn.you.membership_token, action: "complete", id: t.id, claim_token: claimed.claim_token,
+  })) as RfaTask;
+  assert.equal(done.state, "completed", "the spec 10.3 restart-recovery story finally works on the wire");
+
+  // A dead fence stays dead: after release the token no longer completes anything.
+  const t2 = (await hub.task({ room: handle, membership_token: creator.membership_token, action: "create", title: "released fence" })) as RfaTask;
+  const c2 = (await hub.task({ room: handle, membership_token: worker.you.membership_token, action: "claim", id: t2.id })) as RfaTask & { claim_token: string };
+  await hub.task({ room: handle, membership_token: worker.you.membership_token, action: "release", id: t2.id });
+  const stale = await fails(() => hub.task({ room: handle, membership_token: reborn.you.membership_token, action: "complete", id: t2.id, claim_token: c2.claim_token }));
+  assert.equal(stale.code, "unauthorized", "releaseTask deletes the fence with the claim");
+  hub.close();
+});
+
+test("create honors max_attempts, and the default stays 1", async () => {
+  const { hub, handle, creator, join } = await room();
+  const w1 = join("w1");
+  const w2 = join("w2");
+
+  // Advertised by the schema and, until 2026-08-21, silently dropped by create.
+  const generous = (await hub.task({
+    room: handle, membership_token: creator.membership_token, action: "create", title: "three tries", max_attempts: 3,
+  })) as RfaTask;
+  assert.equal(generous.max_attempts, 3, "the argument the schema advertises lands on the task");
+  await hub.task({ room: handle, membership_token: w1.you.membership_token, action: "claim", id: generous.id });
+  await hub.task({ room: handle, membership_token: w1.you.membership_token, action: "release", id: generous.id });
+  const second = (await hub.task({ room: handle, membership_token: w2.you.membership_token, action: "claim", id: generous.id })) as RfaTask;
+  assert.equal(second.attempt, 2, "a second worker gets the second attempt");
+
+  // Unchanged default: a task created without the argument is still single-attempt.
+  const strict = (await hub.task({ room: handle, membership_token: creator.membership_token, action: "create", title: "one try" })) as RfaTask;
+  await hub.task({ room: handle, membership_token: w1.you.membership_token, action: "claim", id: strict.id });
+  await hub.task({ room: handle, membership_token: w1.you.membership_token, action: "release", id: strict.id });
+  const capped = await fails(() => hub.task({ room: handle, membership_token: w2.you.membership_token, action: "claim", id: strict.id }));
+  assert.equal(capped.code, "task_conflict");
+  assert.match(capped.message, /must reopen it/, "the refusal says who can unstick it");
+  hub.close();
+});

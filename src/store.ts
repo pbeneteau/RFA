@@ -2332,6 +2332,11 @@ export class RoomHub {
           reply_by: replyBy,
           evidence_required: args.evidence_required ?? false,
           evidence: null,
+          // Honored at create since 2026-08-21: the schema advertised this argument
+          // while create silently dropped it, so every task was born single-attempt
+          // and one network hiccup burned a remote worker's only try. The creator
+          // caps its own task here; RAISING it later stays privileged (see update).
+          ...(args.max_attempts !== undefined ? { max_attempts: args.max_attempts } : {}),
           verification: { pending: false, verifier: null, verdict: null, note: null },
           note: args.note ?? null,
           created_at: iso(now),
@@ -2409,7 +2414,12 @@ export class RoomHub {
       case "update": {
         const task = get(args.id);
         if (TERMINAL_TASK_STATES.has(task.state)) throw new RfaError("task_conflict", `task ${task.id} is terminal (${task.state})`);
-        const isOwner = task.owner === member.id;
+        // Same fence as complete: a reconnected worker acts on its task through
+        // the claim_token it was handed, not the member id it lost.
+        const updatesWithToken =
+          typeof args.claim_token === "string" &&
+          claimTokens.get(`${room.handle}:${task.id}:${task.attempt ?? 0}`)?.token === args.claim_token;
+        const isOwner = task.owner === member.id || updatesWithToken;
         const isCreator = task.created_by === member.id;
         const privileged = isCreator || member.isHost || member.origin === "human";
         // Reopening a used-up task, and clearing a rejection counter, are both
@@ -2445,7 +2455,18 @@ export class RoomHub {
       case "complete": {
         const task = get(args.id);
         if (TERMINAL_TASK_STATES.has(task.state)) throw new RfaError("task_conflict", `task ${task.id} is terminal (${task.state})`);
-        if (task.owner !== member.id) throw new RfaError("unauthorized", "only the owner can complete a task");
+        // The claim fence's whole point (spec 10.3): a worker that reconnects
+        // holds a NEW member id but the SAME claim_token, and must be able to
+        // finish its own work. Until 2026-08-21 the token was accepted by the
+        // schema here and ignored, so a restarted remote worker was locked out
+        // of its own task. The token dies with the claim (releaseTask deletes
+        // it), so it never outlives the attempt it fences.
+        const completesWithToken =
+          typeof args.claim_token === "string" &&
+          claimTokens.get(`${room.handle}:${task.id}:${task.attempt ?? 0}`)?.token === args.claim_token;
+        if (task.owner !== member.id && !completesWithToken) {
+          throw new RfaError("unauthorized", "only the owner, or a valid claim_token holder, can complete a task");
+        }
         if (task.evidence_required) {
           if (!args.evidence?.summary) {
             throw new RfaError("bad_request", "this task requires evidence ({summary, artifacts?}) to complete");
