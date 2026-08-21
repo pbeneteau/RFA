@@ -185,6 +185,14 @@ export interface RoomPolicies {
   moderator: string | null;
   history_visibility: "member" | "joined_after";
   max_members: number;
+  /**
+   * SHA-256 hex digests of transport bearers that may join WITHOUT a
+   * join_secret (RFA-0.6 sect. 4's admission record, first slice). The secret
+   * then lives in the peer's MCP config beside the bearer itself, and no
+   * credential ever has to travel through a model's context or a chat. Hashes,
+   * never the bearers: room metadata is persisted and must not hold the secret.
+   */
+  join_bearer_sha256?: string[];
   /** Per-member sends/minute; null falls back to the hub-wide default (v0.4.2 rate budgets). */
   member_rpm?: number | null;
   /** Rejections allowed per (task, attempt) before a creator, host or human must clear the counter (spec 10.4). */

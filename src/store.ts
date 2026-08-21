@@ -16,6 +16,7 @@ import { verifyCard, type Jwk, type VerificationDetail } from "./signing.js";
 import { TERMINAL_TASK_STATES } from "./model.js";
 import { consoleNameFor, matchPrincipal } from "./principals.js";
 import { foldWhitespace, neutralize, renderWrapped } from "./wrap.js";
+import { bearerSha256 } from "./reqcontext.js";
 import type {
   AgentCard,
   EventInput,
@@ -150,7 +151,11 @@ export const DEFAULT_CONFIG: HubConfig = {
   flapWindowS: 10,
   listenCapMs: 60_000,
   listenGraceS: 15,
-  historyDefault: 50,
+  // 0 since 2026-08-21: catch-up is a per-agent appetite the joiner asks for
+  // (history_limit, capped by the room's visibility rule), not something to
+  // push into every new member's context. A remote member's first measured
+  // friction was exactly this payload.
+  historyDefault: 0,
   replayCap: 200,
   rateMsgsPerMin: 30,
   dupWindowS: 30,
@@ -581,7 +586,13 @@ export class RoomHub {
       attention: "mentions",
       mode: "open",
       moderator: null,
-      history_visibility: "member",
+      // "joined_after" since 2026-08-21 (owner decision): the room's dominant
+      // usage is ask/serve with self-contained requests, so a new member has
+      // no business reading what the room said before it arrived, and the old
+      // "member" default kept the spec 5.4 clamp permanently inert. Rooms that
+      // ARE shared workspaces opt back in with history_visibility: "member";
+      // existing rooms keep whatever they persisted.
+      history_visibility: "joined_after",
       max_members: 32,
       ...(args.policies ?? {}),
     };
@@ -638,8 +649,21 @@ export class RoomHub {
   }): JoinContract {
     const room = this.getRoom(args.room);
     if (room.ended) throw new RfaError("room_ended", `room ${room.handle} has ended`);
+    // Two admission paths (spec 4.3, first slice): the room-wide join_secret,
+    // or a transport bearer the operator listed in join_bearer_sha256. The
+    // bearer identity comes from the HTTP layer via request context, never
+    // from an argument, so a client cannot assert it, and main.ts sets it ONLY
+    // when transport auth actually validated the header; on secretless
+    // transports (stdio, in-process) and unauthenticated hubs it is absent and
+    // only the secret path exists. Plain includes() is fine here, unlike the
+    // raw-secret compares in principals.ts: both sides are SHA-256 digests, so
+    // a timing leak of a digest yields nothing a preimage would need.
     if (room.policies.join === "invite" && args.join_secret !== room.joinSecret) {
-      throw new RfaError("join_denied", "this room requires a valid join_secret");
+      const presented = bearerSha256();
+      const admittedByBearer = presented !== undefined && (room.policies.join_bearer_sha256 ?? []).includes(presented);
+      if (!admittedByBearer) {
+        throw new RfaError("join_denied", "this room requires a valid join_secret, or a transport bearer its operator has listed");
+      }
     }
     // Quarantined identities (name or capability digest) stay out pending human action (spec 12.1).
     if (room.quarantinedNames.has(args.name) || room.quarantinedDigests.has(digestCard(args.card))) {
@@ -777,10 +801,17 @@ export class RoomHub {
       members: this.rosterSnapshot(room),
     });
 
-    // History per visibility policy: "joined_after" starts you at the join point.
+    // History per visibility policy: "joined_after" starts you at the join
+    // point. Local human principals are exempt here for the same reason as in
+    // visibleSince, and this slice is the exemption that actually matters: the
+    // console's ONLY scrollback is the join contract (it renders
+    // contract.history and then long-polls forward), so without this line a
+    // joined_after room's overnight alerts would be invisible to the operator
+    // who opens the console in the morning (found in review, 2026-08-22).
     let history: RfaEvent[] = [];
     let truncated = false;
-    if (room.policies.history_visibility === "member" && args.historyLimit > 0) {
+    const seesBack = room.policies.history_visibility === "member" || (member.origin === "human" && (member.home ?? "local") === "local");
+    if (seesBack && args.historyLimit > 0) {
       const before = room.events.filter((e) => e.seq < joinSeq);
       history = before.slice(-args.historyLimit);
       truncated = before.length > history.length;
@@ -860,7 +891,17 @@ export class RoomHub {
    * applies it to everyone.
    */
   private visibleSince(room: Room, member: Member, requested: number): number {
-    if (room.policies.history_visibility !== "joined_after" && member.home === "local") return requested;
+    // Order is load-bearing. The non-local clamp comes FIRST because spec 5.4
+    // forces it for every guest with no carve-outs: a remote member is clamped
+    // even if it somehow carries a human principal (review 2026-08-22; inert
+    // today while every home is "local", correct the day it is not).
+    if ((member.home ?? "local") !== "local") return Math.max(requested, member.joinSeq - 1);
+    // Local human principals are exempt: the key that minted them could read
+    // the log file on the hub's own disk, so clamping the console's scrollback
+    // would inconvenience the operator while protecting nothing. The rule
+    // governs AGENT members, which is who history_visibility exists to contain.
+    if (member.origin === "human") return requested;
+    if (room.policies.history_visibility !== "joined_after") return requested;
     return Math.max(requested, member.joinSeq - 1);
   }
 
@@ -2097,8 +2138,34 @@ export class RoomHub {
           room.policies.max_pending_requests = n;
           changes.max_pending_requests = n;
         }
+        if (patch.join_bearer_sha256 !== undefined) {
+          // Hashes of transport bearers admitted without a join_secret (spec
+          // 4.3, first slice). Hex digests only: a raw bearer arriving here
+          // would land in persisted room metadata and the audited intervention.
+          // Give each peer its OWN bearer: listing the hash of a token that
+          // several parties hold (the local RFA_TOKEN every resident presents)
+          // bearer-admits all of them at once.
+          const list = patch.join_bearer_sha256 === null ? [] : patch.join_bearer_sha256;
+          if (!Array.isArray(list) || list.length > 16 || list.some((h) => typeof h !== "string" || !/^[0-9a-f]{64}$/.test(h))) {
+            throw new RfaError("bad_request", "join_bearer_sha256 must be up to 16 lowercase sha256 hex digests (or null to clear)");
+          }
+          room.policies.join_bearer_sha256 = list as string[];
+          changes.join_bearer_sha256 = list;
+        }
+        if (patch.history_visibility !== undefined) {
+          // Room-wide by design: the reader never picks its own visibility. It
+          // became settable when joined_after became the create default, since
+          // an "opt back in" that only exists at create is not an opt-in
+          // (review 2026-08-22; rebuildFromLog also resets to the default and
+          // the operator needs a wire path to re-apply a non-default).
+          if (patch.history_visibility !== "member" && patch.history_visibility !== "joined_after") {
+            throw new RfaError("bad_request", `unknown history_visibility "${patch.history_visibility}"`);
+          }
+          room.policies.history_visibility = patch.history_visibility;
+          changes.history_visibility = patch.history_visibility;
+        }
         if (Object.keys(changes).length === 0) {
-          throw new RfaError("bad_request", "set_policy accepts params.policies with mode, moderator, attention, max_members, member_rpm, max_pending_requests");
+          throw new RfaError("bad_request", "set_policy accepts params.policies with mode, moderator, attention, max_members, member_rpm, max_pending_requests, join_bearer_sha256, history_visibility");
         }
         intervene(null, { changes });
         return done({ policies: room.policies });

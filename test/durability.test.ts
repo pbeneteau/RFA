@@ -143,7 +143,9 @@ test("an envelope's seq and ts survive a restart, and the chain verifies over wh
   // chain verifier had to know to zero the field to reproduce the hash.
   const dir = tmpdir();
   let hub = new RoomHub({ dataDir: dir, sweepIntervalMs: 0 });
-  const a = hub.createRoom({ topic: "chain", name: "host", card: card("host") });
+  // Shared history on purpose: the fresh post-restart reader below must be able
+  // to replay the whole log, and the default is joined_after since 2026-08-21.
+  const a = hub.createRoom({ topic: "chain", name: "host", card: card("host"), policies: { history_visibility: "member" } });
   const tok = a.contract.you.membership_token;
   const sent = await hub.send({ room: a.room, membership_token: tok, message_id: "msg_stamped", body: [{ type: "text", text: "stamp me" }] });
   const live = (await hub.listen({ room: a.room, membership_token: tok, since: 0, timeout_ms: 0, wait_for: "all" })) as { events: any[] };

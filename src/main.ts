@@ -42,6 +42,7 @@ import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { listPacks, parseAgentMd } from "./agentdef.js";
 import { createHubServer } from "./hub.js";
 import { sha256hex } from "./jcs.js";
+import { withBearer } from "./reqcontext.js";
 import { ObsStore } from "./obs.js";
 import { RoomHub } from "./store.js";
 import { constantTimeMatch, matchPrincipal } from "./principals.js";
@@ -80,12 +81,11 @@ const httpPort = arg("--http");
 // therefore MUST mean "behave exactly as before"; the startup banner states
 // which of the two modes is in force so an operator never has to guess.
 //
-// UNRESOLVED, sect. 4.4 spike 11, UNRUN: it is not known whether a real MCP
-// host (Claude Code, Cursor) can carry a static Authorization header into a
-// registered server. If it cannot, the credential has to move into the tool
-// arguments instead and this flag's shape changes. Nothing below is evidence
-// that the header path works with a host: it is only known to work for a client
-// that makes its own HTTP request.
+// RESOLVED, sect. 4.4 spike 11, run live 2026-08-21: a real MCP host CAN carry
+// a static Authorization header into a registered server. Claude Code on a
+// second machine (`claude mcp add --transport http --header "Authorization:
+// Bearer ..."`) joined the live room through a tailnet proxy and conversed
+// with a resident. The header path is the credential path.
 // A flag value is visible in `ps`, so RFA_MCP_TOKENS is the better of the two paths for a real token.
 const mcpTokens = (arg("--mcp-token") ?? process.env.RFA_MCP_TOKENS ?? "")
   .split(",")
@@ -1009,7 +1009,22 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
         headers,
         body: hasBody ? new Uint8Array(Buffer.concat(chunks)) : undefined,
       });
-      const response = await handler.fetch(request);
+      // The authenticated bearer's hash rides request context into the store
+      // (never a tool argument, which a client could forge): it is what lets a
+      // room's join_bearer_sha256 policy admit this caller without a secret.
+      //
+      // ONLY when transport auth is on. With no tokens configured,
+      // mcpAuthorized validates nothing, so the header is client-chosen prose,
+      // and hashing it into request context would quietly turn "a bearer the
+      // transport authenticated" into "a string the caller typed" (review
+      // 2026-08-22). On an unauthenticated hub the join_bearer_sha256 policy
+      // is therefore inert, which the docs state.
+      const presented = req.headers.authorization;
+      const bearer =
+        mcpTokens.length > 0 && typeof presented === "string" && presented.startsWith("Bearer ") ? presented.slice(7).trim() : null;
+      const response = bearer
+        ? await withBearer(sha256hex(bearer), () => handler.fetch(request))
+        : await handler.fetch(request);
       res.writeHead(response.status, Object.fromEntries(response.headers.entries()));
       if (response.body) {
         const reader = response.body.getReader();

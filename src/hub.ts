@@ -58,11 +58,19 @@ const policiesSchema = z
     join: z.enum(["open", "invite"]).optional(),
     attention: z.enum(["mentions", "all"]).optional(),
     mode: z.enum(["open", "sequential", "moderator"]).optional(),
-    history_visibility: z.enum(["member", "joined_after"]).optional(),
+    history_visibility: z
+      .enum(["member", "joined_after"])
+      .optional()
+      .describe("Default joined_after: members read only what happened after their join. 'member' opts a shared-workspace room back into full history"),
     max_members: z.number().int().min(2).max(256).optional(),
+    join_bearer_sha256: z
+      .array(z.string().regex(/^[0-9a-f]{64}$/))
+      .max(16)
+      .optional()
+      .describe("SHA-256 hex of transport bearers admitted without a join_secret (spec 4.3 first slice); hashes, never raw bearers"),
   })
   .optional()
-  .describe("Room policies; defaults: join=invite, attention=mentions, mode=open");
+  .describe("Room policies; defaults: join=invite, attention=mentions, mode=open, history_visibility=joined_after");
 
 const DECLARED = z.enum(["ready", "busy", "away"]);
 
@@ -218,7 +226,10 @@ export function createHubServer(hub: RoomHub): McpServer {
         "with presence states and capability digests, recent history, and a cursor for room_listen. Process in that order.",
       inputSchema: {
         room: z.string().describe("Room handle (r_*)"),
-        join_secret: z.string().optional(),
+        join_secret: z
+          .string()
+          .optional()
+          .describe("Not needed when the operator listed your transport bearer in the room's join_bearer_sha256 policy: then just join"),
         name: NAME,
         card: cardSchema,
         role: z
@@ -416,7 +427,8 @@ export function createHubServer(hub: RoomHub): McpServer {
         "membership), quarantine (evict + refuse that identity's re-join), inject (speak as the supervisor: " +
         "params.text, optional params.mentions/kind/conversation_id/in_reply_to), cancel_task (target = task id), " +
         "approve/reject (target = approval request_id; approve requires a human-origin principal), set_policy " +
-        "(params.policies: mode/moderator/attention/max_members), set_role (host only; params.role), grant_floor " +
+        "(params.policies: mode/moderator/attention/max_members/member_rpm/max_pending_requests/join_bearer_sha256/history_visibility), " +
+        "set_role (host only; params.role), grant_floor " +
         "(assign the floor; also allowed for the designated moderator). Targets are member refs unless noted.",
       inputSchema: {
         room: z.string(),
