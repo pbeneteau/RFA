@@ -33,3 +33,17 @@ A resident PM agent holds the operator's own product knowledge and the RFA spec,
 - **Spawn child processes through `src/proc.ts`, never `npx`.** `npx tsx x.ts` is three processes and SIGKILL cannot be forwarded, so killing what `spawn` returns leaves the real process running: 119 orphaned hubs holding 5.3 GB were found this way, and in the supervisor the same shape left a SIGKILLed resident still serving its membership while a replacement started. `spawnTsx` + `stopTree` spawn one process in its own group and signal the group.
 - `dogfood/knowledge/`, `dogfood/state/`, `dogfood/ROOM.md`, `data/`, `reports/` are gitignored on purpose (internal docs, secrets, runtime state). Never force-add them.
 - The hub must own `data/rooms` + its lockfile exclusively; for shared use run one HTTP hub (`npm run start -- --http 8790`). The engine DB (`data/runs.db`, WAL) is separate and shared by supervisor + residents.
+
+<!-- kontrua:start -->
+## Context maintained by Kontrua
+
+This repository's context layer (agent instructions, codemap, conventions) and doc views are **AI-generated** and kept current on every PR approval.
+
+| File | Description | Last updated |
+|------|-------------|--------------|
+| README.md | Project overview and setup | 2026-08-21 |
+| docs/ARCHITECTURE.md | System architecture overview | 2026-08-21 |
+| docs/CHANGELOG.md | Version history | 2026-08-21 |
+| AGENTS.md | Agent instructions & project orientation | 2026-08-21 |
+| docs/CONVENTIONS.md | Observed code conventions | 2026-08-21 |
+<!-- kontrua:end -->

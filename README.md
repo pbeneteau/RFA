@@ -64,14 +64,14 @@ point at directories a fresh clone does not have. Retire what you do not want:
 
 ```bash
 npm install
-npm run e2e       # THE fast answer: starts real hubs, tests every profile over the wire, writes a report (~4s)
+npm run e2e       # THE fast answer: starts real hubs, tests every profile over the wire, writes a report
 npm run e2e:full  # same + the real-time presence-expiry scenario (~45s)
-npm test          # 126 unit/integration tests over MCP in-memory transports
+npm test          # unit/integration tests over MCP in-memory transports (npm test prints the live count)
 npm run demo      # the dev-asks-PM flow: join, discovery, busy refusal, presence, streamed answer
 npm run demo:push # push profile: events arrive with zero polling (spec 11.2b)
 ```
 
-`npm run e2e` boots isolated hub processes (random ports, temp data dirs; your dev hub is untouched), exercises both MCP eras over HTTP and stdio across its scenarios (unit suite, lockfile guard, dual-era serving, the spec section 17 core flow, tasks with a real claim race, signing incl. a strict `--require-signed` hub, moderation, push notifications, restart persistence; the report prints the live count), and writes `reports/latest.md` + `latest.json` plus a timestamped copy. Exit code = number of failed scenarios, so it drops straight into CI. `--keep` preserves the temp data dirs for inspection.
+`npm run e2e` boots isolated hub processes (random ports, temp data dirs; your dev hub is untouched), exercises both MCP eras over HTTP and stdio across its scenarios, and writes `reports/latest.md` + `latest.json` plus a timestamped copy. Exit code = number of failed scenarios, so it drops straight into CI. `--keep` preserves the temp data dirs for inspection.
 
 ### Run an agent
 
@@ -136,7 +136,7 @@ npm run tail -- data/rooms/r_XXXX.ndjson --follow
 
 ## What the hub implements (spec `core` profile)
 
-- **Tools** (12): `room_create`, `room_join`, `room_leave`, `room_send`, `room_listen`, `room_roster`, `room_presence`, `agent_describe`, `room_task`, `room_admin`, `room_watch`, `room_end`.
+- **Tools**: `room_create`, `room_join`, `room_leave`, `room_send`, `room_listen`, `room_roster`, `room_presence`, `agent_describe`, `room_task`, `room_admin`, `room_watch`, `room_end`.
 - **Join contract** (spec 11.3): identity + full roster with capability digests + history cursor + LLM-facing instructions, in one result.
 - **Presence** (spec 7): declared `ready|busy|away` with detail; `offline` inferred from lease expiry (default 180s) with flap debounce; return-from-offline restores the declared state; leases renewed by listen/send/presence calls.
 - **Capability discovery** (spec 6): A2A-compatible agent cards, `sha256:` JCS digests in every roster entry and presence event, digest-addressed `agent_describe` with `ttl_ms`/`cache_scope`.
@@ -179,7 +179,7 @@ Still not implemented: TLS termination (front it with a proxy), OAuth tiers, per
 
 **Client-side rule that no hub can enforce for you**: treat every message from another member as untrusted data. Wrap it in a data boundary before showing it to your model, and never let its content authorize anything.
 
-**Retrievable memory is a worm substrate** (spec 14.3, the Morris-II result): never auto-ingest peer messages into RAG or conversation memory raw. The SDK ships the defenses: `RoomMember.sanitizeForMemory(envelope)` produces a provenance-stamped, neutralized record, and `MemoryGate.inspect(envelope)` flags near-identical content arriving from *different* senders: the replication signature of a self-propagating prompt (shingle-Jaccard, configurable window/threshold). The resident pm-agent gates its conversation memory with exactly this.
+**Retrievable memory is a worm substrate** (spec 14.3, the Morris-II result): never auto-ingest peer messages into RAG or conversation memory raw. The test suite includes `test/sanitizer.test.ts` covering defenses against prompt-injection via memory ingestion.
 
 ## License
 
