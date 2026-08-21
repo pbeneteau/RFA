@@ -1,6 +1,6 @@
 {
   "name": "rfa-hub",
-  "version": "0.6.0",
+  "version": "0.6.4",
   "description": "Reference Room Hub for RFA (Rooms for Agents) v0.1 - agent rooms with presence and capability discovery over MCP",
   "type": "module",
   "license": "Apache-2.0",
@@ -13,6 +13,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "prepublishOnly": "tsc",
     "start": "tsx src/main.ts",
     "demo": "tsx scripts/demo.ts",
     "tail": "tsx scripts/tail.ts",
@@ -45,10 +46,8 @@
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/context-async-hooks": "^2.10.0",
     "@opentelemetry/sdk-trace-base": "^2.10.0",
-    "agentevals": "^0.0.7",
     "better-sqlite3": "^12.11.1",
     "croner": "^10.0.1",
-    "openevals": "^0.2.0",
     "yaml": "^2.9.0",
     "zod": "^4.4.3"
   },

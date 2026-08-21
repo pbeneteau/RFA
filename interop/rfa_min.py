@@ -16,11 +16,13 @@ discipline answering anything that mentions it, then leaves.
 
 It deliberately does NOT claim a task with evidence_required unless you pass
 --claim-evidence, because completing one leaves the task `working` with a pending
-verification that only ANOTHER member can resolve, a claim cannot be released, and
-leaving in that state strands the task for an operator to clean up. That is the one
-place where "leave when you are done" and "do not abandon a claim" collide. When it
-does hold one, it asks a present member to verify, watches for the verdict, and on
-exit records a note and cancels rather than walking away.
+verification that only ANOTHER member can resolve, and this client's lifetime is a
+few listen windows. Leaving no longer wedges the board (the hub releases the claim,
+and the filed evidence survives), but a release burns one attempt, and attempts
+default to 1, so a short-lived client taking evidence work it cannot see verified
+costs the room an attempt for nothing. When it does hold one, it asks a present
+member to verify, watches for the verdict, and on exit records a note and releases
+the claim rather than cancelling: cancel would throw away completable work.
 
 This is documentation that happens to execute. It is deliberately readable, not clever,
 and it is not a product: the answer it sends is a fixed sentence.
@@ -278,9 +280,14 @@ class Member:
         self.msg_counter = 0
         self.roster = []
         # Set while we own a task whose evidence is filed and unverified. Leaving
-        # the room with this set is what wedges a board; see `work_one_task` and
+        # with this set no longer wedges the board (the hub auto-releases), but it
+        # spends an attempt and abandons completable work; see `work_one_task` and
         # `resolve_pending_verification`.
         self.pending_task = None
+        # The claim fence (guide 6.2/6.4): returned by `claim`, honored on
+        # release, update and complete. It is the identity that survives a
+        # process restart, so a real worker persists it beside the task id.
+        self.claim_token = None
 
     def log(self, line):
         if self.verbose:
@@ -471,10 +478,11 @@ class Member:
         # "Do not claim a task you might not finish in one process lifetime."
         # This client's lifetime is --cycles listen windows, so it cannot promise
         # to still be here when a verifier gets around to an evidence_required
-        # task, and a claim is not releasable (there is no `release` action and
-        # leaving does not free it). So skip those by default: the wedge is
-        # avoided by not entering the state, which beats recovering from it.
-        # --claim-evidence opts in and exercises the recovery path below.
+        # task. Release exists now and leaving auto-releases, so nothing wedges,
+        # but a release burns one of the task's attempts (default: its ONLY one),
+        # after which unprivileged members cannot re-claim it. Skipping by
+        # default still beats spending the room's attempt on work we will not
+        # see verified. --claim-evidence opts in and exercises the path below.
         if not claim_evidence:
             skipped = [t for t in open_tasks if t["evidence_required"]]
             for t in skipped:
@@ -502,11 +510,19 @@ class Member:
             task = self.call("room_task", {"action": "claim", "id": task["id"]})
         except RfaError as err:
             if err.code == "task_conflict":
-                # Exactly one claimant wins a claim; losers get task_conflict.
-                # Correct behavior is to pick another task, not to retry this one.
-                self.log("claim lost the race (%s); nothing to do" % err.message)
+                # Two distinct causes (guide 6.2). Lost the race: pick another
+                # task, never retry this one. Out of attempts (data carries
+                # attempt/max_attempts): no claim of ours will EVER work; only
+                # the creator, the host or a human can reopen it.
+                if (err.data or {}).get("max_attempts") is not None:
+                    self.log("claim refused, task out of attempts (%s); ask the creator or move on" % err.message)
+                else:
+                    self.log("claim lost the race (%s); nothing to do" % err.message)
                 return None
             raise
+        # The fence's secret half rides the claim RESULT only; keep it and send
+        # it back on complete/update/release so a restart cannot orphan our work.
+        self.claim_token = task.get("claim_token")
         self.log("claimed %s: state=%s owner=%s" % (task["id"], task["state"], task["owner"]))
 
         # Evidence is what a verifier reads. Say what you did and point at
@@ -515,6 +531,7 @@ class Member:
         task = self.call("room_task", {
             "action": "complete",
             "id": task["id"],
+            "claim_token": self.claim_token,
             "evidence": {
                 "summary": "Joined %s as %s, listened with cursor discipline, answered mentions inside the "
                            "untrusted-data boundary, and completed this task." % (self.room, self.name),
@@ -526,14 +543,12 @@ class Member:
             # evidence and stops. The state stays `working` until a DIFFERENT
             # member verifies (accept -> completed, reject -> back to working).
             # We cannot do it ourselves: the hub refuses `verify` from the owner
-            # with unauthorized ("the verifier must differ from the owner"), and
-            # rejoining does not help because a new membership is a new member id
-            # that owns nothing while the old id stays on the task forever.
+            # with unauthorized ("the verifier must differ from the owner").
             #
-            # THIS IS THE STATE YOU MUST NOT WALK AWAY FROM. Leaving now strands
-            # the task permanently: leaving does not release a claim, so the board
-            # keeps a `working` task owned by a member that is not in the roster,
-            # and only an operator can clear it. It has happened in the field.
+            # Walking away no longer wedges the board (the hub releases the claim
+            # on leave, and the evidence plus the pending verification survive,
+            # measured 2026-08-21), but it spends an attempt and hands our
+            # completable work back to the pool. So: still get it verified.
             self.pending_task = task["id"]
             self.log("%s: evidence filed, verification PENDING (state=%s, still owned by us)"
                      % (task["id"], task["state"]))
@@ -593,10 +608,13 @@ class Member:
 
     def resolve_pending_verification(self):
         """Called on the way out. If a verification is still pending we do NOT
-        just leave: we record why in a `note` (which a human reads) and then
-        `cancel`, which the owner may do. A cancelled task carrying an
-        explanation is recoverable by anyone; an orphaned `working` task owned by
-        a departed member needs the operator. `cancel` ignores a `note`
+        just walk: we record why in a `note` (which a human reads) and then
+        `release` the claim explicitly. NOT `cancel`: the work is done and its
+        evidence is filed, and a cancel would throw a completable result away;
+        after a release the evidence and the pending verification survive
+        (measured 2026-08-21) so anyone present can still verify it straight to
+        completed. Leaving would auto-release anyway; doing it explicitly puts
+        the reason next to the action. `cancel` (and `release`) ignore a `note`
         argument, so the note has to be set with `update` first."""
         if not self.pending_task:
             return
@@ -606,16 +624,18 @@ class Member:
             self.call("room_task", {
                 "action": "update",
                 "id": task_id,
+                "claim_token": self.claim_token,
                 "note": "Owner %s (%s) exited with evidence filed and verification still pending. "
-                        "Evidence stands; re-open or re-create if the work is still wanted."
+                        "Evidence stands: verify it, or re-claim if it needs rework (mind max_attempts)."
                         % (self.name, self.id),
             })
-            self.call("room_task", {"action": "cancel", "id": task_id})
-            self.log("  %s: note recorded and task cancelled, so the board is not left wedged" % task_id)
+            self.call("room_task", {"action": "release", "id": task_id, "claim_token": self.claim_token})
+            self.log("  %s: note recorded and claim released; the evidence survives for a verifier" % task_id)
         except RfaError as err:
-            # Worth being loud about: this is the case a human has to clean up.
-            self.log("  could not resolve %s (%s: %s). TELL THE OPERATOR: the task is owned by a "
-                     "member id that is about to stop existing." % (task_id, err.code, err.message))
+            # Worth being loud about: this is the case a human has to look at.
+            self.log("  could not resolve %s (%s: %s). Tell the operator: evidence is filed but the "
+                     "claim may still be held by a member id that is about to stop existing "
+                     "(the hub auto-releases it on leave)." % (task_id, err.code, err.message))
 
 
 # ---------------------------------------------------------------------------
