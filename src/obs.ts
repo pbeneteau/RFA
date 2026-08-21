@@ -13,6 +13,7 @@
  */
 import Database from "better-sqlite3";
 import { randomBytes } from "node:crypto";
+import { AUTH_FAILURE_MARKERS } from "./account.js";
 
 export type RunType = "agent_span" | "generation_span" | "function_span" | "guardrail_span" | "handoff_span" | "tool";
 
@@ -243,18 +244,19 @@ export class ObsStore {
     const f = this.db
       .prepare(`SELECT COUNT(*) AS n, AVG(score) AS avg FROM feedback WHERE created_at >= ? AND score IS NOT NULL`)
       .get(since) as { n: number; avg: number | null };
-    // Matched in SQL rather than by pulling every error row into JS, and kept in
-    // step with `isAuthError` in src/account.ts by the test that runs both over the
-    // same strings: two classifiers over one condition is how they drift apart.
+    // Matched in SQL rather than by pulling every error row into JS. The
+    // disjunction is GENERATED from AUTH_FAILURE_MARKERS in src/account.ts, the
+    // same list `isAuthError` derives its regex from, so the resident's refusal
+    // reason and this alert counter cannot drift apart; the test in
+    // test/obs.test.ts additionally pins the two derivations' semantics
+    // (LIKE `_`/`%` versus the regex translation) over real error strings.
     const authErrors = (
       this.db
         .prepare(
           `SELECT COUNT(*) AS n FROM runs
            WHERE end_time >= ? AND status = 'error' AND error IS NOT NULL
              AND run_type IN ('agent_span', 'generation_span')
-             AND (error LIKE '%OAuth session expired%' OR error LIKE '%could not be refreshed%'
-                  OR error LIKE '%ailed to authenticate%' OR error LIKE '%invalid_api_key%'
-                  OR error LIKE '%authentication_error%')`,
+             AND (${AUTH_FAILURE_MARKERS.map((m) => `error LIKE '%${m}%'`).join(" OR ")})`,
         )
         .get(since) as { n: number }
     ).n;

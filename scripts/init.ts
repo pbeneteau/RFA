@@ -95,6 +95,67 @@ if (fs.existsSync(HUMAN_KEY) && !force) {
   console.log(`  created ${path.relative(ROOT, HUMAN_KEY)} (0600)`);
 }
 
+// ---------------------------------------------------------------- model credential
+// The credentials above move messages; they do not make an agent think. The brain
+// is the Claude Agent SDK, which inherits whatever credential this machine already
+// has (a `claude` login, or ANTHROPIC_API_KEY in the supervisor's environment,
+// which residents inherit). init cannot provision one, but it must not print
+// "ready" while the first question is guaranteed to die: measured 2026-08-21, a
+// credential-less machine came up green everywhere and the first ask failed.
+function modelCredentialStatus(): { ok: boolean | null; detail: string } {
+  if (process.env.ANTHROPIC_API_KEY)
+    return {
+      ok: true,
+      // Shell-local, unlike a `claude` login: green HERE proves nothing about the
+      // terminal that runs step 3, and residents inherit the SUPERVISOR's shell.
+      detail: "ANTHROPIC_API_KEY is set in this shell; step 3's supervisor shell must export it too",
+    };
+  // `claude auth status` exits NON-ZERO when not logged in, with the JSON verdict
+  // on stdout either way, so the throw path is a normal answer, not a failure.
+  let out: string;
+  try {
+    out = execFileSync("claude", ["auth", "status"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 10_000,
+      killSignal: "SIGKILL",
+    });
+  } catch (err) {
+    out = String((err as { stdout?: unknown }).stdout ?? "");
+  }
+  try {
+    const parsed = JSON.parse(out) as { loggedIn?: boolean; authMethod?: string };
+    if (parsed.loggedIn === true) return { ok: true, detail: `\`claude\` is logged in (${parsed.authMethod ?? "method unknown"})` };
+    // Only an explicit false is a verdict; a missing field is a CLI whose output
+    // this check does not understand, which must not read as "not logged in".
+    if (parsed.loggedIn === false) return { ok: false, detail: "`claude auth status` reports not logged in" };
+    return { ok: null, detail: "could not verify (unrecognized `claude auth status` output)" };
+  } catch {
+    return { ok: null, detail: "could not verify (no `claude` CLI on PATH, or it did not answer)" };
+  }
+}
+
+const cred = modelCredentialStatus();
+if (cred.ok === true) {
+  console.log(`  model credential: ${cred.detail}`);
+} else if (cred.ok === false) {
+  // A confirmed absence gets the strong wording; "could not verify" must not,
+  // because on a logged-in machine with an older CLI it would be a false alarm.
+  console.log(`
+  WARNING, model credential: ${cred.detail}.
+  Agents will start, join their room and sit "ready", but every answer will be
+  refused (unauthorized: cannot authenticate to the model provider). Before
+  step 3 below, in the SAME shell that runs the supervisor, either:
+      claude /login                       # once, on this machine
+      export ANTHROPIC_API_KEY=sk-ant-... # or an API key; residents inherit it`);
+} else {
+  console.log(`
+  model credential: ${cred.detail}. If agents later refuse answers with
+  "unauthorized: cannot authenticate to the model provider", this is why:
+  run \`claude /login\` on this machine, or export ANTHROPIC_API_KEY in the
+  shell that runs the supervisor (step 3).`);
+}
+
 // ---------------------------------------------------------------- first pack
 if (agentName) {
   console.log(`\nrfa: scaffolding the first agent pack "${agentName}"`);

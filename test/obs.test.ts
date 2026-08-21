@@ -217,6 +217,13 @@ test("the SQL classifier and isAuthError agree, so they cannot drift apart", asy
     "invalid_api_key: your key is not valid",
     "authentication_error",
     "could not be refreshed",
+    // A host that never authenticated at all, measured on a fresh clone 2026-08-21.
+    "brain error: success: Not logged in · Please run /login",
+    "brain error: success: Not logged in · Run /login",
+    // Prose that contains ONE of the two required phrases must NOT classify:
+    // model-authored result text reaches the classifier via the brain error.
+    "brain error: success: the GitHub CLI is not logged in, so I could not fetch the PR",
+    "Run /login after upgrading to use your new plan.",
     "brain error: error_max_turns",
     "429 rate_limited: too many requests",
     "socket hang up",

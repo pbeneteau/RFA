@@ -706,7 +706,12 @@ function writeRoomMd(): void {
       `- Hub: \`${HUB}\``,
       `- Room: \`${member.room}\``,
       `- Join secret: \`${joinSecret}\``,
-      `- Resident: **${member.name}** (\`${member.memberId}\`), skill \`answer-product-question\`, definition \`${pack.definitionHash.slice(0, 15)}\``,
+      // The pack's real first offer, never a hardcoded or fabricated skill id: this
+      // line is what `npm run ask` trusts as its default capability, and a hardcoded
+      // id here sent a fresh environment's first ask to a capability nobody offers
+      // (2026-08-21). A pack with no offers (reachable: the offers requirement only
+      // covers packs with a serving rooms binding) advertises no skill at all.
+      `- Resident: **${member.name}** (\`${member.memberId}\`), ${pack.def.offers?.[0]?.id ? `skill \`${pack.def.offers[0].id}\`, ` : ""}definition \`${pack.definitionHash.slice(0, 15)}\``,
       `- Knowledge: ${knowledgeFiles(pack).map((f) => `\`${path.relative(ROOT, f)}\``).join(", ")}`,
       ``,
       `## Ask it something from any Claude Code session`,

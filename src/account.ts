@@ -112,7 +112,38 @@ export function isRateLimitError(err: unknown): boolean {
  * just as bad, so it matches only phrasings a provider actually emits for a bad or
  * expired credential.
  */
-const AUTH_FAILURE_RE = /OAuth session expired|could not be refreshed|failed to authenticate|invalid[_ ]api[_ ]key|authentication[_ ]error/i;
+// ONE marker list, in SQL LIKE syntax, shared with ObsStore.summary's auth_errors
+// query: `_` matches any single character (so invalid_api_key also matches
+// "invalid api key"), `%` is an any-length gap. The regex below is DERIVED from
+// this list with the same semantics, so the resident's refusal reason and the
+// #ops credential alert cannot classify the same error differently: keeping them
+// as two hand-written copies is exactly how they drifted apart before.
+export const AUTH_FAILURE_MARKERS = [
+  "OAuth session expired",
+  "could not be refreshed",
+  "failed to authenticate",
+  "invalid_api_key",
+  "authentication_error",
+  // The never-authenticated host: the SDK emits "Not logged in · Please run
+  // /login" (or "· Run /login"), measured on a fresh clone 2026-08-21. BOTH
+  // phrases are required, in order: either alone is ordinary prose that reaches
+  // this classifier through model-authored result text (resident.ts embeds up to
+  // 200 chars of msg.result in the brain error), e.g. a gh tool failure saying
+  // "not logged in", or the SDK's own upgrade advisory "Run /login after
+  // upgrading", and a false positive here is a permanent refusal plus a
+  // credential page for a credential that is fine.
+  "Not logged in%run /login",
+] as const;
+
+const AUTH_FAILURE_RE = new RegExp(
+  AUTH_FAILURE_MARKERS.map((m) =>
+    m
+      .replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")
+      .replace(/_/g, ".") // LIKE `_` is any single character
+      .replace(/%/g, "[\\s\\S]*"), // LIKE `%` is any gap
+  ).join("|"),
+  "i",
+);
 
 export function isAuthError(err: unknown): boolean {
   const text = err instanceof Error ? `${err.message} ${String((err as { code?: unknown }).code ?? "")}` : String(err);

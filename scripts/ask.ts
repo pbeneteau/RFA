@@ -33,10 +33,29 @@ if (!question) {
  * reported "nobody offers answer-product-question" and listed an agent that plainly
  * could have answered.
  */
-function chooseCapability(roster: { card_summary: { skill_ids: string[] } }[]): string {
+type RosterEntry = { id: string; name: string; role: string; state: string; card_summary: { skill_ids: string[] } };
+
+/**
+ * Members this CLI could actually get an answer from: other participants whose
+ * lease has not expired. The raw roster snapshot includes this CLI's OWN
+ * just-created membership and present-but-offline members, which had two costs:
+ * the sole-capability rule below was unreachable (offered always contained our
+ * own `operate`), and the target find could pick an offline member and burn the
+ * whole ask timeout against someone who will never answer (both 2026-08-21).
+ */
+function answerers(roster: RosterEntry[], selfId: string): RosterEntry[] {
+  return roster.filter((r) => r.id !== selfId && r.role === "participant" && r.state !== "offline");
+}
+
+function chooseCapability(roster: RosterEntry[], selfId: string): string {
   const explicit = flag("--capability");
   if (explicit) return explicit;
-  const offered = [...new Set(roster.flatMap((r) => r.card_summary.skill_ids))];
+  const offered = [...new Set(answerers(roster, selfId).flatMap((r) => r.card_summary.skill_ids))];
+  // ROOM.md records the room-creating resident's actual first offer, so on the
+  // STANDING room the default ask goes to the agent that publishes the room; a
+  // --room override targets a different room the hint knows nothing about.
+  const hinted = flag("--room") ? undefined : /skill `([^`]+)`/.exec(roomMd)?.[1];
+  if (hinted && offered.includes(hinted)) return hinted;
   if (offered.length === 1) return offered[0];
   return "answer-product-question";
 }
@@ -88,8 +107,10 @@ const me = await RoomMember.create({
   card: { name: "paul-cli", description: "the operator, from the terminal", skills: [{ id: "operate", description: "asks and decides" }] },
 });
 try {
-  const capability = chooseCapability(me.roster);
-  const target = me.roster.find((r) => r.card_summary.skill_ids.includes(capability));
+  const capability = chooseCapability(me.roster, me.memberId);
+  const eligible = answerers(me.roster, me.memberId).filter((r) => r.card_summary.skill_ids.includes(capability));
+  // A ready member beats one that is busy or away; offline is already excluded.
+  const target = eligible.find((r) => r.state === "ready") ?? eligible[0];
   if (!target) {
     console.error(`nobody in ${room} offers "${capability}". Roster: ${me.roster.map((r) => `${r.name} [${r.card_summary.skill_ids.join(",")}]`).join(" · ")}`);
     process.exit(1);
