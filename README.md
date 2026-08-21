@@ -24,8 +24,8 @@ This repo contains:
 | [`console/index.html`](console/index.html) | Room console: live web view + supervisor controls, served by the hub at `/console` |
 | [`scripts/demo.ts`](scripts/demo.ts) | The spec's worked example (dev-agent asks pm-agent), live over real MCP clients |
 | [`scripts/tail.ts`](scripts/tail.ts) | Conversation-level log debugger for room event logs |
-| [`scripts/`](scripts/) | Operator CLIs: `new-agent` (scaffold a pack), `retire-agent` (stop, leave, evict, archive, deregister), `sync-handbook` (attach a knowledge source as a tracked clone), `ask` (ask an agent by capability from a terminal) |
-| [`test/`](test/) | 126 tests. The `test` script globs `test/*.test.ts`, so a new file is in the gate the moment it exists |
+| [`scripts/`](scripts/) | Operator CLIs. The lifecycle four: `new-agent` (scaffold a pack), `retire-agent` (stop, leave, evict, archive, deregister), `sync-handbook` (attach a knowledge source as a tracked clone), `ask` (ask an agent by capability from a terminal); plus `init`, `e2e`, `verify-log`, `keygen`/`sign-card`, `tail`, the demos, and maintenance tools without npm aliases (`label`, `promote-case`, `watchdog-replay`, `repair-obs-cost`) |
+| [`test/`](test/) | The unit/integration suite (`npm test` prints the live count; no number here, numbers here rot). The `test` script globs `test/*.test.ts`, so a new file is in the gate the moment it exists |
 | [`research/`](research/README.md) | Four deep-research waves, each adversarially verified: [01-protocol](research/01-protocol/REPORT.md), [02-platform](research/02-platform/REPORT.md), [03-reach-and-collaboration](research/03-reach-and-collaboration/REPORT.md) (v0.5), [04-remote-agents](research/04-remote-agents/REPORT.md) (v0.6) |
 | [`research/01-protocol/papers/`](research/01-protocol/papers/) | 70 downloaded papers/specs with an [index](research/01-protocol/papers/INDEX.md) |
 
@@ -71,7 +71,7 @@ npm run demo      # the dev-asks-PM flow: join, discovery, busy refusal, presenc
 npm run demo:push # push profile: events arrive with zero polling (spec 11.2b)
 ```
 
-`npm run e2e` boots isolated hub processes (random ports, temp data dirs; your dev hub is untouched), exercises both MCP eras over HTTP and stdio across 8 scenarios (unit suite, lockfile guard, dual-era serving, the spec section 17 core flow, tasks with a real claim race, signing incl. a strict `--require-signed` hub, push notifications, restart persistence), and writes `reports/latest.md` + `latest.json` plus a timestamped copy. Exit code = number of failed scenarios, so it drops straight into CI. `--keep` preserves the temp data dirs for inspection.
+`npm run e2e` boots isolated hub processes (random ports, temp data dirs; your dev hub is untouched), exercises both MCP eras over HTTP and stdio across its scenarios (unit suite, lockfile guard, dual-era serving, the spec section 17 core flow, tasks with a real claim race, signing incl. a strict `--require-signed` hub, moderation, push notifications, restart persistence; the report prints the live count), and writes `reports/latest.md` + `latest.json` plus a timestamped copy. Exit code = number of failed scenarios, so it drops straight into CI. `--keep` preserves the temp data dirs for inspection.
 
 ### Run an agent
 
@@ -164,7 +164,7 @@ npm run tail -- data/rooms/r_XXXX.ndjson --follow
 - (fixed in 0.1.5: the `moderation` profile is implemented; see below)
 - The per-room event log is kept fully in memory as well as on disk; fine for reference scale.
 - The pre-delivery policy gate (spec 12.2) **is** implemented (`--gate deploy/gate.json`): rules and command-tier checks, most-severe-wins, fail-closed-to-hold, with alerts and refusals audited as system events. `policies.join: "approve"` and `message_ttl_s` remain unimplemented policy fields.
-- **Protocol 0.1.8 changed the `core` and `tasks` profiles, and the reference hub does not yet meet its own amended profile.** That is stated rather than hidden: wire section 16.1 splits 0.1.8 into a half that binds now and a half gated on a named remote peer, and Appendix F marks every requirement SHIPPED, PENDING, or SPECIFIED AND UNIMPLEMENTED. Two known-open items with a real consequence: `room_listen` does not yet clamp `since` to a member's join point (so `history_visibility` is advisory), and task `verify` authorizes any non-owner (so one principal can accept its own evidence). Both only bite once a room holds members you do not control.
+- **Protocol 0.1.8 changed the `core` and `tasks` profiles, and the reference hub does not yet meet its own amended profile.** That is stated rather than hidden: wire section 16.1 splits 0.1.8 into a half that binds now and a half gated on a named remote peer, and **Appendix F is the single per-requirement status table** (SHIPPED, PENDING, or SPECIFIED AND UNIMPLEMENTED); this README repeats none of its rows because a second copy is how they rot. The open half that bites with members you do not control is the admission story of wire 4.3: one shared join secret, no per-peer identity, quarantine keyed on joiner-chosen values, and verification separation that is one shared-secret membership deep for agent parties.
 
 ## Security posture (spec section 14)
 
