@@ -1,29 +1,23 @@
 {
-  "sha": "542c2cadfe4fbfbce990dfa4411273026c083a4c",
+  "sha": "91a98a36246c10f9604aa9847c5bbc1cc537d68c",
   "entries": [
     {
-      "prose": "The project is compiled with TypeScript via the `build` script.",
+      "prose": "The package is named `agent-com` and published under the Apache-2.0 license.",
       "anchor": {
-        "kind": "script",
-        "command": "build"
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"license\": \"Apache-2.0\""
       },
-      "proof": "script"
+      "proof": "literal"
     },
     {
-      "prose": "The CLI entry point is `src/cli/main.ts`, run in development via the `dev` script.",
+      "prose": "The package exposes two CLI binary names: `rfa` and `agent-com`, both pointing to `dist/cli/main.js`.",
       "anchor": {
-        "kind": "script",
-        "command": "dev"
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"rfa\": \"dist/cli/main.js\""
       },
-      "proof": "script"
-    },
-    {
-      "prose": "The hub server entry point is `src/main.ts`, run via the `start` script.",
-      "anchor": {
-        "kind": "script",
-        "command": "start"
-      },
-      "proof": "script"
+      "proof": "literal"
     },
     {
       "prose": "Node.js 22 or later is required.",
@@ -35,25 +29,47 @@
       "proof": "literal"
     },
     {
-      "prose": "Two CLI bin aliases are provided: `rfa` and `agent-com`, both pointing to `dist/cli/main.js`.",
+      "prose": "Run `npm run build` (or `pnpm build`) to compile TypeScript via `tsc`.",
       "anchor": {
-        "kind": "literal",
-        "path": "package.json",
-        "value": "\"rfa\": \"dist/cli/main.js\""
+        "kind": "script",
+        "command": "build"
       },
-      "proof": "literal"
+      "proof": "script"
     },
     {
-      "prose": "Unit tests are executed with `node --import tsx --test` over `test/*.test.ts`.",
+      "prose": "Run `npm run dev` to start the CLI entry point without compiling, using `tsx src/cli/main.ts`.",
       "anchor": {
-        "kind": "literal",
-        "path": "package.json",
-        "value": "\"test\": \"node --import tsx --test test/*.test.ts\""
+        "kind": "script",
+        "command": "dev"
       },
-      "proof": "literal"
+      "proof": "script"
     },
     {
-      "prose": "End-to-end tests are run via the `e2e` script (`scripts/e2e.ts`).",
+      "prose": "Run `npm run start` to start the hub server via `tsx src/main.ts`.",
+      "anchor": {
+        "kind": "script",
+        "command": "start"
+      },
+      "proof": "script"
+    },
+    {
+      "prose": "Run `npm run supervisor` to start the supervisor process via `tsx src/supervisor.ts`.",
+      "anchor": {
+        "kind": "script",
+        "command": "supervisor"
+      },
+      "proof": "script"
+    },
+    {
+      "prose": "Unit tests are run with `npm test`, which invokes `node --import tsx --test test/*.test.ts`.",
+      "anchor": {
+        "kind": "script",
+        "command": "test"
+      },
+      "proof": "script"
+    },
+    {
+      "prose": "End-to-end tests are run with `npm run e2e`, executing `scripts/e2e.ts`.",
       "anchor": {
         "kind": "script",
         "command": "e2e"
@@ -61,7 +77,15 @@
       "proof": "script"
     },
     {
-      "prose": "Evaluations are run through the CLI with `tsx src/cli/main.ts evals run`, aliased as the `evals` script.",
+      "prose": "A fuller e2e suite is available via `npm run e2e:full`, passing `--full` to the same script.",
+      "anchor": {
+        "kind": "script",
+        "command": "e2e:full"
+      },
+      "proof": "script"
+    },
+    {
+      "prose": "Evals are run with `npm run evals`, which calls `tsx src/cli/main.ts evals run`.",
       "anchor": {
         "kind": "script",
         "command": "evals"
@@ -69,7 +93,7 @@
       "proof": "script"
     },
     {
-      "prose": "Judged evaluations add `--judged` and are available as the `evals:judged` script.",
+      "prose": "Judged evals are run with `npm run evals:judged`, passing `--judged` to the evals runner.",
       "anchor": {
         "kind": "script",
         "command": "evals:judged"
@@ -77,32 +101,24 @@
       "proof": "script"
     },
     {
-      "prose": "Parity evaluation is available as the `parity` script.",
+      "prose": "The cold-start operator test (`npm run coldstart`) packs the checkout, installs it into a temp prefix, inits an empty folder, and asserts a real model answer, then tears down.",
       "anchor": {
         "kind": "script",
-        "command": "parity"
+        "command": "coldstart"
       },
       "proof": "script"
     },
     {
-      "prose": "The cold-start integration test (`scripts/coldstart.ts`) packs the checkout, installs the tarball globally into a temp prefix, and verifies a full init-ask-down cycle; it is not part of `npm test` and requires a model credential.",
+      "prose": "The `--keep` flag on the coldstart script retains the temp prefix and directory for inspection.",
       "anchor": {
         "kind": "literal",
         "path": "scripts/coldstart.ts",
-        "value": "not in `npm test`"
+        "value": "const KEEP = process.argv.includes(\"--keep\");"
       },
       "proof": "literal"
     },
     {
-      "prose": "Agent pack definitions live under `agents/`, each in its own subdirectory containing an `agent.md` file.",
-      "anchor": {
-        "kind": "exists",
-        "path": "agents/pm-agent"
-      },
-      "proof": "path"
-    },
-    {
-      "prose": "CLI source files are under `src/cli/`.",
+      "prose": "CLI source lives under `src/cli/`.",
       "anchor": {
         "kind": "exists",
         "path": "src/cli"
@@ -110,23 +126,23 @@
       "proof": "path"
     },
     {
-      "prose": "Eval source files are under `src/evals/`.",
+      "prose": "Agent pack definitions live under `agents/`, with each agent in its own subdirectory containing `agent.md`.",
       "anchor": {
         "kind": "exists",
-        "path": "src/evals"
+        "path": "agents/pm-agent"
       },
       "proof": "path"
     },
     {
-      "prose": "Research notes are under `research/`, divided into numbered topic directories.",
+      "prose": "Eval cases live under `evals/cases/`.",
       "anchor": {
         "kind": "exists",
-        "path": "research/01-protocol"
+        "path": "evals/cases"
       },
       "proof": "path"
     },
     {
-      "prose": "Specification files are in `spec/`.",
+      "prose": "Spec documents live under `spec/`.",
       "anchor": {
         "kind": "exists",
         "path": "spec"
@@ -134,15 +150,15 @@
       "proof": "path"
     },
     {
-      "prose": "Interoperability definitions are in `interop/`.",
+      "prose": "Research documents are organized under `research/` in numbered subdirectories.",
       "anchor": {
         "kind": "exists",
-        "path": "interop"
+        "path": "research/01-protocol"
       },
       "proof": "path"
     },
     {
-      "prose": "Agent and command templates are in `templates/`.",
+      "prose": "Templates for new agents and commands are under `templates/`.",
       "anchor": {
         "kind": "exists",
         "path": "templates/service"
@@ -150,7 +166,15 @@
       "proof": "path"
     },
     {
-      "prose": "The web console asset is in `console/`.",
+      "prose": "MCP interoperability definitions are in `interop/`.",
+      "anchor": {
+        "kind": "exists",
+        "path": "interop"
+      },
+      "proof": "path"
+    },
+    {
+      "prose": "The console (web UI) asset directory is `console/`.",
       "anchor": {
         "kind": "exists",
         "path": "console"
@@ -158,25 +182,24 @@
       "proof": "path"
     },
     {
-      "prose": "Published package files include `dist`, `console`, `templates`, `interop`, `spec`, and `README.md`.",
+      "prose": "Scripts for maintenance and one-time operations are in `scripts/`.",
+      "anchor": {
+        "kind": "exists",
+        "path": "scripts"
+      },
+      "proof": "path"
+    },
+    {
+      "prose": "Each agent pack is a directory under `agents/<name>/` with an `agent.md` file containing YAML frontmatter (the definition) and a markdown body (the system prompt).",
       "anchor": {
         "kind": "literal",
-        "path": "package.json",
-        "value": "\"dist\",\n    \"console\",\n    \"templates\",\n    \"interop\""
+        "path": "src/agentdef.ts",
+        "value": "* A pack is a directory `agents/<name>/` whose `agent.md` is YAML frontmatter"
       },
       "proof": "literal"
     },
     {
-      "prose": "An agent pack is a directory under `agents/<name>/` whose `agent.md` begins with YAML frontmatter (the definition) followed by a markdown body used as the system prompt.",
-      "anchor": {
-        "kind": "symbol",
-        "path": "src/agentdef.ts",
-        "name": "parseAgentMd"
-      },
-      "proof": "ast"
-    },
-    {
-      "prose": "The frontmatter schema is `agentDefSchema`, validated with Zod.",
+      "prose": "The `agentDefSchema` Zod schema is the single shared schema used by the resident runner, supervisor, and console editor.",
       "anchor": {
         "kind": "symbol",
         "path": "src/agentdef.ts",
@@ -185,34 +208,34 @@
       "proof": "ast"
     },
     {
-      "prose": "The frontmatter must declare `rfa_agent: 1` as a literal field.",
-      "anchor": {
-        "kind": "literal",
-        "path": "src/agentdef.ts",
-        "value": "rfa_agent: z.literal(1)"
-      },
-      "proof": "literal"
-    },
-    {
-      "prose": "A pack that serves a room as participant must declare at least one entry in `offers`.",
-      "anchor": {
-        "kind": "literal",
-        "path": "src/agentdef.ts",
-        "value": "a pack that serves a room as participant must declare at least one entry in `offers`"
-      },
-      "proof": "literal"
-    },
-    {
-      "prose": "Sub-agent fan-out tools (`agent`, `task`) are deny-listed by default and require `tools.allow_subagents: true` in the definition.",
+      "prose": "`parseAgentMd` parses an agent.md string and throws with a precise message on invalid input.",
       "anchor": {
         "kind": "symbol",
         "path": "src/agentdef.ts",
-        "name": "SUBAGENT_TOOLS"
+        "name": "parseAgentMd"
       },
       "proof": "ast"
     },
     {
-      "prose": "The capability card is derived from the pack definition via `deriveCard`, including a `definition_hash` so roster entries rotate on any definition edit.",
+      "prose": "`loadPack` loads a pack directory from disk.",
+      "anchor": {
+        "kind": "symbol",
+        "path": "src/agentdef.ts",
+        "name": "loadPack"
+      },
+      "proof": "ast"
+    },
+    {
+      "prose": "`listPacks` enumerates all packs under an agents root, skipping directories without `agent.md`.",
+      "anchor": {
+        "kind": "symbol",
+        "path": "src/agentdef.ts",
+        "name": "listPacks"
+      },
+      "proof": "ast"
+    },
+    {
+      "prose": "`deriveCard` derives the capability card from an agent pack, including the definition hash as a deployed-version marker.",
       "anchor": {
         "kind": "symbol",
         "path": "src/agentdef.ts",
@@ -221,16 +244,25 @@
       "proof": "ast"
     },
     {
-      "prose": "All secret names a pack requires are collected by `declaredSecretNames`, covering both `secrets` and per-MCP-server `env_secrets`/`bearer_secret`.",
+      "prose": "A pack that serves a room as a participant must declare at least one entry in `offers`.",
       "anchor": {
-        "kind": "symbol",
+        "kind": "literal",
         "path": "src/agentdef.ts",
-        "name": "declaredSecretNames"
+        "value": "a pack that serves a room as participant must declare at least one entry in `offers`"
       },
-      "proof": "ast"
+      "proof": "literal"
     },
     {
-      "prose": "Tool calls matching an `interrupt_on` rule in the pack definition are routed through the approval bridge in `src/bridge.ts`.",
+      "prose": "Fan-out (subagent) tools are opt-in and require `tools.allow_subagents: true` in the pack definition.",
+      "anchor": {
+        "kind": "literal",
+        "path": "src/agentdef.ts",
+        "value": "lists \\`${entry}\\`, which spawns subagents; declare tools.allow_subagents: true to permit fan-out"
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "`requestApproval` publishes an approval request for a pending tool call and blocks until a human decision, expiry, or timeout.",
       "anchor": {
         "kind": "symbol",
         "path": "src/bridge.ts",
@@ -239,34 +271,25 @@
       "proof": "ast"
     },
     {
-      "prose": "The bridge uses a lazy observer sidekick membership named `<residentName>-hitl` to watch for decisions without consuming the main member's event cursor.",
+      "prose": "The approval sidekick membership is named `<residentName>-hitl` and joins as an observer role.",
       "anchor": {
-        "kind": "symbol",
+        "kind": "literal",
         "path": "src/bridge.ts",
-        "name": "joinSidekick"
+        "value": "name: `${residentName}-hitl`"
       },
-      "proof": "ast"
+      "proof": "literal"
     },
     {
       "prose": "The default approval window when no `reply_by` is present is 30 minutes.",
       "anchor": {
         "kind": "literal",
         "path": "src/bridge.ts",
-        "value": "DEFAULT_APPROVAL_WINDOW_MS = 30 * 60_000"
+        "value": "export const DEFAULT_APPROVAL_WINDOW_MS = 30 * 60_000;"
       },
       "proof": "literal"
     },
     {
-      "prose": "Clock-expired approvals use the wire reason `deadline_expired`; human refusals use `declined`.",
-      "anchor": {
-        "kind": "symbol",
-        "path": "src/bridge.ts",
-        "name": "refusalForOutcome"
-      },
-      "proof": "ast"
-    },
-    {
-      "prose": "Tool names are matched against `interrupt_on` keys with trailing-`*` glob support via `interruptMatch`.",
+      "prose": "`interruptMatch` matches a tool name against `interrupt_on` keys, with trailing `*` acting as a prefix glob.",
       "anchor": {
         "kind": "symbol",
         "path": "src/bridge.ts",
@@ -275,7 +298,16 @@
       "proof": "ast"
     },
     {
-      "prose": "Offline chain verification is implemented in `src/chain.ts` as a pure function over a pre-parsed event array.",
+      "prose": "`refusalForOutcome` returns `deadline_expired` for clock-based denials and `declined` for human rejections.",
+      "anchor": {
+        "kind": "symbol",
+        "path": "src/bridge.ts",
+        "name": "refusalForOutcome"
+      },
+      "proof": "ast"
+    },
+    {
+      "prose": "`verifyChain` walks an event log in order, checking each event's `prev_hash` link and reporting all divergences.",
       "anchor": {
         "kind": "symbol",
         "path": "src/chain.ts",
@@ -284,34 +316,16 @@
       "proof": "ast"
     },
     {
-      "prose": "Each event's link is JCS-SHA256 over its stored form; for redacted events the `content_hash` field is used instead of recomputing.",
+      "prose": "Events predating the chain (no `prev_hash`) are counted as `unchainedPrefix` and skipped rather than treated as breaks.",
       "anchor": {
         "kind": "symbol",
         "path": "src/chain.ts",
-        "name": "linkOf"
+        "name": "ChainResult"
       },
       "proof": "ast"
     },
     {
-      "prose": "The `wrapped` field is stripped before hashing; no other fields are excluded.",
-      "anchor": {
-        "kind": "symbol",
-        "path": "src/chain.ts",
-        "name": "hashedForm"
-      },
-      "proof": "ast"
-    },
-    {
-      "prose": "Events with no `prev_hash` (written before chain support shipped in 0.1.7) are counted as an `unchainedPrefix` rather than treated as breaks.",
-      "anchor": {
-        "kind": "literal",
-        "path": "src/chain.ts",
-        "value": "unchainedPrefix"
-      },
-      "proof": "literal"
-    },
-    {
-      "prose": "A normative scope qualifier string is exported as `CHAIN_SCOPE_QUALIFIER`, stating that the chain only proves non-hub parties did not rewrite the log.",
+      "prose": "The `CHAIN_SCOPE_QUALIFIER` constant states that chain verification only proves no party other than the hub rewrote the log.",
       "anchor": {
         "kind": "symbol",
         "path": "src/chain.ts",
@@ -320,7 +334,43 @@
       "proof": "ast"
     },
     {
-      "prose": "The Anthropic Claude Agent SDK is used as the agent runtime.",
+      "prose": "`genesisFor` computes the genesis link as the hex SHA-256 of the room handle.",
+      "anchor": {
+        "kind": "symbol",
+        "path": "src/chain.ts",
+        "name": "genesisFor"
+      },
+      "proof": "ast"
+    },
+    {
+      "prose": "`bindPack` rewrites only the `rooms:` block of an agent.md file, validates the result through the pack schema before writing, and returns definition hashes before and after.",
+      "anchor": {
+        "kind": "symbol",
+        "path": "src/cli/agentmd.ts",
+        "name": "bindPack"
+      },
+      "proof": "ast"
+    },
+    {
+      "prose": "`addKnowledge` merges new globs into the `knowledge:` block, deduplicates them, and validates before writing.",
+      "anchor": {
+        "kind": "symbol",
+        "path": "src/cli/agentmd.ts",
+        "name": "addKnowledge"
+      },
+      "proof": "ast"
+    },
+    {
+      "prose": "`setTopBlock` replaces or adds one top-level YAML block in agent.md frontmatter without touching any other lines.",
+      "anchor": {
+        "kind": "symbol",
+        "path": "src/cli/agentmd.ts",
+        "name": "setTopBlock"
+      },
+      "proof": "ast"
+    },
+    {
+      "prose": "The Anthropic Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`) is a runtime dependency.",
       "anchor": {
         "kind": "literal",
         "path": "package.json",
@@ -329,7 +379,7 @@
       "proof": "literal"
     },
     {
-      "prose": "MCP client and server packages from `@modelcontextprotocol` are used for the tool protocol.",
+      "prose": "MCP client and server packages (`@modelcontextprotocol/client`, `@modelcontextprotocol/server`, `@modelcontextprotocol/sdk`) are runtime dependencies.",
       "anchor": {
         "kind": "literal",
         "path": "package.json",
@@ -338,7 +388,7 @@
       "proof": "literal"
     },
     {
-      "prose": "SQLite persistence is provided by `better-sqlite3`.",
+      "prose": "`better-sqlite3` is used for local SQLite storage (e.g., the observability store).",
       "anchor": {
         "kind": "literal",
         "path": "package.json",
@@ -347,29 +397,47 @@
       "proof": "literal"
     },
     {
-      "prose": "Cron scheduling is handled by `croner`.",
-      "anchor": {
-        "kind": "literal",
-        "path": "package.json",
-        "value": "\"croner\""
-      },
-      "proof": "literal"
-    },
-    {
-      "prose": "YAML frontmatter parsing uses the `yaml` package.",
-      "anchor": {
-        "kind": "literal",
-        "path": "package.json",
-        "value": "\"yaml\""
-      },
-      "proof": "literal"
-    },
-    {
-      "prose": "Schema validation uses `zod`.",
+      "prose": "`zod` is used for schema validation throughout the project.",
       "anchor": {
         "kind": "literal",
         "path": "package.json",
         "value": "\"zod\""
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "`tsx` is the dev-time TypeScript runner used in all `npm run` scripts that don't compile first.",
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"tsx\": \"^4.23.12\""
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "`scripts/repair-obs-cost.ts` is a one-time repair script for observability rows whose `cost_usd` was incorrectly set to a day ledger total; it requires `--apply` to write changes.",
+      "anchor": {
+        "kind": "literal",
+        "path": "scripts/repair-obs-cost.ts",
+        "value": "const apply = process.argv.includes(\"--apply\");"
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "`scripts/watchdog-replay.ts` replays watchdog invariants against room logs and the observability store, and refuses to bless any invariant until the log corpus is at least 14 days.",
+      "anchor": {
+        "kind": "literal",
+        "path": "scripts/watchdog-replay.ts",
+        "value": "const REQUIRED_SPAN_DAYS = 14; // spec 20.6"
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "`scripts/demo-push.ts` demonstrates zero-polling push delivery over a real stdio MCP transport.",
+      "anchor": {
+        "kind": "literal",
+        "path": "scripts/demo-push.ts",
+        "value": "* Push-profile demo over a REAL stdio transport"
       },
       "proof": "literal"
     }
