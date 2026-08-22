@@ -1,0 +1,387 @@
+{
+  "sha": "47fd22843311f1a4a971c13697557b73e0fa9da3",
+  "entries": [
+    {
+      "prose": "The published npm package exposes two CLI entry points: `rfa` and `agent-com`, both resolving to `dist/cli/main.js`.",
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"rfa\": \"dist/cli/main.js\""
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "The package is licensed under Apache-2.0.",
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"license\": \"Apache-2.0\""
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "Node.js 22 or later is required by the engines field.",
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"node\": \">=22\""
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "Run `pnpm build` (or `npm run build`) to compile TypeScript via `tsc`; the same compilation runs automatically on `prepare` and `prepublishOnly`.",
+      "anchor": {
+        "kind": "script",
+        "command": "build"
+      },
+      "proof": "script"
+    },
+    {
+      "prose": "Run `npm run dev` to start the CLI without a prior compile step using `tsx src/cli/main.ts`.",
+      "anchor": {
+        "kind": "script",
+        "command": "dev"
+      },
+      "proof": "script"
+    },
+    {
+      "prose": "Run `npm start` to launch the hub server directly via `tsx src/main.ts`.",
+      "anchor": {
+        "kind": "script",
+        "command": "start"
+      },
+      "proof": "script"
+    },
+    {
+      "prose": "Run `npm run supervisor` to start the supervisor process via `tsx src/supervisor.ts`.",
+      "anchor": {
+        "kind": "script",
+        "command": "supervisor"
+      },
+      "proof": "script"
+    },
+    {
+      "prose": "Unit tests are run with `npm test`, which uses Node's built-in test runner: `node --import tsx --test test/*.test.ts`.",
+      "anchor": {
+        "kind": "script",
+        "command": "test"
+      },
+      "proof": "script"
+    },
+    {
+      "prose": "End-to-end tests are run with `npm run e2e` (standard) or `npm run e2e:full` (full suite), both via `tsx scripts/e2e.ts`.",
+      "anchor": {
+        "kind": "script",
+        "command": "e2e"
+      },
+      "proof": "script"
+    },
+    {
+      "prose": "Eval runs are invoked with `npm run evals` (`evals run`) or `npm run evals:judged` (`evals run --judged`), both via the CLI entry point.",
+      "anchor": {
+        "kind": "script",
+        "command": "evals"
+      },
+      "proof": "script"
+    },
+    {
+      "prose": "The cold-start operator test (`npm run coldstart`) packs the checkout, installs into a temp prefix, inits an empty folder, sends a question, and tears everything down; it is not part of `npm test` because it requires a model credential.",
+      "anchor": {
+        "kind": "script",
+        "command": "coldstart"
+      },
+      "proof": "script"
+    },
+    {
+      "prose": "`src/cli/main.ts` is the CLI entry point used during development via `npm run dev`.",
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"dev\": \"tsx src/cli/main.ts\""
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "`src/main.ts` is the hub server entry point.",
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"start\": \"tsx src/main.ts\""
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "`src/supervisor.ts` is the supervisor process entry point.",
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"supervisor\": \"tsx src/supervisor.ts\""
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "`src/agentdef.ts` exports `agentDefSchema`, `parseAgentMd`, `loadPack`, `listPacks`, and `deriveCard` — the single Zod schema shared by the resident runner, supervisor, and console editor for agent pack definitions.",
+      "anchor": {
+        "kind": "symbol",
+        "path": "src/agentdef.ts",
+        "name": "agentDefSchema"
+      },
+      "proof": "ast"
+    },
+    {
+      "prose": "`src/bridge.ts` implements the approval bridge (spec 7.3), routing tool calls through the room's approval machinery when a pack declares `interrupt_on`.",
+      "anchor": {
+        "kind": "symbol",
+        "path": "src/bridge.ts",
+        "name": "requestApproval"
+      },
+      "proof": "ast"
+    },
+    {
+      "prose": "`src/chain.ts` provides offline verification of a room's hash chain as defined in wire spec section 13.",
+      "anchor": {
+        "kind": "symbol",
+        "path": "src/chain.ts",
+        "name": "verifyChain"
+      },
+      "proof": "ast"
+    },
+    {
+      "prose": "An agent pack lives in `agents/<name>/agent.md` with a YAML frontmatter block (the definition) and a markdown body (the system prompt).",
+      "anchor": {
+        "kind": "symbol",
+        "path": "src/agentdef.ts",
+        "name": "loadPack"
+      },
+      "proof": "ast"
+    },
+    {
+      "prose": "The frontmatter must begin with `rfa_agent: 1` — the literal key checked by `agentDefSchema`.",
+      "anchor": {
+        "kind": "literal",
+        "path": "src/agentdef.ts",
+        "value": "rfa_agent: z.literal(1)"
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "Fan-out subagent tools (`agent`, `task`) are denied by default; they require `tools.allow_subagents: true` in the pack definition.",
+      "anchor": {
+        "kind": "symbol",
+        "path": "src/agentdef.ts",
+        "name": "toolsSchema"
+      },
+      "proof": "ast"
+    },
+    {
+      "prose": "A pack that serves a room as participant must declare at least one entry in `offers`; `parseAgentMd` throws if this constraint is violated.",
+      "anchor": {
+        "kind": "literal",
+        "path": "src/agentdef.ts",
+        "value": "a pack that serves a room as participant must declare at least one entry in `offers`"
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "The `definitionHash` is a `sha256:` prefixed hex digest over the full `agent.md` content; changing the file rotates the hash visible in every roster.",
+      "anchor": {
+        "kind": "literal",
+        "path": "src/agentdef.ts",
+        "value": "\"sha256:\" + sha256hex(content)"
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "The CLI rewrites only the `rooms:` or `knowledge:` block of `agent.md` it is asked to touch, and validates through the same schema before writing, via `src/cli/agentmd.ts`.",
+      "anchor": {
+        "kind": "symbol",
+        "path": "src/cli/agentmd.ts",
+        "name": "bindPack"
+      },
+      "proof": "ast"
+    },
+    {
+      "prose": "Agent pack directories live under `agents/` (e.g. `agents/pm-agent/`, `agents/linear-scribe/`).",
+      "anchor": {
+        "kind": "exists",
+        "path": "agents/pm-agent/"
+      },
+      "proof": "path"
+    },
+    {
+      "prose": "End-to-end and maintenance scripts live under `scripts/`.",
+      "anchor": {
+        "kind": "exists",
+        "path": "scripts/"
+      },
+      "proof": "path"
+    },
+    {
+      "prose": "Eval case definitions live under `evals/cases/`.",
+      "anchor": {
+        "kind": "exists",
+        "path": "evals/cases/"
+      },
+      "proof": "path"
+    },
+    {
+      "prose": "Pack and command templates live under `templates/` (subdirectories `service/`, `commands/`, `skills/`).",
+      "anchor": {
+        "kind": "exists",
+        "path": "templates/"
+      },
+      "proof": "path"
+    },
+    {
+      "prose": "Interoperability definitions are in `interop/` and `INTEROP.md`, both included in the published package `files` list.",
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"interop\""
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "Specification documents live under `spec/`, included in the published package.",
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"spec\""
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "Research notes are organized under `research/` with subdirectories for protocol, platform, reach-and-collaboration, and remote-agents topics.",
+      "anchor": {
+        "kind": "exists",
+        "path": "research/"
+      },
+      "proof": "path"
+    },
+    {
+      "prose": "`.claude/commands/` and `.claude/skills/` hold Claude-specific command and skill configurations.",
+      "anchor": {
+        "kind": "exists",
+        "path": ".claude/commands/"
+      },
+      "proof": "path"
+    },
+    {
+      "prose": "Agent SDK integration uses `@anthropic-ai/claude-agent-sdk`.",
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"@anthropic-ai/claude-agent-sdk\""
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "MCP client, server, and SDK packages from `@modelcontextprotocol` are all direct dependencies.",
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"@modelcontextprotocol/client\""
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "SQLite storage is handled via `better-sqlite3`.",
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"better-sqlite3\""
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "YAML frontmatter parsing uses the `yaml` package.",
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"yaml\""
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "Schema validation throughout uses `zod`.",
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"zod\""
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "Cron scheduling uses `croner`.",
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"croner\""
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "`verifyChain` reports every divergence in the chain, not just the first, and re-anchors after each break by continuing from the event's own computed link.",
+      "anchor": {
+        "kind": "literal",
+        "path": "src/chain.ts",
+        "value": "Every divergence is reported, not just the first"
+      },
+      "proof": "literal"
+    },
+    {
+      "prose": "Events that predate chain support (no `prev_hash` field) are counted as `unchainedPrefix` and skipped rather than treated as breaks.",
+      "anchor": {
+        "kind": "symbol",
+        "path": "src/chain.ts",
+        "name": "ChainResult"
+      },
+      "proof": "ast"
+    },
+    {
+      "prose": "The constant `CHAIN_SCOPE_QUALIFIER` records the normative disclaimer that the chain proves only that no party other than the hub rewrote the log.",
+      "anchor": {
+        "kind": "symbol",
+        "path": "src/chain.ts",
+        "name": "CHAIN_SCOPE_QUALIFIER"
+      },
+      "proof": "ast"
+    },
+    {
+      "prose": "The default approval window when no `reply_by` deadline is present is 30 minutes (`DEFAULT_APPROVAL_WINDOW_MS = 30 * 60_000`).",
+      "anchor": {
+        "kind": "symbol",
+        "path": "src/bridge.ts",
+        "name": "DEFAULT_APPROVAL_WINDOW_MS"
+      },
+      "proof": "ast"
+    },
+    {
+      "prose": "The sidekick observer membership is named `<residentName>-hitl` and is joined once per resident process via `joinSidekick`.",
+      "anchor": {
+        "kind": "symbol",
+        "path": "src/bridge.ts",
+        "name": "joinSidekick"
+      },
+      "proof": "ast"
+    },
+    {
+      "prose": "A clock-expired approval returns `expired: true` and maps to wire reason `deadline_expired`; a human rejection maps to `declined`.",
+      "anchor": {
+        "kind": "symbol",
+        "path": "src/bridge.ts",
+        "name": "refusalForOutcome"
+      },
+      "proof": "ast"
+    },
+    {
+      "prose": "`interruptMatch` supports trailing `*` glob patterns in `interrupt_on` keys, with exact rules taking priority over globs.",
+      "anchor": {
+        "kind": "symbol",
+        "path": "src/bridge.ts",
+        "name": "interruptMatch"
+      },
+      "proof": "ast"
+    }
+  ]
+}
