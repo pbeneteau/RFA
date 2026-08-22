@@ -4,15 +4,19 @@
  * directory lazily, run, and turn every failure into one line of cause and one
  * of fix with the exit code a script can act on.
  */
+import * as path from "node:path";
 import { parseArgs } from "node:util";
-import { HubDirError } from "../hubdir.js";
+import { detectLegacyLayout, HubDirError } from "../hubdir.js";
 import { CliContext, CliError } from "./context.js";
 import { GLOBAL_OPTIONS, Router, UsageError } from "./router.js";
+import { suggestCommands } from "./suggest.js";
 import { Ui } from "./ui.js";
-import { agentBind, agentEdit, agentLs, agentNew, agentRestart, agentRetire, agentShow, agentStart, agentStop, agentValidate } from "./commands/agent.js";
+import { agentBind, agentEdit, agentLs, agentMode, agentNew, agentRestart, agentRetire, agentShow, agentStart, agentStop, agentValidate } from "./commands/agent.js";
 import { connectClaude, connectCursor, connectMcp, hubExpose, peerAdd, peerLs, peerRevoke, peerShow } from "./commands/connect.js";
 import { configGet, configSet, configShow, humanAdd, humanLs, humanRemove, humanRotate, keyNew, keySign, secretsLs, secretsSet, secretsUnset, tokenLs, tokenMint, tokenRevoke } from "./commands/creds.js";
 import { doctor } from "./commands/doctor.js";
+import { completionCommands } from "./commands/completion.js";
+import { dashboardCommands } from "./commands/dash.js";
 import { init } from "./commands/init.js";
 import { evalsLabel, evalsLs, evalsParity, evalsPromote, evalsRun, knowledgeAdd, knowledgePin, knowledgeStatusCmd, knowledgeSync, logVerify } from "./commands/instruments.js";
 import { demo, docs, migrate, version } from "./commands/misc.js";
@@ -34,7 +38,7 @@ for (const stream of [process.stdout, process.stderr]) {
 const router = new Router();
 router.register(
   init, up, down, restart, status, doctor, logs, consoleCmd, hubRun, supervisorRun, migrate, demo, docs, version,
-  agentNew, agentLs, agentShow, agentValidate, agentBind, agentStart, agentStop, agentRestart, agentEdit, agentRetire,
+  agentNew, agentLs, agentShow, agentValidate, agentBind, agentStart, agentStop, agentRestart, agentEdit, agentMode, agentRetire,
   roomCreate, roomLs, roomShow, roomTail, roomAllow, roomDisallow, roomPolicy, roomSecret, roomEvict, roomHold, roomRelease, roomQuarantine, roomInject, roomEnd, roomAdopt,
   ask, taskLs, taskShow, taskCreate, taskCancel, taskVerify, approvalsLs, approvalsShow, approvalsApprove, approvalsReject,
   humanAdd, humanLs, humanRotate, humanRemove, tokenMint, tokenLs, tokenRevoke, secretsSet, secretsLs, secretsUnset, configShow, configGet, configSet, keyNew, keySign,
@@ -43,6 +47,7 @@ router.register(
   backupNow, backupLs, backupRestore, serviceInstall, serviceUninstall, serviceStatus,
   server,
 );
+router.register(...dashboardCommands(router), ...completionCommands(router));
 
 async function main(argv: string[]): Promise<number> {
   // Global flags first, leniently, so `rfa --dir x status --json` and
@@ -62,10 +67,20 @@ async function main(argv: string[]): Promise<number> {
   const found = router.find(argv);
   const words = Router.commandWords(argv);
   if (!found) {
+    // The front door (RFA-0.7 sect. 11): `rfa` alone on a terminal opens the
+    // onboarding where there is no hub directory and the dashboard where there
+    // is one. On a pipe, or with --json, it stays the help it always was.
+    if (argv.length === 0 && tty && !g.json && !g.quiet) return frontDoor(ctx);
     if (argv.length === 0 || g.help || words.length === 0) {
       // `rfa agent --help` lists the group's commands; bare `rfa` lists the groups.
       process.stdout.write(router.help(words.slice(0, 2)) + "\n");
       return argv.length === 0 || g.help ? 0 : 2;
+    }
+    const guesses = suggestCommands(words, router.all());
+    if (guesses.length) {
+      ui.fail(`no such command: rfa ${words.join(" ")}`, `did you mean: ${guesses.map((g) => `rfa ${g}`).join("  ·  ")}`);
+      process.stderr.write(`   rfa --help lists everything; rfa alone opens the dashboard\n`);
+      return 2;
     }
     process.stderr.write(router.help(words.slice(0, 2)) + "\n");
     return 2;
@@ -98,6 +113,29 @@ async function main(argv: string[]): Promise<number> {
     if (ctx.flags.json) ui.json({ error: e.message ?? String(err), exit: 1 });
     return 1;
   }
+}
+
+/** `rfa` with nothing after it, on a terminal. */
+async function frontDoor(ctx: CliContext): Promise<number> {
+  const { makeChildRunner, runDashboard, runOnboarding } = await import("./tui/index.js");
+  let h = null;
+  try {
+    h = ctx.maybe();
+  } catch (err) {
+    if (err instanceof CliError || err instanceof HubDirError) {
+      ctx.ui.fail(err.message, (err as { hint?: string }).hint);
+      return 3;
+    }
+    throw err;
+  }
+  if (h) return runDashboard(ctx, h, { commands: router.all(), runChild: makeChildRunner() });
+  const target = path.resolve(ctx.flags.dir ?? process.cwd());
+  const legacy = detectLegacyLayout(target);
+  if (legacy) {
+    ctx.ui.fail(`${target} has the pre-0.7 layout (${legacy.found.join(", ")})`, "rfa migrate --dry-run shows the move; rfa migrate performs it");
+    return 3;
+  }
+  return runOnboarding(ctx, { target, existing: null, flags: {} });
 }
 
 main(process.argv.slice(2)).then(

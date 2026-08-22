@@ -26,6 +26,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseAgentMd } from "../agentdef.js";
 import type { HubDir } from "../hubdir.js";
+import type { AgentMode } from "../posture.js";
 import { packageFile } from "../pkg.js";
 
 export type PackKind = "answerer" | "tool" | "spec-expert";
@@ -50,8 +51,32 @@ export interface ScaffoldOptions {
   model?: string;
   /** For an answerer: a directory of markdown to point a knowledge glob at (absolute or relative to the pack). */
   knowledge?: string;
-  /** For a tool user: the MCP server and the tool id that pauses for a human. */
-  tool?: { server: string; command: string; args?: string[]; tool: string };
+  /** For a tool user: the MCP server (a command, or one built into this package) and the tool id that pauses for a human. */
+  tool?: ToolSpec;
+  /** For a tool user: how its acting tools are treated (src/posture.ts). Default ask. */
+  mode?: AgentMode;
+}
+
+export interface ToolSpec {
+  server: string;
+  command?: string;
+  args?: string[];
+  /** A server shipped inside this package (`rfa server <name>`), started by the resident from its own entry. */
+  builtin?: string;
+  tool: string;
+  /** Secret NAMES the server needs; the supervisor injects their values. */
+  envSecrets?: string[];
+}
+
+/** The servers this package ships, for `--builtin <name>` and the onboarding's first choice. */
+export const BUILTIN_SERVERS: Record<string, { description: string; tools: string[]; defaultTool: string; envSecrets: string[] }> = {
+  linear: { description: "finds Linear projects and saves documents into them (dry-run drafts without the key)", tools: ["search_project", "save_document"], defaultTool: "save_document", envSecrets: ["LINEAR_API_KEY"] },
+};
+
+export function builtinTool(name: string, toolId?: string, server?: string): ToolSpec {
+  const b = BUILTIN_SERVERS[name];
+  if (!b) throw new Error(`no built-in server named ${name}; this package ships: ${Object.keys(BUILTIN_SERVERS).join(", ")}`);
+  return { server: server ?? name, builtin: name, tool: toolId ?? b.defaultTool, envSecrets: b.envSecrets };
 }
 
 function roomsBlock(room: string | null): string {
@@ -105,7 +130,7 @@ export function renderAgentMd(o: ScaffoldOptions): string {
   const toolsBlock =
     kind === "tool"
       ? `tools:
-  allow: [Read, Grep, Glob, mcp__${o.tool?.server ?? "yourservice"}__${o.tool?.tool ?? "do_thing"}]
+  allow: [Read, Grep, Glob, ${(o.tool?.builtin && BUILTIN_SERVERS[o.tool.builtin] ? BUILTIN_SERVERS[o.tool.builtin].tools : [o.tool?.tool ?? "do_thing"]).map((t) => `mcp__${o.tool?.server ?? "yourservice"}__${t}`).join(", ")}]
   # Add mcp__rfa__ask to let this agent consult OTHER room members (opt-in: a
   # voice is a posture decision, not a default).
   allow_subagents: false      # listing Agent or Task without this fails validation
@@ -113,9 +138,9 @@ mcp_servers:
   # The server that provides the tool above. Secrets are NAMES; the supervisor
   # injects their values from .rfa/secrets.json into this server's environment.
   ${o.tool?.server ?? "yourservice"}:
-    command: ${JSON.stringify(o.tool?.command ?? "npx")}
-    args: ${JSON.stringify(o.tool?.args ?? ["-y", "your-mcp-server"])}
-    env_secrets: []
+${o.tool?.builtin ? `    builtin: ${o.tool.builtin}   # shipped in this package; the resident starts it from its own entry` : `    command: ${JSON.stringify(o.tool?.command ?? "npx")}
+    args: ${JSON.stringify(o.tool?.args ?? ["-y", "your-mcp-server"])}`}
+    env_secrets: ${JSON.stringify(o.tool?.envSecrets ?? [])}
 interrupt_on:
   # Every tool named here pauses for a human approve/edit/reject decision.
   # Name the exact tool id; a trailing * is a prefix match.
@@ -171,13 +196,14 @@ offers:
 memory:
   scope: pack
   gate: memory-gate   # peer content cannot become memory unexamined
-sandbox:
+${kind === "tool" ? `mode: ${o.mode ?? "ask"}   # ask: cards for every acting tool · plan: proposes, never acts · auto: the SDK's classifier decides · bypass: acts without asking
+` : ""}sandbox:
   isolation: none     # worktree or container once it runs code
   permission_mode: default
   network: none
 # Names only, never values. The supervisor injects these from .rfa/secrets.json.
 # RFA_TOKEN: the bearer that reaches the hub; residents join their room with it.
-secrets: [RFA_TOKEN]
+secrets: [RFA_TOKEN${o.tool?.envSecrets?.length ? `, ${o.tool.envSecrets.join(", ")}` : ""}]
 budgets:
   max_turns: ${kind === "tool" ? 20 : 8}
   per_task_usd: ${kind === "tool" ? "1.00" : "0.25"}
@@ -194,9 +220,12 @@ export interface ScaffoldResult {
   definitionHash: string;
   skillId: string;
   files: string[];
+  /** Files already in a taken-over folder that the scaffold left alone. */
+  kept: string[];
+  reused: boolean;
 }
 
-/** Write the whole pack (spec 3.1). Refuses an existing directory. */
+/** Write the whole pack (spec 3.1). Refuses an existing definition; takes over a folder that has none. */
 /** A knowledge directory as the pack will see it: relative to the pack's own folder, whatever the caller's cwd was. */
 export function knowledgeRelativeToPack(h: HubDir, name: string, knowledge: string | undefined): string | undefined {
   if (!knowledge) return undefined;
@@ -212,14 +241,23 @@ export function scaffoldPack(h: HubDir, o: ScaffoldOptions): ScaffoldResult {
   const problem = nameProblem(o.name);
   if (problem) throw new Error(problem);
   const dir = path.join(h.paths.agents, o.name);
-  if (fs.existsSync(dir)) throw new Error(`agents/${o.name} already exists; edit it, or \`rfa agent retire ${o.name}\` first`);
+  if (fs.existsSync(path.join(dir, "agent.md"))) throw new Error(`agents/${o.name} already exists; edit it, or \`rfa agent retire ${o.name}\` first`);
+  // A folder with no definition (made by hand, or left by an older retire) is
+  // taken over: agent.md is written, anything already in it is kept.
+  const reused = fs.existsSync(dir);
   if (o.knowledge && !fs.existsSync(path.resolve(o.knowledge))) throw new Error(`knowledge directory ${o.knowledge} does not exist`);
   o = { ...o, knowledge: knowledgeRelativeToPack(h, o.name, o.knowledge) };
   const content = renderAgentMd(o);
   const parsed = parseAgentMd(content); // a generated pack can never be one the platform then refuses
   const files: string[] = [];
+  const kept: string[] = [];
   const write = (rel: string, text: string): void => {
     const full = path.join(dir, rel);
+    // In a taken-over folder the operator's own files win over the scaffold's templates; only agent.md is ours to write.
+    if (reused && rel !== "agent.md" && fs.existsSync(full)) {
+      kept.push(rel);
+      return;
+    }
     fs.mkdirSync(path.dirname(full), { recursive: true });
     fs.writeFileSync(full, text);
     files.push(rel);
@@ -294,5 +332,5 @@ expect:
     must_mention: [${o.kind === "spec-expert" ? '"lease"' : '"something the correct answer must contain"'}]
 ${o.kind === "tool" ? "" : "  protocol: [citations_present]\n"}`,
   );
-  return { dir, definitionHash: parsed.definitionHash, skillId, files };
+  return { dir, definitionHash: parsed.definitionHash, skillId, files , kept, reused };
 }

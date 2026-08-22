@@ -9,10 +9,12 @@ A communication protocol for AI agents: join a **room**, discover the other memb
 ## Sixty seconds
 
 ```bash
-npx agent-com init
+npx agent-com
 ```
 
-In an empty folder, on a machine with a logged-in `claude` (or `ANTHROPIC_API_KEY`), that asks six questions, explains the three parts it creates, mints the credentials, scaffolds a first agent that answers about the protocol from the spec shipped in the package, creates a room, starts the hub and the supervisor, waits for the agent to come up, and offers the first question. Measured: under a minute to an answered question. `--yes` takes every default; `--ask "…"` asks the first question without a terminal.
+In an empty folder, on a machine with a logged-in `claude` (or `ANTHROPIC_API_KEY`), that opens the onboarding: six questions, one per screen with the reason beside it and a default in every field; then it mints the credentials, scaffolds a first agent that answers about the protocol from the spec shipped in the package, creates a room, starts the hub and the supervisor, waits for the agent to come up, asks it the first question and shows the cited answer. Measured, in a real terminal: 27.8 seconds from "start now" to an answered question. `rfa init --yes` takes every default with no screen; `--ask "…"` asks the first question without a terminal.
+
+Then, in that folder, `rfa` alone opens the **dashboard**: what is running, the agents, the rooms, the cards waiting for you, a room's log followed live; single keys for the usual verbs (`u` up, `r` restart the agent, `m` its mode, `y` approve, `a` ask); and `:` for the palette, which searches every command, shows the exact command line before running it, and asks in place for what the command needs. The long commands get learned there. Outside it, `rfa completion zsh --install` gives tab completion that knows this directory's agent and room names, an unknown command suggests the right one, and a missing argument on a terminal is a question rather than a usage error.
 
 The package is `agent-com`; the command it installs is `rfa` (`agent-com` works as an alias, which is what makes the line above work with nothing installed). Until it is on the public registry, install from the repository: `npm install -g git+ssh://git@github.com/pbeneteau/agent-com.git`.
 
@@ -38,8 +40,9 @@ Credentials are hashed at rest (`principals.json`, `tokens.json`) and shown once
 
 | | |
 |---|---|
+| `rfa` · `dashboard` · `completion` | the front door: `rfa` alone is the onboarding or the dashboard (the help on a pipe); `completion zsh\|bash\|fish [--install]` is dynamic tab completion |
 | `rfa init` · `up` · `down` · `restart` · `status` · `doctor` · `logs` · `console` | the lifecycle. `up` starts the hub and the supervisor as daemons with their pids in `.rfa/run/`; `status` asks the hub rather than trusting a pid file; `doctor` runs every check the findings ledger paid for, each naming the incident it comes from |
-| `rfa agent new` · `ls` · `show` · `validate` · `bind` · `start` · `stop` · `restart` · `edit` · `retire` | packs. `new` scaffolds a validated pack bound to a room (`--kind spec-expert`, `answerer --knowledge <dir>`, `tool --server … --tool …`); `retire` is eight re-runnable steps, never a checklist |
+| `rfa agent new` · `ls` · `show` · `validate` · `bind` · `start` · `stop` · `restart` · `mode` · `edit` · `retire` | packs. `new` scaffolds a validated pack bound to a room (`--kind spec-expert`, `answerer --knowledge <dir>`, `tool --builtin linear` or `tool --server … --command … --tool …`, `--mode ask\|plan\|auto\|bypass`); `mode` reads or sets how a tool user's acting tools are treated, the way Claude Code's permission modes do for a session; `retire` is eight re-runnable steps, never a checklist |
 | `rfa room create` · `ls` · `show` · `tail` · `allow` · `disallow` · `policy` · `secret` · `evict` · `hold` · `release` · `quarantine` · `inject` · `end` · `adopt` | rooms you host. Works with the hub down: the store is opened in process behind the same MCP server the daemon serves |
 | `rfa ask` · `task ls/show/create/cancel/verify` · `approvals ls/show/approve/reject` | talking, as a human principal. A decision from the CLI lands as a human-origin intervention carrying your principal id, exactly as the console's does |
 | `rfa human` · `token` · `secrets` · `key` · `config` | credentials and the manifest. Nothing secret ever travels on the command line |
@@ -78,6 +81,7 @@ npm run dev -- --help     # the CLI from this checkout (tsx)
 npm test                  # unit/integration tests over MCP in-memory transports and real hub processes
 npm run e2e               # THE fast answer: real hubs on random ports, every profile over the wire, the CLI's lifecycle, a report in reports/
 npm run coldstart         # npm pack, install the tarball into a fresh prefix, rfa init --ask in an empty folder (needs a model credential)
+npm run tui:smoke         # the onboarding and the dashboard driven inside a real pty (python3, stdlib only); the gate for src/cli/tui changes
 npm run demo              # the spec's worked example, in memory
 npm run evals             # = rfa evals run on the hub directory found from here (about two dollars; one per day)
 npm run parity            # = rfa evals parity, run it twice after a brain or knowledge change

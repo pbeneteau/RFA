@@ -13,10 +13,12 @@ import { daemonState } from "../../daemon.js";
 import { findRoom, roomsStore, secretsStore, type HubDir, type RoomRecord } from "../../hubdir.js";
 import { packageVersion } from "../../pkg.js";
 import { residentProcessesSync } from "../../procscan.js";
-import { bindPack } from "../agentmd.js";
+import { bindPack, setAgentMode } from "../agentmd.js";
+import { effectiveMode, isMode, MODE_SUMMARY, MODES, type AgentMode } from "../../posture.js";
 import { CliError, type CliContext } from "../context.js";
 import type { CommandDef } from "../router.js";
-import { knowledgeRelativeToPack, nameProblem, PACK_KINDS, renderAgentMd, scaffoldPack, type PackKind } from "../scaffold.js";
+import { BUILTIN_SERVERS, builtinTool, knowledgeRelativeToPack, nameProblem, PACK_KINDS, renderAgentMd, scaffoldPack, type PackKind, type ToolSpec } from "../scaffold.js";
+import { askLine, pickOne } from "../prompts.js";
 import { fmtAge } from "../ui.js";
 
 /** `--room <alias|handle>`: an alias from rooms.json, or a handle as given. */
@@ -31,30 +33,41 @@ function resolveRoom(h: HubDir, ref: string | undefined): RoomRecord | { handle:
 export const agentNew: CommandDef = {
   path: ["agent", "new"],
   summary: "Scaffold a pack, validated, bound to a room",
-  usage: "<name> [--kind spec-expert|answerer|tool] [--room <alias|handle>] [--knowledge <dir>] [--model haiku|sonnet] [--server <name> --command <cmd> --tool <id>] [--dry-run]",
+  usage: "<name> [--kind spec-expert|answerer|tool] [--room <alias|handle>] [--knowledge <dir>] [--model haiku|sonnet] [--server <name> --command <cmd> --tool <id> | --builtin linear [--tool <id>]] [--mode ask|plan|auto|bypass] [--dry-run]",
   why: "Everything the scaffold writes is something a hand-written pack got wrong at least once here: RFA_TOKEN in secrets, a skill on the card, budgets, allow_subagents: false, a room binding. It is validated through the supervisor's own schema, so it either loads or says why before the supervisor sees it. A tool user names the MCP server it brings; the runtime loads it from the pack's own declaration.",
-  options: { kind: { type: "string" }, room: { type: "string" }, knowledge: { type: "string" }, model: { type: "string" }, server: { type: "string" }, command: { type: "string" }, tool: { type: "string" }, "dry-run": { type: "boolean", default: false } },
-  examples: ["rfa agent new pm --kind answerer --knowledge ./docs --room product", "rfa agent new scribe --kind tool --server linear --command 'rfa server linear' --tool save_document"],
+  options: { kind: { type: "string" }, room: { type: "string" }, knowledge: { type: "string" }, model: { type: "string" }, server: { type: "string" }, command: { type: "string" }, builtin: { type: "string" }, tool: { type: "string" }, mode: { type: "string" }, "dry-run": { type: "boolean", default: false } },
+  examples: ["rfa agent new pm --kind answerer --knowledge ./docs --room product", "rfa agent new scribe --kind tool --builtin linear", "rfa agent new filer --kind tool --server filesystem --command 'npx -y @modelcontextprotocol/server-filesystem /tmp/scratch' --tool write_file"],
   run: async (ctx, a) => {
     const h = ctx.hubdir();
-    const name = a.positionals[0];
-    if (!name) throw new CliError(2, "rfa agent new <name> [--kind …]");
+    const name = a.positionals[0] ?? (await askLine(ctx, "Name the new agent", "rfa agent new <name> [--kind …]", { placeholder: "pm-agent" }));
     const problem = nameProblem(name);
     if (problem) throw new CliError(2, problem);
     const kind = (a.values.kind as PackKind | undefined) ?? "answerer";
     if (!PACK_KINDS.includes(kind)) throw new CliError(2, `--kind takes ${PACK_KINDS.join(", ")}`);
     const rooms = roomsStore(h).read().rooms;
     const room = resolveRoom(h, a.values.room as string | undefined) ?? rooms.find((r) => r.alias !== "ops") ?? null;
-    let tool: { server: string; command: string; args?: string[]; tool: string } | undefined;
+    let tool: ToolSpec | undefined;
     if (kind === "tool") {
       const server = a.values.server as string | undefined;
       const command = a.values.command as string | undefined;
       const toolId = a.values.tool as string | undefined;
-      if (!server || !command || !toolId) throw new CliError(2, "a tool user needs --server <name> --command <cmd> --tool <id>", "the tool id is what pauses for your approval: mcp__<server>__<id>");
-      const [cmd, ...args] = command.split(/\s+/);
-      tool = { server, command: cmd, args, tool: toolId };
+      const builtin = a.values.builtin as string | undefined;
+      if (builtin) {
+        try {
+          tool = builtinTool(builtin, toolId, server);
+        } catch (err) {
+          throw new CliError(2, (err as Error).message);
+        }
+      } else {
+        if (!server || !command || !toolId) throw new CliError(2, "a tool user needs --server <name> --command <cmd> --tool <id>, or --builtin <name> [--tool <id>]", `the tool id is what pauses for your approval: mcp__<server>__<id>; built in: ${Object.keys(BUILTIN_SERVERS).join(", ")}`);
+        const [cmd, ...args] = command.split(/\s+/);
+        tool = { server, command: cmd, args, tool: toolId };
+      }
     }
-    const opts = { name, kind, room: room?.handle ?? null, model: a.values.model as string | undefined, knowledge: a.values.knowledge as string | undefined, tool };
+    const modeFlag = a.values.mode as string | undefined;
+    if (modeFlag && !isMode(modeFlag)) throw new CliError(2, `--mode takes ${MODES.join(", ")}`);
+    if (modeFlag && kind !== "tool") throw new CliError(2, `--mode applies to a tool user; a${kind === "answerer" ? "n answerer" : " spec-expert"} has no acting tool`);
+    const opts = { name, kind, room: room?.handle ?? null, model: a.values.model as string | undefined, knowledge: a.values.knowledge as string | undefined, tool, mode: modeFlag as AgentMode | undefined };
     if (a.values["dry-run"]) {
       const content = renderAgentMd({ ...opts, knowledge: knowledgeRelativeToPack(h, name, opts.knowledge) });
       parseAgentMd(content);
@@ -64,12 +77,12 @@ export const agentNew: CommandDef = {
     try {
       const res = scaffoldPack(h, opts);
       ctx.ui.done(`agents/${name}/agent.md`, `definition ${res.definitionHash.slice(7, 15)} · offers ${res.skillId}${room ? ` · room ${room.alias ?? room.handle}` : " · NOT bound to a room yet"}`);
-      ctx.ui.note("the pack is a folder: agent.md, knowledge/, memory/, skills/, evals/");
+      ctx.ui.note(res.reused ? `the folder already existed and was taken over${res.kept.length ? `; kept ${res.kept.length} file(s) of yours: ${res.kept.slice(0, 4).join(", ")}${res.kept.length > 4 ? ", …" : ""}` : ""}` : "the pack is a folder: agent.md, knowledge/, memory/, skills/, evals/");
       const sup = daemonState(h.paths.supervisorPid);
       const next: string[] = [];
       if (kind === "answerer" && !a.values.knowledge) next.push(`put markdown in agents/${name}/knowledge/, or rfa knowledge add ${name} <dir>`);
       if (!room) next.push(`rfa agent bind ${name} --room <alias>`);
-      if (kind === "tool") next.push(`rfa secrets set <NAME> for any secret the server needs, and declare it under mcp_servers.${tool!.server}.env_secrets`);
+      if (kind === "tool") next.push(tool?.envSecrets?.length ? `rfa secrets set ${tool.envSecrets.join(" / ")}: the server runs in dry-run mode until then` : `rfa secrets set <NAME> for any secret the server needs, and declare it under mcp_servers.${tool!.server}.env_secrets`);
       next.push(sup.alive ? "the supervisor picks it up within 30s: rfa status" : "rfa up starts it");
       for (const n of next) ctx.ui.note(`→ ${n}`);
       if (ctx.flags.json) ctx.ui.json({ name, dir: res.dir, definition_hash: res.definitionHash, skill: res.skillId, room: room?.handle ?? null });
@@ -111,6 +124,7 @@ export const agentLs: CommandDef = {
         pid: sup[p.name]?.pid ?? null,
         room: rooms.find((r) => r.handle === handle)?.alias ?? handle,
         model: p.def.model ?? "inherit",
+        mode: effectiveMode(p.def),
         offers: (p.def.offers ?? []).map((o) => o.id),
         heartbeat_age_ms: fs.existsSync(hb) ? Date.now() - Number(fs.readFileSync(hb, "utf8")) : null,
         spend_today_usd: member?.spend?.day === today ? member.spend.usd : 0,
@@ -120,7 +134,7 @@ export const agentLs: CommandDef = {
     if (ctx.flags.json) return void ctx.ui.json(rows);
     if (rows.length === 0) return void ctx.ui.note("no packs: rfa agent new <name>");
     ctx.ui.table(
-      rows.map((r) => [r.status === "running" ? ctx.ui.good("●") : ctx.ui.dim("○"), r.name, r.status, r.room ?? "-", r.model, `$${r.spend_today_usd.toFixed(2)} today`, r.heartbeat_age_ms === null ? ctx.ui.dim("no heartbeat") : `heartbeat ${fmtAge(Date.now() - r.heartbeat_age_ms)}`, ctx.ui.dim(r.offers.join(", "))]),
+      rows.map((r) => [r.status === "running" ? ctx.ui.good("●") : ctx.ui.dim("○"), r.name, r.status, r.room ?? "-", r.model, r.mode === "bypass" ? ctx.ui.bad(r.mode) : r.mode === "read-only" ? ctx.ui.dim(r.mode) : r.mode, `$${r.spend_today_usd.toFixed(2)} today`, r.heartbeat_age_ms === null ? ctx.ui.dim("no heartbeat") : `heartbeat ${fmtAge(Date.now() - r.heartbeat_age_ms)}`, ctx.ui.dim(r.offers.join(", "))]),
     );
   },
 };
@@ -131,8 +145,7 @@ export const agentShow: CommandDef = {
   usage: "<name>",
   run: async (ctx, a) => {
     const h = ctx.hubdir();
-    const name = a.positionals[0];
-    if (!name) throw new CliError(2, "rfa agent show <name>");
+    const name = await packArg(ctx, h, a.positionals[0], "rfa agent show <name>");
     const dir = path.join(h.paths.agents, name);
     if (!fs.existsSync(path.join(dir, "agent.md"))) throw new CliError(2, `no pack agents/${name}`, "rfa agent ls");
     const pack = loadPack(dir);
@@ -255,7 +268,7 @@ export const agentBind: CommandDef = {
 };
 
 /** Append a command for the supervisor and wait for its state file to reflect it. */
-async function supervisorCommand(ctx: CliContext, h: HubDir, agent: string, action: "start" | "stop" | "restart"): Promise<string> {
+export async function supervisorCommand(ctx: CliContext, h: HubDir, agent: string, action: "start" | "stop" | "restart"): Promise<string> {
   if (!daemonState(h.paths.supervisorPid).alive) throw new CliError(3, "the supervisor is not running", "rfa up");
   if (!fs.existsSync(path.join(h.paths.agents, agent, "agent.md"))) throw new CliError(2, `no pack agents/${agent}`);
   fs.appendFileSync(h.paths.supervisorCommands, JSON.stringify({ ts: new Date().toISOString(), agent, action, principal: "cli" }) + "\n");
@@ -276,8 +289,7 @@ const lifecycle = (action: "start" | "stop" | "restart"): CommandDef => ({
   usage: "<name>",
   run: async (ctx, a) => {
     const h = ctx.hubdir();
-    const name = a.positionals[0];
-    if (!name) throw new CliError(2, `rfa agent ${action} <name>`);
+    const name = await packArg(ctx, h, a.positionals[0], `rfa agent ${action} <name>`);
     const status = await supervisorCommand(ctx, h, name, action);
     ctx.ui.done(`${name} ${status}`);
   },
@@ -292,8 +304,7 @@ export const agentEdit: CommandDef = {
   usage: "<name>",
   run: async (ctx, a) => {
     const h = ctx.hubdir();
-    const name = a.positionals[0];
-    if (!name) throw new CliError(2, "rfa agent edit <name>");
+    const name = await packArg(ctx, h, a.positionals[0], "rfa agent edit <name>");
     const file = path.join(h.paths.agents, name, "agent.md");
     if (!fs.existsSync(file)) throw new CliError(2, `no pack agents/${name}`);
     const editor = ctx.env.VISUAL || ctx.env.EDITOR;
@@ -309,6 +320,50 @@ export const agentEdit: CommandDef = {
     } catch (err) {
       throw new CliError(1, `agent.md is now INVALID and the supervisor keeps the running resident: ${(err as Error).message}`, `fix it: rfa agent edit ${name}`);
     }
+  },
+};
+
+/** A missing pack name on a terminal is a pick from the packs that exist; elsewhere it is the usage error. */
+async function packArg(ctx: CliContext, h: HubDir, given: string | undefined, usage: string): Promise<string> {
+  if (given) return given;
+  return pickOne(ctx, "Which agent?", listPacks(h.paths.agents).map((p) => ({ value: p.name, hint: (p.def.offers ?? []).map((o) => o.id).join(", ") })), usage);
+}
+
+// ---------------------------------------------------------------- mode
+
+export const agentMode: CommandDef = {
+  path: ["agent", "mode"],
+  summary: "Show or set how an agent's acting tools are treated: ask, plan, auto or bypass",
+  usage: "<name> [ask|plan|auto|bypass]",
+  why: "The same idea as Claude Code's permission modes, for a resident. ask (the default) pauses every acting tool on a card you decide; plan proposes and never acts; auto lets the SDK's classifier wave through what it judges safe and sends the rest to you; bypass acts without asking, and the room gate, budgets, hold and quarantine still apply. A mode is one line in agent.md, so changing it rotates the definition: a running supervisor drains and respawns the resident, and the room sees the digest change.",
+  examples: ["rfa agent mode linear-agent", "rfa agent mode linear-agent plan", "rfa agent mode linear-agent bypass --yes"],
+  run: async (ctx, a) => {
+    const h = ctx.hubdir();
+    const name = await packArg(ctx, h, a.positionals[0], "rfa agent mode <name> [ask|plan|auto|bypass]");
+    const pack = listPacks(h.paths.agents).find((p) => p.name === name);
+    if (!pack) throw new CliError(2, `no pack agents/${name}`, "rfa agent ls");
+    const current = effectiveMode(pack.def);
+    const wanted = a.positionals[1];
+    if (!wanted) {
+      if (ctx.flags.json) return void ctx.ui.json({ name, mode: current, acting: (pack.def.tools?.allow ?? []).filter((t) => Object.keys(pack.def.interrupt_on ?? {}).some((p) => p === t || (p.endsWith("*") && t.startsWith(p.slice(0, -1))))) });
+      ctx.ui.line(`${ctx.ui.bold(name)}  ${current === "bypass" ? ctx.ui.bad(current) : ctx.ui.accent(current)}${current === "read-only" ? "" : `  ${ctx.ui.dim(MODE_SUMMARY[current])}`}`);
+      if (current === "read-only") ctx.ui.note("no acting tool (nothing in interrupt_on), so there is nothing a mode would change");
+      else for (const m of MODES) ctx.ui.note(`${m === current ? "▸" : " "} ${m.padEnd(7)} ${MODE_SUMMARY[m]}`);
+      return;
+    }
+    if (!isMode(wanted)) throw new CliError(2, `a mode is one of ${MODES.join(", ")}`);
+    if (current === "read-only") throw new CliError(2, `${name} has no acting tool (nothing in interrupt_on); a mode would change nothing`, "rfa agent new <name> --kind tool … makes a tool user");
+    if (wanted === "bypass" && !ctx.flags.yes) {
+      if (!ctx.interactive) throw new CliError(2, "bypass acts without a human; pass --yes to set it without a prompt");
+      const p = await import("@clack/prompts");
+      const ok = await p.confirm({ message: `${name} will call ${(pack.def.tools?.allow ?? []).filter((t) => Object.keys(pack.def.interrupt_on ?? {}).includes(t)).join(", ") || "its acting tools"} without asking anyone. Set bypass?`, initialValue: false });
+      if (p.isCancel(ok) || !ok) throw new CliError(2, "mode unchanged");
+    }
+    const res = setAgentMode(path.join(pack.dir, "agent.md"), wanted);
+    if (ctx.flags.json) return void ctx.ui.json({ name, mode: wanted, was: current, definition: { before: res.before, after: res.after } });
+    if (res.before === res.after) return void ctx.ui.step(`${name} is already in ${wanted} mode`);
+    ctx.ui.done(`${name}: ${current} -> ${wanted}`, `definition ${res.before.slice(7, 15)} -> ${res.after.slice(7, 15)}; a running supervisor drains and respawns it`);
+    ctx.ui.note(MODE_SUMMARY[wanted]);
   },
 };
 
@@ -530,13 +585,19 @@ export const agentRetire: CommandDef = {
     }
 
     // 8. the definition
-    say("move agent.md aside so the card digest leaves every roster");
-    if (!fs.existsSync(defFile)) note("already moved aside");
-    else if (dryRun) would(`rename ${path.relative(h.root, defFile)} to ${path.relative(h.root, path.join(archive, "agent.md"))}`);
+    say("move the pack aside (agent.md, knowledge, memory, skills, evals) so the card digest leaves every roster and the name is free again");
+    // The WHOLE folder goes, not only agent.md: a folder left behind without a
+    // definition is invisible to the supervisor but blocks `rfa agent new` under
+    // the same name, which is exactly what the owner hit on the first retire.
+    if (!fs.existsSync(packDir)) note("already moved aside");
+    else if (dryRun) would(`move ${path.relative(h.root, packDir)}/ to ${path.relative(h.root, archive)}/pack/`);
     else {
       fs.mkdirSync(archive, { recursive: true });
-      fs.renameSync(defFile, path.join(archive, "agent.md"));
-      note(`moved to ${path.relative(h.root, path.join(archive, "agent.md"))}; the supervisor drops it from the registry on its next reconcile`);
+      if (fs.existsSync(defFile)) fs.renameSync(defFile, path.join(archive, "agent.md"));
+      let dest = path.join(archive, "pack");
+      for (let n = 2; fs.existsSync(dest); n++) dest = path.join(archive, `pack-${n}`);
+      fs.renameSync(packDir, dest);
+      note(`moved to ${path.relative(h.root, archive)}/ (agent.md beside ${path.basename(dest)}/); the supervisor drops it from the registry on its next reconcile`);
     }
     ui.blank();
     ui.line(dryRun ? `dry run complete: nothing changed. Run again without --dry-run to retire ${name}.` : `${ui.bold(name)} is retired. Its memory and definition are in ${path.relative(h.root, archive)}; its observability rows and human feedback stay in obs.db.`);

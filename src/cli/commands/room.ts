@@ -9,9 +9,19 @@ import { findRoom, roomsStore, secretsStore, tokensStore, type HubDir, type Room
 import { packageVersion } from "../../pkg.js";
 import { CliError, type CliContext } from "../context.js";
 import { openHubCall, type HubCall } from "../hubaccess.js";
+import { pickOne } from "../prompts.js";
 import type { CommandDef } from "../router.js";
 import { fmtAge } from "../ui.js";
 import { createRoomRecord } from "./init.js";
+
+/** A missing room on a terminal is a pick from the recorded rooms; with one room it is that room. */
+export async function roomArg(ctx: CliContext, h: HubDir, given: string | undefined, usage: string): Promise<RoomRecord> {
+  if (given) return requireRoom(h, given);
+  const rooms = roomsStore(h).read().rooms;
+  if (rooms.length <= 1 || !ctx.interactive) return requireRoom(h, undefined, true);
+  const alias = await pickOne(ctx, "Which room?", rooms.map((r) => ({ value: r.alias, hint: `${r.handle} · ${r.topic}` })), usage);
+  return requireRoom(h, alias);
+}
 
 export function requireRoom(h: HubDir, ref: string | undefined, fallbackFirst = false): RoomRecord {
   const file = roomsStore(h).read();
@@ -104,7 +114,7 @@ export const roomShow: CommandDef = {
   usage: "<alias|handle>",
   run: async (ctx, a) => {
     const h = ctx.hubdir();
-    const rec = requireRoom(h, a.positionals[0]);
+    const rec = await roomArg(ctx, h, a.positionals[0], "rfa room show <alias|handle>");
     const snap = snapshot(h, rec.handle);
     let roster: { id: string; name: string; role: string; state: string; home?: string; held?: boolean; card_summary: { skill_ids: string[]; description?: string } }[] = [];
     let tasks: Record<string, unknown>[] = [];
@@ -157,7 +167,7 @@ export const roomTail: CommandDef = {
   options: { follow: { type: "boolean", short: "f", default: false }, lines: { type: "string", short: "n" } },
   run: async (ctx, a) => {
     const h = ctx.hubdir();
-    const rec = requireRoom(h, a.positionals[0], true);
+    const rec = await roomArg(ctx, h, a.positionals[0], "rfa room tail <alias|handle>");
     const file = path.join(h.paths.roomLogs, `${rec.handle}.ndjson`);
     if (!fs.existsSync(file)) throw new CliError(3, `no log yet for ${rec.alias} (${path.relative(h.root, file)})`);
     const ui = ctx.ui;

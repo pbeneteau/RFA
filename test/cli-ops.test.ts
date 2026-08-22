@@ -230,8 +230,24 @@ test("packs: new binds to the first room, validate checks what the supervisor wo
   const archives = fs.readdirSync(h.paths.retired);
   assert.equal(archives.length, 1);
   assert.ok(fs.existsSync(path.join(h.paths.retired, archives[0], "agent.md")));
+  assert.ok(fs.existsSync(path.join(h.paths.retired, archives[0], "pack", "knowledge")), "the whole pack folder went with it, not only agent.md");
+  assert.ok(!fs.existsSync(path.join(h.paths.agents, "fees")), "the name is free again: a folder left behind blocked rfa agent new on the owner's first retire");
   const gone = await rfa(["agent", "ls", "--json"]);
-  assert.deepEqual(json<unknown[]>(gone), []);
+  assert.deepEqual(json<unknown[]>(gone), [], "a retired pack is gone from the registry");
+  const reborn = await rfa(["agent", "new", "fees", "--kind", "answerer", "--json"]);
+  assert.equal(reborn.code, 0, reborn.stderr);
+  assert.ok(fs.existsSync(path.join(h.paths.agents, "fees", "agent.md")));
+  // A folder made by hand, with no definition, is taken over and its files kept.
+  fs.mkdirSync(path.join(h.paths.agents, "handmade", "knowledge"), { recursive: true });
+  fs.writeFileSync(path.join(h.paths.agents, "handmade", "knowledge", "mine.md"), "# mine\n");
+  const took = await rfa(["agent", "new", "handmade", "--kind", "answerer"]);
+  assert.equal(took.code, 0, took.stderr);
+  assert.match(took.stdout, /taken over/);
+  assert.equal(fs.readFileSync(path.join(h.paths.agents, "handmade", "knowledge", "mine.md"), "utf8"), "# mine\n", "the operator's file is untouched");
+  const dup = await rfa(["agent", "new", "handmade", "--kind", "answerer"]);
+  assert.equal(dup.code, 1, "a folder WITH a definition is still refused");
+  const after = await rfa(["agent", "ls", "--json"]);
+  assert.deepEqual(json<{ name: string }[]>(after).map((a) => a.name).sort(), ["fees", "handmade"]);
 });
 
 test("connect and peer: a client bearer is minted, admitted by hash, printed once; a guest home is refused with the gate named; revoke removes the admission", async () => {

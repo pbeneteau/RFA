@@ -13,7 +13,8 @@ import { PrincipalSet } from "../../principals.js";
 import { residentProcesses } from "../../procscan.js";
 import { genesisFor, verifyChain } from "../../chain.js";
 import { type CliContext } from "../context.js";
-import { credentialAdvice, modelCredentialStatus, portFree } from "../preflight.js";
+import { effectiveMode } from "../../posture.js";
+import { credentialAdvice, modelCredentialStatus, nativeBindingProblem, portFree } from "../preflight.js";
 import type { CommandDef } from "../router.js";
 import { fmtAge } from "../ui.js";
 
@@ -33,16 +34,8 @@ export async function runChecks(ctx: CliContext, opts: { deep?: boolean } = {}):
   const checks: Check[] = [];
   const major = Number(process.versions.node.split(".")[0]);
   checks.push(major >= 22 ? ok("node", `node ${process.version}`) : fail("node", `node ${process.version} is below 22`, "Node 20 reached end of life in April 2026; install 22 or newer"));
-  try {
-    // Importing the wrapper proves nothing: the native binding is loaded when a
-    // database opens, and a binding built for another Node version fails there
-    // (seen live: "ok" here, then every store unreadable under NODE_MODULE_VERSION 137).
-    const { default: Database } = await import("better-sqlite3");
-    new Database(":memory:").close();
-    checks.push(ok("sqlite", `better-sqlite3 opens a database under node ${process.version}`));
-  } catch (err) {
-    checks.push(fail("sqlite", `better-sqlite3 does not load: ${(err as Error).message.split("\n")[0]}`, "npm rebuild better-sqlite3, or reinstall the package for this node version"));
-  }
+  const binding = nativeBindingProblem();
+  checks.push(binding ? fail("sqlite", binding.message, binding.hint) : ok("sqlite", `better-sqlite3 opens a database under node ${process.version}`));
   const cred = modelCredentialStatus(ctx.env);
   checks.push(cred.ok === true ? ok("model-credential", cred.detail) : cred.ok === false ? fail("model-credential", cred.detail, credentialAdvice(cred).join(" ")) : warn("model-credential", cred.detail, credentialAdvice(cred).join(" ")));
 
@@ -146,7 +139,9 @@ export async function runChecks(ctx: CliContext, opts: { deep?: boolean } = {}):
       else if (binding.room && rooms.length && !rooms.some((r) => r.handle === binding.room)) problems.push(`binds to ${binding.room}, which rooms.json does not list`);
       const files = knowledgeFiles(pack).length;
       if ((pack.def.knowledge ?? []).length > 0 && files === 0) problems.push("knowledge globs resolve to zero files");
-      checks.push(problems.length ? warn(`pack-${pack.name}`, `${pack.name}: ${problems.join("; ")}`, "rfa agent show / rfa agent bind / rfa agent edit") : ok(`pack-${pack.name}`, `${pack.name}: valid, ${files} knowledge file${files === 1 ? "" : "s"}, room ${binding?.room ?? "-"}`));
+      checks.push(problems.length ? warn(`pack-${pack.name}`, `${pack.name}: ${problems.join("; ")}`, "rfa agent show / rfa agent bind / rfa agent edit") : ok(`pack-${pack.name}`, `${pack.name}: valid, ${files} knowledge file${files === 1 ? "" : "s"}, room ${binding?.room ?? "-"}${effectiveMode(pack.def) === "read-only" ? "" : `, mode ${effectiveMode(pack.def)}`}`));
+      if (effectiveMode(pack.def) === "bypass") checks.push(warn(`mode-${pack.name}`, `${pack.name} is in bypass mode: its acting tools run without a human`, `rfa agent mode ${pack.name} ask`));
+      if (effectiveMode(pack.def) === "auto") checks.push(skip(`mode-${pack.name}`, `${pack.name} is in auto mode: the SDK decides, and so far it has approved every acting call without a card`));
     } catch (err) {
       checks.push(fail(`pack-${entry.name}`, `agents/${entry.name}/agent.md: ${(err as Error).message}`, "rfa agent validate " + entry.name));
     }

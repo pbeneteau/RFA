@@ -19,7 +19,7 @@
     "dev": "tsx src/cli/main.ts",
     "start": "tsx src/main.ts",
     "supervisor": "tsx src/supervisor.ts",
-    "test": "node --import tsx --test test/*.test.ts",
+    "test": "node --import tsx --test test/*.test.ts test/*.test.tsx",
     "e2e": "tsx scripts/e2e.ts",
     "e2e:full": "tsx scripts/e2e.ts --full",
     "evals": "tsx src/cli/main.ts evals run",
@@ -27,7 +27,8 @@
     "demo": "tsx src/cli/main.ts demo",
     "demo:push": "tsx scripts/demo-push.ts",
     "coldstart": "tsx scripts/coldstart.ts",
-    "parity": "tsx src/cli/main.ts evals parity"
+    "parity": "tsx src/cli/main.ts evals parity",
+    "tui:smoke": "python3 scripts/tui-drive.py --smoke"
   },
   "engines": {
     "node": ">=22"
@@ -36,6 +37,7 @@
     "@anthropic-ai/claude-agent-sdk": "^0.3.233",
     "@anthropic-ai/sandbox-runtime": "^0.0.73",
     "@clack/prompts": "^1.7.0",
+    "@inkjs/ui": "^2.0.0",
     "@modelcontextprotocol/client": "^2.0.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@modelcontextprotocol/server": "^2.0.0",
@@ -44,12 +46,17 @@
     "@opentelemetry/sdk-trace-base": "^2.10.0",
     "better-sqlite3": "^12.11.1",
     "croner": "^10.0.1",
+    "fuzzysort": "^4.0.2",
+    "ink": "^7.1.1",
+    "react": "^19.2.8",
     "yaml": "^2.9.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^26.2.0",
+    "@types/react": "^19.2.18",
+    "ink-testing-library": "^4.0.0",
     "tsx": "^4.23.12",
     "typescript": "^7.0.2"
   },

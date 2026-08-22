@@ -590,12 +590,64 @@ One gap this plan exposes and does not close: the hub cannot rotate a room's joi
 ## 12. Non-goals
 
 - **No daemon manager beyond `up`/`down` and the service templates.** No pm2, no restart policy for the supervisor itself outside a service manager; `rfa up` prints that distinction the first time.
-- **No dashboard in the terminal.** The console is the live view; `rfa status` is a snapshot.
+- ~~**No dashboard in the terminal.**~~ Withdrawn by section 13 (2026-08-22): the operator asked for one after three days of forgetting the long commands, and `rfa` alone now opens it. The console stays the browser's live view; `rfa status` stays the snapshot a script reads.
 - **No global state.** No `~/.rfa`, no registry of hub directories, no "current hub" switch. The working directory is the context, as it is for git.
 - **No plugin system for commands,** no telemetry, no auto-update, no YAML (the manifest is JSON because the spec said `rfa.json` and because JSON has one parser).
 - **No merge of hub and supervisor**, and no hub inside the CLI process.
 - **No guest admission ahead of its trigger** (rung 5), no Docker ahead of RFA-0.6 sect. 8.8's own condition, no Windows.
 - **No second copy of any document.** The CLI's help text is generated from the command definitions; the README links to `rfa --help` output rather than restating it; and the specs keep owning defaults, which the CLI reads from the code that implements them.
+
+
+## 13. The front door (amendment, 2026-08-22)
+
+Three days into using the rungs above, the operator's verdict was that the command tree is complete and that nobody can remember it: "we are getting lost, we forget the commands". The command tree stays; what changes is how it is reached. This section is normative for `rfa` with no arguments and for the discoverability rules every command now follows. It withdraws the "no dashboard in the terminal" non-goal of section 12.
+
+### 13.1 `rfa`, alone
+
+On a terminal (both ends a TTY, no `--json`, no `--quiet`):
+
+- in a folder that is not a hub directory (and not a pre-0.7 checkout, which is still told to `rfa migrate`): the **onboarding** (13.2);
+- in a hub directory: the **dashboard** (13.3).
+
+On a pipe, or with `--json`, `rfa` alone prints the help it always printed and exits 0. Nothing interactive ever starts on a pipe; this is the invariant that keeps every script that ever shelled out to `rfa` working. `rfa dashboard` (alias `rfa ui`) opens the dashboard by name and refuses a pipe with exit 2 and `rfa status --json` named as the script's equivalent.
+
+### 13.2 The onboarding
+
+`rfa init` on a terminal IS the onboarding; `rfa init --yes` and every flag are the same provisioning with no screen. The onboarding is a way to fill the answers `rfa init` takes (`InitAnswers`) and nothing more, so it can never do something the headless path cannot, and `provision()` is the one implementation behind both.
+
+- One question per screen, the reason for the question in a panel beside it, the default pre-filled, escape goes back (over the screens that did not apply: an answerer is asked what it reads, a tool user what it acts through, a spec-expert neither; an existing directory skips the manifest questions).
+- A tool user names its MCP server before anything is written: one of the servers shipped in the package (`builtin: linear` today, with the secret it needs named on the done screen) or a command plus the tool id that pauses for approval, the server's name derived from the command. A pack with a placeholder server validates and acts on nothing, which is the trap this screen exists to close; `rfa agent new --kind tool --builtin <name>` and `rfa init --builtin <name>` are the headless forms.
+- Before the stack is started, the native SQLite binding is opened once in process: a machine with two Nodes runs `rfa` under whichever is on PATH, and a hub spawned under the other dies on its first database with a reason only its log sees. The refusal names both ABIs and the fix, before anything is spawned; `rfa up` and `rfa doctor` do the same.
+- Provisioning is a live checklist: each line the headless path prints becomes a line that ticks, with its one-line explanation under it.
+- The first minute ends in **first value**: if the stack was started and the agent joined, the last screen asks the question the agent can answer, waits with the agent's name on the spinner, and shows the answer with its citations, duration, cost and run id. Then the next commands that matter, the human key shown once, and enter opens the dashboard (as its own `rfa dashboard` in the directory just written).
+- The wordmark reveals itself once, through its gradient, on the welcome screen. That is the whole of the theatre.
+
+### 13.3 The dashboard
+
+Five tabs over one snapshot refreshed every two seconds: **Overview** (processes, agents, rooms, the last 24 hours with answers per hour, alerts, recent answers), **Agents**, **Rooms**, **Approvals**, **Feed** (a room's log followed live, from the file, as `rfa room tail -f` reads it). Single-key verbs on each tab do what the matching command does, by calling the same function the command calls: `r s x` restart/start/stop an agent through the supervisor's command channel, `m` cycle its mode (RFA-0.4 sect. 3.12: ask, plan, auto, bypass; bypass confirmed first), `y n` approve/reject a card through the same workbench route the console uses, `u d` are `rfa up` and `rfa down`, `a` opens the ask box (discovery by capability, the choice shown when more than one is offered). The keys are the ones operators already have in their fingers from lazygit and k9s: `?` help, `:` (or `/`, or ctrl-k) the palette, numbers and tab for tabs, j/k or arrows to move, q to leave.
+
+**The palette is how the long commands get learned.** Every command, fuzzy-searched by path and summary (a prefix match outranks a scattered one; what was run last is listed first). It ALWAYS shows the exact command line it is about to run, asks in place for the arguments a command requires (one field per `<token>` in its usage), then runs it as an ordinary `rfa` child with the terminal handed over (ctrl-c belongs to the child, so `rfa logs -f` ends the way it always did), waits for a key, and takes the terminal back. Nothing is reimplemented for the dashboard; a verb that is not a thin call into a command's own code is a bug.
+
+### 13.4 Discoverability outside the dashboard
+
+- **Completion.** `rfa completion zsh|bash|fish` prints a few lines that defer every tab to the hidden `rfa __complete`, so completion knows what the CLI knows: groups, commands, flags, and what THIS directory holds (agent names, room aliases, bearer labels), never a list frozen at install time. `--install` writes the line into the shell's rc.
+- **Did you mean.** An unknown command is matched fuzzily against every command path: `rfa agnet restrt` and `rfa restart-agent` both suggest `rfa agent restart`. Suggestions only; nothing runs on a guess.
+- **A missing argument on a terminal is a question.** `rfa agent restart` with no name lists the packs; `rfa ask` with no question asks for one and, when several capabilities are offered, lists them with who is behind each; `rfa room show` with no room lists the rooms; `rfa approvals approve` with no id lists the pending cards. On a pipe, or under `--yes`/`--json`, the same call is the usage error it always was (exit 2), so scripts never block on a prompt.
+
+### 13.5 Design rules
+
+- The terminal UI is Ink (React rendering to the terminal; the engine under Claude Code's own CLI) with `@inkjs/ui` for text fields and `fuzzysort` for the palette. `@clack/prompts` stays for the one-line prompts of 13.4 and the confirmations that already used it. No other UI dependency.
+- One accent (the console's blue), the console's presence colors, the terminal's own palette for everything else, and exactly one flourish: the wordmark's gradient. No animation anywhere after the welcome screen except spinners while something is awaited.
+- Every number on the dashboard is a number a command prints (`rfa status --json`, `/api/approvals`, the observability store read-only). The dashboard is a view over the same data, which is what keeps it honest.
+- Nothing interactive on a pipe, ever (13.1).
+
+### 13.6 Non-goals, still
+
+No mouse, no web rendering of the dashboard (the console is the browser's view), no global state, no dashboard-only feature: anything the dashboard can do has a command.
+
+### 13.7 Testing
+
+The pure parts (the palette's search and argument form, the onboarding's screen order, completion candidates, did-you-mean) and the components rendered headless with `ink-testing-library` run under `npm test`. The other half runs the front door inside a real pseudo-terminal: `npm run tui:smoke` (`scripts/tui-drive.py`, Python's stdlib pty, the one non-TypeScript file under `scripts/`) drives the dashboard through its tabs, help and palette and the onboarding through every default to the done screen, and reads back what was painted. It exists because it found the bug no headless render could: a select that fires only on CHANGE left the onboarding stuck on its own default, which is the common case.
 
 ---
 

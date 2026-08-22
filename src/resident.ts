@@ -22,6 +22,11 @@ import { deriveCard, knowledgeFiles, loadPack, type AgentPack } from "./agentdef
 import { HubDirError, requireHubDir, roomsStore, type HubDir } from "./hubdir.js";
 import { entryFor, nodeArgsFor } from "./proc.js";
 import { fileHint } from "./knowledge.js";
+import { agentPosture } from "./posture.js";
+
+const PLAN_MODE_NOTE = `
+
+MODE: plan. You propose and never act. Your acting tools are refused in this mode, so do not call them, do not write a plan file, and do not call ExitPlanMode: none of that exists here. Your ANSWER is the plan. Write it in full: every tool call you would make, in order, with the complete arguments (for a document, the complete title and content), so that a human can run it as written or switch you to ask mode and say "go".`;
 import { renderWrapped, wrapTaskText } from "./wrap.js";
 import { approvalWindowMs, interruptMatch, joinSidekick, refusalForOutcome, requestApproval } from "./bridge.js";
 import { MemoryGate, RoomMember, ServeRefusal, type ServeContext } from "./client.js";
@@ -554,22 +559,35 @@ async function brain(
   const slot = await account.waitForSlot({ agent: pack.name, lane, runId: currentRunId }, { timeoutMs: 120_000 });
   if (!slot.ok) throw new AccountStop(slot.detail ?? "no account slot", slot.retry_after_s ?? null);
   currentLease = slot.lease?.lease_id ?? null;
+  const posture = agentPosture(pack.def);
   const q = query({
     prompt,
     options: {
       cwd: HUB_ROOT,
       model: pack.def.model,
       ...(pack.def.effort ? { effort: pack.def.effort } : {}),
-      systemPrompt: systemPrompt(),
+      // In plan mode the SDK expects a plan file and ExitPlanMode, neither of
+      // which exists in a room: the answer is the plan (found live: the first
+      // plan-mode answer apologised for a tool it could not call).
+      systemPrompt: systemPrompt() + (posture.mode === "plan" ? PLAN_MODE_NOTE : ""),
       settingSources: [],
       mcpServers: { rfa: rfaServer, memory: memoryServer, ...packServers },
       // interrupt_on tools are EXCLUDED from the allowlist so they fall through
       // to canUseTool, where the human decision happens (spec 7.3).
-      allowedTools: [...(pack.def.tools?.allow ?? []), ...MCP_TOOLS].filter((t) => !interruptMatch(pack.def.interrupt_on, t)),
+      allowedTools: [...posture.allowedTools, ...MCP_TOOLS],
       disallowedTools: pack.def.tools?.deny,
       canUseTool: async (toolName, input) => {
         const rule = interruptMatch(pack.def.interrupt_on, toolName);
         if (!rule) return { behavior: "deny" as const, message: `tool ${toolName} is not allowed for this pack` };
+        // The mode decides what an acting tool meets here (src/posture.ts).
+        if (posture.onActing === "refuse-plan") {
+          log(`plan mode: ${toolName} not called`);
+          return { behavior: "deny" as const, message: `plan mode: ${toolName} is not called. Put the complete call you would make (the tool and every argument) in your answer as the plan; a human runs it, or switches this agent to ask mode.` };
+        }
+        if (posture.onActing === "allow") {
+          log(`bypass mode: ${toolName} allowed without a card`);
+          return { behavior: "allow" as const, updatedInput: input as Record<string, unknown> };
+        }
         // Preflight before paging a human (`require_one_of` on the rule): a call
         // missing every one of the named keys is doomed downstream, so bounce it
         // back to the model instead of burning an approval on it. The Linear
@@ -616,7 +634,7 @@ async function brain(
           ? { behavior: "allow" as const, updatedInput: { ...(input as Record<string, unknown>), ...(outcome.params ?? {}) } }
           : { behavior: "deny" as const, message: `human decision: ${outcome.reason}. Report this outcome; do not retry the tool.` };
       },
-      permissionMode: (pack.def.sandbox?.permission_mode ?? "default") as "default",
+      permissionMode: posture.permissionMode,
       maxTurns: budgets.max_turns ?? 10,
       // min(per_task, per_day - spend) (spec 18.1). A min() over an ABSENT
       // per_task_usd is not a ceiling, which is why the per-day remainder is
@@ -752,7 +770,7 @@ const save = () =>
 
 save();
 recordRoom();
-log(`definition ${pack.definitionHash.slice(0, 15)} (model ${pack.def.model ?? "inherit"}); knowledge: ${knowledgeFiles(pack).length} files; episodes so far: ${episodes.count()}`);
+log(`definition ${pack.definitionHash.slice(0, 15)} (model ${pack.def.model ?? "inherit"}); knowledge: ${knowledgeFiles(pack).length} files; episodes so far: ${episodes.count()}; mode ${agentPosture(pack.def).mode}`);
 // Once per pack at startup (spec 18.1): a pack with neither ceiling can spend
 // without bound, and silence about that is the worst of the three states.
 if (!pack.def.budgets?.per_task_usd && !pack.def.budgets?.per_day_usd) {

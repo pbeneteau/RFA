@@ -39,6 +39,7 @@ export const GLOBAL_OPTIONS: ParseArgsOptionsConfig = {
 
 export const GROUPS: { name: string; summary: string }[] = [
   { name: "init", summary: "Create a hub directory here, interactively or from flags" },
+  { name: "dashboard", summary: "The live dashboard: what rfa alone opens in a hub directory" },
   { name: "up", summary: "Start the hub and the supervisor as daemons" },
   { name: "down", summary: "Stop them" },
   { name: "restart", summary: "Stop, then start" },
@@ -49,7 +50,7 @@ export const GROUPS: { name: string; summary: string }[] = [
   { name: "ask", summary: "Ask an agent by capability, as a human principal" },
   { name: "hub", summary: "The hub process: run in the foreground, expose it" },
   { name: "supervisor", summary: "The supervisor process, in the foreground" },
-  { name: "agent", summary: "Packs: new, ls, show, validate, bind, start, stop, restart, edit, retire" },
+  { name: "agent", summary: "Packs: new, ls, show, validate, bind, start, stop, restart, mode, edit, retire" },
   { name: "room", summary: "Rooms: create, ls, show, tail, allow, policy, secret, evict, end, adopt" },
   { name: "task", summary: "The task board of a room" },
   { name: "approvals", summary: "Pending approval cards and their decision" },
@@ -69,6 +70,7 @@ export const GROUPS: { name: string; summary: string }[] = [
   { name: "demo", summary: "The spec's worked example, in memory, in ten seconds" },
   { name: "docs", summary: "The interop guide, the specs and the README shipped in the package" },
   { name: "version", summary: "Tool, manifest and protocol versions" },
+  { name: "completion", summary: "Tab completion for zsh, bash or fish" },
 ];
 
 export class UsageError extends Error {
@@ -89,6 +91,11 @@ export class Router {
   }
 
   list(): readonly CommandDef[] {
+    return this.commands;
+  }
+
+  /** Every registered command, hidden ones included; the palette, completion and did-you-mean read it. */
+  all(): CommandDef[] {
     return this.commands;
   }
 

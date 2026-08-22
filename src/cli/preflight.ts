@@ -11,6 +11,8 @@
  * that would be a false alarm.
  */
 import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
+import * as path from "node:path";
 import * as net from "node:net";
 
 export interface CredentialStatus {
@@ -73,4 +75,36 @@ export function portFree(port: number, host = "127.0.0.1"): Promise<boolean> {
 export async function nextFreePort(from: number): Promise<number> {
   for (let p = from; p < from + 200; p++) if (await portFree(p)) return p;
   return from;
+}
+
+/**
+ * better-sqlite3 is a native module built for ONE Node ABI. A machine with two
+ * Nodes (nvm beside Homebrew, say) runs `rfa` under whichever is on PATH, and
+ * the hub then dies at boot with a dlopen error nobody sees. Opening a database
+ * here, before anything is spawned, turns that into one sentence with the fix.
+ */
+export function nativeBindingProblem(): { message: string; hint: string } | null {
+  try {
+    // The import is lazy on purpose: the wrapper loads fine, the binding loads
+    // in the constructor, and the constructor is what fails.
+    const req = createRequire(import.meta.url);
+    const Database = req("better-sqlite3") as new (file: string) => { close(): void };
+    new Database(":memory:").close();
+    return null;
+  } catch (err) {
+    const msg = String((err as Error).message ?? err);
+    const built = /NODE_MODULE_VERSION (\d+)\./.exec(msg)?.[1];
+    const needs = /requires\s+NODE_MODULE_VERSION (\d+)/.exec(msg)?.[1];
+    const where = (() => {
+      try {
+        return path.dirname(createRequire(import.meta.url).resolve("better-sqlite3/package.json"));
+      } catch {
+        return "node_modules/better-sqlite3";
+      }
+    })();
+    return {
+      message: built && needs ? `better-sqlite3 in ${where} is built for another Node (ABI ${built}); this is node ${process.version} (ABI ${needs})` : `better-sqlite3 does not load: ${msg.split("\n")[0]}`,
+      hint: `either run rfa with the Node it was installed under, or rebuild for this one: cd ${path.resolve(where, "..", "..")} && npm rebuild better-sqlite3`,
+    };
+  }
 }

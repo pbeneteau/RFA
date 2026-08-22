@@ -96,12 +96,28 @@ test("ui: tables align on visible width, ignoring color codes", () => {
   assert.equal(visibleLength("\x1b[32m●\x1b[0m"), 1);
 });
 
-test("rfa --help lists the groups; an unknown command exits 2", async () => {
+test("rfa --help lists the groups; an unknown command exits 2 with a guess; bare rfa on a pipe is the help, never the dashboard", async () => {
   const help = await rfa(["--help"]);
   assert.equal(help.code, 0);
   assert.ok(help.stdout.includes("init") && help.stdout.includes("Global flags"));
+  const bare = await rfa([]);
+  assert.equal(bare.code, 0);
+  assert.ok(bare.stdout.includes("Commands:") && bare.stdout.includes("dashboard"), "on a pipe the front door is the help");
   const unknown = await rfa(["frobnicate"]);
   assert.equal(unknown.code, 2);
+  const typo = await rfa(["agnet", "restrt", "pm"]);
+  assert.equal(typo.code, 2);
+  assert.match(typo.stderr, /did you mean: rfa agent restart/);
+  const zsh = await rfa(["completion", "zsh"]);
+  assert.equal(zsh.code, 0);
+  assert.ok(zsh.stdout.includes("#compdef rfa") && zsh.stdout.includes("rfa __complete"), "the script defers to the CLI at every tab");
+  const fish = await rfa(["completion", "fish"]);
+  assert.ok(fish.stdout.includes("complete -c rfa"));
+  const groups = await rfa(["__complete", "--", ""]);
+  assert.ok(groups.stdout.includes("agent:") && groups.stdout.includes("dashboard:"), "top-level candidates carry descriptions for zsh");
+  const dash = await rfa(["dashboard"]);
+  assert.equal(dash.code, 2, "the dashboard refuses a pipe and names rfa status --json");
+  assert.match(dash.stderr, /needs a terminal/);
   const v = await rfa(["version", "--json"]);
   assert.equal(v.code, 0);
   const parsed = JSON.parse(v.stdout) as { protocol: string; manifest: number };

@@ -87,6 +87,8 @@ export const agentDefSchema = z.object({
       ]),
     )
     .optional(),
+  /** How the acting tools are treated (src/posture.ts): ask (default), plan, auto, bypass. */
+  mode: z.enum(["ask", "plan", "auto", "bypass"]).optional(),
   knowledge: z.array(z.string()).optional(),
   offers: z
     .array(
@@ -107,7 +109,7 @@ export const agentDefSchema = z.object({
   sandbox: z
     .object({
       isolation: z.enum(["none", "worktree", "container"]).default("none"),
-      permission_mode: z.enum(["default", "dontAsk"]).default("default"),
+      permission_mode: z.enum(["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk", "auto"]).default("default"),
       network: z.enum(["none", "allowlist", "open"]).default("none"),
       allowed_domains: z.array(z.string()).optional(),
       cwd: z.string().optional(),

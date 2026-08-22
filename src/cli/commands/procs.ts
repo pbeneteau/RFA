@@ -15,6 +15,8 @@ import { minimalEnv } from "../../env.js";
 import { ensureRuntime, roomsStore, type HubDir } from "../../hubdir.js";
 import { residentProcesses } from "../../procscan.js";
 import { CliError, type CliContext } from "../context.js";
+import { effectiveMode } from "../../posture.js";
+import { nativeBindingProblem } from "../preflight.js";
 import type { CommandDef } from "../router.js";
 import { fmtAge, fmtDuration } from "../ui.js";
 
@@ -70,6 +72,8 @@ async function startSupervisor(ctx: CliContext, h: HubDir): Promise<{ started: b
 export async function upAll(ctx: CliContext, opts: { only?: "hub" | "supervisor" } = {}): Promise<{ hub: { started: boolean; pid: number } | null; supervisor: { started: boolean; pid: number } | null }> {
   const h = ctx.hubdir();
   ensureRuntime(h);
+  const binding = nativeBindingProblem();
+  if (binding) throw new CliError(3, binding.message, binding.hint);
   const ui = ctx.ui;
   let hub: { started: boolean; pid: number } | null = null;
   let supervisor: { started: boolean; pid: number } | null = null;
@@ -206,6 +210,7 @@ export async function collectStatus(ctx: CliContext): Promise<Record<string, unk
       model: p.def.model ?? "inherit",
       room: (p.def.rooms ?? [])[0]?.room ?? member?.room ?? null,
       offers: (p.def.offers ?? []).map((o) => o.id),
+      mode: effectiveMode(p.def),
       definition: p.definitionHash.slice(7, 15),
       supervisor: supFile?.agents?.[p.name] ?? null,
       heartbeat_age_ms: hbAge,

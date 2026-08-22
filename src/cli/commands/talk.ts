@@ -7,8 +7,9 @@ import { roomsStore, type HubDir, type RoomRecord } from "../../hubdir.js";
 import { packageVersion } from "../../pkg.js";
 import { CliError, type CliContext } from "../context.js";
 import { openHubCall } from "../hubaccess.js";
+import { askLine, pickOne } from "../prompts.js";
 import type { CommandDef } from "../router.js";
-import { fmtAge } from "../ui.js";
+import { fmtAge, fmtDuration } from "../ui.js";
 import { requireRoom } from "./room.js";
 
 const clientInfo = () => ({ name: "rfa-cli", version: packageVersion() });
@@ -53,8 +54,7 @@ export const ask: CommandDef = {
   examples: ['rfa ask "how do presence leases work?"', 'rfa ask --room product --capability draft-linear-document "draft an expression de besoin from: …"'],
   run: async (ctx, a) => {
     const h = ctx.hubdir();
-    const question = a.positionals.join(" ").trim();
-    if (!question) throw new CliError(2, 'rfa ask "<question>"');
+    const question = a.positionals.join(" ").trim() || (await askLine(ctx, "Your question", 'rfa ask "<question>"', { placeholder: "how do presence leases work?" }));
     if (!(await ctx.healthz())) throw new CliError(3, `the hub at ${ctx.hubUrl()} is not answering`, "rfa up");
     const rec = requireRoom(h, a.values.room as string | undefined, true);
     const timeoutS = Number(a.values.timeout ?? 1800);
@@ -64,7 +64,10 @@ export const ask: CommandDef = {
       const candidates = answerers(roster, me.memberId);
       const offered = [...new Set(candidates.flatMap((r) => r.card_summary.skill_ids))];
       const explicit = a.values.capability as string | undefined;
-      const capability = explicit ?? (offered.length === 1 ? offered[0] : null);
+      let capability = explicit ?? (offered.length === 1 ? offered[0] : null);
+      if (!capability && offered.length > 1 && ctx.interactive) {
+        capability = await pickOne(ctx, `${rec.alias} offers ${offered.length} capabilities`, offered.map((c) => ({ value: c, hint: candidates.filter((r) => r.card_summary.skill_ids.includes(c)).map((r) => r.name).join(", ") })), "rfa ask --capability <id>");
+      }
       if (!capability) {
         if (offered.length === 0) throw new CliError(3, `nobody in ${rec.alias} is present to answer`, candidates.length ? "" : "rfa status shows whether the agents are up");
         throw new CliError(2, `${rec.alias} offers ${offered.length} capabilities: ${describeOffers(candidates, offered)}`, "pick one with --capability <id>");
@@ -74,7 +77,27 @@ export const ask: CommandDef = {
       if (!target) throw new CliError(3, `nobody in ${rec.alias} offers ${capability}`, `present: ${candidates.map((r) => `${r.name} [${r.card_summary.skill_ids.join(",")}]`).join(" · ") || "nobody"}`);
       const sp = ctx.ui.spinner(`asking ${target.name} (${capability}, ${target.state})`);
       const t0 = Date.now();
-      const answer = await me.ask(target.id, question, { timeoutMs: timeoutS * 1000 });
+      // A tool user that calls a gated tool pauses on a card and waits for a
+      // human; from here that looked like a silent four minutes. Poll the
+      // cards while waiting and say so, with the command that unblocks it.
+      const watch = ctx.humanKey()
+        ? setInterval(() => {
+            void ctx
+              .workbench<Card[]>("/api/approvals")
+              .then((cards) => {
+                const mine = cards.find((c) => c.status === "pending" && c.requester_name === target.name && c.room === rec.handle);
+                if (mine) sp.update(`${target.name} is waiting for YOUR decision on "${mine.action}": rfa approvals approve ${mine.request_id}  (or rfa, tab 4, y)`);
+              })
+              .catch(() => {});
+          }, 3000)
+        : null;
+      watch?.unref?.();
+      let answer;
+      try {
+        answer = await me.ask(target.id, question, { timeoutMs: timeoutS * 1000 });
+      } finally {
+        if (watch) clearInterval(watch);
+      }
       const meta = answer.parts.find((p) => p.type === "json")?.value as { cost_usd?: number; run_id?: string } | undefined;
       const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
       sp.stop({ ok: answer.kind === "response", text: answer.kind === "response" ? `${target.name} answered` : `${target.name} refused: ${answer.refusal?.reason ?? "?"}${answer.refusal?.detail ? ` (${answer.refusal.detail})` : ""}`, detail: `${elapsed}s${meta?.cost_usd != null ? ` · $${meta.cost_usd}` : ""}${meta?.run_id ? ` · ${meta.run_id}` : ""}` });
@@ -244,7 +267,7 @@ export const approvalsLs: CommandDef = {
     const aliases = new Map(roomsStore(h).read().rooms.map((r) => [r.handle, r.alias]));
     if (ctx.flags.json) return void ctx.ui.json(list);
     if (list.length === 0) return void ctx.ui.note("nothing pending");
-    ctx.ui.table(list.map((c) => [c.status === "pending" ? ctx.ui.caution("●") : ctx.ui.dim("○"), c.request_id, aliases.get(c.room) ?? c.room, `${c.requester_name} (${c.requester_home})`, c.action, ctx.ui.dim(c.tool_name), c.expires_at ? `expires ${fmtAge(c.expires_at).replace(" ago", "")}` : "", c.held ? ctx.ui.caution("held") : ""]));
+    ctx.ui.table(list.map((c) => [c.status === "pending" ? ctx.ui.caution("●") : ctx.ui.dim("○"), c.request_id, aliases.get(c.room) ?? c.room, `${c.requester_name} (${c.requester_home})`, c.action, ctx.ui.dim(c.tool_name), c.expires_at ? (Date.parse(c.expires_at) > Date.now() ? `expires in ${fmtDuration(Date.parse(c.expires_at) - Date.now())}` : `expired ${fmtAge(c.expires_at)}`) : "", c.held ? ctx.ui.caution("held") : ""]));
     ctx.ui.note("rfa approvals show <id> for the preview; rfa approvals approve|reject <id>");
   },
 };
@@ -283,8 +306,7 @@ const decide = (verb: "approve" | "reject"): CommandDef => ({
   options: verb === "approve" ? { edit: { type: "string", multiple: true } } : { reason: { type: "string" } },
   why: "A decision lands as a human-origin intervention carrying your principal id, exactly as the console's does (same POST /auth, same per-principal membership): the CLI on the operator's machine is the console's equal, which is why v0.5 sect. 17.2's 'sole verdict surface' was amended to include it. Notifications over broadcast channels still carry no button.",
   run: async (ctx, a) => {
-    const id = a.positionals[0];
-    if (!id) throw new CliError(2, `rfa approvals ${verb} <request_id>`);
+    const id = a.positionals[0] ?? (await pickOne(ctx, `Which card to ${verb}?`, (await cards(ctx)).filter((c) => c.status === "pending").map((c) => ({ value: c.request_id, hint: `${c.action} from ${c.requester_name} in ${c.room}` })), `rfa approvals ${verb} <request_id>`));
     const c = (await cards(ctx)).find((x) => x.request_id === id);
     if (!c) throw new CliError(2, `no card ${id}`, "rfa approvals ls");
     if (c.status !== "pending") throw new CliError(2, `card ${id} is ${c.status}`);

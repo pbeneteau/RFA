@@ -20,6 +20,7 @@ import { CLONE_SUFFIX, cloneNameFor, countDocs, fileProvenance, isGitRemote, kno
 import { describeReport, expandLogTargets, verifyLogFile, type LogReport } from "../../logverify.js";
 import { addKnowledge } from "../agentmd.js";
 import { CliError } from "../context.js";
+import { askLine, pickOne } from "../prompts.js";
 import type { CommandDef } from "../router.js";
 import { daemonEnv } from "./procs.js";
 import { requireRoom } from "./room.js";
@@ -46,8 +47,9 @@ export const knowledgeAdd: CommandDef = {
   examples: ["rfa knowledge add pm-agent ./docs", "rfa knowledge add pm-agent git@gitlab.example.com:org/handbook.git --docs src/content/docs"],
   run: async (ctx, a) => {
     const h = ctx.hubdir();
-    const [name, source] = a.positionals;
-    if (!name || !source) throw new CliError(2, "rfa knowledge add <agent> <path|git remote>");
+    const usage = "rfa knowledge add <agent> <path|git remote>";
+    const name = a.positionals[0] ?? (await pickOne(ctx, "Which agent?", listPacks(h.paths.agents).map((p) => ({ value: p.name })), usage));
+    const source = a.positionals[1] ?? (await askLine(ctx, "A folder of markdown, or a git remote", usage, { placeholder: "./docs  or  git@host:org/handbook.git" }));
     const pack = requirePack(h, name);
     const file = path.join(pack.dir, "agent.md");
     let globs: string[];

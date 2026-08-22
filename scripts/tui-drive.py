@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""
+Drive the front door inside a real pseudo-terminal (RFA-0.7 sect. 13.7).
+
+The unit tests render components headless; this is the other half: `rfa` in an
+actual pty, keys sent on a schedule, the painted screen read back. It found the
+bug no headless test could (a select that only fired on CHANGE left the
+onboarding stuck on its own default). Python's stdlib has a pty; Node's does
+not, which is why the one non-TypeScript file in scripts/ is this one.
+
+  python3 scripts/tui-drive.py --smoke        both scenarios against temp directories, exit 1 on a miss
+  python3 scripts/tui-drive.py <dir> dashboard '[[1500,"2"],[600,"q"]]'
+  python3 scripts/tui-drive.py <dir> init '[[1500,"<CR>"],...]'
+
+Keys are JSON pairs of [delay_ms, text]; <CR>, <ESC> and <C-c> stand for the
+control bytes. The CLI runs from this checkout through tsx.
+"""
+import fcntl
+import json
+import os
+import pty
+import re
+import select
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CLI = os.path.join(ROOT, "src", "cli", "main.ts")
+TSX = subprocess.check_output(["node", "-p", 'require.resolve("tsx",{paths:[process.argv[1]]})', ROOT], text=True).strip()
+COLS, ROWS = 120, 38
+
+
+def drive(target, script, keys, extra_args=(), tail=60, quiet=False):
+    argv = ["node", "--import", TSX, CLI, "--dir", target] + list(script) + list(extra_args)
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ["TERM"] = "xterm-256color"
+        os.environ["COLUMNS"] = str(COLS)
+        os.environ["LINES"] = str(ROWS)
+        os.execvp(argv[0], argv)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
+    out = b""
+    t0 = time.time()
+    i = 0
+    due = t0 + keys[0][0] / 1000 if keys else None
+    deadline = t0 + sum(k[0] for k in keys) / 1000 + 6
+    alive = True
+    while time.time() < deadline and alive:
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if r:
+            try:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    alive = False
+                out += chunk
+            except OSError:
+                alive = False
+        if due and time.time() >= due:
+            k = keys[i][1].replace("<ESC>", "\x1b").replace("<CR>", "\r").replace("<C-c>", "\x03")
+            os.write(fd, k.encode())
+            i += 1
+            due = time.time() + keys[i][0] / 1000 if i < len(keys) else None
+        try:
+            wpid, _ = os.waitpid(pid, os.WNOHANG)
+            if wpid == pid:
+                alive = False
+        except ChildProcessError:
+            alive = False
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except Exception:
+        pass
+    text = out.decode("utf8", "replace")
+    plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
+    plain = re.sub(r"\x1b\][^\x07]*\x07", "", plain)
+    plain = re.sub(r"\x1b[()][A-Z0-9]", "", plain)
+    lines = [l.rstrip() for l in plain.split("\n") if l.strip()]
+    if not quiet:
+        print(f"bytes={len(out)} nonblank_lines={len(lines)} exited={'yes' if not alive else 'killed'}")
+        print("--- tail of what was painted ---")
+        print("\n".join(lines[-tail:]))
+    return plain
+
+
+def headless(target, *args):
+    return subprocess.run(["node", "--import", TSX, CLI, "--dir", target, *args], capture_output=True, text=True, timeout=120)
+
+
+def free_port():
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+def smoke():
+    failures = []
+    base = tempfile.mkdtemp(prefix="rfa-tui-smoke-")
+    try:
+        # 1. the dashboard over a provisioned directory with nothing running
+        d = os.path.join(base, "dash")
+        os.makedirs(d)
+        r = headless(d, "init", "--yes", "--no-start", "--name", "smoke", "--port", str(free_port()), "--human", "paul", "--agent", "spec-expert", "--room", "protocol", "--json")
+        if r.returncode != 0:
+            failures.append(f"headless init failed: {r.stderr[-400:]}")
+        painted = drive(d, ["dashboard"], [[1800, "2"], [600, "3"], [600, "4"], [600, "5"], [600, "1"], [600, "?"], [600, " "], [600, ":"], [700, "agent re"], [900, "<ESC>"], [600, "q"]], quiet=True)
+        for want in ["1 Overview", "2 Agents", "3 Rooms", "4 Approvals", "5 Feed", "spec-expert", "protocol", "not running · press u", "keys", "runs: rfa agent restart <name>", "pending approvals", "feed ·"]:
+            if want not in painted:
+                failures.append(f"dashboard never painted: {want!r}")
+        # 2. the onboarding with every default and 'not yet' for the start
+        o = os.path.join(base, "onboard")
+        os.makedirs(o)
+        painted = drive(o, ["init"], [[1800, "<CR>"], [900, "<CR>"], [900, "<CR>"], [900, "<CR>"], [900, "<CR>"], [900, "<CR>"], [900, "<CR>"], [900, "<CR>"], [900, "j"], [500, "<CR>"], [7000, "q"]], extra_args=["--port", str(free_port())], quiet=True)
+        for want in ["Rooms for Agents", "Run a hub here", "Name this hub", "Your name", "Your first agent?", "A room for it", "Start the hub and the supervisor now?", "rfa.json", "human principal", "your hub directory is ready", "Your human key, shown once"]:
+            if want not in painted:
+                failures.append(f"onboarding never painted: {want!r}")
+        for f in ["rfa.json", ".rfa/secrets.json", ".rfa/rooms.json", "agents/spec-expert/agent.md", "policies/gate.json"]:
+            if not os.path.exists(os.path.join(o, f)):
+                failures.append(f"onboarding did not write {f}")
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    if failures:
+        print("TUI SMOKE FAIL")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print("TUI SMOKE PASS: dashboard (5 tabs, help, palette) and onboarding (defaults, provisioning, done screen) painted what they should")
+    return 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--smoke":
+        sys.exit(smoke())
+    if len(sys.argv) < 4:
+        print(__doc__)
+        sys.exit(2)
+    target, script, keys = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+    extra = sys.argv[4:]
+    drive(target, [script] if script != "bare" else [], keys, extra_args=extra)

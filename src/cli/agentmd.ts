@@ -1,5 +1,5 @@
 /**
- * Editing the two blocks of agent.md the CLI owns: `rooms:` and `knowledge:`.
+ * Editing what the CLI owns in agent.md: the `rooms:` and `knowledge:` blocks, and the `mode:` line.
  *
  * The file is the operator's; the CLI rewrites only the block it is asked to,
  * keeps every other line byte for byte, and validates the result through the
@@ -88,4 +88,29 @@ export function addKnowledge(file: string, globs: string[]): { before: string; a
   const after = parseAgentMd(next).definitionHash;
   if (after !== parsed.definitionHash) fs.writeFileSync(file, next);
   return { before: parsed.definitionHash, after, knowledge: merged };
+}
+
+/** Replace (or add, before `sandbox:` or at the end) one top-level scalar line of the frontmatter. */
+export function setTopScalar(text: string, key: string, line: string): string {
+  const m = FRONTMATTER.exec(text);
+  if (!m) throw new Error("agent.md must start with a YAML frontmatter block (--- ... ---)");
+  const lines = m[2].split("\n");
+  const at = lines.findIndex((l) => new RegExp(`^${key}:`).test(l));
+  if (at >= 0) lines[at] = line;
+  else {
+    const before = lines.findIndex((l) => /^sandbox:/.test(l));
+    if (before >= 0) lines.splice(before, 0, line);
+    else lines.push(line);
+  }
+  return `${m[1]}${lines.join("\n")}${m[3]}${m[4]}`;
+}
+
+/** Set a pack's mode in its agent.md, validated before the write. */
+export function setAgentMode(file: string, mode: "ask" | "plan" | "auto" | "bypass"): { before: string; after: string } {
+  const text = fs.readFileSync(file, "utf8");
+  const before = parseAgentMd(text).definitionHash;
+  const next = setTopScalar(text, "mode", `mode: ${mode}   # ask: cards for every acting tool · plan: proposes, never acts · auto: the SDK's classifier decides · bypass: acts without asking`);
+  const after = parseAgentMd(next).definitionHash;
+  if (after !== before) fs.writeFileSync(file, next);
+  return { before, after };
 }
