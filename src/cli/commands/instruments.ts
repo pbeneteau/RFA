@@ -23,7 +23,7 @@ import { CliError } from "../context.js";
 import type { CommandDef } from "../router.js";
 import { daemonEnv } from "./procs.js";
 import { requireRoom } from "./room.js";
-import { speaker } from "./talk.js";
+import { describeOffers, speaker } from "./talk.js";
 import { knowledgeRelativeToPack } from "../scaffold.js";
 
 function requirePack(h: HubDir, name: string | undefined): AgentPack {
@@ -354,7 +354,7 @@ export const evalsParity: CommandDef = {
       const candidates = roster.filter((r) => r.id !== me.memberId && r.role === "participant" && r.state !== "offline");
       const offered = [...new Set(candidates.flatMap((r) => r.card_summary.skill_ids))];
       const capability = (a.values.capability as string | undefined) ?? (offered.length === 1 ? offered[0] : offered.find((s) => /answer/.test(s)));
-      if (!capability) throw new CliError(offered.length ? 2 : 3, offered.length ? `${rec.alias} offers ${offered.length} capabilities: ${offered.join(", ")}` : `nobody in ${rec.alias} is present to answer`, offered.length ? "pick one with --capability" : "rfa status");
+      if (!capability) throw new CliError(offered.length ? 2 : 3, offered.length ? `${rec.alias} offers ${offered.length} capabilities: ${describeOffers(candidates, offered)}` : `nobody in ${rec.alias} is present to answer`, offered.length ? "pick one with --capability <id>" : "rfa status");
       const eligible = candidates.filter((r) => r.card_summary.skill_ids.includes(capability));
       const target = eligible.find((r) => r.state === "ready") ?? eligible[0];
       if (!target) throw new CliError(3, `nobody in ${rec.alias} offers ${capability}`);

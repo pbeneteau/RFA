@@ -39,6 +39,11 @@ type RosterEntry = { id: string; name: string; role: string; state: string; card
 /** Members this CLI could get an answer from: other participants whose lease has not expired. */
 const answerers = (roster: RosterEntry[], selfId: string) => roster.filter((r) => r.id !== selfId && r.role === "participant" && r.state !== "offline");
 
+/** `answer-product-question (pm-agent), draft-linear-document (linear-scribe)`: the choice --capability makes, with who is behind each. */
+export function describeOffers(candidates: { name: string; card_summary: { skill_ids: string[] } }[], offered: string[]): string {
+  return offered.map((c) => `${c} (${candidates.filter((r) => r.card_summary.skill_ids.includes(c)).map((r) => r.name).join(", ")})`).join(", ");
+}
+
 export const ask: CommandDef = {
   path: ["ask"],
   summary: "Ask an agent by capability, as a human principal, and wait for the answer",
@@ -62,7 +67,7 @@ export const ask: CommandDef = {
       const capability = explicit ?? (offered.length === 1 ? offered[0] : null);
       if (!capability) {
         if (offered.length === 0) throw new CliError(3, `nobody in ${rec.alias} is present to answer`, candidates.length ? "" : "rfa status shows whether the agents are up");
-        throw new CliError(2, `${rec.alias} offers ${offered.length} capabilities: ${offered.join(", ")}`, "pick one with --capability");
+        throw new CliError(2, `${rec.alias} offers ${offered.length} capabilities: ${describeOffers(candidates, offered)}`, "pick one with --capability <id>");
       }
       const eligible = candidates.filter((r) => r.card_summary.skill_ids.includes(capability));
       const target = eligible.find((r) => r.state === "ready") ?? eligible[0];
