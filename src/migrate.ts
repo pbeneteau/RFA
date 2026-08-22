@@ -15,6 +15,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { tokenDigest } from "./credentials.js";
+import { packageFile } from "./pkg.js";
 import {
   defaultManifest,
   detectLegacyLayout,
@@ -152,6 +153,11 @@ export function planMigration(legacyRoot: string, target: string, opts: Migratio
   if (exists(legacy.gate)) {
     if (inPlace) steps.push({ kind: "copy", from: legacy.gate, to: p.gate!, detail: `copy ${rel(legacy.gate)} -> ${tgt(p.gate!)} (the old checkout's deploy/ is not touched; 0.7 ships no deploy/ and rfa service replaces it)` });
     else move(legacy.gate, p.gate!, "policy gate");
+  } else if (p.gate) {
+    // A checkout that pulled 0.7 before migrating has no deploy/ any more (the
+    // first live migration hit exactly this): the hub refuses to start without
+    // a gate, so the packaged default goes in, the same file rfa init writes.
+    steps.push({ kind: "copy", from: packageFile("templates", "gate.json"), to: p.gate, detail: `write the default policy gate -> ${tgt(p.gate)} (no deploy/gate.json in the checkout; this is the file rfa init writes)` });
   }
   if (!inPlace) {
     if (exists(legacy.agents)) move(legacy.agents, p.agents, "agent packs, state included, so every resident resumes its membership");

@@ -34,8 +34,12 @@ export async function runChecks(ctx: CliContext, opts: { deep?: boolean } = {}):
   const major = Number(process.versions.node.split(".")[0]);
   checks.push(major >= 22 ? ok("node", `node ${process.version}`) : fail("node", `node ${process.version} is below 22`, "Node 20 reached end of life in April 2026; install 22 or newer"));
   try {
-    await import("better-sqlite3");
-    checks.push(ok("sqlite", "better-sqlite3 loads (native binding present)"));
+    // Importing the wrapper proves nothing: the native binding is loaded when a
+    // database opens, and a binding built for another Node version fails there
+    // (seen live: "ok" here, then every store unreadable under NODE_MODULE_VERSION 137).
+    const { default: Database } = await import("better-sqlite3");
+    new Database(":memory:").close();
+    checks.push(ok("sqlite", `better-sqlite3 opens a database under node ${process.version}`));
   } catch (err) {
     checks.push(fail("sqlite", `better-sqlite3 does not load: ${(err as Error).message.split("\n")[0]}`, "npm rebuild better-sqlite3, or reinstall the package for this node version"));
   }
@@ -89,7 +93,7 @@ export async function runChecks(ctx: CliContext, opts: { deep?: boolean } = {}):
 
   // The gate.
   if (h.paths.gate) {
-    if (!fs.existsSync(h.paths.gate)) checks.push(fail("gate", `policy gate ${path.relative(h.root, h.paths.gate)} is missing; the hub refuses to start without it`, "rfa init writes the default; or set hub.gate to null in rfa.json"));
+    if (!fs.existsSync(h.paths.gate)) checks.push(fail("gate", `policy gate ${path.relative(h.root, h.paths.gate)} is missing; the hub refuses to start without it`, "rfa init --yes re-run writes the missing default (it rotates nothing); or set hub.gate to null in rfa.json"));
     else {
       try {
         const g = JSON.parse(fs.readFileSync(h.paths.gate, "utf8"));

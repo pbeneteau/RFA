@@ -166,3 +166,19 @@ test("apply is re-runnable: a second run skips what already moved and refuses an
   applyMigration(planMigration(legacy, target, { name: "acme" }));
   assert.throws(() => planMigration(legacy, target, { name: "acme" }), /already holds rfa.json/);
 });
+
+test("a checkout that pulled 0.7 before migrating (no deploy/gate.json) still gets a gate: the packaged default", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-migrate-nogate-"));
+  const root = path.join(dir, "checkout");
+  fs.mkdirSync(path.join(root, "data"), { recursive: true });
+  fs.writeFileSync(path.join(root, "data", "secrets.json"), JSON.stringify({ RFA_TOKEN: "tok_operator_000000000000" }));
+  const target = path.join(dir, "instance");
+  const plan = planMigration(root, target, { name: "nogate", port: 48999 });
+  const gateStep = plan.steps.find((s) => /default policy gate/.test(s.detail));
+  assert.ok(gateStep, "the plan says where the gate comes from");
+  applyMigration(plan);
+  const written = path.join(target, "policies", "gate.json");
+  assert.ok(fs.existsSync(written), "policies/gate.json exists, so rfa up does not refuse to start");
+  assert.equal(fs.readFileSync(written, "utf8"), fs.readFileSync(path.resolve(import.meta.dirname, "..", "templates", "gate.json"), "utf8"), "byte for byte the file rfa init writes");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
