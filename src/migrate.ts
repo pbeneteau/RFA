@@ -14,6 +14,7 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { parseAgentMd } from "./agentdef.js";
 import { tokenDigest } from "./credentials.js";
 import { packageFile } from "./pkg.js";
 import {
@@ -36,7 +37,9 @@ import {
 import { principalRecordFor } from "./principals.js";
 
 export interface MigrationStep {
-  kind: "move" | "copy" | "write" | "record" | "note";
+  kind: "move" | "copy" | "write" | "record" | "note" | "rewrite";
+  /** For `rewrite`: the knowledge globs of one agent.md that point outside the pack, and their absolute form. */
+  rewrites?: { from: string; to: string }[];
   from?: string;
   to?: string;
   detail: string;
@@ -162,6 +165,38 @@ export function planMigration(legacyRoot: string, target: string, opts: Migratio
   if (!inPlace) {
     if (exists(legacy.agents)) move(legacy.agents, p.agents, "agent packs, state included, so every resident resumes its membership");
     if (exists(legacy.evals)) move(legacy.evals, p.evals, "eval cases, baseline and rubric");
+    if (exists(legacy.agents)) {
+      // A pack that read the checkout's own files through `../../` (the PM pack
+      // read spec/RFA-0.1.md and README.md that way) would resolve those globs
+      // against its NEW parent after the move and silently read nothing: the
+      // first live migration dropped 2 of 38 knowledge files exactly so. Such
+      // globs become absolute paths into the checkout, which stays where it is.
+      for (const entry of fs.readdirSync(legacy.agents, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const file = path.join(legacy.agents, entry.name, "agent.md");
+        if (!fs.existsSync(file)) continue;
+        let globs: string[] = [];
+        try {
+          globs = parseAgentMd(fs.readFileSync(file, "utf8")).def.knowledge ?? [];
+        } catch {
+          warnings.push(`agents/${entry.name}/agent.md does not parse; its knowledge globs are moved as they are`);
+          continue;
+        }
+        const legacyPack = path.join(legacy.agents, entry.name);
+        const targetPack = path.join(p.agents, entry.name);
+        const rewrites = globs
+          .filter((g) => g.startsWith("../"))
+          .map((g) => {
+            const tail = g.slice(g.replace(/\*\*?.*$/, "").length);
+            const base = g.slice(0, g.length - tail.length);
+            return { from: g, to: path.resolve(legacyPack, base) + tail, probe: path.resolve(legacyPack, base), after: path.resolve(targetPack, base) };
+          })
+          .filter((r) => fs.existsSync(r.probe) && !fs.existsSync(r.after))
+          .map(({ from, to }) => ({ from, to }));
+        if (rewrites.length === 0) continue;
+        steps.push({ kind: "rewrite", to: path.join(targetPack, "agent.md"), rewrites, detail: `rewrite ${rewrites.length} knowledge glob(s) in agents/${entry.name}/agent.md that point outside the pack, so the move does not lose them: ${rewrites.map((r) => `${r.from} -> ${r.to}`).join(", ")}` });
+      }
+    }
     if (fs.existsSync(path.join(legacyRoot, ".git")) && (exists(legacy.agents) || exists(legacy.evals))) {
       afterwards.push("the checkout's tracked files under agents/ and evals/ (the example packs, the generic case, the rubric) now show as deleted in git: `git checkout -- agents evals` there restores them as the repository's examples; the instance has its own copies");
     }
@@ -182,6 +217,16 @@ export function planMigration(legacyRoot: string, target: string, opts: Migratio
   afterwards.push(`\`rfa room adopt <alias>\` for each recorded room (${[opts.roomAlias ?? "main", "ops"].join(", ")}) creates the operator's own admin membership and allows the operator bearer in it (join_bearer_sha256), after which residents need no join secret`);
   afterwards.push("`rfa log verify` (every room), then one `rfa ask`");
   return { legacy, target: targetRoot, inPlace, manifest, steps, warnings, afterwards, options: opts };
+}
+
+/** Replace knowledge list items in an agent.md frontmatter, quoted or bare, keeping every other byte. */
+export function rewriteKnowledgeGlobs(text: string, rewrites: { from: string; to: string }[]): string {
+  let out = text;
+  for (const r of rewrites) {
+    const escaped = r.from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    out = out.replace(new RegExp(`^(\\s*-\\s*)(["']?)${escaped}\\2(\\s*(?:#.*)?)$`, "gm"), (_m, lead: string, _q: string, tail: string) => `${lead}${JSON.stringify(r.to)}${tail}`);
+  }
+  return out;
 }
 
 /** Move across filesystems too: rename, and on EXDEV copy then remove. */
@@ -253,6 +298,21 @@ export function applyMigration(plan: MigrationPlan, opts: MigrationOptions = pla
       }
       fs.mkdirSync(path.dirname(step.to), { recursive: true });
       fs.copyFileSync(step.from, step.to);
+      done.push(step.detail);
+    } else if (step.kind === "rewrite" && step.to && step.rewrites) {
+      if (!fs.existsSync(step.to)) {
+        skipped.push(step.detail);
+        continue;
+      }
+      const text = fs.readFileSync(step.to, "utf8");
+      const next = rewriteKnowledgeGlobs(text, step.rewrites);
+      try {
+        parseAgentMd(next);
+      } catch (err) {
+        skipped.push(`${step.detail} (the rewritten agent.md would not parse: ${(err as Error).message.split("\n")[0]}; left as it was)`);
+        continue;
+      }
+      fs.writeFileSync(step.to, next);
       done.push(step.detail);
     }
   }

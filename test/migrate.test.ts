@@ -10,6 +10,7 @@ import * as path from "node:path";
 import { test } from "node:test";
 import { matchDigest } from "../src/credentials.js";
 import { loadHubDir, principalsStore, roomsStore, secretsStore, tokensStore } from "../src/hubdir.js";
+import { knowledgeFiles, loadPack } from "../src/agentdef.js";
 import { applyMigration, lockStatus, parseRoomMd, planMigration } from "../src/migrate.js";
 import { principalIdFor, PrincipalSet } from "../src/principals.js";
 
@@ -180,5 +181,32 @@ test("a checkout that pulled 0.7 before migrating (no deploy/gate.json) still ge
   const written = path.join(target, "policies", "gate.json");
   assert.ok(fs.existsSync(written), "policies/gate.json exists, so rfa up does not refuse to start");
   assert.equal(fs.readFileSync(written, "utf8"), fs.readFileSync(path.resolve(import.meta.dirname, "..", "templates", "gate.json"), "utf8"), "byte for byte the file rfa init writes");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("a pack that read the checkout through ../ keeps reading it after a --to move: those globs become absolute paths", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-migrate-globs-"));
+  const root = path.join(dir, "checkout");
+  const w = (rel: string, content: string) => {
+    fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+    fs.writeFileSync(path.join(root, rel), content);
+  };
+  w("data/secrets.json", JSON.stringify({ RFA_TOKEN: "tok_operator_000000000000" }));
+  w("spec/RFA-0.1.md", "# the wire\n");
+  w("README.md", "# readme\n");
+  w("agents/pm/knowledge/a.md", "# a\n");
+  w("agents/pm/agent.md", ['---', 'rfa_agent: 1', 'name: pm', 'description: d', 'knowledge:', '  - "knowledge/**/*.md"', '  - "../../spec/RFA-0.1.md"   # the spec, read from the checkout', '  - ../../README.md', '  - "../../nowhere/*.md"', '---', 'prompt', ''].join("\n"));
+  const target = path.join(dir, "instance");
+  const plan = planMigration(root, target, { name: "globs", port: 48998 });
+  const step = plan.steps.find((s) => s.kind === "rewrite");
+  assert.ok(step, "the plan names the rewrite");
+  assert.deepEqual(step.rewrites!.map((r) => r.from), ["../../spec/RFA-0.1.md", "../../README.md"], "only globs that resolve now and would not after the move; a dead glob is left alone");
+  applyMigration(plan);
+  const moved = fs.readFileSync(path.join(target, "agents", "pm", "agent.md"), "utf8");
+  assert.ok(moved.includes(`  - ${JSON.stringify(path.join(root, "spec", "RFA-0.1.md"))}   # the spec, read from the checkout`), "quoted item rewritten in place, comment kept");
+  assert.ok(moved.includes(`  - ${JSON.stringify(path.join(root, "README.md"))}`), "bare item rewritten too");
+  assert.ok(moved.includes('  - "knowledge/**/*.md"') && moved.includes('  - "../../nowhere/*.md"'), "everything else byte for byte");
+  const files = knowledgeFiles(loadPack(path.join(target, "agents", "pm")));
+  assert.deepEqual(files.map((f) => path.basename(f)).sort(), ["README.md", "RFA-0.1.md", "a.md"], "the pack reads the checkout's files from its new home");
   fs.rmSync(dir, { recursive: true, force: true });
 });
