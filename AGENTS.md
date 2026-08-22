@@ -1,80 +1,65 @@
-## Project Overview
+## Build & Run
 
-- The package is named `agent-com` and published under the Apache-2.0 license.
-- The package exposes two CLI binary names: `rfa` and `agent-com`, both pointing to `dist/cli/main.js`.
+- The project is compiled with TypeScript via the `build` script.
+- The CLI entry point is `src/cli/main.ts`, run in development via the `dev` script.
+- The hub server entry point is `src/main.ts`, run via the `start` script.
 - Node.js 22 or later is required.
+- Two CLI bin aliases are provided: `rfa` and `agent-com`, both pointing to `dist/cli/main.js`.
 
-## Build and Development Commands
+## Tests & Evaluations
 
-- Run `npm run build` (or `pnpm build`) to compile TypeScript via `tsc`.
-- Run `npm run dev` to start the CLI entry point without compiling, using `tsx src/cli/main.ts`.
-- Run `npm run start` to start the hub server via `tsx src/main.ts`.
-- Run `npm run supervisor` to start the supervisor process via `tsx src/supervisor.ts`.
+Unit tests, e2e scripts, and eval commands are each separate scripts.
 
-## Testing
-
-- Unit tests are run with `npm test`, which invokes `node --import tsx --test test/*.test.ts`.
-- End-to-end tests are run with `npm run e2e`, executing `scripts/e2e.ts`.
-- A fuller e2e suite is available via `npm run e2e:full`, passing `--full` to the same script.
-- Evals are run with `npm run evals`, which calls `tsx src/cli/main.ts evals run`.
-- Judged evals are run with `npm run evals:judged`, passing `--judged` to the evals runner.
-- The cold-start operator test (`npm run coldstart`) packs the checkout, installs it into a temp prefix, inits an empty folder, and asserts a real model answer, then tears down.
-- The `--keep` flag on the coldstart script retains the temp prefix and directory for inspection.
+- Unit tests are executed with `node --import tsx --test` over `test/*.test.ts`.
+- End-to-end tests are run via the `e2e` script (`scripts/e2e.ts`).
+- Evaluations are run through the CLI with `tsx src/cli/main.ts evals run`, aliased as the `evals` script.
+- Judged evaluations add `--judged` and are available as the `evals:judged` script.
+- Parity evaluation is available as the `parity` script.
+- The cold-start integration test (`scripts/coldstart.ts`) packs the checkout, installs the tarball globally into a temp prefix, and verifies a full init-ask-down cycle; it is not part of `npm test` and requires a model credential.
 
 ## Project Layout
 
-- CLI source lives under `src/cli/`.
-- Agent pack definitions live under `agents/`, with each agent in its own subdirectory containing `agent.md`.
-- Eval cases live under `evals/cases/`.
-- Spec documents live under `spec/`.
-- Research documents are organized under `research/` in numbered subdirectories.
-- Templates for new agents and commands are under `templates/`.
-- MCP interoperability definitions are in `interop/`.
-- The console (web UI) asset directory is `console/`.
-- Scripts for maintenance and one-time operations are in `scripts/`.
+- Agent pack definitions live under `agents/`, each in its own subdirectory containing an `agent.md` file.
+- CLI source files are under `src/cli/`.
+- Eval source files are under `src/evals/`.
+- Research notes are under `research/`, divided into numbered topic directories.
+- Specification files are in `spec/`.
+- Interoperability definitions are in `interop/`.
+- Agent and command templates are in `templates/`.
+- The web console asset is in `console/`.
+- Published package files include `dist`, `console`, `templates`, `interop`, `spec`, and `README.md`.
 
-## Agent Packs
+## Agent Pack Format
 
-- Each agent pack is a directory under `agents/<name>/` with an `agent.md` file containing YAML frontmatter (the definition) and a markdown body (the system prompt).
-- The `agentDefSchema` Zod schema is the single shared schema used by the resident runner, supervisor, and console editor.
-- `parseAgentMd` parses an agent.md string and throws with a precise message on invalid input.
-- `loadPack` loads a pack directory from disk.
-- `listPacks` enumerates all packs under an agents root, skipping directories without `agent.md`.
-- `deriveCard` derives the capability card from an agent pack, including the definition hash as a deployed-version marker.
-- A pack that serves a room as a participant must declare at least one entry in `offers`.
-- Fan-out (subagent) tools are opt-in and require `tools.allow_subagents: true` in the pack definition.
+- An agent pack is a directory under `agents/<name>/` whose `agent.md` begins with YAML frontmatter (the definition) followed by a markdown body used as the system prompt.
+- The frontmatter schema is `agentDefSchema`, validated with Zod.
+- The frontmatter must declare `rfa_agent: 1` as a literal field.
+- A pack that serves a room as participant must declare at least one entry in `offers`.
+- Sub-agent fan-out tools (`agent`, `task`) are deny-listed by default and require `tools.allow_subagents: true` in the definition.
+- The capability card is derived from the pack definition via `deriveCard`, including a `definition_hash` so roster entries rotate on any definition edit.
+- All secret names a pack requires are collected by `declaredSecretNames`, covering both `secrets` and per-MCP-server `env_secrets`/`bearer_secret`.
 
 ## Human-in-the-Loop Approval Bridge
 
-- `requestApproval` publishes an approval request for a pending tool call and blocks until a human decision, expiry, or timeout.
-- The approval sidekick membership is named `<residentName>-hitl` and joins as an observer role.
+- Tool calls matching an `interrupt_on` rule in the pack definition are routed through the approval bridge in `src/bridge.ts`.
+- The bridge uses a lazy observer sidekick membership named `<residentName>-hitl` to watch for decisions without consuming the main member's event cursor.
 - The default approval window when no `reply_by` is present is 30 minutes.
-- `interruptMatch` matches a tool name against `interrupt_on` keys, with trailing `*` acting as a prefix glob.
-- `refusalForOutcome` returns `deadline_expired` for clock-based denials and `declined` for human rejections.
+- Clock-expired approvals use the wire reason `deadline_expired`; human refusals use `declined`.
+- Tool names are matched against `interrupt_on` keys with trailing-`*` glob support via `interruptMatch`.
 
-## Hash-Chain Verification
+## Hash Chain Verification
 
-- `verifyChain` walks an event log in order, checking each event's `prev_hash` link and reporting all divergences.
-- Events predating the chain (no `prev_hash`) are counted as `unchainedPrefix` and skipped rather than treated as breaks.
-- The `CHAIN_SCOPE_QUALIFIER` constant states that chain verification only proves no party other than the hub rewrote the log.
-- `genesisFor` computes the genesis link as the hex SHA-256 of the room handle.
-
-## agent.md Editing Conventions
-
-- `bindPack` rewrites only the `rooms:` block of an agent.md file, validates the result through the pack schema before writing, and returns definition hashes before and after.
-- `addKnowledge` merges new globs into the `knowledge:` block, deduplicates them, and validates before writing.
-- `setTopBlock` replaces or adds one top-level YAML block in agent.md frontmatter without touching any other lines.
+- Offline chain verification is implemented in `src/chain.ts` as a pure function over a pre-parsed event array.
+- Each event's link is JCS-SHA256 over its stored form; for redacted events the `content_hash` field is used instead of recomputing.
+- The `wrapped` field is stripped before hashing; no other fields are excluded.
+- Events with no `prev_hash` (written before chain support shipped in 0.1.7) are counted as an `unchainedPrefix` rather than treated as breaks.
+- A normative scope qualifier string is exported as `CHAIN_SCOPE_QUALIFIER`, stating that the chain only proves non-hub parties did not rewrite the log.
 
 ## Key Dependencies
 
-- The Anthropic Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`) is a runtime dependency.
-- MCP client and server packages (`@modelcontextprotocol/client`, `@modelcontextprotocol/server`, `@modelcontextprotocol/sdk`) are runtime dependencies.
-- `better-sqlite3` is used for local SQLite storage (e.g., the observability store).
-- `zod` is used for schema validation throughout the project.
-- `tsx` is the dev-time TypeScript runner used in all `npm run` scripts that don't compile first.
-
-## Maintenance Scripts
-
-- `scripts/repair-obs-cost.ts` is a one-time repair script for observability rows whose `cost_usd` was incorrectly set to a day ledger total; it requires `--apply` to write changes.
-- `scripts/watchdog-replay.ts` replays watchdog invariants against room logs and the observability store, and refuses to bless any invariant until the log corpus is at least 14 days.
-- `scripts/demo-push.ts` demonstrates zero-polling push delivery over a real stdio MCP transport.
+- The Anthropic Claude Agent SDK is used as the agent runtime.
+- MCP client and server packages from `@modelcontextprotocol` are used for the tool protocol.
+- SQLite persistence is provided by `better-sqlite3`.
+- Cron scheduling is handled by `croner`.
+- YAML frontmatter parsing uses the `yaml` package.
+- Schema validation uses `zod`.
