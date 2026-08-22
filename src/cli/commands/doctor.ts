@@ -162,7 +162,7 @@ export async function runChecks(ctx: CliContext, opts: { deep?: boolean } = {}):
         if (!fs.existsSync(meta)) continue;
         const m = JSON.parse(fs.readFileSync(meta, "utf8")) as { policies?: { join_bearer_sha256?: string[] }; ended?: boolean };
         if (m.ended) continue;
-        checks.push((m.policies?.join_bearer_sha256 ?? []).includes(digest) ? ok(`room-${r.alias}`, `room ${r.alias} admits the operator bearer`) : warn(`room-${r.alias}`, `room ${r.alias} (${r.handle}) does not list the operator bearer: residents need its join secret`, `rfa room allow ${r.alias} --token operator`));
+        checks.push((m.policies?.join_bearer_sha256 ?? []).includes(digest) ? ok(`room-${r.alias}`, `room ${r.alias} admits the operator bearer`) : warn(`room-${r.alias}`, `room ${r.alias} (${r.handle}) does not list the operator bearer: residents need its join secret`, r.operator ? `rfa room allow ${r.alias} --token operator` : `rfa room adopt ${r.alias} (no operator membership yet: adopting joins as supervisor and admits the bearer)`));
       }
     }
   } catch {

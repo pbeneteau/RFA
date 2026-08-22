@@ -371,14 +371,18 @@ export const roomEnd: CommandDef = {
 export const roomAdopt: CommandDef = {
   path: ["room", "adopt"],
   summary: "Record a room this CLI did not create, joining it as the operator (supervisor)",
-  usage: "<handle> [--alias <alias>] [--secret <join secret>] [--no-allow]",
+  usage: "<alias|handle> [--alias <alias>] [--secret <join secret>] [--no-allow]",
   options: { alias: { type: "string" }, secret: { type: "string" }, allow: { type: "boolean", default: true } },
-  why: "After a migration, or for a room a pack created on its own, the operator needs an admin membership in it. This joins as a human supervisor and, unless --no-allow, admits the operator bearer so residents can join without the secret.",
+  why: "After a migration (rooms recorded without an operator membership), or for a room a pack created on its own, the operator needs an admin membership in it. This joins as a human supervisor and, unless --no-allow, admits the operator bearer so residents can join without the secret. A recorded room is named by its alias; a room nobody recorded yet by its handle.",
+  examples: ["rfa room adopt product", "rfa room adopt r_9a25e48c0e --alias product --secret <join secret>"],
   run: async (ctx, a) => {
     const h = ctx.hubdir();
-    const handle = a.positionals[0];
-    if (!handle || !/^r_[a-f0-9]+$/.test(handle)) throw new CliError(2, "rfa room adopt <handle r_…>");
     const file = roomsStore(h).read();
+    const ref = a.positionals[0];
+    if (!ref) throw new CliError(2, "rfa room adopt <alias|handle>");
+    // An alias names a recorded room; a handle may name one nobody recorded yet.
+    const handle = /^r_[a-f0-9]+$/.test(ref) ? ref : findRoom(file, ref)?.handle;
+    if (!handle) throw new CliError(2, `no recorded room named ${ref}`, "rfa room ls; a room not recorded yet is adopted by its handle r_…");
     const existing = file.rooms.find((r) => r.handle === handle);
     if (existing?.operator) throw new CliError(2, `${handle} is already recorded as ${existing.alias} with an operator membership`);
     const alias = (a.values.alias as string | undefined) ?? existing?.alias ?? `room-${handle.slice(2, 8)}`;

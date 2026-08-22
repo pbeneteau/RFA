@@ -179,7 +179,7 @@ export function planMigration(legacyRoot: string, target: string, opts: Migratio
     afterwards.push("launchd agents com.rfa.hub and com.rfa.supervisor still point at the old checkout: `launchctl bootout gui/$(id -u)/com.rfa.hub` and `.../com.rfa.supervisor`, then `rfa service install`");
   }
   afterwards.push("`rfa up`, then `rfa status` until every resident shows ready (they resume their memberships; the epoch does not bump)");
-  afterwards.push("`rfa room adopt` for each recorded room creates the operator's own admin membership and allows the operator bearer in it (join_bearer_sha256), after which residents need no join secret");
+  afterwards.push(`\`rfa room adopt <alias>\` for each recorded room (${[opts.roomAlias ?? "main", "ops"].join(", ")}) creates the operator's own admin membership and allows the operator bearer in it (join_bearer_sha256), after which residents need no join secret`);
   afterwards.push("`rfa log verify` (every room), then one `rfa ask`");
   return { legacy, target: targetRoot, inPlace, manifest, steps, warnings, afterwards, options: opts };
 }

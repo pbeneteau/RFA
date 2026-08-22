@@ -275,3 +275,35 @@ test("connect and peer: a client bearer is minted, admitted by hash, printed onc
   assert.ok(expose.stdout.includes("tailscale serve --bg --https=443"), "the dry run prints the commands and changes nothing");
   assert.equal(loadHubDir(dir).manifest.hub && "port" in loadHubDir(dir).manifest.hub ? (loadHubDir(dir).manifest.hub as { public_url: string | null }).public_url : null, null);
 });
+
+test("room adopt by alias: a recorded room without an operator membership (the migration's case) gets one, as supervisor, and the operator bearer is admitted", async () => {
+  const created = await rfa(["room", "create", "adoptme", "--topic", "recorded without an operator, like after rfa migrate", "--json"]);
+  assert.equal(created.code, 0, created.stderr);
+  const handle = json<{ handle: string }>(created).handle;
+  // What the migration leaves behind: the record, the secret, no operator membership.
+  roomsStore(h).update((f) => {
+    const rec = f.rooms.find((r) => r.alias === "adoptme")!;
+    rec.operator = null;
+  });
+  const refused = await rfa(["room", "allow", "adoptme", "--token", "operator"]);
+  assert.equal(refused.code, 3, "an admin verb without an operator membership is refused and names adopt");
+  assert.match(refused.stderr, /rfa room adopt/);
+
+  const adopted = await rfa(["room", "adopt", "adoptme"]);
+  assert.equal(adopted.code, 0, adopted.stderr);
+  assert.match(adopted.stdout, /adopted r_[a-f0-9]+ as adoptme/);
+  const rec = roomsStore(h).read().rooms.find((r) => r.alias === "adoptme")!;
+  assert.equal(rec.handle, handle);
+  assert.equal(rec.operator?.role, "supervisor", "the operator joined as a human supervisor");
+  const shown = await rfa(["room", "show", "adoptme", "--json"]);
+  assert.equal(shown.code, 0, shown.stderr);
+  const view = json<{ policies: { join_bearer_sha256?: string[] } | null }>(shown);
+  const digest = tokensStore(h).read().tokens.find((t) => t.kind === "operator")!.sha256;
+  assert.ok(view.policies?.join_bearer_sha256?.includes(digest), "the operator bearer is admitted by hash, so residents need no join secret");
+
+  const twice = await rfa(["room", "adopt", "adoptme"]);
+  assert.equal(twice.code, 2, "a room that already has an operator membership is not adopted again");
+  const unknown = await rfa(["room", "adopt", "nosuch"]);
+  assert.equal(unknown.code, 2);
+  assert.match(unknown.stderr, /no recorded room named nosuch/);
+});
