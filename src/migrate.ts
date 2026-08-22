@@ -130,6 +130,9 @@ export function planMigration(legacyRoot: string, target: string, opts: Migratio
       else if (f === "ops-digest.json") move(from, p.opsDigest, "digest stamp");
       else if (f === "judge-count.json") move(from, p.judgeCount, "judge counter");
       else if (f === "retired") move(from, p.retired, "retired packs");
+      else if (f.startsWith(".")) continue; // Finder droppings and the like: not data
+      else if (f.endsWith(".pid")) steps.push({ kind: "note", detail: `${rel(from)} is the pid of a pre-0.7 process: left behind (the new runtime keeps pids under ${tgt(p.run)}/)` });
+      else if (f.endsWith(".log")) move(from, path.join(p.logs, f), "log");
       else move(from, path.join(p.data, f), "data file");
     }
   }
@@ -153,6 +156,9 @@ export function planMigration(legacyRoot: string, target: string, opts: Migratio
   if (!inPlace) {
     if (exists(legacy.agents)) move(legacy.agents, p.agents, "agent packs, state included, so every resident resumes its membership");
     if (exists(legacy.evals)) move(legacy.evals, p.evals, "eval cases, baseline and rubric");
+    if (fs.existsSync(path.join(legacyRoot, ".git")) && (exists(legacy.agents) || exists(legacy.evals))) {
+      afterwards.push("the checkout's tracked files under agents/ and evals/ (the example packs, the generic case, the rubric) now show as deleted in git: `git checkout -- agents evals` there restores them as the repository's examples; the instance has its own copies");
+    }
   }
   if (exists(legacy.parity)) move(legacy.parity, p.evalParity, "parity fixtures");
   if (exists(legacy.dogfoodState)) {
@@ -168,7 +174,7 @@ export function planMigration(legacyRoot: string, target: string, opts: Migratio
   }
   afterwards.push("`rfa up`, then `rfa status` until every resident shows ready (they resume their memberships; the epoch does not bump)");
   afterwards.push("`rfa room adopt` for each recorded room creates the operator's own admin membership and allows the operator bearer in it (join_bearer_sha256), after which residents need no join secret");
-  afterwards.push("`rfa log verify all`, then one `rfa ask`");
+  afterwards.push("`rfa log verify` (every room), then one `rfa ask`");
   return { legacy, target: targetRoot, inPlace, manifest, steps, warnings, afterwards, options: opts };
 }
 
