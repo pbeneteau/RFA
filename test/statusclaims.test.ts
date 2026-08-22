@@ -109,8 +109,14 @@ test("the LLM-facing surfaces advertise no credential path that does not exist",
   }
 });
 
-test("README carries no hardcoded test or scenario counts (numbers there rot)", () => {
-  const readme = read("README.md");
-  assert.ok(!/\b\d+ tests\b/.test(readme), "README states a test count; the suite prints the live one");
-  assert.ok(!/across \d+ scenarios\b/.test(readme), "README states an e2e scenario count; the report prints the live one");
+test("README and CLAUDE.md carry no hardcoded test or scenario counts (numbers there rot)", () => {
+  // CLAUDE.md joined this pin on 2026-08-22: the status sweep fixed README,
+  // STATUS and the specs but missed the count here, and a doc generator then
+  // faithfully propagated the stale number into a PR. Whichever copy a sweep
+  // forgets is the one that rots.
+  for (const f of ["README.md", "CLAUDE.md"]) {
+    const text = read(f);
+    assert.ok(!/\b\d+ tests\b/.test(text), `${f} states a test count; the suite prints the live one`);
+    assert.ok(!/across \d+ scenarios\b/.test(text), `${f} states an e2e scenario count; the report prints the live one`);
+  }
 });
