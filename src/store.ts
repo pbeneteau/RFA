@@ -14,7 +14,7 @@ import { RfaError } from "./errors.js";
 import { canonicalize, digestCard, sha256hex } from "./jcs.js";
 import { verifyCard, type Jwk, type VerificationDetail } from "./signing.js";
 import { TERMINAL_TASK_STATES } from "./model.js";
-import { consoleNameFor, matchPrincipal } from "./principals.js";
+import { consoleNameFor, PrincipalSet } from "./principals.js";
 import { foldWhitespace, neutralize, renderWrapped } from "./wrap.js";
 import { bearerSha256 } from "./reqcontext.js";
 import type {
@@ -41,6 +41,23 @@ import type {
   SendResult,
 } from "./model.js";
 
+/** One row of `roomsSummary()`: what an operator needs to pick a room, nothing a peer could use. */
+export interface RoomSummary {
+  handle: string;
+  topic: string;
+  ended: boolean;
+  created_at: string;
+  epoch: number;
+  seq: number;
+  members: number;
+  online: number;
+  guests: number;
+  humans: number;
+  open_tasks: number;
+  pending_approvals: number;
+  held: number;
+}
+
 export interface HubConfig {
   dataDir: string | null;
   defaultLeaseS: number;
@@ -62,8 +79,14 @@ export interface HubConfig {
   trustedKeys: Record<string, Jwk>;
   allowEmbeddedJwk: boolean;
   requireSignedCards: boolean;
-  /** Provisioned bearer keys whose presenters join as human principals (spec 12.1/14.1). */
+  /** Provisioned bearer keys whose presenters join as human principals (spec 12.1/14.1). Plaintext; tests and throwaway hubs. */
   humanKeys: string[];
+  /**
+   * The principal set a hub directory's hub runs on (RFA-0.7 sect. 2.4): digests
+   * from `.rfa/principals.json`, replaced in place on reload, shared with the HTTP
+   * layer. When absent it is built from `humanKeys`.
+   */
+  principals?: PrincipalSet;
   floorGraceS: number;
   floorRenewS: number;
   floorCapS: number;
@@ -446,12 +469,15 @@ const firstToken = (name: string): string => name.split(/[ _.\-]/, 1)[0].toLower
 
 export class RoomHub {
   readonly cfg: HubConfig;
+  /** Who counts as a human here. One object for the wire join path and `POST /auth`, so a reload reaches both. */
+  readonly principals: PrincipalSet;
   private rooms = new Map<string, Room>();
   private tokens = new Map<string, { room: string; memberId: string }>();
   private sweepTimer: NodeJS.Timeout | null = null;
 
   constructor(cfg: Partial<HubConfig> = {}) {
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
+    this.principals = cfg.principals ?? PrincipalSet.fromKeys(this.cfg.humanKeys);
     if (this.cfg.dataDir) {
       fs.mkdirSync(this.cfg.dataDir, { recursive: true });
       this.acquireLock();
@@ -706,7 +732,7 @@ export class RoomHub {
    */
   private resolvePrincipal(humanKey: string | undefined): { origin: Origin; principal: string | null } {
     if (humanKey === undefined) return { origin: "agent", principal: null };
-    const principal = matchPrincipal(humanKey, this.cfg.humanKeys);
+    const principal = this.principals.match(humanKey);
     if (principal === null) {
       throw new RfaError("join_denied", "invalid human_key");
     }
@@ -1843,6 +1869,34 @@ export class RoomHub {
    * session token chains to a provisioned human key, so its questions are
    * human-origin by construction and land as ordinary auditable traffic.
    */
+  /**
+   * Every room on this hub, summarized for the operator (`GET /api/rooms`,
+   * `rfa room ls`, `rfa status`). Counts only, never a secret: no join secret,
+   * no membership token, no card.
+   */
+  roomsSummary(): RoomSummary[] {
+    return [...this.rooms.values()]
+      .map((room) => {
+        const members = [...room.members.values()].filter((m) => m.present);
+        return {
+          handle: room.handle,
+          topic: room.topic,
+          ended: room.ended,
+          created_at: new Date(room.createdAt).toISOString(),
+          epoch: room.epoch,
+          seq: room.seq,
+          members: members.length,
+          online: members.filter((m) => m.state !== "offline").length,
+          guests: members.filter((m) => (m.home ?? "local") !== "local").length,
+          humans: members.filter((m) => m.origin === "human").length,
+          open_tasks: [...room.tasks.values()].filter((t) => !TERMINAL_TASK_STATES.has(t.state)).length,
+          pending_approvals: [...room.approvals.values()].filter((a) => a.status === "pending").length,
+          held: members.filter((m) => m.held).length,
+        };
+      })
+      .sort((a, b) => a.created_at.localeCompare(b.created_at));
+  }
+
   captureMembership(roomHandle: string): { membership_token: string; member_id: string } {
     const room = this.getRoom(roomHandle);
     for (const m of room.members.values()) {

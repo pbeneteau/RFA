@@ -1,16 +1,18 @@
 /**
  * The eval runner (RFA v0.4 spec section 8).
  *
- *   npm run evals                     tier 2: replay + live cases, baseline-diff gate (exit 1 on regression)
- *   npm run evals -- --update-baseline
- *   npm run evals:judged              tier 3: adds the claude judge on live trajectories
+ *   rfa evals run                     tier 2: replay + live cases, baseline-diff gate (exit 1 on regression)
+ *   rfa evals run --update-baseline
+ *   rfa evals run --judged            tier 3: adds the claude judge on live trajectories
+ *   rfa evals run --room <alias>      live cases against that room (default: the first non-ops room in rooms.json)
  *
  * Cases are directories holding case.yaml (+ reference.ndjson for replay):
- * discovered under evals/cases/ (tracked, generic) and agents/<x>/evals/cases/
- * (pack-local, gitignored when they carry internal facts). kind: replay scores
- * a recorded event slice; kind: live asks the real resident (by capability)
- * through the standing room, N trials for pass^k. Every live verdict lands as
- * evaluator feedback in obs.db, keyed on the run_id the answer carries.
+ * discovered under <hub directory>/evals/cases/ (tracked, generic) and
+ * agents/<x>/evals/cases/ (pack-local, gitignored when they carry internal
+ * facts). kind: replay scores a recorded event slice; kind: live asks the real
+ * resident (by capability) through a room, N trials for pass^k. Every live
+ * verdict lands as evaluator feedback in obs.db, keyed on the run_id the answer
+ * carries.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -20,28 +22,8 @@ import type { Envelope, RfaEvent } from "../model.js";
 import { ObsStore } from "../obs.js";
 import { claudeJudge } from "./judge.js";
 import { loadPack } from "../agentdef.js";
+import { findRoom, HubDirError, requireHubDir, roomsStore, type HubDir } from "../hubdir.js";
 import { computeReward, passHatK, rfaLogToTrajectory, type ExpectBlock } from "./trajectory.js";
-
-/**
- * The standing room's join info, or a readable failure.
- *
- * `dogfood/ROOM.md` is gitignored (it holds a join secret), so in a fresh checkout it
- * does not exist and a bare readFileSync here died with an unhandled ENOENT stack
- * trace: the wrong first experience for a tool an operator has just cloned.
- */
-function readRoomMd(root: string): string {
-  const file = path.join(root, "dogfood", "ROOM.md");
-  if (!fs.existsSync(file)) {
-    console.error(
-      `no dogfood/ROOM.md, so there is no room to talk to yet.\n` +
-        `  New checkout?  npm run init        then start the hub and the supervisor\n` +
-        `  Already set up? the first resident with no \`rooms:\` binding writes this file when it creates the room;\n` +
-        `                  check dogfood/state/*.log, or pass --room <handle> explicitly.`,
-    );
-    process.exit(2);
-  }
-  return fs.readFileSync(file, "utf8");
-}
 
 /**
  * The gate's k and band (spec 20.3). Both are CHOSEN, not measured: k=4 is the
@@ -60,14 +42,28 @@ interface CaseBaseline {
   definition_hash: string | null;
 }
 
-const ROOT = path.resolve(import.meta.dirname ?? ".", "..", "..");
+function flag(name: string): string | undefined {
+  const i = process.argv.indexOf(name);
+  return i >= 0 ? process.argv[i + 1] : undefined;
+}
+
+let hubdir: HubDir;
+try {
+  hubdir = requireHubDir({ dir: flag("--dir") });
+} catch (err) {
+  if (err instanceof HubDirError) {
+    console.error(`evals: ${err.message}\n  ${err.hint}`);
+    process.exit(2);
+  }
+  throw err;
+}
 
 // A hub with tokens configured refuses an unauthenticated /mcp, and this harness
 // joins rooms like any other client. Without this the whole gate reported
 // regressions whose real cause was a 401 (observed).
 {
   const { transportToken } = await import("../secrets.js");
-  const tok = transportToken(path.join(ROOT, "data", "secrets.json"));
+  const tok = transportToken(hubdir.paths.secrets);
   if (tok && !process.env.RFA_TOKEN) process.env.RFA_TOKEN = tok;
 }
 
@@ -101,7 +97,7 @@ interface CaseResult {
  */
 function subjectModel(memberName: string): string | null {
   try {
-    const dir = path.join(ROOT, "agents", memberName);
+    const dir = path.join(hubdir.paths.agents, memberName);
     if (!fs.existsSync(path.join(dir, "agent.md"))) return null;
     return loadPack(dir).def.model ?? null;
   } catch {
@@ -121,7 +117,8 @@ function packIsLive(caseRoot: string): boolean {
 }
 
 function discoverCases(): { dir: string; def: CaseDef }[] {
-  const roots = [path.join(ROOT, "evals", "cases"), ...fs.existsSync(path.join(ROOT, "agents")) ? fs.readdirSync(path.join(ROOT, "agents")).map((a) => path.join(ROOT, "agents", a, "evals", "cases")) : []];
+  const agentsDir = hubdir.paths.agents;
+  const roots = [hubdir.paths.evalCases, ...(fs.existsSync(agentsDir) ? fs.readdirSync(agentsDir).map((a) => path.join(agentsDir, a, "evals", "cases")) : [])];
   const out: { dir: string; def: CaseDef }[] = [];
   for (const root of roots.filter((r) => fs.existsSync(r) && packIsLive(r))) {
     for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
@@ -166,15 +163,28 @@ async function runReplay(dir: string, def: CaseDef): Promise<CaseResult> {
 interface LiveEnv {
   hubUrl: string;
   room: string;
-  secret: string;
+  /** Null when the probe joins on its transport bearer alone (bearer-implied admission). */
+  secret: string | null;
 }
 
+/**
+ * The room live cases ask in: `--room <alias|handle>`, or the first room in
+ * rooms.json that is not `ops`. A room the CLI did not create can still be
+ * named by handle; the probe then relies on the operator bearer being allowed in
+ * it, which is what `rfa room create` and `rfa room allow` arrange.
+ */
 function liveEnv(): LiveEnv {
-  const roomMd = readRoomMd(ROOT);
+  const wanted = flag("--room");
+  const file = roomsStore(hubdir).read();
+  const record = wanted ? findRoom(file, wanted) : file.rooms.find((r) => r.alias !== "ops");
+  if (!record && !wanted) {
+    console.error("no room to ask in: rooms.json lists none. Create one with `rfa room create <alias>`, or pass --room <handle>.");
+    process.exit(2);
+  }
   return {
-    hubUrl: process.env.RFA_HUB_URL ?? "http://localhost:8790/mcp",
-    room: /Room: `(r_\w+)`/.exec(roomMd)![1],
-    secret: /Join secret: `([^`]+)`/.exec(roomMd)![1],
+    hubUrl: process.env.RFA_HUB_URL ?? hubdir.hubUrl,
+    room: record?.handle ?? wanted!,
+    secret: record?.join_secret ?? null,
   };
 }
 
@@ -188,7 +198,7 @@ async function runLive(def: CaseDef, env: LiveEnv, obs: ObsStore | null, judged:
   const probes: RoomMember[] = [];
   const newProbe = async (n: number): Promise<RoomMember> => {
     const p = await RoomMember.create({
-      hubUrl: env.hubUrl, room: env.room, joinSecret: env.secret, name: `eval-${def.id.slice(0, 16)}-t${n}`,
+      hubUrl: env.hubUrl, room: env.room, joinSecret: env.secret ?? undefined, name: `eval-${def.id.slice(0, 16)}-t${n}`,
       card: { name: "eval-probe", description: "eval harness probe", skills: [{ id: "eval", description: "runs eval cases" }] },
     });
     probes.push(p);
@@ -222,7 +232,7 @@ async function runLive(def: CaseDef, env: LiveEnv, obs: ObsStore | null, judged:
       if (judged && i === 0) {
         // Cross-tier (spec 20.1): pass the subject's own model so the judge
         // picks a different one. Judging haiku with haiku is self-preference.
-        const j = await claudeJudge(ROOT, rfaLogToTrajectory(events, { subject: subjectRec.id }), {
+        const j = await claudeJudge({ rubric: hubdir.paths.evalRubric, counter: hubdir.paths.judgeCount }, rfaLogToTrajectory(events, { subject: subjectRec.id }), {
           subjectModel: subjectModel(subjectRec.name),
         });
         if (j.score >= 0) {
@@ -259,10 +269,10 @@ async function main(): Promise<void> {
   const updateBaseline = process.argv.includes("--update-baseline");
   const cases = discoverCases();
   if (cases.length === 0) {
-    console.error("no eval cases found (evals/cases/, agents/*/evals/cases/)");
+    console.error(`no eval cases found (${hubdir.paths.evalCases}, agents/*/evals/cases/)`);
     process.exit(2);
   }
-  const obsPath = path.join(ROOT, "data", "obs.db");
+  const obsPath = hubdir.paths.obsDb;
   const obs = fs.existsSync(path.dirname(obsPath)) ? new ObsStore(obsPath) : null;
   const env = cases.some((c) => c.def.kind === "live") ? liveEnv() : null;
   const results: CaseResult[] = [];
@@ -284,7 +294,7 @@ async function main(): Promise<void> {
 
   // Report + baseline gate.
   const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const reportDir = path.join(ROOT, "reports", "evals");
+  const reportDir = path.join(hubdir.paths.reports, "evals");
   fs.mkdirSync(reportDir, { recursive: true });
   fs.writeFileSync(path.join(reportDir, `${ts}.json`), JSON.stringify({ ts, judged, results }, null, 1));
   const md = [
@@ -305,7 +315,7 @@ async function main(): Promise<void> {
   // CHOSEN rather than measured, which is why the gate prints its own flake rate
   // and must not be tightened until that rate has been measured by repeated
   // no-change runs.
-  const baselineFile = path.join(ROOT, "evals", "baseline.json");
+  const baselineFile = hubdir.paths.evalBaseline;
   const stored: Record<string, unknown> = fs.existsSync(baselineFile) ? JSON.parse(fs.readFileSync(baselineFile, "utf8")) : {};
   const corpusVersion = typeof stored.corpus_version === "string" ? stored.corpus_version : null;
   const baseCases: Record<string, CaseBaseline> = (stored.cases as Record<string, CaseBaseline>) ?? {};
@@ -348,7 +358,7 @@ async function main(): Promise<void> {
       baselineFile,
       JSON.stringify({ ...(corpusVersion ? { corpus_version: corpusVersion } : {}), gate: { k: GATE_K, band: GATE_BAND }, cases: next }, null, 1) + "\n",
     );
-    console.log(`baseline updated: ${results.length} cases at pass^${GATE_K} -> ${path.relative(ROOT, baselineFile)}`);
+    console.log(`baseline updated: ${results.length} cases at pass^${GATE_K} -> ${path.relative(hubdir.root, baselineFile)}`);
     console.log(`  ${flakeNote}`);
   } else {
     for (const row of rows) {
@@ -369,7 +379,7 @@ async function main(): Promise<void> {
     }
   }
   const pass = results.filter((r) => r.score === 1).length;
-  console.log(`evals: ${pass}/${results.length} clean at pass^${GATE_K} band ${GATE_BAND} · ${flakeNote} · report: reports/evals/latest.md`);
+  console.log(`evals: ${pass}/${results.length} clean at pass^${GATE_K} band ${GATE_BAND} · ${flakeNote} · report: ${path.relative(hubdir.root, path.join(reportDir, "latest.md"))}`);
   if (pass === results.length) {
     // Anti-ossification (spec 20.4): a clean sweep is only meaningful if someone
     // writes down that it was reviewed. The instrument cannot tell whether it

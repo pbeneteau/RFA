@@ -8,7 +8,7 @@ import * as z from "zod";
 import { RfaError } from "./errors.js";
 
 /** The wire version this hub implements (spec 11.2). */
-const RFA_SPEC_VERSION = "0.1.8";
+export const RFA_SPEC_VERSION = "0.1.8";
 import type { RoomHub } from "./store.js";
 
 const NAME = z.string().min(1).max(64).describe("Member name (unique in room; hub may suffix on collision)");

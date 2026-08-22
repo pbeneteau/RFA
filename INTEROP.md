@@ -1547,8 +1547,9 @@ word for either number: the hub ships the verifier that produced them, and it re
 needing a running hub.
 
 ```bash
-npm run verify-log -- data/rooms/<room>.ndjson     # INTACT / DIVERGED / NOT-CHAINED, per log
-npm run verify-log -- data/rooms --json            # the same as JSON
+rfa log verify <room>                              # INTACT / DIVERGED / NOT-CHAINED, per log
+rfa log verify --json                              # every room log of the hub directory, as JSON
+rfa log verify --file <any log or directory>       # a backup, a copy, a log handed to you
 ```
 
 A log that carries no chain at all reports **NOT-CHAINED** rather than intact, deliberately: ten of

@@ -179,7 +179,9 @@ const startedAt = new Date();
 // 1. Unit + integration suite
 await scenario("unit suite (test/hub.test.ts)", async () => {
   const out = await new Promise<string>((resolve) => {
-    const p = spawn("node", ["--import", "tsx", "--test", "test/hub.test.ts"], { cwd: ROOT });
+    // The TAP reporter by name: Node 26 made `spec` the default on every stream,
+    // and `spec` prints "ℹ tests N" where this parser reads "# tests N".
+    const p = spawn("node", ["--import", "tsx", "--test", "--test-reporter=tap", "test/hub.test.ts"], { cwd: ROOT });
     let buf = "";
     p.stdout.on("data", (d) => (buf += d));
     p.stderr.on("data", (d) => (buf += d));
@@ -509,6 +511,164 @@ async function assertRejectsCode(p: Promise<unknown>, code: string): Promise<voi
   }
   throw new Error(`expected error ${code}, but the call succeeded`);
 }
+
+// 10. The operator CLI's lifecycle (RFA-0.7): a fresh hub directory, the daemons up and down, nothing left behind.
+await scenario("rfa: init --yes, up, status, down leaves no process", async () => {
+  const dir = tmpDir("rfa");
+  const port = await freePort();
+  const { execFile } = await import("node:child_process");
+  const { nodeArgsFor } = await import("../src/proc.js");
+  const cli = path.join(ROOT, "src", "cli", "main.ts");
+  const rfa = (args: string[]): Promise<{ code: number; stdout: string; stderr: string }> =>
+    new Promise((resolve) =>
+      execFile(process.execPath, [...nodeArgsFor(cli), ...args], { cwd: dir, env: { ...process.env, RFA_DIR: "", NO_COLOR: "1" }, encoding: "utf8", timeout: 120_000 }, (err, stdout, stderr) =>
+        resolve({ code: err ? ((err as { code?: number }).code ?? 1) : 0, stdout, stderr }),
+      ),
+    );
+  const init = await rfa(["init", "--yes", "--no-start", "--name", "e2e", "--port", String(port), "--human", "e2e", "--agent", "none", "--json"]);
+  assert(init.code === 0, `init failed: ${init.stderr.trim()}`);
+  try {
+    const up = await rfa(["up", "--json"]);
+    assert(up.code === 0, `up failed: ${up.stderr.trim()}`);
+    const health = await fetch(`http://127.0.0.1:${port}/healthz`);
+    assert(health.status === 200, "the daemon hub answers /healthz");
+    const st = await rfa(["status", "--json"]);
+    assert(st.code === 0, `status failed: ${st.stderr.trim()}`);
+    const status = JSON.parse(st.stdout) as { hub: { healthy: boolean; pid: number }; supervisor: { running: boolean; pid: number }; rooms: { alias: string }[]; rooms_source: string };
+    assert(status.hub.healthy && status.supervisor.running, "both daemons report running");
+    assert(status.rooms_source === "hub" && status.rooms.length === 1 && status.rooms[0].alias === "ops", `rooms from the hub: ${JSON.stringify(status.rooms)}`);
+    const down = await rfa(["down", "--json"]);
+    assert(down.code === 0, `down failed: ${down.stderr.trim()}`);
+    const gone = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return false;
+      } catch {
+        return true;
+      }
+    };
+    assert(gone(status.hub.pid) && gone(status.supervisor.pid), "both pids are gone after down");
+    const after = await fetch(`http://127.0.0.1:${port}/healthz`).then(() => "up", () => "down");
+    assert(after === "down", "the port is released");
+    return `port ${port}: hub pid ${status.hub.pid}, supervisor pid ${status.supervisor.pid}, both gone after down`;
+  } finally {
+    await rfa(["down"]).catch(() => {});
+  }
+});
+
+// 11. An approval decided from the CLI lands as a human-origin intervention carrying the principal (RFA-0.7 sect. 3.4, v0.5 sect. 17.2 as amended).
+await scenario("rfa: approvals reject from the CLI is a human-origin intervention with a principal", async () => {
+  const dir = tmpDir("rfa-appr");
+  const port = await freePort();
+  const { execFile } = await import("node:child_process");
+  const { nodeArgsFor } = await import("../src/proc.js");
+  const { RoomMember } = await import("../src/client.js");
+  const cli = path.join(ROOT, "src", "cli", "main.ts");
+  const rfa = (args: string[]): Promise<{ code: number; stdout: string; stderr: string }> =>
+    new Promise((resolve) =>
+      execFile(process.execPath, [...nodeArgsFor(cli), ...args], { cwd: dir, env: { ...process.env, RFA_DIR: "", NO_COLOR: "1" }, encoding: "utf8", timeout: 120_000 }, (err, stdout, stderr) =>
+        resolve({ code: err ? ((err as { code?: number }).code ?? 1) : 0, stdout, stderr }),
+      ),
+    );
+  const init = await rfa(["init", "--yes", "--no-start", "--name", "appr", "--port", String(port), "--human", "e2e", "--agent", "none", "--room", "work", "--json"]);
+  assert(init.code === 0, `init failed: ${init.stderr.trim()}`);
+  const room = (JSON.parse(init.stdout) as { room: string }).room;
+  const secrets = JSON.parse(fs.readFileSync(path.join(dir, ".rfa", "secrets.json"), "utf8")) as { RFA_TOKEN: string };
+  const up = await rfa(["up", "--only", "hub"]);
+  assert(up.code === 0, `up failed: ${up.stderr.trim()}`);
+  try {
+    // A local worker joins on the operator bearer alone (bearer-implied admission) and raises an approval card.
+    process.env.RFA_TOKEN = secrets.RFA_TOKEN;
+    const worker = await RoomMember.create({ hubUrl: `http://127.0.0.1:${port}/mcp`, room, name: "worker", card: { name: "worker", description: "raises an approval", skills: [{ id: "work", description: "works" }] } });
+    const requestId = `apr_e2e_${Date.now().toString(36)}`;
+    await worker.send({
+      kind: "request",
+      body: "APPROVAL NEEDED: save a document",
+      ext: { "io.github.pbeneteau/approval": { request_id: requestId, action: "save document", tool_name: "mcp__linear__save_document", input_preview: "title: Spec\nproject_id: PRJ-1", params: { title: "Spec" }, allowed_decisions: ["approve", "edit", "reject"], expires_at: new Date(Date.now() + 300_000).toISOString() } },
+    });
+    const ls = await rfa(["approvals", "ls", "--json"]);
+    assert(ls.code === 0, `approvals ls failed: ${ls.stderr.trim()}`);
+    const cards = JSON.parse(ls.stdout) as { request_id: string; status: string; requester_home: string }[];
+    const card = cards.find((c) => c.request_id === requestId);
+    assert(card && card.status === "pending" && card.requester_home === "local", `the card is listed as pending and local: ${ls.stdout}`);
+    const cursor = worker.cursor;
+    const rej = await rfa(["approvals", "reject", requestId, "--yes"]);
+    assert(rej.code === 0, `reject failed: ${rej.stderr.trim()}`);
+    worker.cursor = cursor;
+    let intervention: { verb: string; actor: string; refs: { request_id?: string; principal?: string } } | null = null;
+    for (let i = 0; i < 3 && !intervention; i++) {
+      const events = await worker.listenOnce({ timeoutMs: 3000, waitFor: "all" });
+      intervention = (events.find((e: { type: string; verb?: string; refs?: { request_id?: string } }) => e.type === "intervention" && e.verb === "reject" && e.refs?.request_id === requestId) as never) ?? null;
+    }
+    assert(intervention, "the rejection landed as an intervention event");
+    assert(/^hp_[0-9a-f]{12}$/.test(intervention.refs.principal ?? ""), `the intervention names the deciding human principal, got ${JSON.stringify(intervention.refs)}`);
+    await worker.leave();
+    return `card ${requestId} rejected by ${intervention.actor} as ${intervention.refs.principal}`;
+  } finally {
+    delete process.env.RFA_TOKEN;
+    await rfa(["down"]).catch(() => {});
+  }
+});
+
+// 12. Bearer-implied admission end to end, and revocation without a restart (RFA-0.7 sect. 2.4, wire 4.3 first slice).
+await scenario("rfa: a connect bearer joins with no secret; a revoked peer is refused on its next request, no restart", async () => {
+  const dir = tmpDir("rfa-bearer");
+  const port = await freePort();
+  const { execFile } = await import("node:child_process");
+  const { nodeArgsFor } = await import("../src/proc.js");
+  const { RoomMember } = await import("../src/client.js");
+  const cli = path.join(ROOT, "src", "cli", "main.ts");
+  const rfa = (args: string[]): Promise<{ code: number; stdout: string; stderr: string }> =>
+    new Promise((resolve) =>
+      execFile(process.execPath, [...nodeArgsFor(cli), ...args], { cwd: dir, env: { ...process.env, RFA_DIR: "", RFA_TOKEN: "", NO_COLOR: "1" }, encoding: "utf8", timeout: 120_000 }, (err, stdout, stderr) =>
+        resolve({ code: err ? ((err as { code?: number }).code ?? 1) : 0, stdout, stderr }),
+      ),
+    );
+  const init = await rfa(["init", "--yes", "--no-start", "--name", "bearer", "--port", String(port), "--human", "e2e", "--agent", "none", "--room", "work", "--json"]);
+  assert(init.code === 0, `init failed: ${init.stderr.trim()}`);
+  const room = (JSON.parse(init.stdout) as { room: string }).room;
+  const hubUrl = `http://127.0.0.1:${port}/mcp`;
+  const up = await rfa(["up", "--only", "hub"]);
+  assert(up.code === 0, `up failed: ${up.stderr.trim()}`);
+  const saved = process.env.RFA_TOKEN;
+  try {
+    const card = { name: "x", description: "a client", skills: [{ id: "ask", description: "asks" }] };
+    // No bearer at all: the transport refuses before any tool runs.
+    delete process.env.RFA_TOKEN;
+    await assertRejectsCode(RoomMember.create({ hubUrl, room, name: "anon", card }), "unauthorized");
+    // A client bearer minted by connect, admitted into the room by hash: joins with no secret.
+    const conn = await rfa(["connect", "mcp", "--room", "work", "--label", "laptop", "--json"]);
+    assert(conn.code === 0, `connect failed: ${conn.stderr.trim()}`);
+    const clientToken = (JSON.parse(conn.stdout) as { token: string }).token;
+    process.env.RFA_TOKEN = clientToken;
+    const session = await RoomMember.create({ hubUrl, room, name: "laptop-session", card });
+    assert(session.roster.some((m) => m.name === "laptop-session"), "the session is in the roster");
+    await session.leave();
+    // A peer bearer works the same way, and stops working the moment it is revoked: the hub reloads tokens.json.
+    const peer = await rfa(["peer", "add", "bot", "--room", "work", "--json"]);
+    assert(peer.code === 0, `peer add failed: ${peer.stderr.trim()}`);
+    const peerToken = (JSON.parse(peer.stdout) as { token: string }).token;
+    process.env.RFA_TOKEN = peerToken;
+    const bot = await RoomMember.create({ hubUrl, room, name: "bot", card });
+    const rev = await rfa(["peer", "revoke", "bot"]);
+    assert(rev.code === 0, `revoke failed: ${rev.stderr.trim()}`);
+    let refused = false;
+    for (let i = 0; i < 30 && !refused; i++) {
+      try {
+        await bot.refreshRoster();
+        await sleep(250);
+      } catch (err) {
+        refused = (err as { code?: string }).code === "unauthorized";
+      }
+    }
+    assert(refused, "the revoked bearer is refused on a later request without a hub restart");
+    return `anonymous 401, connect bearer joined ${room} secretless, peer bearer refused after revoke (reload, no restart)`;
+  } finally {
+    if (saved === undefined) delete process.env.RFA_TOKEN;
+    else process.env.RFA_TOKEN = saved;
+    await rfa(["down"]).catch(() => {});
+  }
+});
 
 // ---------------------------------------------------------------- report
 

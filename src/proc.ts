@@ -30,6 +30,8 @@
  *      wrapper has descendants that a pid-directed SIGKILL would orphan.
  */
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
 /**
  * Spawn a TypeScript entrypoint as its own process group.
@@ -87,4 +89,42 @@ export async function stopTree(proc: ChildProcess, graceMs = 5_000): Promise<voi
   signalTree(proc, "SIGTERM");
   await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, graceMs))]);
   signalTree(proc, "SIGKILL");
+}
+
+/**
+ * A sibling entry module of the CALLING module, by the caller's own extension.
+ *
+ * `entryFor(import.meta.url, "resident")` is `src/resident.ts` when the caller
+ * runs under tsx and `dist/resident.js` when it runs built, so the supervisor
+ * never has to know which it is. `tsx` is a devDependency: the published package
+ * contains compiled JavaScript only, and a hard-coded `src/resident.ts` with
+ * `--import tsx` was the line that made a published package unable to start a
+ * resident at all.
+ */
+export function entryFor(callerUrl: string, name: string): string {
+  const file = fileURLToPath(callerUrl);
+  return path.join(path.dirname(file), `${name}${path.extname(file)}`);
+}
+
+/**
+ * The node arguments that run an entry: the built `.js` directly, a `.ts` entry
+ * through tsx's loader by its ABSOLUTE path.
+ *
+ * Not `--import tsx`: a bare specifier on `--import` is resolved from the
+ * process's working directory, and the supervisor now starts residents with the
+ * hub directory as their cwd, where there is no node_modules. Measured on the
+ * first live run of v0.7: every resident died at boot with "Cannot find package
+ * 'tsx' imported from <hub directory>/", and the supervisor crash-looped it. The
+ * loader is resolved from THIS module's location instead, which is where the
+ * tool's dependencies are.
+ */
+export function nodeArgsFor(script: string): string[] {
+  if (!script.endsWith(".ts")) return [script];
+  return ["--import", fileURLToPath(import.meta.resolve("tsx")), script];
+}
+
+/** Spawn a sibling entry (see `entryFor`) as its own process group, exactly like `spawnTsx`. */
+export function spawnEntry(callerUrl: string, name: string, args: string[], opts: SpawnOptions = {}): ChildProcess {
+  const script = entryFor(callerUrl, name);
+  return spawn(process.execPath, [...nodeArgsFor(script), ...args], { ...opts, detached: true });
 }

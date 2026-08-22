@@ -14,6 +14,8 @@ import type { AgentDef } from "./agentdef.js";
 
 export interface InterruptRule {
   allowed_decisions?: ("approve" | "edit" | "reject" | "respond")[];
+  /** Input keys of which one must be present before a human is paged (src/agentdef.ts). */
+  require_one_of?: string[];
 }
 
 /** Match a tool name against interrupt_on keys (trailing `*` = prefix glob; an exact rule always beats a glob). */
@@ -22,8 +24,8 @@ export function interruptMatch(
   toolName: string,
 ): InterruptRule | null {
   const entries = Object.entries(interruptOn ?? {});
-  const resolve = (rule: boolean | { allowed_decisions?: InterruptRule["allowed_decisions"] }): InterruptRule | null =>
-    rule === false ? null : rule === true ? {} : { allowed_decisions: rule.allowed_decisions };
+  const resolve = (rule: boolean | { allowed_decisions?: InterruptRule["allowed_decisions"]; require_one_of?: string[] }): InterruptRule | null =>
+    rule === false ? null : rule === true ? {} : { allowed_decisions: rule.allowed_decisions, ...(rule.require_one_of ? { require_one_of: rule.require_one_of } : {}) };
   const exact = entries.find(([p]) => p === toolName);
   if (exact) return resolve(exact[1] as never);
   const glob = entries.find(([p]) => p.endsWith("*") && toolName.startsWith(p.slice(0, -1)));

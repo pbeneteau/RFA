@@ -1,14 +1,8 @@
 /**
- * Promotion turns a real room log into an eval case (spec 20.2), and this guards
- * the two things that made it wrong in practice: the provenance keys, and the
- * size of the slice.
- *
- * The slice used to include EVERY roster event since the room opened, on the
- * reasoning that subject resolution needs them. It needs one: a roster event
- * carries the whole `members` array, and the runner takes the first event that
- * advertises the capability. On the standing room that wrote 1041 roster events
- * beside 2 messages, a 4.6 MB reference.ndjson into a TRACKED directory where the
- * existing case is 3.5 KB. Nothing failed, which is why it needs a test.
+ * The evidence-gate flywheel (spec 20.2): a promoted case carries its
+ * provenance, and its slice is one roster snapshot plus the conversation, not
+ * the room's whole roster history. `promoteCase` is the one slicer; the
+ * labelling sitting and `rfa evals promote` both delegate to it.
  */
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
@@ -18,6 +12,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
 import YAML from "yaml";
+import { nodeArgsFor } from "../src/proc.js";
+import { promoteCase } from "../src/evals/promote.js";
 
 const ROOT = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), "..");
 
@@ -53,12 +49,7 @@ test("promotion stamps all five provenance keys, from the log itself", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-promote-"));
   const log = path.join(dir, "room.ndjson");
   syntheticLog(log);
-  execFileSync(
-    process.execPath,
-    ["--import", "tsx", path.join(ROOT, "scripts", "promote-case.ts"), "r_test", "--conversation", "c_test",
-     "--id", "cs", "--out", dir, "--log", log, "--failure-mode", "retrieval-wrong-file"],
-    { cwd: ROOT, encoding: "utf8" },
-  );
+  promoteCase({ logFile: log, room: "r_test", conversation: "c_test", caseId: "cs", outRoot: dir, failureMode: "retrieval-wrong-file" });
   const def = YAML.parse(fs.readFileSync(path.join(dir, "cs", "case.yaml"), "utf8")) as Record<string, unknown>;
 
   assert.equal(def.origin_run_id, "run_deadbeef1234", "the run id comes out of the answer's own json part");
@@ -73,12 +64,7 @@ test("the slice carries one roster snapshot, not the room's whole roster history
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-promote-"));
   const log = path.join(dir, "room.ndjson");
   syntheticLog(log);
-  execFileSync(
-    process.execPath,
-    ["--import", "tsx", path.join(ROOT, "scripts", "promote-case.ts"), "r_test", "--conversation", "c_test",
-     "--id", "cs", "--out", dir, "--log", log],
-    { cwd: ROOT, encoding: "utf8" },
-  );
+  const res = promoteCase({ logFile: log, room: "r_test", conversation: "c_test", caseId: "cs", outRoot: dir });
   const events = fs
     .readFileSync(path.join(dir, "cs", "reference.ndjson"), "utf8")
     .split("\n").filter(Boolean).map((l) => JSON.parse(l) as { type: string; members?: { card_summary: { skill_ids: string[] } }[] });
@@ -86,6 +72,7 @@ test("the slice carries one roster snapshot, not the room's whole roster history
   const roster = events.filter((e) => e.type === "roster");
   assert.equal(roster.length, 1, `one snapshot is sufficient and 200 is bloat (got ${roster.length})`);
   assert.equal(events.length, 3, "the snapshot plus the two messages, and nothing else");
+  assert.equal(res.events, 3);
   // The reason the snapshot is there at all: the runner resolves the subject from it.
   assert.ok(
     roster[0].members!.some((m) => m.card_summary.skill_ids.includes("answer-product-question")),
@@ -94,18 +81,19 @@ test("the slice carries one roster snapshot, not the room's whole roster history
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("an unlabelled promotion still carries the key, and says so", () => {
+test("an unlabelled promotion still carries the key, and the command says so", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-promote-"));
   const log = path.join(dir, "room.ndjson");
   syntheticLog(log);
+  // Through the CLI, from a directory that is not a hub: --log and --out make it a pure file operation.
   const out = execFileSync(
     process.execPath,
-    ["--import", "tsx", path.join(ROOT, "scripts", "promote-case.ts"), "r_test", "--conversation", "c_test",
-     "--id", "cs", "--out", dir, "--log", log],
-    { cwd: ROOT, encoding: "utf8" },
+    [...nodeArgsFor(path.join(ROOT, "src", "cli", "main.ts")), "evals", "promote", "r_test", "--conversation", "c_test", "--id", "cs", "--out", dir, "--log", log],
+    { cwd: dir, encoding: "utf8", env: { ...process.env, NO_COLOR: "1" } },
   );
   const def = YAML.parse(fs.readFileSync(path.join(dir, "cs", "case.yaml"), "utf8")) as Record<string, unknown>;
   assert.equal(def.failure_mode, "UNLABELLED", "spec 20.2 wants five keys present, not four and a silence");
   assert.match(out, /failure_mode is UNLABELLED/, "and the operator is told to label it");
+  assert.match(out, /case promoted/);
   fs.rmSync(dir, { recursive: true, force: true });
 });

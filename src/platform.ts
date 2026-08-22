@@ -3,12 +3,31 @@
  * 3.9): the nightly backup. Extracted so the mechanism is testable and can be
  * exercised once by hand (the restore procedure is only real if it has run).
  */
+import { listPacks } from "./agentdef.js";
+import type { HubDir } from "./hubdir.js";
 import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { promisify } from "node:util";
 
 const execFileP = promisify(execFile);
+
+/**
+ * What a backup of a hub directory holds: every SQLite store (the engine DB, the
+ * observability DB, each pack's memory DB), and one archive of the room logs,
+ * the supervisor's state, the four runtime files and every pack's memory
+ * directory. One list, used by the supervisor's nightly and by `rfa backup now`,
+ * so the two cannot drift apart.
+ */
+export function backupPlan(h: HubDir): { dbs: string[]; dirs: string[] } {
+  const p = h.paths;
+  const rel = (f: string) => path.relative(h.root, f);
+  const packs = listPacks(p.agents);
+  return {
+    dbs: [p.runsDb, p.obsDb, ...packs.map((pack) => path.join(pack.dir, "state", "memory.db"))],
+    dirs: [rel(p.roomLogs), rel(p.supervisor), rel(p.secrets), rel(p.principals), rel(p.tokens), rel(p.rooms), ...packs.map((pack) => rel(path.join(pack.dir, "memory")))],
+  };
+}
 
 export interface BackupResult {
   dest: string;

@@ -58,11 +58,17 @@ const started = new Set<TestHub>();
 export async function startHub(args: string[] = [], opts: { port?: number } = {}): Promise<TestHub> {
   const port = opts.port ?? (await freePort());
   const full = args.includes("--data") ? args : [...args, "--data", "none"];
-  const proc = spawnTsx(HUB_ENTRY, ["--http", String(port), ...full], { cwd: ROOT, stdio: "ignore" });
+  // stderr is kept (bounded) so a hub that dies at boot says WHY in the test
+  // failure, rather than "exited with code 1" and a trip to run it by hand.
+  const proc = spawnTsx(HUB_ENTRY, ["--http", String(port), ...full], { cwd: ROOT, stdio: ["ignore", "ignore", "pipe"] });
+  let stderr = "";
+  proc.stderr?.on("data", (d: Buffer) => {
+    stderr = (stderr + d.toString()).slice(-4000);
+  });
   const hub: TestHub = { proc, port, base: `http://127.0.0.1:${port}`, mcp: `http://127.0.0.1:${port}/mcp` };
   started.add(hub);
   for (let i = 0; i < 200; i++) {
-    if (proc.exitCode !== null) throw new Error(`hub exited at boot with code ${proc.exitCode}`);
+    if (proc.exitCode !== null) throw new Error(`hub exited at boot with code ${proc.exitCode}${stderr ? `: ${stderr.trim().split("\n").slice(-3).join(" | ")}` : ""}`);
     try {
       const r = await fetch(`${hub.base}/api/agents`);
       if (r.status === 401) return hub;

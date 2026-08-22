@@ -653,7 +653,7 @@ const IDEMPOTENT_TOOLS = new Set(["room_roster", "room_listen", "room_presence",
 /** Bounded jitter, so a hub restart does not get a thundering herd of residents. */
 const RETRY_DELAYS_MS = [250, 1_000, 3_000];
 
-async function rawCall(
+export async function rawCall(
   hubUrl: string,
   clientInfo: { name: string; version: string },
   tool: string,

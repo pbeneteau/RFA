@@ -40,35 +40,91 @@ import * as path from "node:path";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { listPacks, parseAgentMd } from "./agentdef.js";
+import { matchDigest, parsePrincipalsFile, parseTokensFile, tokenDigest, WatchedFile } from "./credentials.js";
 import { createHubServer } from "./hub.js";
+import { ensureRuntime, HubDirError, maybeHubDir, roomsStore, type HubDir, type LocalHubConfig, type PrincipalRecord, type TokenRecord } from "./hubdir.js";
 import { sha256hex } from "./jcs.js";
 import { withBearer } from "./reqcontext.js";
 import { ObsStore } from "./obs.js";
+import { packageFile } from "./pkg.js";
 import { RoomHub } from "./store.js";
-import { constantTimeMatch, matchPrincipal } from "./principals.js";
+import { principalRecordFor, PrincipalSet } from "./principals.js";
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(name);
   return i >= 0 ? process.argv[i + 1] : undefined;
 }
 
-const dataArg = arg("--data") ?? "./data";
-const trustedKeysPath = arg("--trusted-keys");
+// ---------------------------------------------------------------- the hub directory (RFA-0.7 sect. 2)
+// Found by `--dir`, `RFA_DIR`, or the walk-up from the working directory. When
+// one is found the manifest supplies every default below and the credential
+// files are loaded and watched; when none is (tests, throwaway hubs, a pre-0.7
+// checkout) the flags and the environment alone configure the hub, exactly as
+// before. Precedence everywhere: flag, environment, manifest, built-in default.
+let hubdir: HubDir | null = null;
+try {
+  hubdir = maybeHubDir({ dir: arg("--dir") });
+} catch (err) {
+  if (err instanceof HubDirError) {
+    console.error(`rfa-hub: ${err.message}\n  ${err.hint}`);
+    process.exit(1);
+  }
+  throw err;
+}
+if (hubdir) ensureRuntime(hubdir);
+const local: LocalHubConfig | null = hubdir && "port" in hubdir.manifest.hub ? hubdir.manifest.hub : null;
+if (hubdir && !local) {
+  console.error(`rfa-hub: ${hubdir.root} is a remote-hub directory (hub.url = ${hubdir.hubUrl}); it hosts agents for a hub elsewhere and does not run one`);
+  process.exit(1);
+}
+
+const dataArg = arg("--data") ?? hubdir?.paths.data ?? "./data";
+const trustedKeysPath = arg("--trusted-keys") ?? hubdir?.paths.trustedKeys ?? undefined;
+const gatePath = arg("--gate") ?? hubdir?.paths.gate ?? undefined;
+if (gatePath && !fs.existsSync(gatePath)) {
+  // A configured gate that is missing must not mean "no gate": the gate is a
+  // MUST (spec 12.2), and running without it silently is the failure that
+  // matters, not the refusal to start.
+  console.error(`rfa-hub: policy gate file not found: ${gatePath}`);
+  process.exit(1);
+}
+
+// Human principals: plaintext keys from the flag or the environment (tests,
+// throwaway hubs) and hashed records from the hub directory's principals file,
+// in ONE set shared by POST /auth and the wire join path and replaced in place
+// when the file reloads (src/credentials.ts), so a removed human stops matching
+// on the next request everywhere at once.
+const plainHumanKeys = (arg("--human-key") ?? process.env.RFA_HUMAN_KEYS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+const plainPrincipals: PrincipalRecord[] = plainHumanKeys.map((k, i) => principalRecordFor(k, `key-${i + 1}`));
+const principals = PrincipalSet.fromRecords(plainPrincipals);
+const principalsFile = hubdir
+  ? new WatchedFile(hubdir.paths.principals, parsePrincipalsFile, () => ({ version: 1 as const, principals: [] }), {
+      onError: (err) => console.error(`rfa-hub: principals file refused (${err.message}); keeping the previous ${principals.size} principal(s)`),
+      onReload: (f) => {
+        principals.replace([...plainPrincipals, ...f.principals]);
+        console.error(`rfa-hub: principals reloaded (${principals.size})`);
+      },
+    })
+  : null;
+if (principalsFile) principals.replace([...plainPrincipals, ...principalsFile.value.principals]);
+
 let hub: RoomHub;
 try {
   hub = new RoomHub({
     dataDir: dataArg === "none" ? null : dataArg,
     trustedKeys: trustedKeysPath ? JSON.parse(fs.readFileSync(trustedKeysPath, "utf8")) : {},
-    requireSignedCards: process.argv.includes("--require-signed"),
-    humanKeys: (arg("--human-key") ?? process.env.RFA_HUMAN_KEYS ?? "").split(",").filter(Boolean),
+    requireSignedCards: process.argv.includes("--require-signed") || (local?.require_signed_cards ?? false),
+    humanKeys: plainHumanKeys,
+    principals,
     // Policy-gate checks (spec 12.2): a JSON array of GateCheck objects.
-    gateChecks: arg("--gate") ? JSON.parse(fs.readFileSync(arg("--gate")!, "utf8")) : [],
+    gateChecks: gatePath ? JSON.parse(fs.readFileSync(gatePath, "utf8")) : [],
   });
 } catch (err) {
   console.error(`rfa-hub: ${(err as Error).message}`);
   process.exit(1);
 }
-const httpPort = arg("--http");
+principalsFile?.start();
+const httpPort = process.argv.includes("--stdio") ? undefined : (arg("--http") ?? (local ? String(local.port) : undefined));
 
 // ---------------------------------------------------------------- /mcp transport bearer (RFA-0.6 sect. 4.2)
 // Operator-configured bearers for the MCP endpoint, same shape as
@@ -87,15 +143,28 @@ const httpPort = arg("--http");
 // Bearer ..."`) joined the live room through a tailnet proxy and conversed
 // with a resident. The header path is the credential path.
 // A flag value is visible in `ps`, so RFA_MCP_TOKENS is the better of the two paths for a real token.
-const mcpTokens = (arg("--mcp-token") ?? process.env.RFA_MCP_TOKENS ?? "")
+const plainTokens: TokenRecord[] = (arg("--mcp-token") ?? process.env.RFA_MCP_TOKENS ?? "")
   .split(",")
   .map((s) => s.trim())
-  .filter(Boolean);
+  .filter(Boolean)
+  .map((t, i) => ({ id: `tk_arg_${i + 1}`, label: `token-${i + 1}`, kind: "operator" as const, sha256: tokenDigest(t), created_at: new Date().toISOString(), expires_at: null }));
+// The hub directory's tokens file: hashed records, watched (RFA-0.7 sect. 2.4),
+// so `rfa token revoke` and `rfa peer revoke` take effect on the next request
+// and a malformed edit keeps the previous set rather than emptying it.
+const tokensFile = hubdir
+  ? new WatchedFile(hubdir.paths.tokens, parseTokensFile, () => ({ version: 1 as const, tokens: [] }), {
+      onError: (err) => console.error(`rfa-hub: tokens file refused (${err.message}); keeping the previous set`),
+      onReload: (f) => console.error(`rfa-hub: tokens reloaded (${plainTokens.length + f.tokens.length})`),
+    })
+  : null;
+tokensFile?.start();
+/** Every bearer this hub accepts right now: flag and environment tokens (hashed at startup) plus the watched file. */
+const mcpTokens = (): TokenRecord[] => [...plainTokens, ...(tokensFile?.value.tokens ?? [])];
 
 // --otel: the built-in minimal exporter (one line per span on stderr). Serious
 // deployments skip the flag and register a real OTel SDK; the hub only ever
 // depends on @opentelemetry/api.
-if (process.argv.includes("--otel")) {
+if (process.argv.includes("--otel") || (local?.otel ?? false)) {
   const { trace } = await import("@opentelemetry/api");
   const { BasicTracerProvider, SimpleSpanProcessor } = await import("@opentelemetry/sdk-trace-base");
   // The obs bridge (spec 7.1): every hub tool-call span also lands as a run
@@ -224,8 +293,8 @@ if (httpPort) {
 // were readable by anything on the laptop's network. Read routes are cheap to
 // gate because the console already sends the bearer and re-prompts on 401.
 
-const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
-const AGENTS_DIR = path.join(ROOT, "agents");
+/** The pack registry, when this hub runs in a hub directory; a bare hub has none and the agent routes say so. */
+const AGENTS_DIR = hubdir?.paths.agents ?? null;
 /**
  * Live workbench sessions: token -> { expires, principal }.
  *
@@ -244,10 +313,13 @@ function obs(): ObsStore | null {
 }
 
 /** Extra browser origins the operator allowlisted (loopback forms are implicit). */
-const extraOrigins = (arg("--allow-origin") ?? "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+const extraOrigins = [
+  ...(arg("--allow-origin") ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+  ...(local?.allow_origins ?? []),
+  // The public URL's own origin is allowed by construction: the console is loaded
+  // from it, and a 403 here "looks exactly like a wrong credential" (STATUS).
+  ...(local?.public_url ? [new URL(local.public_url).origin] : []),
+];
 
 /** True when this request may proceed: no Origin (non-browser client), a loopback origin, or an allowlisted one. */
 function originAllowed(req: http.IncomingMessage): boolean {
@@ -296,8 +368,8 @@ const pendingAsks = new Map<string, { room: string; asked: string; conversationI
  * plain text with ntfy's header names, which Pushover and a bare webhook also
  * tolerate.
  */
-const pushUrl = (arg("--push-url") ?? process.env.RFA_PUSH_URL ?? "").trim();
-const consoleBase = (arg("--console-url") ?? process.env.RFA_CONSOLE_URL ?? "").trim();
+const pushUrl = (arg("--push-url") ?? process.env.RFA_PUSH_URL ?? local?.push_url ?? "").trim();
+const consoleBase = (arg("--console-url") ?? process.env.RFA_CONSOLE_URL ?? local?.public_url ?? "").trim();
 const pushedCards = new Map<string, string>(); // request_id -> last state pushed
 
 async function push(title: string, body: string, clickPath: string): Promise<void> {
@@ -400,7 +472,7 @@ const AUTH_LOG_WINDOW_MS = 5 * 60_000; // one aggregated auth-log row per window
  * implementation was the stated intent anyway.
  */
 function humanKeyMatches(presented: string): boolean {
-  return constantTimeMatch(presented, hub.cfg.humanKeys);
+  return principals.has(presented);
 }
 
 type AuthAttempts = { failures: number; windowStart: number; lockedUntil: number };
@@ -605,7 +677,7 @@ process.on("exit", () => flushAuthWindow());
  * a peer.
  */
 async function mcpAuthorized(req: http.IncomingMessage, res: http.ServerResponse): Promise<boolean> {
-  if (mcpTokens.length === 0) return true; // the default: no header expected, nothing audited, behavior unchanged
+  if (mcpTokens().length === 0) return true; // the default: no header expected, nothing audited, behavior unchanged
   // Answer without the MCP handler running. Drains the request first: Node
   // closes the socket on an unread body, and a client must read the 401 rather
   // than a connection reset.
@@ -649,7 +721,7 @@ const presented = /^Bearer (.+)$/.exec(req.headers.authorization ?? "")?.[1];
     authAudit("mcp_success", source, now);
     return true;
   }
-  if (presented !== undefined && constantTimeMatch(presented, mcpTokens)) {
+  if (presented !== undefined && matchDigest(presented, mcpTokens()) !== null) {
     authAttempts.delete(key); // a good token clears the source's record, exactly as a good human_key does
     authAudit("mcp_success", source, now);
     return true;
@@ -685,7 +757,8 @@ function send(res: http.ServerResponse, status: number, data: unknown, headers: 
 }
 
 function agentStatus(): unknown[] {
-  const stateFile = path.join(ROOT, "data", "supervisor-state.json");
+  if (!hubdir || !AGENTS_DIR) return [];
+  const stateFile = hubdir.paths.supervisorState;
   const sup = fs.existsSync(stateFile)
     ? (JSON.parse(fs.readFileSync(stateFile, "utf8")) as { agents?: Record<string, unknown> })
     : { agents: {} };
@@ -738,15 +811,30 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
       // Which human authenticated, carried for the life of the session so every
       // decision made through it is attributable (RFA-0.6 sect. 4.4). The principal
       // id is a domain-separated hash, never the key, so it is safe in a log.
-      const principal = matchPrincipal(String(b.human_key), hub.cfg.humanKeys);
+      const principal = principals.match(String(b.human_key));
       sessions.set(token, { expires: Date.now() + SESSION_TTL_MS, principal: principal ?? "hp_unknown" });
       return send(res, 200, { session_token: token, ttl_s: SESSION_TTL_MS / 1000, principal_id: principal });
     }
     // Every route below this line is operator-only: reads included.
     if (!authed(req)) return send(res, 401, { error: "session token required (POST /auth)" });
     if (req.method === "GET" && pathname === "/api/agents") return send(res, 200, agentStatus());
+    // Every room on this hub with its alias from rooms.json (RFA-0.7 sect. 3.3):
+    // what `rfa room ls` and `rfa status` read, behind the session token like
+    // every other workbench read. Counts only; never a secret.
+    if (req.method === "GET" && pathname === "/api/rooms") {
+      const aliases = new Map<string, string>();
+      if (hubdir) {
+        try {
+          for (const r of roomsStore(hubdir).read().rooms) aliases.set(r.handle, r.alias);
+        } catch {
+          /* an unreadable rooms.json is the CLI's to report, not this route's to hide behind */
+        }
+      }
+      return send(res, 200, hub.roomsSummary().map((r) => ({ alias: aliases.get(r.handle) ?? null, ...r })));
+    }
     const defMatch = /^\/api\/agents\/([\w.-]+)\/definition$/.exec(pathname);
     if (defMatch) {
+      if (!AGENTS_DIR) return send(res, 404, { error: "no hub directory: this hub runs bare, without a pack registry" });
       const file = path.join(AGENTS_DIR, defMatch[1], "agent.md");
       if (!fs.existsSync(file)) return send(res, 404, { error: "no such agent" });
       if (req.method === "GET") return send(res, 200, { content: fs.readFileSync(file, "utf8") });
@@ -768,9 +856,9 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
       if (!authed(req)) return send(res, 401, { error: "session token required" });
       const b = await body(req);
       if (!["start", "stop", "restart"].includes(String(b.action))) return send(res, 400, { error: "action: start|stop|restart" });
-      fs.mkdirSync(path.join(ROOT, "data"), { recursive: true });
+      if (!hubdir) return send(res, 409, { error: "no hub directory: no supervisor command channel" });
       fs.appendFileSync(
-        path.join(ROOT, "data", "supervisor-commands.ndjson"),
+        hubdir.paths.supervisorCommands,
         JSON.stringify({ ts: new Date().toISOString(), agent: lifeMatch[1], action: b.action, principal: "console" }) + "\n",
       );
       return send(res, 202, { queued: true });
@@ -919,7 +1007,7 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
 
   // The room console: a static, self-contained page that speaks MCP to /mcp
   // on this same origin. Read per request so edits show up without a restart.
-  const consoleFile = path.join(import.meta.dirname ?? ".", "..", "console", "index.html");
+  const consoleFile = packageFile("console", "index.html");
   const server = http.createServer(async (req, res) => {
     try {
       const pathname = (req.url ?? "/").split("?")[0];
@@ -1021,7 +1109,7 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
       // is therefore inert, which the docs state.
       const presented = req.headers.authorization;
       const bearer =
-        mcpTokens.length > 0 && typeof presented === "string" && presented.startsWith("Bearer ") ? presented.slice(7).trim() : null;
+        mcpTokens().length > 0 && typeof presented === "string" && presented.startsWith("Bearer ") ? presented.slice(7).trim() : null;
       const response = bearer
         ? await withBearer(sha256hex(bearer), () => handler.fetch(request))
         : await handler.fetch(request);
@@ -1043,12 +1131,17 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
   });
   // Loopback by default: the previous `listen(port)` bound every interface, so
   // any device on the laptop's network could read the workbench.
-  const bindHost = arg("--bind") ?? "127.0.0.1";
+  const bindHost = arg("--bind") ?? local?.bind ?? "127.0.0.1";
   watchCards();
   server.listen(port, bindHost, () => {
     console.error(
       `rfa-hub: Streamable HTTP MCP at http://localhost:${port}/mcp (data: ${dataArg}, dual-era); console at http://localhost:${port}/console`,
     );
+    if (hubdir) {
+      console.error(
+        `rfa-hub: hub directory ${hubdir.root} (${hubdir.manifest.name}); ${principals.size} human principal(s), ${mcpTokens().length} bearer(s), gate ${gatePath ? path.relative(hubdir.root, gatePath) : "off"}`,
+      );
+    }
     if (pushUrl) {
       console.error(
         `rfa-hub: notification-only push on (${new URL(pushUrl).host}${consoleBase ? `, links to ${consoleBase}` : ", no --console-url so notifications carry no link"}). Never a credential, never an approve button: the console is the only verdict surface`,
@@ -1060,8 +1153,8 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
     // Never make an operator guess which mode is in force: the two differ by
     // whether room_create takes a credential at all.
     console.error(
-      mcpTokens.length
-        ? `rfa-hub: /mcp AUTHENTICATED: Authorization: Bearer required on every request (${mcpTokens.length} operator token${mcpTokens.length === 1 ? "" : "s"}; 401 otherwise, failures rate-limited and counted in auth.log.ndjson). Clients without a header, src/client.ts included, will be refused`
+      mcpTokens().length
+        ? `rfa-hub: /mcp AUTHENTICATED: Authorization: Bearer required on every request (${mcpTokens().length} operator token${mcpTokens().length === 1 ? "" : "s"}; 401 otherwise, failures rate-limited and counted in auth.log.ndjson). Clients without a header, src/client.ts included, will be refused`
         : `rfa-hub: /mcp UNAUTHENTICATED: no --mcp-token/RFA_MCP_TOKENS set, so anything that reaches this listener can call room_create. This is the default and the loopback bind is the only gate; set tokens before exposing /mcp through any proxy`,
     );
   });
@@ -1071,7 +1164,7 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
     onerror: (e) => console.error(`rfa-hub stdio: ${e.message}`),
   });
   console.error(`rfa-hub: MCP server on stdio (data: ${dataArg}, dual-era)`);
-  if (mcpTokens.length) {
+  if (mcpTokens().length) {
     // Silently ignoring a configured credential is how an operator comes to
     // believe a surface is guarded when it is not.
     console.error(

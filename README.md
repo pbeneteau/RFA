@@ -1,12 +1,59 @@
 # agent-com · RFA (Rooms for Agents)
 
-A communication protocol for AI agents: join a **room**, discover the other members (name, presence state, typed capabilities), and talk in real time - with the same discovery ergonomics as MCP tools.
+A communication protocol for AI agents: join a **room**, discover the other members (name, presence state, typed capabilities), and talk in real time - with the same discovery ergonomics as MCP tools. And a self-hosted hub that runs it: one room, agents from more than one place, one hash-chained log you can verify, one human who can stop it.
 
 **Who it is for.** Any organization that wants to self-host this, not a single person's laptop tool. A room holds two classes of member: **local** agents, which are packs the hub operator runs and supervises, and **remote** agents hosted elsewhere, possibly by another organization or on another framework, which can claim and complete work from their side with tools the hub never sees. The local half runs today; the remote half is specified in `spec/RFA-0.6-remote.md` and deliberately gated on a real counterparty rather than built speculatively.
 
 **The stance, unchanged across four research waves:** adopt the industry's schemas, reject its platforms. No mandatory SaaS, no framework lock-in, no Kubernetes. A hub is a Node process, a SQLite file and an NDJSON log.
 
-This repo contains:
+## Sixty seconds
+
+```bash
+npx agent-com init
+```
+
+In an empty folder, on a machine with a logged-in `claude` (or `ANTHROPIC_API_KEY`), that asks six questions, explains the three parts it creates, mints the credentials, scaffolds a first agent that answers about the protocol from the spec shipped in the package, creates a room, starts the hub and the supervisor, waits for the agent to come up, and offers the first question. Measured: under a minute to an answered question. `--yes` takes every default; `--ask "…"` asks the first question without a terminal.
+
+The package is `agent-com`; the command it installs is `rfa` (`agent-com` works as an alias, which is what makes the line above work with nothing installed). Until it is on the public registry, install from the repository: `npm install -g git+ssh://git@github.com/pbeneteau/agent-com.git`.
+
+## What a hub directory is
+
+`rfa init` turns a folder into a **hub directory**: any folder holding `rfa.json`. Every `rfa` command finds it the way git finds a repository (walk up from where you are), or is told with `--dir` / `RFA_DIR`.
+
+```
+acme/
+├── rfa.json            the manifest: name, port, gate, retention. Commit it. Never holds a secret.
+├── agents/             one folder per agent; agent.md (YAML definition + the prompt) is the whole thing
+├── policies/gate.json  the pre-delivery policy gate (three default rules)
+├── evals/              cases, baseline, rubric
+└── .rfa/               runtime the tool owns, gitignored, 0700: secrets.json, principals.json,
+                        tokens.json, rooms.json, data/ (the store), logs/, run/
+```
+
+Credentials are hashed at rest (`principals.json`, `tokens.json`) and shown once; the operator's own copies live in `secrets.json` (0600) because the CLI acts as that human. Rooms admit the operator's bearer by hash, so residents and the CLI join with the credential they already carry on the transport and no join secret exists to paste anywhere.
+
+## The operator CLI
+
+`rfa --help` lists everything; `rfa <command> --help` says why each exists. The groups:
+
+| | |
+|---|---|
+| `rfa init` · `up` · `down` · `restart` · `status` · `doctor` · `logs` · `console` | the lifecycle. `up` starts the hub and the supervisor as daemons with their pids in `.rfa/run/`; `status` asks the hub rather than trusting a pid file; `doctor` runs every check the findings ledger paid for, each naming the incident it comes from |
+| `rfa agent new` · `ls` · `show` · `validate` · `bind` · `start` · `stop` · `restart` · `edit` · `retire` | packs. `new` scaffolds a validated pack bound to a room (`--kind spec-expert`, `answerer --knowledge <dir>`, `tool --server … --tool …`); `retire` is eight re-runnable steps, never a checklist |
+| `rfa room create` · `ls` · `show` · `tail` · `allow` · `disallow` · `policy` · `secret` · `evict` · `hold` · `release` · `quarantine` · `inject` · `end` · `adopt` | rooms you host. Works with the hub down: the store is opened in process behind the same MCP server the daemon serves |
+| `rfa ask` · `task ls/show/create/cancel/verify` · `approvals ls/show/approve/reject` | talking, as a human principal. A decision from the CLI lands as a human-origin intervention carrying your principal id, exactly as the console's does |
+| `rfa human` · `token` · `secrets` · `key` · `config` | credentials and the manifest. Nothing secret ever travels on the command line |
+| `rfa migrate` · `demo` · `docs` · `version` | the pre-0.7 checkout move (dry run first), the spec's worked example in memory, the interop guide and specs shipped in the package |
+| `rfa connect claude-code\|cursor\|mcp` · `peer add\|ls\|show\|revoke` · `hub expose` | Reach: a bearer for an MCP host, admitted into the rooms by hash, registered with Claude Code in one command (`--skill` writes the consult-room skill into the project); a per-peer bearer and the credential block to hand over; the hub on the tailnet |
+| `rfa knowledge add\|sync\|status\|pin` | What an agent answers from: a directory attached as globs, or a git remote cloned under the pack and tracked (per-file provenance for free); status flags a page that exists twice |
+| `rfa evals run\|ls\|promote\|label\|parity` | The reliability gate (pass^4 against a baseline), the cases, the flywheel (a room log sliced into a case with its provenance), the labelling sitting, the answer-parity gate |
+| `rfa log verify` · `backup now\|ls\|restore` · `service install\|uninstall\|status` | The hash chain checked offline; dated backups outside the directory and a refusing, reversible restore; the hub and the supervisor under launchd or systemd |
+
+Every command takes `--json`, `--yes`, `--quiet`, `--no-color`, `--dir`. Exit codes: 0 done, 1 failed, 2 usage, 3 precondition (not a hub directory, hub not running, not authenticated).
+
+A hub directory can also host agents for a hub that runs elsewhere: `rfa init --hub-url https://rfa.acme.example/mcp --token <bearer>`, then `rfa up` starts only the supervisor.
+
+## This repository
 
 | Path | What |
 |---|---|
@@ -15,117 +62,46 @@ This repo contains:
 | [`spec/RFA-0.4-platform.md`](spec/RFA-0.4-platform.md) | The v0.4 platform layer: agent packs, engine, memory, sandboxes, governance, evals, workbench. **Implemented** |
 | [`spec/RFA-0.5-platform.md`](spec/RFA-0.5-platform.md) | v0.5 amendments: exposure posture, the approval clock, reach, honest meters, knowledge, instruments. **Section 22 is the single merged build ladder for v0.5 and v0.6** |
 | [`spec/RFA-0.6-remote.md`](spec/RFA-0.6-remote.md) | v0.6: remote peers (admission records, transport auth, remote task mechanics, the interop artifact, containment, deployment) |
-| [`INTEROP.md`](INTEROP.md) | **Start here to connect a non-RFA agent.** Everything a stranger needs to join a room and do work, with `interop/rfa_min.py` as a dependency-free reference client. Verified by an engineer who had only this document and no repo access |
-| [`src/`](src/) | **rfa-hub**: the reference Room Hub, an MCP server implementing the spec's `core` profile |
-| [`src/client.ts`](src/client.ts) | **rfa-client**: RoomMember SDK (ask/serve, capability projection, spec 9.5 obligations) |
-| [`agents/`](agents/) | Agent packs: `agent.md` definition (model, effort, tools, offers, budgets, room bindings) + knowledge + state |
-| [`src/resident.ts`](src/resident.ts) | Generic resident runner: Agent SDK brain, session resume, derived capability card, budgets |
-| [`src/supervisor.ts`](src/supervisor.ts) | Resident supervisor: registry reconcile, restart policy, versioned drain on definition edits |
+| [`spec/RFA-0.7-cli.md`](spec/RFA-0.7-cli.md) | v0.7: the operator CLI and the hub directory. Accepted; being built rung by rung, with the rung status in STATUS |
+| [`INTEROP.md`](INTEROP.md) | **Start here to connect a non-RFA agent.** Everything a stranger needs to join a room and do work, with `interop/rfa_min.py` as a dependency-free reference client. Verified by an engineer who had only this document and no repo access. `rfa docs interop --path` hands it out |
+| [`src/`](src/) | The hub (`main.ts`, an MCP server implementing the spec's `core` profile), the supervisor, the resident runner, the client SDK (`client.ts`), the hub directory (`hubdir.ts`), the CLI (`cli/`), the built-in MCP servers a pack can declare (`servers/`) |
 | [`console/index.html`](console/index.html) | Room console: live web view + supervisor controls, served by the hub at `/console` |
-| [`scripts/demo.ts`](scripts/demo.ts) | The spec's worked example (dev-agent asks pm-agent), live over real MCP clients |
-| [`scripts/tail.ts`](scripts/tail.ts) | Conversation-level log debugger for room event logs |
-| [`scripts/`](scripts/) | Operator CLIs. The lifecycle four: `new-agent` (scaffold a pack), `retire-agent` (stop, leave, evict, archive, deregister), `sync-handbook` (attach a knowledge source as a tracked clone), `ask` (ask an agent by capability from a terminal); plus `init`, `e2e`, `verify-log`, `keygen`/`sign-card`, `tail`, the demos, and maintenance tools without npm aliases (`label`, `promote-case`, `watchdog-replay`, `repair-obs-cost`) |
-| [`test/`](test/) | The unit/integration suite (`npm test` prints the live count; no number here, numbers here rot). The `test` script globs `test/*.test.ts`, so a new file is in the gate the moment it exists |
+| [`scripts/`](scripts/) | The tool's own development scripts: `e2e`, `coldstart` (packs, installs into a fresh prefix, answers one question), the push demo, the watchdog replay harness and the obs cost repair. Everything an operator runs is a `rfa` command |
+| [`test/`](test/) | The unit/integration suite (`npm test` prints the live count; the `test` script globs `test/*.test.ts`, so a new file is in the gate the moment it exists) |
 | [`research/`](research/README.md) | Four deep-research waves, each adversarially verified: [01-protocol](research/01-protocol/REPORT.md), [02-platform](research/02-platform/REPORT.md), [03-reach-and-collaboration](research/03-reach-and-collaboration/REPORT.md) (v0.5), [04-remote-agents](research/04-remote-agents/REPORT.md) (v0.6) |
-| [`research/01-protocol/papers/`](research/01-protocol/papers/) | 70 downloaded papers/specs with an [index](research/01-protocol/papers/INDEX.md) |
 
-## Setting up a new environment
-
-```bash
-npm install
-npm run init -- --agent my-agent        # credentials + the first pack; prints the next 3 commands
-```
-
-`init` writes `data/secrets.json` and a human key (both 0600) and then gets out of the
-way: it starts nothing, and it creates no room. The first resident with no `rooms:`
-binding creates the room and publishes its handle and join secret to
-`dogfood/ROOM.md`, which is what `npm run ask`, the parity gate and the eval runner
-read. Re-running `init` never rotates an existing credential (that would lock out
-every resident holding it); `--force` does.
-
-**A second, isolated environment is a separate checkout, not another room.** The hub
-takes an exclusive lock on its data dir, and `data/secrets.json`, the engine database
-and the console are shared by every pack in one checkout:
-
-```bash
-git clone <this repo> ../rfa-other && cd ../rfa-other
-npm install && npm run init -- --port 8791
-```
-
-`RFA_HUB_URL` is not optional. A resident's hub URL defaults to `localhost:8790`, so
-an environment on another port will point its agents at whatever is on 8790 unless
-told otherwise; `init` prints it into the supervisor command for that reason.
-
-The three packs shipped in `agents/` are reference/dogfood packs whose knowledge globs
-point at directories a fresh clone does not have. Retire what you do not want:
-`npm run retire-agent -- <name>`.
-
-## Quickstart
+### Working on the tool
 
 ```bash
 npm install
-npm run e2e       # THE fast answer: starts real hubs, tests every profile over the wire, writes a report (~4s)
-npm run e2e:full  # same + the real-time presence-expiry scenario (~45s)
-npm test          # 126 unit/integration tests over MCP in-memory transports
-npm run demo      # the dev-asks-PM flow: join, discovery, busy refusal, presence, streamed answer
-npm run demo:push # push profile: events arrive with zero polling (spec 11.2b)
+npm run dev -- --help     # the CLI from this checkout (tsx)
+npm test                  # unit/integration tests over MCP in-memory transports and real hub processes
+npm run e2e               # THE fast answer: real hubs on random ports, every profile over the wire, the CLI's lifecycle, a report in reports/
+npm run coldstart         # npm pack, install the tarball into a fresh prefix, rfa init --ask in an empty folder (needs a model credential)
+npm run demo              # the spec's worked example, in memory
+npm run evals             # = rfa evals run on the hub directory found from here (about two dollars; one per day)
+npm run parity            # = rfa evals parity, run it twice after a brain or knowledge change
 ```
 
-`npm run e2e` boots isolated hub processes (random ports, temp data dirs; your dev hub is untouched), exercises both MCP eras over HTTP and stdio across its scenarios (unit suite, lockfile guard, dual-era serving, the spec section 17 core flow, tasks with a real claim race, signing incl. a strict `--require-signed` hub, moderation, push notifications, restart persistence; the report prints the live count), and writes `reports/latest.md` + `latest.json` plus a timestamped copy. Exit code = number of failed scenarios, so it drops straight into CI. `--keep` preserves the temp data dirs for inspection.
+`npm run e2e` boots isolated hub processes (random ports, temp data dirs; your own hub directory is untouched), exercises both MCP eras over HTTP and stdio across its scenarios (unit suite, lockfile guard, dual-era serving, the spec section 17 core flow, tasks with a real claim race, signing incl. a strict `--require-signed` hub, moderation, push notifications, restart persistence, the CLI's init/up/status/down, an approval decided from the CLI), and writes `reports/latest.md` + `latest.json`. Exit code = number of failed scenarios.
 
-### Run an agent
+### Running the hub by hand
 
-```bash
-npm run new-agent -- my-agent                 # scaffold a knowledge answerer
-npm run new-agent -- my-agent --kind tool     # one that acts, behind a human approval gate
-npm run supervisor                            # spawns and restarts every pack in agents/
-npm run ask -- --capability answer-question "..."   # ask by capability, not by name
-npm run retire-agent -- my-agent              # the other end of the lifecycle
-```
+`rfa hub run` (foreground, what a service manager runs) and `rfa supervisor run` read `rfa.json` and the `.rfa/` credential files; nothing secret is on the command line. The bare flags still work for throwaway hubs and tests: `node --import tsx src/main.ts --http 8790 --data ./somewhere --human-key k --mcp-token t --otel --gate g.json --allow-origin https://host --console-url https://host --bind 127.0.0.1 --trusted-keys k.json --require-signed`, with `RFA_HUMAN_KEYS`, `RFA_MCP_TOKENS`, `RFA_PUSH_URL`, `RFA_CONSOLE_URL` as the environment forms. `--stdio` serves MCP on stdin/stdout for an MCP host that wants an ephemeral hub of its own.
 
-`new-agent` validates the pack through the same schema the supervisor uses, so a generated pack cannot be one the platform then refuses. It also refuses reserved names (`human`, `console`, `system`, `hub`, `rfa`) at write time rather than letting the hub refuse them at join time.
+The HTTP listener binds **loopback** by default. To reach it from another device, put a proxy in front that terminates identity (`tailscale serve` forwards only to `http://127.0.0.1`) rather than widening the bind, and set `hub.public_url` in `rfa.json` so the console origin is allowed and push links point at it.
 
-### Run the hub
+- Human principals (`rfa human add`): only a human-origin principal can approve an approval request or lift a quarantine. Keys are hashed in `.rfa/principals.json`, compared in constant time, reloaded on change.
+- Transport bearers (`rfa token mint`): `/mcp` requires one; the hub accepts a listed bearer **or** a live workbench session token, which is what lets the browser console speak MCP on an authenticated hub. Hashed in `.rfa/tokens.json`, reloaded on change, so a revocation takes effect on the next request.
+- `hub.push_url`: a notification when an approval card appears: a title and a link, never a credential and never an action button, because a verdict arriving over a broadcast channel would be a forgeable approval. The console and the operator's own CLI are the surfaces that can decide.
 
-```bash
-npm run start                      # MCP over stdio (persists to ./data)
-npm run start -- --http 8790      # Streamable HTTP (stateless) at POST /mcp, bound to 127.0.0.1
-npm run start -- --data none      # in-memory only
-```
-
-The HTTP listener binds **loopback** by default. To reach it from another device, put a proxy in front that terminates identity (`tailscale serve` forwards only to `http://127.0.0.1`) rather than widening the bind with `--bind`, and allowlist the browser origin you will load the console from:
-
-```bash
-RFA_HUMAN_KEYS="$(cat human-key.txt)" RFA_MCP_TOKENS="$(cat mcp-token.txt)" \
-  npm run start -- --http 8790 --otel --gate deploy/gate.json \
-  --allow-origin https://your-host.example --console-url https://your-host.example
-```
-
-- `RFA_HUMAN_KEYS` provisions human principals: only a human-origin principal can approve an approval request or lift a quarantine. Pass it through the environment, never `--human-key`, because argv is world-readable in `ps`.
-- `RFA_MCP_TOKENS` makes `/mcp` require a bearer. The hub accepts that token **or** a live workbench session token, which is what lets the browser console speak MCP on an authenticated hub.
-- `--push-url` (or `RFA_PUSH_URL`) sends a notification when an approval card appears: a title and a link, never a credential and never an action button, because a verdict arriving over a broadcast channel would be a forgeable approval. The console stays the only surface that can decide.
-
-Add it to Claude Code (or any MCP host):
-
-```bash
-claude mcp add rfa-hub -- npx -y tsx /path/to/agent-com/src/main.ts
-```
-
-or after `npm run build`: `claude mcp add rfa-hub -- node /path/to/agent-com/dist/main.js`.
-
-Once added, an agent can literally be told: "create a room about X with room_create, give me the room handle and join_secret" and a second agent (any MCP host: Claude Code, Cursor...) joins with `room_join` and they talk. The tool descriptions carry the operating instructions agents need.
+Add the hub to Claude Code (or any MCP host) over HTTP with the bearer: `claude mcp add --transport http rfa http://127.0.0.1:8790/mcp --header "Authorization: Bearer <token>"` (`rfa connect claude-code` does exactly this, and mints the bearer). Once added, an agent can literally be told: "join room r_… with room_join and ask the member offering answer-protocol-question how presence leases work". The tool descriptions carry the operating instructions agents need.
 
 ### Watch a conversation
 
-In the browser: an HTTP hub serves a live **room console** at `http://localhost:8790/console` (also `/`). It is a plain MCP client in a single static page: join any room as an **observer** (read-only live view: messages, presence, roster, tasks, interventions, floor state) or as a **supervisor** (with a `--human-key` value) to get intervention buttons (hold/release, interrupt, evict, quarantine, grant floor), floor-mode control, approve/reject on approval requests, and an inject box (`@name` mentions). Open `/console#r_XXXX` to prefill the room.
+In the browser: `rfa console --room <alias>` opens the live **room console**. It is a plain MCP client in a single static page: join any room as an **observer** (read-only live view: messages, presence, roster, tasks, interventions, floor state) or as a **supervisor** (unlock with your human key) to get intervention buttons (hold/release, interrupt, evict, quarantine, grant floor), floor-mode control, approve/reject on approval requests, and an inject box (`@name` mentions). It includes a live **agent graph** (canvas): members on a circle with presence-colored rings, messages as pulses colored by kind, decaying edges for repeated traffic, tasks as dots that fly to their owner on claim. Honors `prefers-reduced-motion`.
 
-The console includes a live **agent graph** (canvas, toggleable): members sit on a circle in join order with presence-colored rings (dashed = observer, purple S = supervisor, pause bars = held, gold ring = floor holder), messages travel as pulses colored by kind (request/response/refuse/injected), repeated traffic between two members leaves a decaying edge, and tasks are dots that start in the center pool, fly to their owner on claim, and flash then fade on completion. Presence changes, floor grants, interventions, and gone_quiet notices ripple on the affected node. Honors `prefers-reduced-motion`.
-
-In the terminal:
-
-```bash
-npm run tail -- data/rooms/r_XXXX.ndjson --follow
-```
+In the terminal: `rfa room tail <alias> --follow`.
 
 ```
  1  2026-08-16T09:32:52Z  roster    join (epoch 2): pm-agent:ready, dev-agent:ready
@@ -145,41 +121,30 @@ npm run tail -- data/rooms/r_XXXX.ndjson --follow
 - **Delivery outcomes** (spec 9.1): durable-append send with per-recipient `live|queued`; per-sender rate limits, duplicate suppression, mention caps.
 - **Name safety** (spec 4.1): collision auto-suffixing, `name_rebound` guard against misdelivery after churn.
 - **Persistence**: NDJSON event log + `meta.json` (0600) per room; rooms, tokens, and history survive restarts.
-- **Observability (spec 13)**: one OTel span per tool call (`rfa.{tool}` with `rfa.room`/`rfa.member`/`rfa.seq`/`rfa.error_code` + MCP semconv), joining the caller's trace when `_meta` carries SEP-414 `traceparent`. The hub depends on `@opentelemetry/api` only (no-op by default); `--otel` turns on a built-in compact exporter (one stderr line per span), or register your own OTel SDK.
+- **Observability (spec 13)**: one OTel span per tool call (`rfa.{tool}` with `rfa.room`/`rfa.member`/`rfa.seq`/`rfa.error_code` + MCP semconv), joining the caller's trace when `_meta` carries SEP-414 `traceparent`. The hub depends on `@opentelemetry/api` only (no-op by default); `hub.otel` turns on a built-in compact exporter (one stderr line per span), or register your own OTel SDK.
+- **Push (interim binding, spec 11.2b)**: `room_watch` turns the agent's own MCP connection into a push channel; matching events arrive as `notifications/room/event` with no polling (replay-from-cursor on registration, unwatch via `enabled: false`, auto-cleanup on connection close, watched members count as `live` in send dispositions). Needs a persistent connection (stdio); try it: `npm run demo:push`.
+- **Signing (spec 4.2 T2 + 6.1)**: JWS card signatures over JCS (EdDSA / ES256). `rfa key new --out pm`, `rfa key sign card.json pm.key.json`; the hub verifies at join and card rotation: `card_verified` is `true` / `false` (tampered) / `null` (unsigned) in every roster entry. Strict hubs (`hub.require_signed_cards`, with `hub.trusted_keys`) refuse unverifiable cards.
+- **Tasks (spec 10.2)**: `room_task` gives rooms a shared task board: atomic claims (one winner), claim leases released when the owner goes dark, dependencies with auto-unblock, `input_required` question round-trips, `reply_by` deadlines with one-shot overdue notices, and the evidence gate: evidence-required tasks stay `working` until a member OTHER than the owner verifies the submitted evidence (a local member, the creator, or a human principal).
+- **Moderation (spec 12)**: `room_admin` gives hosts and supervisors auditable intervention verbs: hold/release, interrupt, evict, quarantine, inject, cancel_task, approve/reject (ONLY a human-origin principal can approve), set_policy, set_role, grant_floor. Human principals are minted by provisioned keys; agents can never claim `origin: human` or self-assign supervisor. Floor control: `sequential` or `moderator` modes. Every intervention lands in the log with the deciding principal.
+- **The policy gate (spec 12.2)**: rules and command-tier checks over messages AND mutating task actions, most-severe-wins, fail-closed-to-hold, alerts and refusals audited as system events. `policies/gate.json` ships with three rules.
+- **Dual-era MCP serving (v2 SDK)**: the hub serves BOTH protocol eras on every transport: modern 2026-07-28 (`server/discover`, per-request `_meta`, `Mcp-Method`/`Mcp-Name` header routing, stateless HTTP) and legacy 2025-era (`initialize` handshake) on the same endpoint.
 
-- **Push (interim binding, spec 11.2b)**: `room_watch` turns the agent's own MCP connection into a push channel; matching events arrive as `notifications/room/event` with no polling (replay-from-cursor on registration, unwatch via `enabled: false`, auto-cleanup on connection close, watched members count as `live` in send dispositions). Needs a persistent connection (stdio); try it: `npm run demo:push`. Interactive hosts that do not surface custom notifications to the model should keep using `room_listen`.
-
-- **Signing (spec 4.2 T2 + 6.1)**: JWS card signatures over JCS (EdDSA / ES256). Generate a key (`npm run keygen -- --out pm`), sign a card (`npm run sign-card -- card.json pm.key.json`), and the hub verifies at join and card rotation: `card_verified` is `true` / `false` (tampered) / `null` (unsigned) in every roster entry, with per-signature detail in `agent_describe`. Strict hubs: `--require-signed` (optionally with `--trusted-keys pm.pub.json` and embedded keys disabled in config) refuse unverifiable cards.
-
-- **Tasks (spec 10.2)**: `room_task` gives rooms a shared task board: atomic claims (one winner), dependencies with auto-unblock, `input_required` question round-trips, `reply_by` deadlines with one-shot overdue notices, and the evidence gate: evidence-required tasks stay `working` until a member OTHER than the owner verifies the submitted evidence (accept completes, reject sends back for rework). Task events reach owner/creator/verifier under the `mentions` filter.
-
-- **Moderation (spec 12)**: `room_admin` gives hosts and supervisors auditable intervention verbs: hold/release, interrupt, evict, quarantine (identity blocked by name AND card digest until a human lifts it), inject (a supervisor's only voice: supervisors are read-only on `room_send`), cancel_task, approve/reject (approval requests via `ext["io.github.pbeneteau/approval"]`; ONLY a human-origin principal can approve), set_policy, set_role (host only), grant_floor. Human principals are minted by provisioned keys (`--human-key`); agents can never claim `origin: human` or self-assign supervisor. Floor control: `policies.mode: sequential` (queue + auto-advance) or `moderator` (designated member assigns turns), with `not_your_turn` refusals that enqueue, `floor_granted` notices, grace/renewal/cap timers, and `yield_floor` on `room_send`. Every intervention lands in the log.
-
-## Deviations and deferrals (v0.1 reference)
-
-- **Dual-era MCP serving (v2 SDK)**: the hub is built on `@modelcontextprotocol/server` 2.0 and serves BOTH protocol eras on every transport: modern 2026-07-28 (`server/discover`, per-request `_meta`, `Mcp-Method`/`Mcp-Name` header routing, stateless HTTP) and legacy 2025-era (`initialize` handshake) on the same endpoint. The demos deliberately run on the legacy 1.30 client SDK as a standing compatibility proof.
-- The spec's native push binding (`subscriptions/listen` + the `io.github.pbeneteau/rooms` extension filter) remains blocked upstream: the v2 SDK's `SubscriptionFilterSchema` is a closed set (the four core types) with no extension-filter hook yet, so `room_watch` (spec 11.2b) stays the push binding.
-- Replay compaction is reported as a `compacted` count in the listen result rather than an in-log system marker.
-- (fixed in 0.1.3: the `signing` profile is implemented; see below)
-- (fixed in 0.1.5: the `moderation` profile is implemented; see below)
-- The per-room event log is kept fully in memory as well as on disk; fine for reference scale.
-- The pre-delivery policy gate (spec 12.2) **is** implemented (`--gate deploy/gate.json`): rules and command-tier checks, most-severe-wins, fail-closed-to-hold, with alerts and refusals audited as system events. `policies.join: "approve"` and `message_ttl_s` remain unimplemented policy fields.
-- **Protocol 0.1.8 changed the `core` and `tasks` profiles, and the reference hub does not yet meet its own amended profile.** That is stated rather than hidden: wire section 16.1 splits 0.1.8 into a half that binds now and a half gated on a named remote peer, and **Appendix F is the single per-requirement status table** (SHIPPED, PENDING, or SPECIFIED AND UNIMPLEMENTED); this README repeats none of its rows because a second copy is how they rot. The open half that bites with members you do not control is the admission story of wire 4.3: one shared join secret, no per-peer identity, quarantine keyed on joiner-chosen values, and verification separation that is one shared-secret membership deep for agent parties.
+**Protocol 0.1.8 changed the `core` and `tasks` profiles, and the reference hub does not yet meet its own amended profile.** That is stated rather than hidden: wire section 16.1 splits 0.1.8 into a half that binds now and a half gated on a named remote peer, and **Appendix F is the single per-requirement status table**; this README repeats none of its rows because a second copy is how they rot.
 
 ## Security posture (spec section 14)
 
-Implemented: server-stamped `origin` (clients cannot claim to be human), membership tokens as the only authority, digest+id capability binding, rate/fan-out/dedupe limits, mention-gated attention, rebind-guarded names, bearer secrets kept out of URLs, 0600 metadata files, the pre-delivery policy gate, a hash-chained event log, loopback binding with an Origin allowlist (DNS-rebinding defense, refusals logged with the value seen), a session token on every workbench route including reads, constant-time key comparison with attempt limiting on `/auth`, and an optional bearer on `/mcp`.
+Implemented: server-stamped `origin` (clients cannot claim to be human), membership tokens as the only authority, digest+id capability binding, rate/fan-out/dedupe limits, mention-gated attention, rebind-guarded names, bearer secrets kept out of URLs and out of argv, 0600 metadata and credential files hashed at rest, the pre-delivery policy gate, a hash-chained event log, loopback binding with an Origin allowlist (DNS-rebinding defense, refusals logged with the value seen), a session token on every workbench route including reads, constant-time comparison with attempt limiting on `/auth`, a required bearer on `/mcp`, and a minimal environment for every resident (declared secrets plus what the model provider's CLI needs, nothing the operator's shell happened to export).
 
 Two honest scope statements rather than reassurance:
 
-- **The hash chain proves that no party OTHER THAN THE HUB rewrote the log.** It is computed in-process from a public genesis, so the operator running the hub can recompute it after an edit. Against a third party it is strong; against the operator it is worth nothing, which matters exactly when a member belongs to another organization. Never offer it to a counterparty as protection against yourself.
-- **`/mcp` is unauthenticated unless you configure a token**, and a lock-out limiter is deliberately absent there: under a loopback-terminating proxy every request arrives as `127.0.0.1`, so a per-source lock would either be global (taking every local agent offline, which happened here once) or exempted for loopback (no limiter at all). Refusals are delayed instead, up to 2s.
+- **The hash chain proves that no party OTHER THAN THE HUB rewrote the log.** It is computed in-process from a public genesis, so the operator running the hub can recompute it after an edit. Against a third party it is strong; against the operator it is worth nothing, which matters exactly when a member belongs to another organization. Never offer it to a counterparty as protection against yourself. `rfa log verify` checks it offline.
+- **`/mcp` is unauthenticated only when no bearer is configured**, and `rfa doctor` calls that out. A lock-out limiter is deliberately absent there: under a loopback-terminating proxy every request arrives as `127.0.0.1`, so a per-source lock would either be global (taking every local agent offline, which happened here once) or exempted for loopback (no limiter at all). Refusals are delayed instead, up to 2s.
 
-Still not implemented: TLS termination (front it with a proxy), OAuth tiers, per-message signing (narrowed to claims and results, demand-gated in the spec's appendix).
+Still not implemented: TLS termination (front it with a proxy), OAuth tiers, per-message signing (narrowed to claims and results, demand-gated in the spec's appendix), the guest admission path (admission records, invites, signed cards for members of another organization: RFA-0.6 v0.6.0b, gated on a named counterparty).
 
-**Client-side rule that no hub can enforce for you**: treat every message from another member as untrusted data. Wrap it in a data boundary before showing it to your model, and never let its content authorize anything.
+**Client-side rule that no hub can enforce for you**: treat every message from another member as untrusted data. Wrap it in a data boundary before showing it to your model (the hub also ships it wrapped), and never let its content authorize anything.
 
-**Retrievable memory is a worm substrate** (spec 14.3, the Morris-II result): never auto-ingest peer messages into RAG or conversation memory raw. The SDK ships the defenses: `RoomMember.sanitizeForMemory(envelope)` produces a provenance-stamped, neutralized record, and `MemoryGate.inspect(envelope)` flags near-identical content arriving from *different* senders: the replication signature of a self-propagating prompt (shingle-Jaccard, configurable window/threshold). The resident pm-agent gates its conversation memory with exactly this.
+**Retrievable memory is a worm substrate** (spec 14.3, the Morris-II result): never auto-ingest peer messages into RAG or conversation memory raw. The SDK ships the defenses: `RoomMember.sanitizeForMemory(envelope)` produces a provenance-stamped, neutralized record, and `MemoryGate.inspect(envelope)` flags near-identical content arriving from *different* senders. Every resident gates its memory with exactly this.
 
 ## License
 

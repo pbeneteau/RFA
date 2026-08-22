@@ -11,6 +11,10 @@ import {
 } from "../src/bridge.js";
 import { RoomMember, ServeRefusal } from "../src/client.js";
 import { sessionToken, startHub, stopAllHubs, type TestHub } from "./hubproc.js";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { defaultManifest, writeManifest } from "../src/hubdir.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const HK = "hk_bridge_test";
@@ -25,8 +29,21 @@ async function wbGet(route: string, token: string = wbToken): Promise<Response> 
 }
 
 before(async () => {
+  // A hub directory with one pack, so the pack registry routes have something to
+  // serve: since v0.7 a bare hub (no rfa.json) has no registry at all, which is
+  // the separation the plan asked for, and the old test read the repository's
+  // own agents/ through the hub.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-bridge-hub-"));
+  writeManifest(dir, defaultManifest({ name: "bridge-test", port: 1 }));
+  fs.mkdirSync(path.join(dir, "policies"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "policies", "gate.json"), "[]\n"); // the manifest's default gate must exist, as rfa init writes it
+  fs.mkdirSync(path.join(dir, "agents", "pm-agent"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "agents", "pm-agent", "agent.md"),
+    "---\nrfa_agent: 1\nname: pm-agent\ndescription: a test pack\noffers:\n  - id: answer-question\n    description: answers\n---\nYou answer questions.\n",
+  );
   // startHub's readiness probe is itself the assertion that workbench reads are gated.
-  hub = await startHub(["--human-key", HK]);
+  hub = await startHub(["--human-key", HK, "--dir", dir]);
   hubUrl = hub.mcp;
   wbToken = await sessionToken(hub, HK);
 });

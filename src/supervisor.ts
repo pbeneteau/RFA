@@ -3,9 +3,9 @@
  * process that owns every resident. launchd keeps THIS alive; this keeps the
  * residents alive.
  *
- *   npm run supervisor
+ *   rfa supervisor run            (or: node --import tsx src/supervisor.ts [--dir <hub directory>])
  *
- * - Registry = `agents/<name>/agent.md` (re-listed every 30s, file-watched).
+ * - Registry = `<hub directory>/agents/<name>/agent.md` (re-listed every 30s, file-watched).
  * - Spawn policy is pm2's vocabulary: autorestart with exponential backoff
  *   (1s doubling, capped 60s), max_restarts within a crash-loop window,
  *   min_uptime to reset the counter, kill_timeout = SIGTERM drain then SIGKILL.
@@ -19,23 +19,44 @@
  * - v0.5.2: it also owns the account layer (spec 18.6): the global cap on model
  *   turns in flight, the sweep of leases whose owner died, and the account-wide
  *   pause after a provider rate limit. The shared state is `src/account.ts` over
- *   `data/runs.db`; residents consult it, the supervisor governs it.
+ *   the hub directory's `runs.db`; residents consult it, the supervisor governs it.
+ * - v0.7: every path comes from the hub directory (src/hubdir.ts), residents are
+ *   spawned through `spawnEntry` so the built package can start them, and they
+ *   receive a MINIMAL environment (v0.4 sect. 6.3 as written) unless the manifest
+ *   says `agents.env: inherit`.
  */
-import { execFileSync, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { AccountLedger, DEFAULT_CAP, RATE_LIMIT_PAUSE_FLOOR_MS } from "./account.js";
-import { listPacks, loadPack, type AgentPack } from "./agentdef.js";
+import { declaredSecretNames, listPacks, loadPack, type AgentPack } from "./agentdef.js";
 import { RoomMember } from "./client.js";
 import { Engine } from "./engine.js";
+import { minimalEnv } from "./env.js";
+import { ensureRuntime, HubDirError, requireHubDir, roomsStore, type HubDir } from "./hubdir.js";
 import { ObsStore, evaluateAlerts, formatReviewDigest } from "./obs.js";
-import { spawnTsx, stopTree } from "./proc.js";
-import { runBackup } from "./platform.js";
+import { spawnEntry, stopTree } from "./proc.js";
+import { residentProcessesSync } from "./procscan.js";
+import { backupPlan, runBackup } from "./platform.js";
 import { loadSecrets, pickSecrets, transportToken } from "./secrets.js";
 
-const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
-const AGENTS = path.join(ROOT, "agents");
-const RESIDENT = path.join(ROOT, "src", "resident.ts");
+function arg(name: string): string | undefined {
+  const i = process.argv.indexOf(name);
+  return i >= 0 ? process.argv[i + 1] : undefined;
+}
+
+let hubdir: HubDir;
+try {
+  hubdir = requireHubDir({ dir: arg("--dir") });
+} catch (err) {
+  if (err instanceof HubDirError) {
+    console.error(`supervisor: ${err.message}\n  ${err.hint}`);
+    process.exit(2);
+  }
+  throw err;
+}
+ensureRuntime(hubdir);
+const AGENTS = hubdir.paths.agents;
 
 const POLICY = {
   maxRestarts: 10, // within the crash-loop window
@@ -86,14 +107,15 @@ const ACCOUNT = {
 
 function configuredCap(): number {
   const raw = Number(process.env.RFA_ACCOUNT_MAX_INFLIGHT);
-  return Number.isInteger(raw) && raw >= 1 ? raw : DEFAULT_CAP;
+  if (Number.isInteger(raw) && raw >= 1) return raw;
+  return hubdir.manifest.agents.max_inflight || DEFAULT_CAP;
 }
 
-const account = new AccountLedger(path.join(ROOT, "data", "runs.db"));
+const account = new AccountLedger(hubdir.paths.runsDb);
 // The same database the residents journal into (WAL, so a second connection in
 // this process is fine). The supervisor needs it for exactly one thing: clearing
 // the runs a dead resident left `running` before it starts a fresh one.
-const engine = new Engine(path.join(ROOT, "data", "runs.db"));
+const engine = new Engine(hubdir.paths.runsDb);
 let pauseStreak = 0;
 let lastPauseAt = 0;
 let announcedPauseUntil = 0;
@@ -110,10 +132,9 @@ function writeStateFile(): void {
       restarts_in_window: c.restarts.length,
     };
   }
-  fs.mkdirSync(path.join(ROOT, "data"), { recursive: true });
   fs.writeFileSync(
-    path.join(ROOT, "data", "supervisor-state.json"),
-    JSON.stringify({ ts: new Date().toISOString(), agents, account: account.snapshot() }, null, 1),
+    hubdir.paths.supervisorState,
+    JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, agents, account: account.snapshot() }, null, 1),
   );
 }
 
@@ -134,22 +155,36 @@ function residentLog(pack: AgentPack): number {
  * collision this project already fixed once at the state-file level.
  */
 function foreignResident(name: string): number | null {
-  try {
-    const out = execFileSync("ps", ["ax", "-o", "pid=,ppid=,command="], { encoding: "utf8" });
-    for (const line of out.split("\n")) {
-      if (!line.includes("resident.ts")) continue;
-      if (!new RegExp(`--agent\\s+${name}(\\s|$)`).test(line)) continue;
-      const [pid, ppid] = line.trim().split(/\s+/, 2).map(Number);
-      if (!Number.isFinite(pid)) continue;
-      // Ours, or a descendant of ours, is not a stray.
-      if (ppid === process.pid || pid === process.pid) continue;
-      if ([...children.values()].some((c) => c.proc?.pid === pid || c.proc?.pid === ppid)) continue;
-      return pid;
-    }
-  } catch {
-    /* cannot enumerate: proceed rather than refuse to supervise */
+  // Strict (src/procscan.ts): a node process whose script IS resident.ts/.js
+  // with `--agent <name>`. A substring match once took a shell script that
+  // mentioned both strings for a running resident and refused to start the
+  // real one.
+  for (const p of residentProcessesSync()) {
+    if (p.agent !== name) continue;
+    // Ours, or a descendant of ours, is not a stray.
+    if (p.ppid === process.pid || p.pid === process.pid) continue;
+    if ([...children.values()].some((c) => c.proc?.pid === p.pid || c.proc?.pid === p.ppid)) continue;
+    return p.pid;
   }
   return null;
+}
+
+// ---------------------------------------------------------------- the resident's environment (v0.4 sect. 6.3)
+
+function residentEnv(pack: AgentPack): NodeJS.ProcessEnv {
+  const base = hubdir.manifest.agents.env === "inherit" ? { ...process.env } : minimalEnv(process.env);
+  // Every child derives its paths from the directory and its hub from the
+  // manifest; RFA_HUB_URL survives only as an explicit override for tests.
+  base.RFA_DIR = hubdir.root;
+  base.RFA_HUB_URL = process.env.RFA_HUB_URL ?? hubdir.hubUrl;
+  // Secrets: the pack declares NAMES (its own, plus its MCP servers'); only those values are injected (6.3).
+  const names = declaredSecretNames(pack.def);
+  if (names.length > 0) {
+    const { env: picked, missing } = pickSecrets(loadSecrets(hubdir.paths.secrets), names);
+    if (missing.length > 0) log(`${pack.name}: missing secrets [${missing.join(", ")}] (add them with \`rfa secrets set <NAME>\`)`);
+    Object.assign(base, picked);
+  }
+  return base;
 }
 
 function start(child: Child): void {
@@ -164,7 +199,7 @@ function start(child: Child): void {
     log(
       `${child.pack.name}: a resident is ALREADY running as pid ${stray} and this supervisor does not own it ` +
         `(usually an orphan from a supervisor that died). NOT starting a second one. Stop that process, or ` +
-        `\`npm run retire-agent -- ${child.pack.name}\` if it is stale.`,
+        `\`rfa agent retire ${child.pack.name}\` if it is stale.`,
     );
     return;
   }
@@ -182,24 +217,16 @@ function start(child: Child): void {
     );
   }
   const fd = residentLog(child.pack);
-  // Secrets: the pack declares NAMES; only those values are injected (6.3).
-  let env = process.env;
-  const names = child.pack.def.secrets ?? [];
-  if (names.length > 0) {
-    const { env: picked, missing } = pickSecrets(loadSecrets(path.join(ROOT, "data", "secrets.json")), names);
-    if (missing.length > 0) log(`${child.pack.name}: missing secrets [${missing.join(", ")}] (declare them in data/secrets.json)`);
-    env = { ...process.env, ...picked };
-  }
-  // `node --import tsx` and its own process group, NOT `npx tsx` (src/proc.ts):
-  // the wrapper stack cannot forward the SIGKILL that `drain` escalates to, so a
-  // resident that missed its drain deadline used to survive as an unsupervised
-  // process still serving its membership while this supervisor recorded it as
-  // dead and started a replacement. The group also covers the Agent SDK's
-  // `claude` child, which a pid-directed kill would orphan mid-answer.
-  const proc = spawnTsx(RESIDENT, ["--agent", child.pack.name], {
-    cwd: ROOT,
+  // `node --import tsx` (or the built entry) in its own process group, NOT `npx
+  // tsx` (src/proc.ts): the wrapper stack cannot forward the SIGKILL that `drain`
+  // escalates to, so a resident that missed its drain deadline used to survive as
+  // an unsupervised process still serving its membership while this supervisor
+  // recorded it as dead and started a replacement. The group also covers the
+  // Agent SDK's `claude` child, which a pid-directed kill would orphan mid-answer.
+  const proc = spawnEntry(import.meta.url, "resident", ["--agent", child.pack.name], {
+    cwd: hubdir.root,
     stdio: ["ignore", fd, fd],
-    env,
+    env: residentEnv(child.pack),
   });
   child.proc = proc;
   child.startedAt = Date.now();
@@ -331,7 +358,7 @@ async function reconcile(): Promise<void> {
 
 // ---------------------------------------------------------------- workbench commands (v0.4.5)
 
-const CMD_FILE = path.join(ROOT, "data", "supervisor-commands.ndjson");
+const CMD_FILE = hubdir.paths.supervisorCommands;
 let cmdOffset = fs.existsSync(CMD_FILE) ? fs.statSync(CMD_FILE).size : 0;
 
 /** One reader at a time: the watch and the poll below must not both consume the same bytes. */
@@ -400,7 +427,6 @@ async function readCommands(size: number): Promise<void> {
   }
 }
 try {
-  fs.mkdirSync(path.join(ROOT, "data"), { recursive: true });
   if (!fs.existsSync(CMD_FILE)) fs.writeFileSync(CMD_FILE, "");
   fs.watch(CMD_FILE, () => void drainCommands());
 } catch (err) {
@@ -409,20 +435,20 @@ try {
 
 // ---------------------------------------------------------------- platform duties (v0.4.3): #ops alerts, retention, backup
 
-const HUB = process.env.RFA_HUB_URL ?? "http://localhost:8790/mcp";
+const HUB = process.env.RFA_HUB_URL ?? hubdir.hubUrl;
 
 // The supervisor is a hub CLIENT as well as a process manager, and it had no
 // transport credential: since /mcp started requiring one (2026-08-18) every #ops
 // post failed with 401 and the alert triad quietly degraded to this log file.
 // The residents were unaffected because their token is INJECTED from their pack's
 // declared `secrets`, which is exactly why nobody noticed for a day. Resolved the
-// same way `npm run ask` and the retire script do it, and set on the environment
+// same way `rfa ask` and the retire command do it, and set on the environment
 // because src/client.ts reads it per call (a module-level capture was its own bug).
-const supervisorToken = transportToken(path.join(ROOT, "data", "secrets.json"));
+const supervisorToken = transportToken(hubdir.paths.secrets);
 if (supervisorToken && !process.env.RFA_TOKEN) process.env.RFA_TOKEN = supervisorToken;
 
-const OPS_STATE = path.join(ROOT, "data", "ops-room.json");
-const OBS_DB = path.join(ROOT, "data", "obs.db");
+const OPS_STATE = hubdir.paths.opsRoom;
+const OBS_DB = hubdir.paths.obsDb;
 const OPS = {
   alertEveryMs: 5 * 60_000,
   alertWindowMs: 15 * 60_000,
@@ -433,36 +459,64 @@ const OPS = {
   // every five minutes is a channel an operator learns to ignore.
   digestEveryMs: 24 * 3_600_000,
   digestWindowMs: 24 * 3_600_000,
-  retentionDays: 14,
+  retentionDays: hubdir.manifest.retention.obs_days,
   backupHourLocal: 3, // daily, once past 03:00
-  backupKeep: 7,
+  backupKeep: hubdir.manifest.retention.backup_keep,
 };
 
 let opsRoom: RoomMember | null = null;
 const alertLastSent = new Map<string, number>();
 
-/** The supervisor is itself a member: it owns the #ops room and speaks alerts into it. */
+/**
+ * The supervisor is itself a member: it speaks alerts into the `ops` room.
+ *
+ * Since v0.7 the room is the operator's: `rfa init` creates it and records it in
+ * `rooms.json` under the alias `ops`, and the supervisor JOINS it with the bearer
+ * it already holds (bearer-implied admission, so no secret travels). A directory
+ * migrated from the pre-0.7 layout, or one whose operator deleted the alias, still
+ * gets a room: the supervisor creates one and records it, so `rfa room ls` shows
+ * it, which is the one room-creation path this process keeps.
+ */
 async function opsMember(): Promise<RoomMember | null> {
   if (opsRoom) return opsRoom;
+  const clientInfo = { name: "rfa-supervisor", version: "0.7.0" };
   try {
     if (fs.existsSync(OPS_STATE)) {
       const saved = JSON.parse(fs.readFileSync(OPS_STATE, "utf8"));
-      opsRoom = await RoomMember.resume({ hubUrl: HUB, ...saved, clientInfo: { name: "rfa-supervisor", version: "0.4.3" } });
+      opsRoom = await RoomMember.resume({ hubUrl: HUB, ...saved, clientInfo });
       return opsRoom;
     }
-    opsRoom = await RoomMember.create({
-      hubUrl: HUB,
+    const card = {
       name: "platform",
-      topic: "#ops: platform alerts (error rate, latency, feedback), backups, retention",
-      card: { name: "platform", description: "The supervisor process: posts alerts and platform notices.", skills: [{ id: "ops-alerts", description: "Posts threshold alerts from the local observability store." }] },
-      clientInfo: { name: "rfa-supervisor", version: "0.4.3" },
-    });
+      description: "The supervisor process: posts alerts and platform notices.",
+      skills: [{ id: "ops-alerts", description: "Posts threshold alerts from the local observability store." }],
+    };
+    const rooms = roomsStore(hubdir);
+    const known = rooms.read().rooms.find((r) => r.alias === "ops");
+    if (known) {
+      opsRoom = await RoomMember.create({ hubUrl: HUB, room: known.handle, joinSecret: known.join_secret ?? undefined, name: "platform", card, clientInfo });
+      log(`joined the ops room ${known.handle}`);
+    } else {
+      opsRoom = await RoomMember.create({
+        hubUrl: HUB,
+        name: "platform",
+        topic: "#ops: platform alerts (error rate, latency, feedback), backups, retention",
+        card,
+        clientInfo,
+      });
+      const handle = opsRoom.room;
+      rooms.update((f) => {
+        if (!f.rooms.some((r) => r.handle === handle)) {
+          f.rooms.push({ alias: "ops", handle, topic: "#ops: platform alerts", join_secret: opsRoom!.joinSecret, operator: null, created_at: new Date().toISOString() });
+        }
+      });
+      log(`ops room created: ${handle}; recorded in rooms.json as \`ops\`; watch it with \`rfa console --room ops\``);
+    }
     fs.writeFileSync(
       OPS_STATE,
       JSON.stringify({ room: opsRoom.room, membershipToken: opsRoom.membershipToken, memberId: opsRoom.memberId, name: opsRoom.name, joinSecret: opsRoom.joinSecret }, null, 2),
       { mode: 0o600 },
     );
-    log(`#ops room created: ${opsRoom.room} (join_secret ${opsRoom.joinSecret}); watch it at /console#${opsRoom.room}`);
     return opsRoom;
   } catch (err) {
     log(`ops room unavailable (${(err as Error).message}); alerts stay in this log`);
@@ -499,7 +553,7 @@ async function alertPass(): Promise<void> {
  * timer would post a fresh digest on each one, which is how a digest becomes
  * noise.
  */
-const DIGEST_STATE = path.join(ROOT, "data", "ops-digest.json");
+const DIGEST_STATE = hubdir.paths.opsDigest;
 function lastDigestAt(): number {
   try {
     return (JSON.parse(fs.readFileSync(DIGEST_STATE, "utf8")) as { last_at?: number }).last_at ?? 0;
@@ -541,11 +595,11 @@ async function nightlyPass(): Promise<void> {
     if (pruned > 0) log(`retention: pruned ${pruned} obs runs older than ${OPS.retentionDays}d`);
   }
   try {
+    const p = hubdir.paths;
     const res = await runBackup({
-      root: ROOT,
-      dbs: [path.join(ROOT, "data", "runs.db"), OBS_DB, ...listPacks(AGENTS).map((p) => path.join(p.dir, "state", "memory.db"))],
-      dirs: ["data/rooms", "dogfood/state", ...listPacks(AGENTS).map((p) => path.relative(ROOT, path.join(p.dir, "memory")))],
-      destRoot: path.join(process.env.HOME ?? ROOT, "Backups", "rfa-agent-com"),
+      root: hubdir.root,
+      ...backupPlan(hubdir),
+      destRoot: p.backups,
       keep: OPS.backupKeep,
       day,
     });
@@ -601,7 +655,7 @@ function accountPass(): void {
 
 // ---------------------------------------------------------------- main
 
-log(`registry: ${AGENTS}`);
+log(`hub directory: ${hubdir.root} (${hubdir.mode === "hub" ? `hub on ${HUB}` : `remote hub ${HUB}`}); registry: ${AGENTS}; resident env: ${hubdir.manifest.agents.env}`);
 account.setCap(configuredCap());
 account.sweep();
 log(`account layer: cap ${account.cap()} model turn(s) in flight (lane limits: serve ${account.laneLimit("serve")}, schedule ${account.laneLimit("schedule")}, background ${account.laneLimit("background")})`);

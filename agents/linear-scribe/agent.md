@@ -18,6 +18,13 @@ sandbox:
   isolation: none
   permission_mode: default
   network: none
+# The Linear tools are a server this pack BRINGS (v0.7), not part of the runner:
+# the package ships it, the resident runs it through its own entry, and
+# LINEAR_API_KEY reaches it by NAME from the hub directory's secrets file.
+mcp_servers:
+  linear:
+    builtin: linear
+    env_secrets: [LINEAR_API_KEY]
 secrets: [RFA_JOIN_SECRET, LINEAR_API_KEY, RFA_TOKEN]
 budgets:
   max_turns: 20
@@ -26,6 +33,9 @@ budgets:
 interrupt_on:
   mcp__linear__save_document:
     allowed_decisions: [approve, edit, reject]
+    # Bounced back to the model BEFORE a human is paged: a save with neither
+    # parent is doomed at Linear's door (found live, 2026-08-17).
+    require_one_of: [project_id, team_id]
 rooms:
   - room: r_9a25e48c0e
     role: participant

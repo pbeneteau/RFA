@@ -2,7 +2,7 @@
  * Background memory consolidation (RFA v0.4 spec 5.3): episodes -> facts,
  * NEVER in the answer path.
  *
- *   npx tsx src/consolidate.ts --agent pm-agent      one pass, prints results
+ *   node --import tsx src/consolidate.ts --agent pm-agent [--dir <hub directory>]   one pass, prints results
  *
  * Mem0's two-phase contract, verbatim shapes:
  *  1. extraction over recent episode texts  -> {"facts": ["..."]}
@@ -16,11 +16,11 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import * as path from "node:path";
 import { loadPack } from "./agentdef.js";
+import { HubDirError, requireHubDir, type HubDir } from "./hubdir.js";
 import { MemoryGate } from "./client.js";
 import { EpisodeLog, FactStore, type Episode, type ReconciliationItem } from "./memoryfs.js";
 import { AccountLedger } from "./account.js";
 
-const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
 const WATERMARK = "consolidation_watermark";
 
 export interface ConsolidationResult {
@@ -36,11 +36,11 @@ export interface ConsolidationResult {
   deferred?: string;
 }
 
-async function llm(systemPrompt: string, prompt: string, model: string): Promise<{ text: string; cost: number }> {
+async function llm(cwd: string, systemPrompt: string, prompt: string, model: string): Promise<{ text: string; cost: number }> {
   const q = query({
     prompt,
     options: {
-      cwd: ROOT,
+      cwd,
       model,
       systemPrompt,
       settingSources: [],
@@ -82,12 +82,13 @@ For each new fact decide: ADD (genuinely new), UPDATE (an existing candidate id 
 Also rate importance 0..1 (product numbers and corrections high; trivia low).
 Respond with ONLY: {"memory": [{"id": <candidate id, when UPDATE/DELETE>, "text": "...", "event": "ADD|UPDATE|DELETE|NONE", "old_memory": "<candidate text, when UPDATE/DELETE>", "importance": 0.7}]}`;
 
-export async function consolidate(agentName: string, opts: { model?: string; batch?: number } = {}): Promise<ConsolidationResult> {
-  const pack = loadPack(path.join(ROOT, "agents", agentName));
+export async function consolidate(agentName: string, opts: { model?: string; batch?: number; hubdir?: HubDir } = {}): Promise<ConsolidationResult> {
+  const hubdir = opts.hubdir ?? requireHubDir();
+  const pack = loadPack(path.join(hubdir.paths.agents, agentName));
   // Background lane (spec 18.6): consolidation yields to anything a human is
   // waiting on. Refused rather than queued, because the caller is an idle timer
   // that will simply come back.
-  const ledger = new AccountLedger(path.join(ROOT, "data", "runs.db"));
+  const ledger = new AccountLedger(hubdir.paths.runsDb);
   const slot = ledger.acquire({ agent: agentName, lane: "background" });
   if (!slot.ok) {
     ledger.close();
@@ -116,7 +117,7 @@ export async function consolidate(agentName: string, opts: { model?: string; bat
       .map((e) => `[#${e.id} ${e.from_name} (${e.origin}) ${e.kind}]\n${(e.wrapped ?? e.text).slice(0, 1200)}`)
       .join("\n\n")
       .slice(0, 40_000);
-    const ext = await llm(EXTRACT_SYSTEM, `Episodes:\n\n${material}`, model);
+    const ext = await llm(hubdir.root, EXTRACT_SYSTEM, `Episodes:\n\n${material}`, model);
     const extracted = extractJson<string[]>(ext.text, "facts").filter((f) => typeof f === "string" && f.trim().length > 10);
 
     let totalCost = ext.cost;
@@ -126,6 +127,7 @@ export async function consolidate(agentName: string, opts: { model?: string; bat
       const candidateMap = new Map<number, string>();
       for (const f of extracted) for (const c of store.candidates(f, 4)) candidateMap.set(c.id, c.text);
       const rec = await llm(
+        hubdir.root,
         RECONCILE_SYSTEM,
         `Existing memory candidates:\n${[...candidateMap.entries()].map(([id, t]) => `${id}: ${t}`).join("\n") || "(none)"}\n\nNew facts:\n${extracted.map((f) => `- ${f}`).join("\n")}`,
         model,
@@ -152,16 +154,28 @@ export async function consolidate(agentName: string, opts: { model?: string; bat
   }
 }
 
-// Standalone: npx tsx src/consolidate.ts --agent pm-agent
-if (process.argv[1]?.endsWith("consolidate.ts")) {
-  const i = process.argv.indexOf("--agent");
-  const name = i >= 0 ? process.argv[i + 1] : undefined;
+// Standalone: node --import tsx src/consolidate.ts --agent pm-agent [--dir <hub directory>]
+if (/consolidate\.(ts|js)$/.test(process.argv[1] ?? "")) {
+  const flag = (n: string) => {
+    const i = process.argv.indexOf(n);
+    return i >= 0 ? process.argv[i + 1] : undefined;
+  };
+  const name = flag("--agent");
   if (!name) {
-    console.error("usage: consolidate --agent <name> [--model haiku]");
+    console.error("usage: consolidate --agent <name> [--model haiku] [--dir <hub directory>]");
     process.exit(2);
   }
-  const mi = process.argv.indexOf("--model");
-  const res = await consolidate(name, { model: mi >= 0 ? process.argv[mi + 1] : undefined });
+  let hubdir: HubDir;
+  try {
+    hubdir = requireHubDir({ dir: flag("--dir") });
+  } catch (err) {
+    if (err instanceof HubDirError) {
+      console.error(`consolidate: ${err.message}\n  ${err.hint}`);
+      process.exit(2);
+    }
+    throw err;
+  }
+  const res = await consolidate(name, { model: flag("--model"), hubdir });
   console.log(
     `consolidated ${res.episodes} episodes -> ${res.extracted} extracted, +${res.added} added, ~${res.updated} updated, -${res.invalidated} invalidated, ${res.skipped} skipped ($${res.cost_usd.toFixed(4)}, watermark ${res.watermark})`,
   );

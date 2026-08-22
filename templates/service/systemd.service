@@ -1,0 +1,15 @@
+[Unit]
+Description={{DESCRIPTION}}
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory={{ROOT}}
+ExecStart=/bin/sh -lc 'exec {{COMMAND}}'
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:{{LOG}}
+StandardError=append:{{LOG}}
+
+[Install]
+WantedBy=default.target

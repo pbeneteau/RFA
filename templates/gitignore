@@ -1,0 +1,5 @@
+# rfa: runtime state, secrets and logs (owned by the tool)
+.rfa/
+agents/*/state/
+agents/*/knowledge/*-clone/
+agents/*/knowledge/handbook-clone/

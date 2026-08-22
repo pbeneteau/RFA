@@ -26,9 +26,14 @@ function crossTier(subjectModel: string | null | undefined): string {
   return "haiku";
 }
 
+/** Where the judge reads and counts: the hub directory's rubric and its daily counter (src/hubdir.ts). */
+export interface JudgeFiles {
+  rubric: string;
+  counter: string;
+}
+
 /** The rubric is a versioned FILE, so an edit is visible as an edit (spec 20.1). */
-function loadRubric(root: string): { text: string; hash: string } {
-  const file = path.join(root, "evals", "rubric.md");
+function loadRubric(file: string): { text: string; hash: string } {
   const text = fs.readFileSync(file, "utf8");
   return { text, hash: createHash("sha256").update(text).digest("hex") };
 }
@@ -44,35 +49,32 @@ export interface JudgeResult {
   judge_model?: string;
 }
 
-function capFile(root: string): string {
-  return path.join(root, "data", "judge-count.json");
-}
-
-export function judgeBudgetLeft(root: string, cap = DAILY_CAP): number {
-  const f = capFile(root);
+export function judgeBudgetLeft(counterFile: string, cap = DAILY_CAP): number {
+  const f = counterFile;
   const day = new Date().toISOString().slice(0, 10);
   if (!fs.existsSync(f)) return cap;
   const cur = JSON.parse(fs.readFileSync(f, "utf8")) as { day: string; count: number };
   return cur.day === day ? Math.max(0, cap - cur.count) : cap;
 }
 
-function consumeBudget(root: string): void {
-  const f = capFile(root);
+function consumeBudget(counterFile: string): void {
+  const f = counterFile;
+  fs.mkdirSync(path.dirname(f), { recursive: true });
   const day = new Date().toISOString().slice(0, 10);
   const cur = fs.existsSync(f) ? (JSON.parse(fs.readFileSync(f, "utf8")) as { day: string; count: number }) : { day, count: 0 };
   fs.writeFileSync(f, JSON.stringify(cur.day === day ? { day, count: cur.count + 1 } : { day, count: 1 }));
 }
 
 export async function claudeJudge(
-  root: string,
+  files: JudgeFiles,
   trajectory: TrajectoryMessage[],
   opts: { model?: string; subjectModel?: string | null } = {},
 ): Promise<JudgeResult> {
-  if (judgeBudgetLeft(root) <= 0) {
+  if (judgeBudgetLeft(files.counter) <= 0) {
     return { key: "judge", score: -1, comment: `judge budget exhausted (${DAILY_CAP}/day); try tomorrow` };
   }
-  consumeBudget(root);
-  const rubric = loadRubric(root);
+  consumeBudget(files.counter);
+  const rubric = loadRubric(files.rubric);
   // Never the subject's own tier: an explicit opts.model wins, otherwise pick a
   // different tier from the subject's.
   const judgeModel = opts.model ?? crossTier(opts.subjectModel);

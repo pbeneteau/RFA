@@ -1,7 +1,7 @@
 {
-  "name": "rfa-hub",
+  "name": "agent-com",
   "version": "0.6.4",
-  "description": "Reference Room Hub for RFA (Rooms for Agents) v0.1 - agent rooms with presence and capability discovery over MCP",
+  "description": "RFA (Rooms for Agents): a self-hosted hub where local and remote AI agents work together in rooms, on a log you can verify, with a human who can stop it. Installs the rfa operator CLI.",
   "type": "module",
   "license": "Apache-2.0",
   "repository": {
@@ -9,37 +9,33 @@
     "url": "git+https://github.com/pbeneteau/agent-com.git"
   },
   "bin": {
-    "rfa-hub": "dist/main.js"
+    "rfa": "dist/cli/main.js",
+    "agent-com": "dist/cli/main.js"
   },
   "scripts": {
     "build": "tsc",
+    "prepare": "tsc",
     "prepublishOnly": "tsc",
+    "dev": "tsx src/cli/main.ts",
     "start": "tsx src/main.ts",
-    "demo": "tsx scripts/demo.ts",
-    "tail": "tsx scripts/tail.ts",
+    "supervisor": "tsx src/supervisor.ts",
     "test": "node --import tsx --test test/*.test.ts",
-    "new-agent": "tsx scripts/new-agent.ts",
-    "retire-agent": "tsx scripts/retire-agent.ts",
-    "sync-handbook": "tsx scripts/sync-handbook.ts",
-    "demo:push": "tsx scripts/demo-push.ts",
-    "keygen": "tsx scripts/keygen.ts",
-    "sign-card": "tsx scripts/sign-card.ts",
     "e2e": "tsx scripts/e2e.ts",
     "e2e:full": "tsx scripts/e2e.ts --full",
-    "pm-agent": "tsx src/resident.ts --agent pm-agent",
-    "supervisor": "tsx src/supervisor.ts",
-    "evals": "tsx src/evals/runner.ts",
-    "evals:judged": "tsx src/evals/runner.ts --judged",
-    "ask": "tsx scripts/ask.ts",
-    "verify-log": "tsx scripts/verify-log.ts",
-    "init": "tsx scripts/init.ts"
+    "evals": "tsx src/cli/main.ts evals run",
+    "evals:judged": "tsx src/cli/main.ts evals run --judged",
+    "demo": "tsx src/cli/main.ts demo",
+    "demo:push": "tsx scripts/demo-push.ts",
+    "coldstart": "tsx scripts/coldstart.ts",
+    "parity": "tsx src/cli/main.ts evals parity"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.233",
     "@anthropic-ai/sandbox-runtime": "^0.0.73",
+    "@clack/prompts": "^1.7.0",
     "@modelcontextprotocol/client": "^2.0.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@modelcontextprotocol/server": "^2.0.0",
@@ -56,5 +52,15 @@
     "@types/node": "^26.2.0",
     "tsx": "^4.23.12",
     "typescript": "^7.0.2"
-  }
+  },
+  "files": [
+    "dist",
+    "console",
+    "templates",
+    "interop",
+    "INTEROP.md",
+    "spec",
+    "README.md",
+    "LICENSE"
+  ]
 }

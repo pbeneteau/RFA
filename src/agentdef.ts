@@ -57,6 +57,36 @@ export const agentDefSchema = z.object({
   effort: z.enum(["low", "medium", "high", "xhigh", "max"]).optional(),
   tools: toolsSchema.optional(),
   skills: z.array(z.string()).optional(),
+  /**
+   * MCP servers this pack brings (v0.4 sect. 3.2), by the name that prefixes
+   * their tool ids (`mcp__<name>__<tool>`). A stdio server is a command; an HTTP
+   * server is a URL. Secrets are NAMES: the supervisor and the resident inject
+   * their values from the hub directory's secrets file, never the pack.
+   */
+  mcp_servers: z
+    .record(
+      z.string().regex(/^[a-z0-9_-]+$/, "a server name: lowercase letters, digits, underscore, hyphen"),
+      z.union([
+        z.object({
+          command: z.string().min(1),
+          args: z.array(z.string()).optional(),
+          /** Secret NAMES to inject into the server process's environment. */
+          env_secrets: z.array(z.string()).optional(),
+          env: z.record(z.string(), z.string()).optional(),
+        }),
+        z.object({
+          url: z.string().url(),
+          /** The secret NAME whose value is sent as `Authorization: Bearer`. */
+          bearer_secret: z.string().optional(),
+        }),
+        z.object({
+          /** A server this package ships (`src/servers/`), run through the tool's own entry. */
+          builtin: z.enum(["linear"]),
+          env_secrets: z.array(z.string()).optional(),
+        }),
+      ]),
+    )
+    .optional(),
   knowledge: z.array(z.string()).optional(),
   offers: z
     .array(
@@ -99,7 +129,17 @@ export const agentDefSchema = z.object({
       z.string(),
       z.union([
         z.boolean(),
-        z.object({ allowed_decisions: z.array(z.enum(["approve", "edit", "reject", "respond"])) }),
+        z.object({
+          allowed_decisions: z.array(z.enum(["approve", "edit", "reject", "respond"])),
+          /**
+           * Input keys of which at least one must be present BEFORE a human is
+           * paged; a call missing all of them is bounced back to the model. The
+           * generic form of the Linear parent preflight: a save without a
+           * project or a team is doomed at Linear's door, and paging a human for
+           * it wastes the scarcest thing the platform has.
+           */
+          require_one_of: z.array(z.string()).optional(),
+        }),
       ]),
     )
     .optional(),
@@ -121,6 +161,16 @@ export const agentDefSchema = z.object({
 });
 
 export type AgentDef = z.infer<typeof agentDefSchema>;
+
+/** Every secret NAME a pack needs injected: its own `secrets` plus what its MCP servers declare. */
+export function declaredSecretNames(def: AgentDef): string[] {
+  const names = new Set(def.secrets ?? []);
+  for (const server of Object.values(def.mcp_servers ?? {})) {
+    if ("env_secrets" in server) for (const n of server.env_secrets ?? []) names.add(n);
+    if ("bearer_secret" in server && server.bearer_secret) names.add(server.bearer_secret);
+  }
+  return [...names];
+}
 
 export interface AgentPack {
   name: string;

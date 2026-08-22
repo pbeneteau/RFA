@@ -3,8 +3,8 @@
  * joins/resumes its bound room, and serves questions with a Claude Agent SDK
  * brain.
  *
- *   npx tsx src/resident.ts --agent pm-agent
- *   RFA_HUB_URL=http://localhost:8790/mcp    hub endpoint
+ *   node --import tsx src/resident.ts --agent pm-agent [--dir <hub directory>]
+ *   (spawned by the supervisor; RFA_DIR names the hub directory, RFA_HUB_URL overrides the hub)
  *
  * v0.4.1 shape: every serve turn is a durable run in the engine (SQLite) with
  * a checkpoint {claude_session_id, room_cursor}; inbound and own messages are
@@ -14,11 +14,13 @@
  * fire through the engine and post into the room. Knowledge is consulted via
  * Read/Grep (never prompt-stuffed); cost and turns are recorded everywhere.
  */
-import { createSdkMcpServer, query, tool } from "@anthropic-ai/claude-agent-sdk";
+import { createSdkMcpServer, query, tool, type McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as z from "zod";
 import { deriveCard, knowledgeFiles, loadPack, type AgentPack } from "./agentdef.js";
+import { HubDirError, requireHubDir, roomsStore, type HubDir } from "./hubdir.js";
+import { entryFor, nodeArgsFor } from "./proc.js";
 import { fileHint } from "./knowledge.js";
 import { renderWrapped, wrapTaskText } from "./wrap.js";
 import { approvalWindowMs, interruptMatch, joinSidekick, refusalForOutcome, requestApproval } from "./bridge.js";
@@ -30,24 +32,32 @@ import { consolidate } from "./consolidate.js";
 import { EpisodeLog, FactStore, GatedMemory } from "./memoryfs.js";
 import type { Part } from "./model.js";
 
-const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
-const HUB = process.env.RFA_HUB_URL ?? "http://localhost:8790/mcp";
-
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(name);
   return i >= 0 ? process.argv[i + 1] : undefined;
 }
 const agentName = arg("--agent");
 if (!agentName) {
-  console.error("usage: resident --agent <name>  (a directory under agents/)");
+  console.error("usage: resident --agent <name> [--dir <hub directory>]  (a pack under the hub directory's agents/)");
   process.exit(2);
 }
-const pack: AgentPack = loadPack(path.join(ROOT, "agents", agentName));
+let hubdir: HubDir;
+try {
+  hubdir = requireHubDir({ dir: arg("--dir") });
+} catch (err) {
+  if (err instanceof HubDirError) {
+    console.error(`resident: ${err.message}\n  ${err.hint}`);
+    process.exit(2);
+  }
+  throw err;
+}
+/** The hub directory root: what knowledge paths are relative to, and the Agent SDK's working directory. */
+const HUB_ROOT = hubdir.root;
+const HUB = process.env.RFA_HUB_URL ?? hubdir.hubUrl;
+const pack: AgentPack = loadPack(path.join(hubdir.paths.agents, agentName));
 const STATE_DIR = path.join(pack.dir, "state");
 const STATE_FILE = path.join(STATE_DIR, "member.json");
 const HEARTBEAT = path.join(STATE_DIR, "heartbeat");
-const LEGACY_STATE = path.join(ROOT, "dogfood", "state", "pm-agent.json");
-const ROOM_MD = path.join(ROOT, "dogfood", "ROOM.md");
 
 /**
  * A cost ceiling was reached. Distinct from a crash so the serve path can
@@ -113,18 +123,12 @@ interface SavedState {
 }
 
 function readState(): SavedState | null {
-  // The legacy migration path belongs to pm-agent alone: any other pack
-  // falling back to it would RESUME PM'''S MEMBERSHIP (found live: the scribe
-  // answered product questions as pm-agent for 40 seconds).
-  const candidates = pack.name === 'pm-agent' ? [STATE_FILE, LEGACY_STATE] : [STATE_FILE];
-  for (const file of candidates) {
-    if (fs.existsSync(file)) {
-      const s = JSON.parse(fs.readFileSync(file, "utf8")) as SavedState;
-      if (file === LEGACY_STATE) log(`migrating legacy state from ${path.relative(ROOT, file)}`);
-      return s;
-    }
-  }
-  return null;
+  // Only this pack's own state file. A legacy fallback to a shared dogfood
+  // state file once let another pack RESUME PM-AGENT'S MEMBERSHIP (found live:
+  // the scribe answered product questions as pm-agent for 40 seconds), and the
+  // pre-0.7 migration has moved that file for good.
+  if (!fs.existsSync(STATE_FILE)) return null;
+  return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")) as SavedState;
 }
 
 function writeState(s: SavedState): void {
@@ -135,12 +139,12 @@ function writeState(s: SavedState): void {
 // ---------------------------------------------------------------- boot
 
 const gate = new MemoryGate();
-const engine = new Engine(path.join(ROOT, "data", "runs.db"));
+const engine = new Engine(hubdir.paths.runsDb);
 // Layer 3 (spec 18.6): one account-wide cap on model turns in flight, shared
 // with every other resident and background pass through the same SQLite file.
-const account = new AccountLedger(path.join(ROOT, "data", "runs.db"));
+const account = new AccountLedger(hubdir.paths.runsDb);
 let currentLease: string | null = null;
-const obs = new ObsStore(path.join(ROOT, "data", "obs.db"));
+const obs = new ObsStore(hubdir.paths.obsDb);
 const episodes = new EpisodeLog(path.join(STATE_DIR, "memory.db"));
 const facts = new FactStore(path.join(STATE_DIR, "memory.db"), gate, "self");
 const sessions = new Map<string, string>();
@@ -186,8 +190,8 @@ async function boot(): Promise<{ member: RoomMember; joinSecret: string | null; 
   // future resumes need it (found live: the scribe's sidekick got null and the
   // whole approval bridge answered join_denied).
   const effectiveSecret = member.joinSecret ?? (binding?.room ? process.env.RFA_JOIN_SECRET ?? null : null);
-  // `created` is what decides who publishes dogfood/ROOM.md: no binding means this
-  // pack made the room and holds its join secret first-hand.
+  // `created` is what decides who records the room in rooms.json: no binding
+  // means this pack made the room and holds its join secret first-hand.
   return { member, joinSecret: effectiveSecret, prevHash: null, created: !binding?.room };
 }
 
@@ -396,78 +400,45 @@ const memoryServer = createSdkMcpServer({
   ],
 });
 
-// ---- linear tools (v0.4.6): dry-run without LINEAR_API_KEY, GraphQL with it ----
+// ---- pack-declared MCP servers (v0.4 sect. 3.2, built in v0.7) ----
 
-const LINEAR_KEY = process.env.LINEAR_API_KEY;
-
-async function linearGql(gql: string, variables: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const res = await fetch("https://api.linear.app/graphql", {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: LINEAR_KEY! },
-    body: JSON.stringify({ query: gql, variables }),
-  });
-  const data = (await res.json()) as { data?: Record<string, unknown>; errors?: { message: string }[] };
-  if (data.errors?.length) throw new Error(data.errors.map((e) => e.message).join("; "));
-  return data.data ?? {};
+/**
+ * The servers a pack brings, in the Agent SDK's config shapes.
+ *
+ * Secrets are NAMES resolved from this process's environment, which the
+ * supervisor filled from the hub directory's secrets file with exactly the names
+ * the pack declares (its own `secrets` plus every server's `env_secrets` and
+ * `bearer_secret`). A built-in server is one this package ships under
+ * `src/servers/` and runs through its own entry, so a pack never has to know
+ * where the tool is installed. Every server also learns where it is running
+ * (RFA_DIR, RFA_PACK_DIR, RFA_DRAFTS_DIR) and nothing else from this
+ * environment, for the same reason the resident itself gets a minimal one.
+ *
+ * Until v0.7 a Linear server was hard-coded here, which meant every pack on
+ * every hub carried one tenant's integration and a pack bringing any other tool
+ * had no way to load it.
+ */
+function packMcpServers(): Record<string, McpServerConfig> {
+  const out: Record<string, McpServerConfig> = {};
+  const pick = (names: string[] = []): Record<string, string> => Object.fromEntries(names.filter((n) => process.env[n] !== undefined).map((n) => [n, process.env[n]!]));
+  const base: Record<string, string> = { RFA_DIR: HUB_ROOT, RFA_PACK_DIR: pack.dir, RFA_DRAFTS_DIR: path.join(STATE_DIR, "drafts"), PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" };
+  for (const [name, def] of Object.entries(pack.def.mcp_servers ?? {})) {
+    const wanted = [...(("env_secrets" in def ? def.env_secrets : undefined) ?? []), ...("bearer_secret" in def && def.bearer_secret ? [def.bearer_secret] : [])];
+    for (const n of wanted) if (process.env[n] === undefined) log(`mcp server ${name}: secret ${n} is not set; add it with \`rfa secrets set ${n}\` (the server runs without it)`);
+    if ("builtin" in def) {
+      const entry = entryFor(import.meta.url, path.join("servers", def.builtin));
+      out[name] = { type: "stdio", command: process.execPath, args: nodeArgsFor(entry), env: { ...base, ...pick(def.env_secrets) } };
+    } else if ("command" in def) {
+      out[name] = { type: "stdio", command: def.command, args: def.args, env: { ...base, ...(def.env ?? {}), ...pick(def.env_secrets) } };
+    } else {
+      const bearer = def.bearer_secret ? process.env[def.bearer_secret] : undefined;
+      out[name] = { type: "http", url: def.url, ...(bearer ? { headers: { authorization: `Bearer ${bearer}` } } : {}) };
+    }
+  }
+  return out;
 }
-
-const linearServer = createSdkMcpServer({
-  name: "linear",
-  version: "0.4.6",
-  tools: [
-    tool(
-      "search_project",
-      "Find a Linear project or team by name (returns ids). ALWAYS use before save_document: a live save requires exactly one parent (project_id or team_id).",
-      { query: z.string() },
-      async (a) => {
-        if (!LINEAR_KEY) return asText("[dry-run] LINEAR_API_KEY not configured: skip project linking and save without a project.");
-        try {
-          const data = await linearGql(
-            `query($q: String!) {
-               projects(filter: { name: { containsIgnoreCase: $q } }, first: 5) { nodes { id name state } }
-               teams(filter: { name: { containsIgnoreCase: $q } }, first: 5) { nodes { id name key } }
-             }`,
-            { q: a.query },
-          );
-          return asText({
-            projects: (data.projects as { nodes: unknown[] }).nodes,
-            teams: (data.teams as { nodes: unknown[] }).nodes,
-          });
-        } catch (err) {
-          return asError(err);
-        }
-      },
-    ),
-    tool(
-      "save_document",
-      "Create a Linear document with the final draft. REQUIRES human approval (the call pauses on an approve/edit/reject decision). Call exactly once, with the complete markdown. Linear requires exactly one parent: pass project_id OR team_id (find either with search_project first).",
-      { title: z.string(), content: z.string(), project_id: z.string().optional(), team_id: z.string().optional() },
-      async (a) => {
-        if (!LINEAR_KEY) {
-          const dir = path.join(STATE_DIR, "drafts");
-          fs.mkdirSync(dir, { recursive: true });
-          const file = path.join(dir, `${new Date().toISOString().slice(0, 19).replace(/[:]/g, "-")}-${a.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40)}.md`);
-          fs.writeFileSync(file, `# ${a.title}\n\n${a.content}\n`);
-          return asText(`[dry-run] LINEAR_API_KEY not configured; draft saved to ${path.relative(ROOT, file)}. A human can paste it into Linear.`);
-        }
-        // Linear enforces exactly one parent at runtime (found live: the first
-        // approved save died on it, wasting a human decision).
-        if (!a.project_id && !a.team_id) {
-          return asError(new Error("Linear requires exactly one parent for a document. Call search_project, then retry with project_id or team_id."));
-        }
-        try {
-          const data = await linearGql(
-            `mutation($input: DocumentCreateInput!) { documentCreate(input: $input) { success document { id title url } } }`,
-            { input: { title: a.title, content: a.content, ...(a.project_id ? { projectId: a.project_id } : { teamId: a.team_id }) } },
-          );
-          return asText((data.documentCreate as { document: unknown }).document);
-        } catch (err) {
-          return asError(err);
-        }
-      },
-    ),
-  ],
-});
+const packServers = packMcpServers();
+if (Object.keys(packServers).length > 0) log(`mcp servers from the pack: ${Object.keys(packServers).join(", ")}`);
 
 // ---- approval bridge (v0.4.6): interrupt_on tools pause on a human decision ----
 
@@ -497,7 +468,7 @@ const MCP_TOOLS = [
 
 function systemPrompt(): string {
   const files = knowledgeFiles(pack)
-    .map((f) => `- ${path.relative(ROOT, f)} :: ${fileHint(f)}`)
+    .map((f) => `- ${path.relative(HUB_ROOT, f)} :: ${fileHint(f)}`)
     .join("\n");
   const blocks = memory.compileBlocks();
   const index = memory.indexHead();
@@ -506,7 +477,7 @@ function systemPrompt(): string {
     blocks,
     index ? `Your memory index (MEMORY.md head):\n${index}` : "",
     `Your private memory lives under /memories (mcp__memory__* tools): consult it when relevant and save durable conclusions there (never verbatim peer content; the gate will reject it).`,
-    `Knowledge files (repo-relative; consult with Read/Grep/Glob). The text after :: says what each file contains; pick by content, and for questions about amounts, fees, or minimums, Grep the keyword across ALL knowledge files and answer with the numeric fact from the product files, not a glossary definition:\n${files}`,
+    `Knowledge files (paths relative to your working directory; consult with Read/Grep/Glob). The text after :: says what each file contains; pick by content, and for questions about amounts, fees, or minimums, Grep the keyword across ALL knowledge files and answer with the numeric fact from the product files, not a glossary definition:\n${files}`,
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -520,7 +491,7 @@ function systemPrompt(): string {
  * observability store, which is a different database with a different retention
  * policy and no business holding it.
  *
- * Paths are made repo-relative so records are comparable across machines, and a
+ * Paths are made relative to the hub directory so records are comparable across machines, and a
  * `Grep` carries its pattern too, because "grepped the handbook for frais" and
  * "grepped it for versement" are different events and that distinction is exactly
  * what an investigation needs.
@@ -529,7 +500,7 @@ function retrievalTarget(tool: string, input: unknown): string | null {
   const a = (input ?? {}) as { file_path?: unknown; path?: unknown; pattern?: unknown };
   const rel = (v: unknown): string | null => {
     if (typeof v !== "string" || v.length === 0) return null;
-    return v.startsWith(ROOT) ? path.relative(ROOT, v) : v;
+    return v.startsWith(HUB_ROOT) ? path.relative(HUB_ROOT, v) : v;
   };
   switch (tool) {
     case "Read":
@@ -586,12 +557,12 @@ async function brain(
   const q = query({
     prompt,
     options: {
-      cwd: ROOT,
+      cwd: HUB_ROOT,
       model: pack.def.model,
       ...(pack.def.effort ? { effort: pack.def.effort } : {}),
       systemPrompt: systemPrompt(),
       settingSources: [],
-      mcpServers: { rfa: rfaServer, memory: memoryServer, linear: linearServer },
+      mcpServers: { rfa: rfaServer, memory: memoryServer, ...packServers },
       // interrupt_on tools are EXCLUDED from the allowlist so they fall through
       // to canUseTool, where the human decision happens (spec 7.3).
       allowedTools: [...(pack.def.tools?.allow ?? []), ...MCP_TOOLS].filter((t) => !interruptMatch(pack.def.interrupt_on, t)),
@@ -599,14 +570,16 @@ async function brain(
       canUseTool: async (toolName, input) => {
         const rule = interruptMatch(pack.def.interrupt_on, toolName);
         if (!rule) return { behavior: "deny" as const, message: `tool ${toolName} is not allowed for this pack` };
-        // Preflight before paging a human: a live save without a parent is doomed
-        // at Linear's door, so bounce it back to the model instead of burning an
-        // approval on it.
-        if (toolName === "mcp__linear__save_document" && LINEAR_KEY) {
-          const i = input as { project_id?: string; team_id?: string };
-          if (!i.project_id && !i.team_id) {
-            log(`preflight deny: ${toolName} without project_id/team_id`);
-            return { behavior: "deny" as const, message: "Linear requires exactly one parent. Call mcp__linear__search_project, then retry save_document with project_id or team_id." };
+        // Preflight before paging a human (`require_one_of` on the rule): a call
+        // missing every one of the named keys is doomed downstream, so bounce it
+        // back to the model instead of burning an approval on it. The Linear
+        // parent rule this generalizes was found live: the first approved save
+        // died at Linear's door for want of a project or a team.
+        if (rule.require_one_of?.length) {
+          const i = input as Record<string, unknown>;
+          if (!rule.require_one_of.some((k) => i[k] !== undefined && i[k] !== null && i[k] !== "")) {
+            log(`preflight deny: ${toolName} without any of ${rule.require_one_of.join("/")}`);
+            return { behavior: "deny" as const, message: `${toolName} needs one of ${rule.require_one_of.join(", ")} before a human is asked to approve it. Add it and retry.` };
           }
         }
         log(`approval needed: ${toolName}`);
@@ -730,61 +703,38 @@ function traceFrom(meta: Record<string, unknown>): { trace_id?: string; parent_r
   return m ? { trace_id: m[1], parent_run_id: m[2] } : {};
 }
 
-// ---------------------------------------------------------------- room doc + state
+// ---------------------------------------------------------------- room record + state
 
 /**
- * Publish this room's join info where the human tools look for it.
+ * Record a room this pack created where the operator's tools look for rooms:
+ * `.rfa/rooms.json`, under the pack's own name as alias.
  *
- * Written by the pack that CREATED the room, which is the one that knows the join
- * secret first-hand. It used to be written by whichever pack was literally named
- * `pm-agent`, a leftover of the original dogfood setup that made a fresh
- * environment unusable: six tools read this file (`npm run ask`, the parity gate,
- * the eval runner, `new-agent`, and two skills) and in a new project nothing ever
- * created it.
- *
- * Never clobbers another room's file. A second project's first agent would
- * otherwise overwrite the first project's join info on boot, and the tools would
- * quietly start talking to the wrong room.
+ * This used to write `dogfood/ROOM.md`, a markdown file six tools read with a
+ * regex, which made a room an accident of which pack booted first. Since v0.7 the
+ * operator creates rooms (`rfa room create`) and a pack with no binding is the
+ * legacy path; it still records what it made so `rfa room ls` shows it, and it
+ * never rewrites a record that already exists.
  */
-function writeRoomMd(): void {
+function recordRoom(): void {
   if (createdRoom !== true) return;
-  if (fs.existsSync(ROOM_MD)) {
-    const existing = fs.readFileSync(ROOM_MD, "utf8");
-    const other = /Room: `(r_\w+)`/.exec(existing);
-    if (other && other[1] !== member.room) {
-      log(`not overwriting ${path.relative(ROOT, ROOM_MD)}: it describes room ${other[1]}, not mine (${member.room})`);
-      return;
-    }
+  try {
+    roomsStore(hubdir).update((file) => {
+      if (file.rooms.some((r) => r.handle === member.room)) return;
+      const base = pack.def.name;
+      const alias = file.rooms.some((r) => r.alias === base) ? `${base}-${member.room.slice(2, 8)}` : base;
+      file.rooms.push({
+        alias,
+        handle: member.room,
+        topic: (pack.def.rooms ?? [])[0]?.topic ?? `${pack.def.name} standing room`,
+        join_secret: joinSecret,
+        operator: null,
+        created_at: new Date().toISOString(),
+      });
+      log(`recorded room ${member.room} in rooms.json as \`${alias}\``);
+    });
+  } catch (err) {
+    log(`could not record the room in rooms.json: ${(err as Error).message}`);
   }
-  fs.writeFileSync(
-    ROOM_MD,
-    [
-      `# Standing product room (dogfood)`,
-      ``,
-      `- Hub: \`${HUB}\``,
-      `- Room: \`${member.room}\``,
-      `- Join secret: \`${joinSecret}\``,
-      // The pack's real first offer, never a hardcoded or fabricated skill id: this
-      // line is what `npm run ask` trusts as its default capability, and a hardcoded
-      // id here sent a fresh environment's first ask to a capability nobody offers
-      // (2026-08-21). A pack with no offers (reachable: the offers requirement only
-      // covers packs with a serving rooms binding) advertises no skill at all.
-      `- Resident: **${member.name}** (\`${member.memberId}\`), ${pack.def.offers?.[0]?.id ? `skill \`${pack.def.offers[0].id}\`, ` : ""}definition \`${pack.definitionHash.slice(0, 15)}\``,
-      `- Knowledge: ${knowledgeFiles(pack).map((f) => `\`${path.relative(ROOT, f)}\``).join(", ")}`,
-      ``,
-      `## Ask it something from any Claude Code session`,
-      ``,
-      `The short way (or use the /ask-pm command):`,
-      ``,
-      "```",
-      `Read dogfood/ROOM.md, join the room as dev-agent, and ask the PM agent:`,
-      `how do presence leases work?`,
-      "```",
-      ``,
-      `Watch live: \`npm run tail -- data/rooms/${member.room}.ndjson --follow\``,
-      `- Watch in the browser: \`http://localhost:8790/console#${member.room}\` (observer with the secret above; supervisor with the human key in \`dogfood/state/human-key.txt\`)`,
-    ].join("\n"),
-  );
 }
 
 const save = () =>
@@ -801,7 +751,7 @@ const save = () =>
   });
 
 save();
-writeRoomMd();
+recordRoom();
 log(`definition ${pack.definitionHash.slice(0, 15)} (model ${pack.def.model ?? "inherit"}); knowledge: ${knowledgeFiles(pack).length} files; episodes so far: ${episodes.count()}`);
 // Once per pack at startup (spec 18.1): a pack with neither ceiling can spend
 // without bound, and silence about that is the worst of the three states.
@@ -867,7 +817,7 @@ const consolidationTimer = setInterval(() => {
   if (sinceConsolidation < 8 && Date.now() - lastConsolidation < 6 * 3600_000) return;
   sinceConsolidation = 0;
   lastConsolidation = Date.now();
-  void consolidate(pack.name)
+  void consolidate(pack.name, { hubdir })
     .then((r) => {
       // The same daily ledger as answer-path work (spec 18.4). It was hiding
       // roughly 3% of the resident's spend in a separate maxBudgetUsd.
