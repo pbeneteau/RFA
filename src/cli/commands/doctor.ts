@@ -183,9 +183,19 @@ export async function runChecks(ctx: CliContext, opts: { deep?: boolean } = {}):
     if (names.has(r.agent) && !owned.has(r.pid)) checks.push(fail("stray-resident", `a resident for ${r.agent} (pid ${r.pid}) is running that the supervisor does not own`, "two residents on one membership answer as one; stop it, or rfa agent retire if it is stale"));
   }
   for (const [name, a] of Object.entries(supFile?.agents ?? {})) {
-    if (a.status === "crash-looped") checks.push(fail(`crash-${name}`, `${name} is crash-looping; the supervisor gave up until its definition changes`, `rfa logs ${name}`));
+    // state.json is the supervisor's view, and a dead supervisor's view is
+    // history: its crash budget lives in memory, so the next rfa up starts
+    // every pack fresh (seen live: the old supervisor had given up on a pack
+    // whose definition it could not parse, and the file said so for hours).
+    if (a.status === "crash-looped") {
+      checks.push(
+        supState.alive
+          ? fail(`crash-${name}`, `${name} is crash-looping; the supervisor gave up until its definition changes`, `rfa logs ${name}; rfa agent restart ${name} grants a fresh crash budget`)
+          : skip(`crash-${name}`, `${name} was crash-looping when the supervisor last wrote its state; rfa up starts it with a fresh crash budget, then rfa logs ${name} if it dies again`),
+      );
+    }
     const hb = path.join(packsDir, name, "state", "heartbeat");
-    if (a.status === "running" && fs.existsSync(hb)) {
+    if (supState.alive && a.status === "running" && fs.existsSync(hb)) {
       const age = Date.now() - Number(fs.readFileSync(hb, "utf8"));
       if (age > 240_000) checks.push(warn(`heartbeat-${name}`, `${name}'s heartbeat is ${fmtAge(Date.now() - age)}; the supervisor restarts it past the lease`, `rfa logs ${name}`));
     }
