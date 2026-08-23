@@ -9,10 +9,13 @@ import * as path from "node:path";
 import { RoomMember } from "../../client.js";
 import type { HubDir, RoomRecord } from "../../hubdir.js";
 import { roomsStore } from "../../hubdir.js";
+import type { RfaTask } from "../../model.js";
 import { packageVersion } from "../../pkg.js";
+import { reviewQueueCounts, type QueueCounts } from "../../evals/label.js";
 import type { CliContext } from "../context.js";
+import { listCases } from "../commands/instruments.js";
 import { collectStatus } from "../commands/procs.js";
-import { speaker } from "../commands/talk.js";
+import { board, speaker } from "../commands/talk.js";
 
 export interface AgentView {
   name: string;
@@ -91,6 +94,8 @@ export interface Snapshot {
   recent: RecentAnswer[];
   /** Answers per hour over the last 24h, oldest first: the overview's sparkline. */
   perHour: number[];
+  /** The labelling sitting's two numbers (spec 20.4/20.5): what waits for a human label, what carries one. Null before the first answer. */
+  review: QueueCounts | null;
   error: string | null;
 }
 
@@ -112,7 +117,15 @@ export async function snapshot(ctx: CliContext, h: HubDir): Promise<Snapshot> {
     }
   }
   const obs = await readObs(h);
-  return { at, status, approvals, alerts: obs.alerts, summary: obs.summary, recent: obs.recent, perHour: obs.perHour, error };
+  let review: QueueCounts | null = null;
+  if (fs.existsSync(h.paths.obsDb)) {
+    try {
+      review = reviewQueueCounts(h.paths.obsDb);
+    } catch {
+      review = null;
+    }
+  }
+  return { at, status, approvals, alerts: obs.alerts, summary: obs.summary, recent: obs.recent, perHour: obs.perHour, review, error };
 }
 
 async function readObs(h: HubDir): Promise<Pick<Snapshot, "alerts" | "summary" | "recent" | "perHour">> {
@@ -155,6 +168,85 @@ async function readObs(h: HubDir): Promise<Pick<Snapshot, "alerts" | "summary" |
   } catch {
     return empty;
   }
+}
+
+// ---------------------------------------------------------------- the gate
+
+export interface GateCase {
+  id: string;
+  kind: string;
+  subject: string;
+  where: string;
+  failure_mode: string | null;
+  /** pass^k in evals/baseline.json, or null when the case has never been baselined. */
+  baseline: number | null;
+  /** What the last `rfa evals run` recorded for it, or null when that run did not include it. */
+  last: { score: number; passk: number | null; trials: boolean[]; refused: number; blocked: string | null; note: string } | null;
+}
+
+export interface GateView {
+  cases: GateCase[];
+  gate: { k: number; band: number };
+  lastRun: { ts: string; at: number; judged: boolean } | null;
+  corpusVersion: string | null;
+}
+
+interface RunReport {
+  ts: string;
+  judged: boolean;
+  results: { id: string; score: number; passk: { k: number; value: number } | null; trials: boolean[]; refused?: string[]; blocked?: string; comments: string[] }[];
+}
+
+/** The runner's report name back to an instant: `2026-08-23T09-17-16` was an ISO time with its colons replaced. */
+function reportInstant(ts: string): number {
+  return Date.parse(`${ts.slice(0, 10)}T${ts.slice(11).replace(/-/g, ":")}Z`);
+}
+
+/**
+ * The gate as the Evals tab shows it: the cases `rfa evals ls` lists, each with
+ * its baseline pass^k and what the newest report under .rfa/reports/evals/ says
+ * about it. Every number here is one `rfa evals run` printed.
+ */
+export function gateView(h: HubDir): GateView {
+  const cases = listCases(h);
+  let stored: Record<string, unknown> = {};
+  if (fs.existsSync(h.paths.evalBaseline)) {
+    try {
+      stored = JSON.parse(fs.readFileSync(h.paths.evalBaseline, "utf8")) as Record<string, unknown>;
+    } catch {
+      stored = {};
+    }
+  }
+  const gate = (stored.gate as { k?: number; band?: number } | undefined) ?? {};
+  const baseCases = (stored.cases as Record<string, { passk: number }> | undefined) ?? {};
+  const baselineOf = (id: string): number | null => {
+    if (baseCases[id]) return baseCases[id].passk;
+    const flat = stored[id];
+    return typeof flat === "number" ? flat : null;
+  };
+  const reportDir = path.join(h.paths.reports, "evals");
+  let report: RunReport | null = null;
+  if (fs.existsSync(reportDir)) {
+    const newest = fs.readdirSync(reportDir).filter((f) => f.endsWith(".json")).sort().at(-1);
+    if (newest) {
+      try {
+        report = JSON.parse(fs.readFileSync(path.join(reportDir, newest), "utf8")) as RunReport;
+      } catch {
+        report = null;
+      }
+    }
+  }
+  const lastOf = (id: string): GateCase["last"] => {
+    const r = report?.results.find((x) => x.id === id);
+    if (!r) return null;
+    return { score: r.score, passk: r.passk?.value ?? null, trials: r.trials ?? [], refused: r.refused?.length ?? 0, blocked: r.blocked ?? null, note: r.blocked ?? r.comments.at(-1) ?? "" };
+  };
+  return {
+    cases: cases.map((c) => ({ id: c.id, kind: c.kind, subject: c.subject, where: c.where, failure_mode: c.failure_mode, baseline: baselineOf(c.id), last: lastOf(c.id) })),
+    gate: { k: gate.k ?? 4, band: gate.band ?? 0.15 },
+    lastRun: report ? { ts: report.ts, at: reportInstant(report.ts), judged: Boolean(report.judged) } : null,
+    corpusVersion: typeof stored.corpus_version === "string" ? stored.corpus_version : null,
+  };
 }
 
 // ---------------------------------------------------------------- the feed
@@ -255,6 +347,47 @@ export function followFile(file: string, onLines: (lines: FeedLine[]) => void, i
   const timer = setInterval(tick, intervalMs);
   timer.unref?.();
   return () => clearInterval(timer);
+}
+
+// ---------------------------------------------------------------- the task board
+
+export interface Member {
+  id: string;
+  name: string;
+  origin: string;
+  state: string;
+}
+
+export interface Board {
+  tasks: RfaTask[];
+  /** The roster, so owners and creators show by name rather than by member id. */
+  members: Member[];
+}
+
+const TERMINAL = new Set(["completed", "failed", "cancelled", "rejected"]);
+export const isOpenTask = (t: RfaTask): boolean => !TERMINAL.has(t.state);
+
+/** A room's board and roster, through the operator membership: what `rfa task ls` reads, one hub call each. */
+export async function readBoard(ctx: CliContext, h: HubDir, rec: RoomRecord): Promise<Board> {
+  const b = await board(ctx, h, rec.alias ?? rec.handle);
+  try {
+    const tasks = (((await b.call({ action: "list" })) as { tasks?: RfaTask[] }).tasks ?? []).sort((x, y) => Number(x.id.replace(/^t_/, "")) - Number(y.id.replace(/^t_/, "")));
+    const raw = (await b.roster()) as { roster?: Member[] };
+    const members = (raw.roster ?? []).map((m) => ({ id: m.id, name: m.name, origin: m.origin, state: m.state }));
+    return { tasks, members };
+  } finally {
+    await b.close();
+  }
+}
+
+/** One task action (create, cancel, verify), the same `room_task` call the task commands make. */
+export async function taskAction(ctx: CliContext, h: HubDir, rec: RoomRecord, args: Record<string, unknown>): Promise<RfaTask> {
+  const b = await board(ctx, h, rec.alias ?? rec.handle);
+  try {
+    return (await b.call(args)) as RfaTask;
+  } finally {
+    await b.close();
+  }
 }
 
 // ---------------------------------------------------------------- asking

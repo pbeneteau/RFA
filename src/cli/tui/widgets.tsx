@@ -68,7 +68,9 @@ export function Table(props: { widths: number[]; rows: React.ReactNode[][]; sele
         <Box>
           {props.header.map((h, i) => (
             <Box key={i} width={props.widths[i]} marginRight={1}>
-              <Text dimColor>{h}</Text>
+              <Text dimColor wrap="truncate-end">
+                {h}
+              </Text>
             </Box>
           ))}
         </Box>
@@ -134,10 +136,18 @@ export function Choice(props: { options: { value: string; label: string; hint?: 
       {props.options.map((o, i) => (
         <Box key={o.value}>
           <Text color={i === cursor ? ACCENT : undefined}>{i === cursor ? "▸ " : "  "}</Text>
-          <Text color={i === cursor ? ACCENT : undefined} bold={i === cursor}>
-            {o.label}
-          </Text>
-          {o.hint ? <Text dimColor>  {o.hint}</Text> : null}
+          <Box flexShrink={0}>
+            <Text color={i === cursor ? ACCENT : undefined} bold={i === cursor}>
+              {o.label}
+            </Text>
+          </Box>
+          {o.hint ? (
+            <Box marginLeft={2} flexShrink={1}>
+              <Text dimColor wrap="truncate-end">
+                {o.hint}
+              </Text>
+            </Box>
+          ) : null}
         </Box>
       ))}
     </Box>

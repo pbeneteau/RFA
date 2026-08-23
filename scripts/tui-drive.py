@@ -119,8 +119,8 @@ def smoke():
         r = headless(d, "init", "--yes", "--no-start", "--name", "smoke", "--port", str(free_port()), "--human", "paul", "--agent", "spec-expert", "--room", "protocol", "--json")
         if r.returncode != 0:
             failures.append(f"headless init failed: {r.stderr[-400:]}")
-        painted = drive(d, ["dashboard"], [[1800, "2"], [600, "3"], [600, "4"], [600, "5"], [600, "1"], [600, "?"], [600, " "], [600, ":"], [700, "agent re"], [900, "<ESC>"], [800, "<RESIZE:160,50>"], [1200, "<RESIZE:80,30>"], [1200, "q"]], quiet=True)
-        for want in ["1 Overview", "2 Agents", "3 Rooms", "4 Approvals", "5 Feed", "spec-expert", "protocol", "not running · press u", "keys", "runs: rfa agent restart <name>", "pending approvals", "feed ·"]:
+        painted = drive(d, ["dashboard"], [[1800, "2"], [600, "3"], [600, "4"], [600, "5"], [600, "6"], [900, "7"], [1500, "1"], [600, "?"], [600, " "], [600, ":"], [700, "agent re"], [900, "<ESC>"], [800, "<RESIZE:160,50>"], [1200, "<RESIZE:80,30>"], [1200, "q"]], quiet=True)
+        for want in ["1 Overview", "2 Agents", "3 Rooms", "4 Approvals", "5 Feed", "6 Evals", "spec-expert", "protocol", "not running · press u", "keys", "runs: rfa agent restart <name>", "pending approvals", "feed ·", "review queue", "no observability store yet", "the gate", "spec-expert-01", "7 Tasks", "tasks · protocol", "no tasks in protocol yet"]:
             if want not in painted:
                 failures.append(f"dashboard never painted: {want!r}")
         borders = [len(l.rstrip()) for l in painted.split("\n") if "╭" in l]
@@ -135,6 +135,14 @@ def smoke():
                 failures.append(f"walkthrough never painted: {want!r}")
         if not os.path.exists(os.path.join(d, "agents", "helper", "agent.md")):
             failures.append("walkthrough did not write agents/helper/agent.md")
+        # the edit walkthrough over the pack just made: the settings list, the model changed, applied
+        painted = drive(d, ["agent", "edit", "helper"], [[1800, "j"], [400, "<CR>"], [900, "j"], [400, "<CR>"], [900, "<CR>"], [2500, "<CR>"]], quiet=True)
+        for want in ["edit helper", "What do you want to change?", "Which model?", "1 pending", "apply 1 change", "haiku → sonnet", "helper edited"]:
+            if want not in painted:
+                failures.append(f"edit walkthrough never painted: {want!r}")
+        with open(os.path.join(d, "agents", "helper", "agent.md")) as f:
+            if "model: sonnet" not in f.read():
+                failures.append("edit walkthrough did not write model: sonnet")
         # 2. the onboarding with every default and 'not yet' for the start
         o = os.path.join(base, "onboard")
         os.makedirs(o)
@@ -152,7 +160,7 @@ def smoke():
         for f in failures:
             print(f"  - {f}")
         return 1
-    print("TUI SMOKE PASS: dashboard (5 tabs, help, palette, two resizes), the walkthrough (an answerer end to end) and the onboarding (checks, defaults, provisioning, done screen) painted what they should")
+    print("TUI SMOKE PASS: dashboard (7 tabs, help, palette, two resizes), the walkthroughs (an answerer end to end, then its model edited) and the onboarding (checks, defaults, provisioning, done screen) painted what they should")
     return 0
 
 

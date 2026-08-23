@@ -12,20 +12,20 @@ import YAML from "yaml";
 import { knowledgeFiles, listPacks, type AgentPack } from "../../agentdef.js";
 import { CHAIN_SCOPE_QUALIFIER } from "../../chain.js";
 import { runForeground } from "../../daemon.js";
-import { applyWorksheet, prepareWorksheet } from "../../evals/label.js";
+import { applyWorksheet, flagForReview, prepareWorksheet } from "../../evals/label.js";
 import { loadFixtures, runParity, type ParityVerdict } from "../../evals/parity.js";
 import { promoteCase } from "../../evals/promote.js";
 import type { HubDir } from "../../hubdir.js";
-import { CLONE_SUFFIX, cloneNameFor, countDocs, fileProvenance, isGitRemote, knowledgeStatus, packClones, pinCorpus, syncClone } from "../../knowledge-sources.js";
+import { countDocs, fileProvenance, isGitRemote, knowledgeStatus, packClones, pinCorpus, syncClone } from "../../knowledge-sources.js";
 import { describeReport, expandLogTargets, verifyLogFile, type LogReport } from "../../logverify.js";
 import { addKnowledge } from "../agentmd.js";
+import { attachKnowledge, AttachError, type Attachment } from "../attach.js";
 import { CliError } from "../context.js";
 import { askLine, pickOne } from "../prompts.js";
 import type { CommandDef } from "../router.js";
 import { daemonEnv } from "./procs.js";
 import { requireRoom } from "./room.js";
 import { describeOffers, speaker } from "./talk.js";
-import { knowledgeRelativeToPack } from "../scaffold.js";
 
 function requirePack(h: HubDir, name: string | undefined): AgentPack {
   if (!name) throw new CliError(2, "which agent? pass its name", "rfa agent ls");
@@ -52,40 +52,24 @@ export const knowledgeAdd: CommandDef = {
     const source = a.positionals[1] ?? (await askLine(ctx, "A folder of markdown, or a git remote", usage, { placeholder: "./docs  or  git@host:org/handbook.git" }));
     const pack = requirePack(h, name);
     const file = path.join(pack.dir, "agent.md");
-    let globs: string[];
-    let attached: string;
-    if (isGitRemote(source)) {
-      const cloneName = a.values.name ? `${String(a.values.name).replace(new RegExp(`${CLONE_SUFFIX}$`), "")}${CLONE_SUFFIX}` : cloneNameFor(source);
-      const dir = path.join(pack.dir, "knowledge", cloneName);
-      const sp = ctx.ui.spinner(`cloning ${source}`);
-      let res: ReturnType<typeof syncClone>;
-      try {
-        res = syncClone(dir, source, { stdio: "pipe" });
-      } catch (err) {
-        sp.stop({ ok: false, text: `could not clone ${source}` });
-        throw new CliError(1, (err as Error).message.split("\n").find((l) => l.trim()) ?? "git clone failed", `this needs YOUR credentials for that host; clone it by hand into ${path.relative(h.root, dir)} and run the command again`);
-      }
-      const docs = String(a.values.docs ?? "").replace(/^\/+|\/+$/g, "");
-      const docsDir = path.join(dir, docs);
-      if (!fs.existsSync(docsDir)) {
-        sp.stop({ ok: false, text: `the clone has no ${docs || "documents"} directory` });
-        throw new CliError(1, `nothing attached: ${path.relative(h.root, docsDir)} does not exist`, "pass --docs <subdir> naming the directory that holds the documents");
-      }
-      const n = countDocs(docsDir);
-      sp.stop({ ok: true, text: `${res.created ? "cloned at" : res.fresh ? "updated to" : "already at"} ${short(res.head)}`, detail: `${n} document(s) under ${docs || "the clone root"}` });
-      const sample = fs.readdirSync(docsDir, { withFileTypes: true }).find((e) => e.isFile() && /\.mdx?$/.test(e.name))?.name;
-      const prov = sample ? fileProvenance(dir, path.join(docs, sample)) : null;
-      if (prov) ctx.ui.note(`provenance works: ${sample} last touched by ${prov.author} at ${prov.committed_at}`);
-      const base = path.posix.join("knowledge", cloneName, ...docs.split("/").filter(Boolean));
-      globs = [`${base}/**/*.md`, `${base}/**/*.mdx`];
-      attached = `${path.relative(h.root, docsDir)} (clone of ${source})`;
-    } else {
-      const abs = path.resolve(source);
-      if (!fs.existsSync(abs)) throw new CliError(2, `no such path: ${source}`);
-      const rel = knowledgeRelativeToPack(h, name, abs)!;
-      globs = fs.statSync(abs).isDirectory() ? [`${rel}/**/*.md`, `${rel}/**/*.mdx`] : [rel];
-      attached = abs;
+    const remote = isGitRemote(source);
+    const sp = remote ? ctx.ui.spinner(`cloning ${source}`) : null;
+    let att: Attachment;
+    try {
+      att = attachKnowledge(h, pack, source, { docs: a.values.docs as string | undefined, cloneName: a.values.name as string | undefined });
+    } catch (err) {
+      sp?.stop({ ok: false, text: `could not attach ${source}` });
+      if (err instanceof AttachError) throw new CliError(remote ? 1 : 2, err.message, err.hint);
+      throw err;
     }
+    if (att.clone) {
+      const docs = String(a.values.docs ?? "").replace(/^\/+|\/+$/g, "");
+      sp?.stop({ ok: true, text: `${att.clone.created ? "cloned at" : att.clone.fresh ? "updated to" : "already at"} ${short(att.clone.head)}`, detail: `${att.clone.docs} document(s) under ${docs || "the clone root"}` });
+      const sample = fs.readdirSync(att.clone.docsDir, { withFileTypes: true }).find((e) => e.isFile() && /\.mdx?$/.test(e.name))?.name;
+      const prov = sample ? fileProvenance(att.clone.dir, path.join(docs, sample)) : null;
+      if (prov) ctx.ui.note(`provenance works: ${sample} last touched by ${prov.author} at ${prov.committed_at}`);
+    }
+    const { globs, attached } = att;
     const r = addKnowledge(file, globs);
     const files = knowledgeFiles(requirePack(h, name)).length;
     if (ctx.flags.json) return void ctx.ui.json({ agent: name, attached, globs, knowledge: r.knowledge, files, definition_changed: r.before !== r.after });
@@ -193,7 +177,7 @@ export const evalsRun: CommandDef = {
   },
 };
 
-interface CaseRow {
+export interface CaseRow {
   id: string;
   kind: string;
   subject: string;
@@ -203,7 +187,7 @@ interface CaseRow {
   promoted_at: string | null;
 }
 
-function listCases(h: HubDir): CaseRow[] {
+export function listCases(h: HubDir): CaseRow[] {
   const roots = [h.paths.evalCases, ...listPacks(h.paths.agents).map((p) => path.join(p.dir, "evals", "cases"))];
   const rows: CaseRow[] = [];
   for (const root of roots.filter((r) => fs.existsSync(r))) {
@@ -279,10 +263,10 @@ export const evalsPromote: CommandDef = {
 
 export const evalsLabel: CommandDef = {
   path: ["evals", "label"],
-  summary: "The labelling sitting: prepare a worksheet from the review queue, then apply it",
+  summary: "The labelling sitting: prepare a worksheet from the review queue, then apply it (the dashboard's Evals tab is the same sitting in place)",
   usage: "--prepare [--limit <n>] [--out <file>] | --apply <worksheet> [--out <cases dir>]   [--db <obs.db>]",
   options: { prepare: { type: "boolean", default: false }, apply: { type: "string" }, limit: { type: "string" }, out: { type: "string" }, db: { type: "string" } },
-  why: "Labelling is the scarce resource (RFA-0.5 sect. 20.4): ONE pass over the same traces produces the binary label, the gold source and the promotion together. The worksheet has the fetching and formatting done so the sitting is only judgement; applying it writes the human feedback rows (no rubric hash: that is how a person's verdict is told from a model's) and cuts the promoted cases. An all-passing sitting prints the exact ledger line the spec requires, because an instrument that has finished and one that has gone blind look the same without it.",
+  why: "Labelling is the scarce resource (RFA-0.5 sect. 20.4): ONE pass over the same traces produces the binary label, the gold source and the promotion together. The worksheet has the fetching and formatting done so the sitting is only judgement (the full answer is read from the room log when it is at hand, so nobody judges obs.db's 300-char excerpt as if it were the answer); applying it writes the human feedback rows (no rubric hash: that is how a person's verdict is told from a model's) and cuts the promoted cases. An all-passing sitting prints the exact ledger line the spec requires, because an instrument that has finished and one that has gone blind look the same without it. The dashboard's Evals tab (6) holds the same queue in memory and applies it through the same function.",
   examples: ["rfa evals label --prepare", "rfa evals label --apply .rfa/reports/labelling-2026-08-22.yaml"],
   run: async (ctx, a) => {
     const h = ctx.maybe();
@@ -292,7 +276,13 @@ export const evalsLabel: CommandDef = {
     if (a.values.prepare) {
       const out = (a.values.out as string | undefined) ?? (h ? path.join(h.paths.reports, `labelling-${new Date().toISOString().slice(0, 10)}.yaml`) : undefined);
       if (!out) throw new CliError(2, "no hub directory here: pass --out <worksheet.yaml>");
-      const r = prepareWorksheet({ obsDb, out: path.resolve(out), limit: a.values.limit ? Number(a.values.limit) : undefined, rubric: h ? path.relative(h.root, h.paths.evalRubric) : "evals/rubric.md" });
+      const r = prepareWorksheet({
+        obsDb,
+        out: path.resolve(out),
+        limit: a.values.limit ? Number(a.values.limit) : undefined,
+        rubric: h ? path.relative(h.root, h.paths.evalRubric) : "evals/rubric.md",
+        roomLogFile: h ? (room) => path.join(h.paths.roomLogs, `${room}.ndjson`) : undefined,
+      });
       if (ctx.flags.json) return void ctx.ui.json({ worksheet: r.out, traces: r.traces, already_labelled: r.alreadyLabelled });
       ctx.ui.done(`worksheet: ${h ? path.relative(h.root, r.out) : r.out}`, `${r.traces} unlabelled trace(s) from the review queue`);
       if (r.alreadyLabelled > 0) ctx.ui.note(`${r.alreadyLabelled} already carry a human label and were left out`);
@@ -321,6 +311,7 @@ export const evalsLabel: CommandDef = {
     if (ctx.flags.json) return void ctx.ui.json({ labelled: r.labelled, gold_sources: r.golds, promoted: r.promoted, failure_modes: [...new Set(r.failures)], ledger_line: r.ledgerLine, problems: r.problems });
     for (const p of r.problems) ctx.ui.warn(p);
     ctx.ui.done(`sitting applied: ${r.labelled} label(s), ${r.golds} gold source(s), ${r.promoted.length} case(s) promoted`);
+    for (const p of r.promotedNotes) ctx.ui.note(`${p.caseId}: ${h ? path.relative(h.root, p.dir) : p.dir}`, p.notes.join("; "));
     if (r.failures.length > 0) ctx.ui.note(`failure modes recorded: ${[...new Set(r.failures)].join("; ")}`);
     if (r.ledgerLine) {
       ctx.ui.blank();
@@ -328,6 +319,31 @@ export const evalsLabel: CommandDef = {
       ctx.ui.line(`  ${r.ledgerLine}`);
       ctx.ui.note("an all-passing review with no such entry is an unaudited instrument: nothing distinguishes", "an instrument that has finished from one that has gone blind");
     }
+  },
+};
+
+export const evalsFlag: CommandDef = {
+  path: ["evals", "flag"],
+  summary: "Flag an answer for the labelling sitting, by its run id, with why",
+  usage: '<run id> ["<why>"] [--db <obs.db>]',
+  options: { db: { type: "string" } },
+  why: "Evals and parity flag their own failures; a person reading a wrong answer had no way into the review queue. This marks the run needs_review and writes a human feedback row at 0 with the reason, so the next sitting (rfa evals label --prepare, or the dashboard's Evals tab) lists the trace with the reason beside it. The run id is on every answer: rfa ask prints it, the ask box shows it, and `!` on the ask box's answer is this command.",
+  examples: ['rfa evals flag run_4d713d020cd7 "cited the wrong plan"'],
+  run: async (ctx, a) => {
+    const h = ctx.maybe();
+    const obsDb = (a.values.db as string | undefined) ?? h?.paths.obsDb;
+    if (!obsDb) throw new CliError(2, "no hub directory here: pass --db <obs.db>", "rfa init, or --dir <hub directory>");
+    if (!fs.existsSync(obsDb)) throw new CliError(1, `no observability store at ${obsDb}`, "residents write it on their first answer");
+    const runId = a.positionals[0] ?? (await askLine(ctx, "Which run? (the run_… id on the answer)", 'rfa evals flag <run id> ["<why>"]', { placeholder: "run_4d713d020cd7" }));
+    const note = a.positionals[1] ?? null;
+    try {
+      flagForReview({ obsDb, runId, note });
+    } catch (err) {
+      throw new CliError(1, (err as Error).message);
+    }
+    if (ctx.flags.json) return void ctx.ui.json({ run_id: runId, flagged: true, note });
+    ctx.ui.done(`${runId} flagged for the sitting`, note ? `"${note}"` : "no reason given; the sitting can still name the failure mode");
+    ctx.ui.note("rfa evals label --prepare lists it, and so does the dashboard's Evals tab (6)");
   },
 };
 

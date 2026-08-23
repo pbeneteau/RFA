@@ -1,10 +1,14 @@
 /**
- * The agent walkthrough (RFA-0.7 sect. 13.5): what `rfa agent new` opens on a
+ * The agent walkthrough (RFA-0.7 sect. 13.7): what `rfa agent new` opens on a
  * terminal when no name is given, and what `n` on the dashboard runs. One
  * question per screen with the reason beside it, every setting a pack has
  * (kind, what it reads or acts through, its mode, model, capability, budgets,
  * room), a review screen, then the same `scaffoldPack` the one-line command
  * uses. The flags of `rfa agent new` stay the headless form of every answer.
+ *
+ * The screens are exported: `rfa agent edit` asks the same questions over an
+ * existing pack (agentedit.tsx), so a setting is asked the same way whether the
+ * pack is being made or changed.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -12,16 +16,17 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Box, render, Text, useApp, useInput, useWindowSize } from "ink";
 import { daemonState } from "../../daemon.js";
 import type { HubDir } from "../../hubdir.js";
-import { cloneNameFor, isGitRemote, syncClone } from "../../knowledge-sources.js";
+import { isGitRemote } from "../../knowledge-sources.js";
 import { MODE_SUMMARY, MODES, type AgentMode } from "../../posture.js";
 import { addKnowledge } from "../agentmd.js";
+import { attachKnowledge } from "../attach.js";
 import { createRoomRecord } from "../commands/init.js";
 import type { CliContext } from "../context.js";
-import { BUILTIN_SERVERS, nameProblem, PACK_KINDS, scaffoldPack, type PackKind, type ToolSpec } from "../scaffold.js";
+import { nameProblem, PACK_KINDS, scaffoldPack, type PackKind, type ToolSpec } from "../scaffold.js";
 import { recordedRooms } from "./data.js";
 import { Mark } from "./logo.js";
 import { Field, ToolServerFields } from "./onboarding.js";
-import { ACCENT, BAD, GOOD, MUTED, WARN } from "./theme.js";
+import { ACCENT, BAD, GOOD, WARN } from "./theme.js";
 import { Choice, Keys, Panel, Spin } from "./widgets.js";
 
 export interface WizardResult {
@@ -69,7 +74,7 @@ export function nextStep(from: Step, d: Draft, dir: 1 | -1 = 1): Step {
   return ORDER[Math.max(0, Math.min(ORDER.length - 1, i))];
 }
 
-const WHY: Record<Step, { title: string; lines: string[] }> = {
+export const WHY: Record<Step, { title: string; lines: string[] }> = {
   name: { title: "the name", lines: ["Lowercase, no spaces: it is the folder under agents/ and the name the room sees.", "Reserved first words (human, console, system, hub, rfa) are refused here rather than at join."] },
   kind: { title: "three kinds of pack", lines: ["An answerer reads markdown and answers with citations; it has no side effects.", "A tool user acts through an MCP server; every acting call pauses for a human unless you set its mode otherwise.", "A spec-expert answers about the RFA protocol from the spec shipped in this package; a demo, not a colleague."] },
   knowledge: { title: "what it answers from", lines: ["A folder is attached as a glob; nothing is copied.", "A git repository is cloned under the pack and tracked: provenance for free, fresh on every push, no credential at answer time.", "Later: fill agents/<name>/knowledge/ or run rfa knowledge add."] },
@@ -84,9 +89,48 @@ const WHY: Record<Step, { title: string; lines: string[] }> = {
   done: { title: "", lines: [] },
 };
 
+/** The shape every walkthrough screen has: the heading line, the question with its keys, the reason beside it when the terminal is wide enough. */
+export function WizardFrame(props: { heading: string; counter?: string; hubName: string; label: string; why?: { title: string; lines: string[] }; footer?: [string, string][]; children: React.ReactNode }): React.JSX.Element {
+  const { columns } = useWindowSize();
+  const narrow = columns < 96;
+  const leftWidth = narrow ? Math.max(40, columns - 2) : Math.min(64, Math.floor(columns * 0.56));
+  const rightWidth = narrow ? Math.max(40, columns - 2) : Math.max(30, columns - leftWidth - 4);
+  return (
+    <Box flexDirection="column">
+      <Box marginBottom={1} gap={1}>
+        <Mark />
+        <Text bold>{props.heading}</Text>
+        <Text dimColor>
+          {" "}
+          {props.counter ? `${props.counter} · ` : ""}
+          {props.hubName}
+        </Text>
+      </Box>
+      <Box gap={narrow ? 0 : 2} flexDirection={narrow ? "column" : "row"}>
+        <Panel title={props.label} active width={leftWidth}>
+          {props.children}
+          <Box marginTop={1}>
+            <Keys items={props.footer ?? [["enter", "next"], ["esc", "back"]]} />
+          </Box>
+        </Panel>
+        {props.why && props.why.lines.length ? (
+          <Panel title={props.why.title} width={rightWidth}>
+            {props.why.lines.map((l, i) => (
+              <Text key={i} dimColor wrap="wrap">
+                {l}
+              </Text>
+            ))}
+          </Panel>
+        ) : null}
+      </Box>
+    </Box>
+  );
+}
+
+export type Screen = (label: string, body: React.ReactNode, footer?: [string, string][]) => React.JSX.Element;
+
 export function AgentWizard(props: { ctx: CliContext; hub: HubDir }): React.JSX.Element {
   const { exit } = useApp();
-  const { columns } = useWindowSize();
   const h = props.hub;
   const [step, setStep] = useState<Step>("name");
   const [d, setD] = useState<Draft>(defaultDraft);
@@ -136,12 +180,9 @@ export function AgentWizard(props: { ctx: CliContext; hub: HubDir }): React.JSX.
         });
         say(true, `agents/${d.name}/agent.md`, `definition ${res.definitionHash.slice(7, 15)} · offers ${res.skillId}${roomHandle ? "" : " · not bound to a room yet"}`);
         if (d.knowledge?.type === "git" && d.knowledge.value) {
-          const dir = path.join(res.dir, "knowledge", cloneNameFor(d.knowledge.value));
-          const r = syncClone(dir, d.knowledge.value, { stdio: "pipe" });
-          const docs = (d.knowledge.docs ?? "").replace(/^\/+|\/+$/g, "");
-          const base = path.posix.join("knowledge", path.basename(dir), ...docs.split("/").filter(Boolean));
-          addKnowledge(path.join(res.dir, "agent.md"), [`${base}/**/*.md`, `${base}/**/*.mdx`]);
-          say(true, `cloned ${d.knowledge.value} at ${r.head.slice(0, 10)}`, `attached as ${base}/**; rfa knowledge sync pulls it`);
+          const att = attachKnowledge(h, { name: d.name, dir: res.dir }, d.knowledge.value, { docs: d.knowledge.docs });
+          addKnowledge(path.join(res.dir, "agent.md"), att.globs);
+          say(true, `cloned ${d.knowledge.value} at ${att.clone?.head.slice(0, 10) ?? "?"}`, `${att.clone?.docs ?? 0} document(s), attached as ${att.globs[0].replace(/\/\*\*\/\*\.md$/, "")}/**; rfa knowledge sync pulls it`);
         }
         const sup = daemonState(h.paths.supervisorPid);
         say(true, sup.alive ? "the supervisor picks it up within 30 seconds" : "nothing is running: rfa up starts it", sup.alive ? "rfa status shows it joining" : undefined);
@@ -153,38 +194,11 @@ export function AgentWizard(props: { ctx: CliContext; hub: HubDir }): React.JSX.
     })();
   }, [step, d, h, props.ctx]);
 
-  const why = WHY[step];
-  const narrow = columns < 96;
-  const leftWidth = narrow ? Math.max(40, columns - 2) : Math.min(64, Math.floor(columns * 0.56));
-  const rightWidth = narrow ? Math.max(40, columns - 2) : Math.max(30, columns - leftWidth - 4);
-  const screen = (label: string, body: React.ReactNode, footer?: [string, string][]) => (
-    <Box flexDirection="column">
-      <Box marginBottom={1} gap={1}>
-        <Mark />
-        <Text bold>new agent</Text>
-        <Text dimColor>
-          {" "}
-          {ORDER.filter((s) => applicableStep(s, d) && !["create", "done"].includes(s)).indexOf(step) + 1}/{ORDER.filter((s) => applicableStep(s, d) && !["create", "done"].includes(s)).length} · {h.manifest.name}
-        </Text>
-      </Box>
-      <Box gap={narrow ? 0 : 2} flexDirection={narrow ? "column" : "row"}>
-        <Panel title={label} active width={leftWidth}>
-          {body}
-          <Box marginTop={1}>
-            <Keys items={footer ?? [["enter", "next"], ["esc", "back"]]} />
-          </Box>
-        </Panel>
-        {why.lines.length ? (
-          <Panel title={why.title} width={rightWidth}>
-            {why.lines.map((l, i) => (
-              <Text key={i} dimColor wrap="wrap">
-                {l}
-              </Text>
-            ))}
-          </Panel>
-        ) : null}
-      </Box>
-    </Box>
+  const asked = ORDER.filter((s) => applicableStep(s, d) && !["create", "done"].includes(s));
+  const screen: Screen = (label, body, footer) => (
+    <WizardFrame heading="new agent" counter={`${asked.indexOf(step) + 1}/${asked.length}`} hubName={h.manifest.name} label={label} why={WHY[step]} footer={footer}>
+      {body}
+    </WizardFrame>
   );
 
   switch (step) {
@@ -212,7 +226,7 @@ export function AgentWizard(props: { ctx: CliContext; hub: HubDir }): React.JSX.
         [["enter", "choose"], ["esc", "back"]],
       );
     case "knowledge":
-      return <KnowledgeScreen d={d} screen={screen} onDone={(k) => {
+      return <KnowledgeScreen screen={screen} onDone={(k) => {
         set({ knowledge: k });
         go(1, { ...d, knowledge: k });
       }} />;
@@ -228,40 +242,28 @@ export function AgentWizard(props: { ctx: CliContext; hub: HubDir }): React.JSX.
     case "mode":
       return screen(
         "How does it act?",
-        <Choice initial={d.mode} options={MODES.map((m) => ({ value: m, label: m, hint: MODE_SUMMARY[m] }))} onChoose={(v) => {
-          set({ mode: v as AgentMode });
-          go(1, { ...d, mode: v as AgentMode });
+        <ModeChoice initial={d.mode} onChoose={(m) => {
+          set({ mode: m });
+          go(1, { ...d, mode: m });
         }} />,
         [["enter", "choose"], ["esc", "back"]],
       );
     case "model":
       return screen(
         "Which model?",
-        <Choice
-          initial={d.model}
-          options={[
-            { value: "haiku", label: "haiku", hint: "fast, cheap; reads and answers" },
-            { value: "sonnet", label: "sonnet", hint: "composes and acts" },
-            { value: "opus", label: "opus", hint: "the most capable, the most expensive" },
-          ]}
-          onChoose={(v) => {
-            set({ model: v as Draft["model"] });
-            go(1, { ...d, model: v as Draft["model"] });
-          }}
-        />,
+        <ModelChoice initial={d.model} onChoose={(m) => {
+          set({ model: m as Draft["model"] });
+          go(1, { ...d, model: m as Draft["model"] });
+        }} />,
         [["enter", "choose"], ["esc", "back"]],
       );
     case "capability":
       return screen(
         "The capability it advertises",
-        <TwoFields
-          first={{ label: "id", value: d.offer.id, placeholder: "answer-question", validate: (v) => (/^[a-z][a-z0-9-]{1,63}$/.test(v) ? null : "lowercase letters, digits and hyphens; make it a verb") }}
-          second={{ label: "description", value: d.offer.description, validate: (v) => (v.length >= 8 ? null : "a sentence an asker can match on") }}
-          onSubmit={(id, description) => {
-            set({ offer: { id, description } });
-            go(1, { ...d, offer: { id, description } });
-          }}
-        />,
+        <CapabilityFields offer={d.offer} onSubmit={(offer) => {
+          set({ offer });
+          go(1, { ...d, offer });
+        }} />,
       );
     case "budgets":
       return screen(
@@ -272,7 +274,7 @@ export function AgentWizard(props: { ctx: CliContext; hub: HubDir }): React.JSX.
         }} />,
       );
     case "room":
-      return <RoomScreen rooms={rooms} d={d} screen={screen} onDone={(room) => {
+      return <RoomScreen rooms={rooms} screen={screen} allowNone onDone={(room) => {
         set({ room });
         go(1, { ...d, room });
       }} />;
@@ -324,8 +326,9 @@ export function AgentWizard(props: { ctx: CliContext; hub: HubDir }): React.JSX.
           {[
             ["rfa agent show " + (created?.name ?? ""), "everything the pack declares"],
             [created?.room ? `rfa ask --capability ${created.skill} "…"` : `rfa agent bind ${created?.name ?? ""} --room <alias>`, created?.room ? "ask it, from anywhere in this folder" : "bind it to a room so it serves"],
-            ...(d.kind === "tool" ? [[`rfa agent mode ${created?.name ?? ""}`, "ask, plan, auto or bypass"]] : []),
+            ...(d.kind === "tool" ? [[`rfa agent mode ${created?.name ?? ""}`, "ask, plan or bypass"]] : []),
             ...(d.tool?.envSecrets?.length ? [[`rfa secrets set ${d.tool.envSecrets[0]}`, `${d.tool.server} runs in dry-run mode until it has this`]] : []),
+            [`rfa agent edit ${created?.name ?? ""}`, "change any of this later, on the same screens"],
             ["rfa", "the dashboard"],
           ].map(([c, w]) => (
             <Box key={c}>
@@ -343,17 +346,53 @@ export function AgentWizard(props: { ctx: CliContext; hub: HubDir }): React.JSX.
   }
 }
 
-function KnowledgeScreen(props: { d: Draft; screen: (label: string, body: React.ReactNode, footer?: [string, string][]) => React.JSX.Element; onDone: (k: Draft["knowledge"]) => void }): React.JSX.Element {
+// ---------------------------------------------------------------- the screens, shared with rfa agent edit
+
+export function ModelChoice(props: { initial?: string; onChoose: (model: string) => void }): React.JSX.Element {
+  return (
+    <Choice
+      initial={props.initial}
+      options={[
+        { value: "haiku", label: "haiku", hint: "fast, cheap; reads and answers" },
+        { value: "sonnet", label: "sonnet", hint: "composes and acts" },
+        { value: "opus", label: "opus", hint: "the most capable, the most expensive" },
+      ]}
+      onChoose={props.onChoose}
+    />
+  );
+}
+
+export function ModeChoice(props: { initial?: AgentMode; onChoose: (mode: AgentMode) => void }): React.JSX.Element {
+  return <Choice initial={props.initial} options={MODES.map((m) => ({ value: m, label: m, hint: MODE_SUMMARY[m] }))} onChoose={(v) => props.onChoose(v as AgentMode)} />;
+}
+
+export function CapabilityFields(props: { offer: { id: string; description: string }; onSubmit: (offer: { id: string; description: string }) => void }): React.JSX.Element {
+  return (
+    <TwoFields
+      first={{ label: "id", value: props.offer.id, placeholder: "answer-question", validate: (v) => (/^[a-z][a-z0-9-]{1,63}$/.test(v) ? null : "lowercase letters, digits and hyphens; make it a verb") }}
+      second={{ label: "description", value: props.offer.description, validate: (v) => (v.length >= 8 ? null : "a sentence an asker can match on") }}
+      onSubmit={(id, description) => props.onSubmit({ id, description })}
+    />
+  );
+}
+
+/**
+ * What an answerer reads: a folder, a git repository, or later. With `keep`
+ * set (the edit walkthrough) the first choice keeps what the pack reads today.
+ */
+export function KnowledgeScreen(props: { screen: Screen; keep?: string; onDone: (k: Draft["knowledge"]) => void }): React.JSX.Element {
   const [type, setType] = useState<"folder" | "git" | null>(null);
   const [remote, setRemote] = useState<string | null>(null);
   if (type === null) {
     return props.screen(
-      "What does it answer from?",
+      props.keep ? "Add to what it reads?" : "What does it answer from?",
       <Choice
+        initial={props.keep ? "later" : undefined}
         options={[
+          ...(props.keep ? [{ value: "later", label: props.keep, hint: "nothing added" }] : []),
           { value: "folder", label: "a folder of markdown", hint: "attached as a glob, nothing copied" },
           { value: "git", label: "a git repository", hint: "cloned under the pack and tracked" },
-          { value: "later", label: "later", hint: "fill knowledge/ or rfa knowledge add" },
+          ...(props.keep ? [] : [{ value: "later", label: "later", hint: "fill knowledge/ or rfa knowledge add" }]),
         ]}
         onChoose={(v) => (v === "later" ? props.onDone({ type: "later" }) : setType(v as "folder" | "git"))}
       />,
@@ -372,17 +411,19 @@ function KnowledgeScreen(props: { d: Draft; screen: (label: string, body: React.
   );
 }
 
-function RoomScreen(props: { rooms: { alias: string; handle: string; topic: string }[]; d: Draft; screen: (label: string, body: React.ReactNode, footer?: [string, string][]) => React.JSX.Element; onDone: (room: Draft["room"]) => void }): React.JSX.Element {
+/** Which room: a recorded one (the current binding marked, when there is one), a new one, or none when the caller allows it. */
+export function RoomScreen(props: { rooms: { alias: string; handle: string; topic: string }[]; screen: Screen; current?: string; allowNone?: boolean; onDone: (room: Draft["room"]) => void }): React.JSX.Element {
   const [creating, setCreating] = useState(false);
   const [alias, setAlias] = useState<string | null>(null);
   if (!creating) {
     return props.screen(
       "Which room does it serve in?",
       <Choice
+        initial={props.current}
         options={[
-          ...props.rooms.map((r) => ({ value: r.handle, label: r.alias, hint: `${r.handle} · ${r.topic}` })),
+          ...props.rooms.map((r) => ({ value: r.handle, label: r.alias, hint: `${r.handle === props.current ? "bound today · " : ""}${r.handle} · ${r.topic}` })),
           { value: "__new", label: "a new room", hint: "created now, you host it" },
-          { value: "__none", label: "none yet", hint: "rfa agent bind later" },
+          ...(props.allowNone ? [{ value: "__none", label: "none yet", hint: "rfa agent bind later" }] : []),
         ]}
         onChoose={(v) => {
           if (v === "__new") return setCreating(true);
@@ -400,7 +441,7 @@ function RoomScreen(props: { rooms: { alias: string; handle: string; topic: stri
   return props.screen("Its topic", <Field key="topic" value="" placeholder="questions and work for the product team" validate={(v) => (v.length >= 3 ? null : "a few words")} onSubmit={(v) => props.onDone({ create: { alias, topic: v } })} />);
 }
 
-function TwoFields(props: { first: { label: string; value: string; placeholder?: string; validate: (v: string) => string | null }; second: { label: string; value: string; placeholder?: string; validate: (v: string) => string | null }; onSubmit: (a: string, b: string) => void }): React.JSX.Element {
+export function TwoFields(props: { first: { label: string; value: string; placeholder?: string; validate: (v: string) => string | null }; second: { label: string; value: string; placeholder?: string; validate: (v: string) => string | null }; onSubmit: (a: string, b: string) => void }): React.JSX.Element {
   const [a, setA] = useState<string | null>(null);
   if (a === null) {
     return (
@@ -421,7 +462,7 @@ function TwoFields(props: { first: { label: string; value: string; placeholder?:
   );
 }
 
-function BudgetFields(props: { initial: Draft["budgets"]; onSubmit: (b: Draft["budgets"]) => void }): React.JSX.Element {
+export function BudgetFields(props: { initial: Draft["budgets"]; onSubmit: (b: Draft["budgets"]) => void }): React.JSX.Element {
   const [task, setTask] = useState<number | null>(null);
   const [day, setDay] = useState<number | null>(null);
   const money = (v: string) => (/^\d+(\.\d{1,2})?$/.test(v) && Number(v) > 0 ? null : "dollars, like 0.25");
@@ -434,7 +475,7 @@ function BudgetFields(props: { initial: Draft["budgets"]; onSubmit: (b: Draft["b
   );
 }
 
-function Labeled(props: { label: string; children: React.ReactNode }): React.JSX.Element {
+export function Labeled(props: { label: string; children: React.ReactNode }): React.JSX.Element {
   return (
     <Box flexDirection="column">
       <Text dimColor>{props.label}</Text>
@@ -450,5 +491,3 @@ export async function runAgentWizard(ctx: CliContext, h: HubDir): Promise<number
   if (result.created) ctx.ui.done(`agents/${result.created}/agent.md written`, `rfa agent show ${result.created}`);
   return result.code;
 }
-
-export { MUTED as _unused };

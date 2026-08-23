@@ -1,13 +1,17 @@
 /**
- * Editing what the CLI owns in agent.md: the `rooms:` and `knowledge:` blocks, and the `mode:` line.
+ * Editing what the CLI owns in agent.md: the `rooms:` and `knowledge:` blocks,
+ * the `mode:` line, and since `rfa agent edit` became a walkthrough, the
+ * settings a pack has (description, model, the capability, the budgets).
  *
- * The file is the operator's; the CLI rewrites only the block it is asked to,
- * keeps every other line byte for byte, and validates the result through the
- * same schema the supervisor uses before writing it, so a bind or a knowledge
- * attach can never produce a pack the platform then refuses.
+ * The file is the operator's; the CLI rewrites only the line or block it is
+ * asked to, keeps every other line byte for byte, and validates the result
+ * through the same schema the supervisor uses before writing it, so an edit can
+ * never produce a pack the platform then refuses.
  */
 import * as fs from "node:fs";
-import { parseAgentMd } from "../agentdef.js";
+import YAML from "yaml";
+import { parseAgentMd, type AgentDef } from "../agentdef.js";
+import { effectiveMode, type AgentMode } from "../posture.js";
 
 const FRONTMATTER = /^(---\r?\n)([\s\S]*?)(\r?\n---\r?\n?)([\s\S]*)$/;
 
@@ -32,8 +36,12 @@ const PLACEHOLDER: Record<string, RegExp> = {
   knowledge: /^# (No knowledge yet|  rfa knowledge add|knowledge:|  - "knowledge\/)/,
 };
 
-/** Replace (or add) one top-level block of an agent.md frontmatter. */
-export function setTopBlock(text: string, key: "rooms" | "knowledge", block: string): string {
+/**
+ * Replace (or add) one top-level block of an agent.md frontmatter. The comment
+ * lines the scaffold puts at the head of a block (the reason the block exists)
+ * survive a rewrite; the entries under them are the caller's.
+ */
+export function setTopBlock(text: string, key: string, block: string): string {
   const m = FRONTMATTER.exec(text);
   if (!m) throw new Error("agent.md must start with a YAML frontmatter block (--- ... ---)");
   const lines = m[2].split("\n");
@@ -41,19 +49,23 @@ export function setTopBlock(text: string, key: "rooms" | "knowledge", block: str
   let i = 0;
   let replaced = false;
   const head = new RegExp(`^${key}:`);
+  const placeholder = PLACEHOLDER[key];
   while (i < lines.length) {
     const line = lines[i];
     if (head.test(line)) {
-      // Skip the existing block: the key line and every indented or blank line under it.
+      // Skip the existing block: the key line and every indented or blank line under it, keeping its leading comments.
       i++;
+      const comments: string[] = [];
+      while (i < lines.length && /^\s+#/.test(lines[i])) comments.push(lines[i++]);
       while (i < lines.length && (/^\s/.test(lines[i]) || lines[i].trim() === "")) i++;
       if (!replaced) {
-        out.push(...block.split("\n"));
+        const [first, ...rest] = block.split("\n");
+        out.push(first, ...comments, ...rest);
         replaced = true;
       }
       continue;
     }
-    if (PLACEHOLDER[key].test(line)) {
+    if (placeholder?.test(line)) {
       i++;
       continue;
     }
@@ -90,27 +102,142 @@ export function addKnowledge(file: string, globs: string[]): { before: string; a
   return { before: parsed.definitionHash, after, knowledge: merged };
 }
 
-/** Replace (or add, before `sandbox:` or at the end) one top-level scalar line of the frontmatter. */
-export function setTopScalar(text: string, key: string, line: string): string {
+/**
+ * Replace (or add) one top-level scalar line of the frontmatter. A missing line
+ * goes after the key named in `after` when that one exists, else before
+ * `sandbox:`, else at the end.
+ */
+export function setTopScalar(text: string, key: string, line: string, opts: { after?: string } = {}): string {
   const m = FRONTMATTER.exec(text);
   if (!m) throw new Error("agent.md must start with a YAML frontmatter block (--- ... ---)");
   const lines = m[2].split("\n");
   const at = lines.findIndex((l) => new RegExp(`^${key}:`).test(l));
   if (at >= 0) lines[at] = line;
   else {
+    const anchor = opts.after ? lines.findIndex((l) => new RegExp(`^${opts.after}:`).test(l)) : -1;
     const before = lines.findIndex((l) => /^sandbox:/.test(l));
-    if (before >= 0) lines.splice(before, 0, line);
+    if (anchor >= 0) lines.splice(anchor + 1, 0, line);
+    else if (before >= 0) lines.splice(before, 0, line);
     else lines.push(line);
   }
   return `${m[1]}${lines.join("\n")}${m[3]}${m[4]}`;
 }
 
+export const MODE_LINE = (mode: AgentMode): string => `mode: ${mode}   # ask: cards for every acting tool · plan: proposes, never acts · bypass: acts without asking`;
+
 /** Set a pack's mode in its agent.md, validated before the write. */
 export function setAgentMode(file: string, mode: "ask" | "plan" | "bypass"): { before: string; after: string } {
   const text = fs.readFileSync(file, "utf8");
   const before = parseAgentMd(text).definitionHash;
-  const next = setTopScalar(text, "mode", `mode: ${mode}   # ask: cards for every acting tool · plan: proposes, never acts · bypass: acts without asking`);
+  const next = setTopScalar(text, "mode", MODE_LINE(mode));
   const after = parseAgentMd(next).definitionHash;
   if (after !== before) fs.writeFileSync(file, next);
   return { before, after };
+}
+
+// ---------------------------------------------------------------- the edit engine
+
+/** A YAML plain scalar when it can be one, a double-quoted one otherwise. */
+export function yamlScalar(v: string): string {
+  return /^[\p{L}\p{N}][\p{L}\p{N} _.,;'!?()/-]*$/u.test(v) && !/: |\s#|^(true|false|null|yes|no|~)$/i.test(v) && !/^\d/.test(v) ? v : JSON.stringify(v);
+}
+
+/**
+ * What `rfa agent edit` can change, from its flags or from the walkthrough.
+ * Every field is optional: an absent one is "leave it"; a present one equal to
+ * what is there is a no-op, so applying the same change twice is harmless.
+ */
+export interface PackChanges {
+  description?: string;
+  /** A model tier; "inherit" removes nothing, it is what an unset model reads as. */
+  model?: string;
+  /** The first capability the card advertises (further offers are kept as they are). */
+  offer?: { id: string; description: string };
+  budgets?: { per_task_usd?: number; per_day_usd?: number; max_turns?: number };
+  mode?: AgentMode;
+  /** The room handle to bind to, replacing the binding (role and serve kept). */
+  room?: string;
+  /** Knowledge globs to add (deduplicated); removal is an edit by hand. */
+  knowledge?: string[];
+}
+
+export interface EditResult {
+  before: string;
+  after: string;
+  /** The settings that actually changed, in the order they are listed on the review screen. */
+  changed: string[];
+}
+
+/** The settings as `rfa agent edit` reads them, for the walkthrough's list and the no-op check. */
+export function currentSettings(def: AgentDef): Required<Pick<PackChanges, "description" | "model">> & { offer: { id: string; description: string } | null; budgets: { per_task_usd: number | null; per_day_usd: number | null; max_turns: number | null }; mode: AgentMode | "read-only"; room: string | null; knowledge: string[] } {
+  return {
+    description: def.description,
+    model: def.model ?? "inherit",
+    offer: def.offers?.[0] ? { id: def.offers[0].id, description: def.offers[0].description } : null,
+    budgets: { per_task_usd: def.budgets?.per_task_usd ?? null, per_day_usd: def.budgets?.per_day_usd ?? null, max_turns: def.budgets?.max_turns ?? null },
+    mode: effectiveMode(def),
+    room: def.rooms?.[0]?.room ?? null,
+    knowledge: def.knowledge ?? [],
+  };
+}
+
+/**
+ * Apply a set of changes to a pack's agent.md: one line or block per setting,
+ * the rest byte for byte, the whole validated once before a single write. The
+ * same function behind the flags and the walkthrough, so the two cannot differ.
+ */
+export function editPack(file: string, c: PackChanges): EditResult {
+  const original = fs.readFileSync(file, "utf8");
+  const parsed = parseAgentMd(original);
+  const def = parsed.def;
+  const now = currentSettings(def);
+  let text = original;
+  const changed: string[] = [];
+  if (c.description !== undefined && c.description !== now.description) {
+    text = setTopScalar(text, "description", `description: ${yamlScalar(c.description)}`, { after: "name" });
+    changed.push("description");
+  }
+  if (c.model !== undefined && c.model !== now.model) {
+    text = setTopScalar(text, "model", `model: ${c.model}   # haiku for retrieval and answers, sonnet when it has to compose`, { after: "description" });
+    changed.push("model");
+  }
+  if (c.offer) {
+    const offers = def.offers ?? [];
+    const next = offers.length ? [{ ...offers[0], id: c.offer.id, description: c.offer.description }, ...offers.slice(1)] : [c.offer];
+    if (JSON.stringify(next) !== JSON.stringify(offers)) {
+      text = setTopBlock(text, "offers", YAML.stringify({ offers: next }).trimEnd());
+      changed.push("capability");
+    }
+  }
+  if (c.budgets) {
+    const merged: Record<string, number> = { ...(def.budgets as Record<string, number> | undefined) };
+    for (const [k, v] of Object.entries(c.budgets)) if (v !== undefined) merged[k] = v;
+    if (JSON.stringify(merged) !== JSON.stringify(def.budgets ?? {})) {
+      text = setTopBlock(text, "budgets", YAML.stringify({ budgets: merged }).trimEnd());
+      changed.push("budgets");
+    }
+  }
+  if (c.mode !== undefined) {
+    if (now.mode === "read-only") throw new Error(`${def.name} has no acting tool (nothing in interrupt_on); a mode would change nothing`);
+    if (c.mode !== now.mode) {
+      text = setTopScalar(text, "mode", MODE_LINE(c.mode));
+      changed.push("mode");
+    }
+  }
+  if (c.room !== undefined && c.room !== now.room) {
+    const b = def.rooms?.[0];
+    text = setRoomsBlock(text, roomsBlock(c.room, { role: b?.role, serve: b?.serve, presenceTtlS: b?.presence_ttl_s }));
+    changed.push("room");
+  }
+  if (c.knowledge?.length) {
+    const merged = [...new Set([...now.knowledge, ...c.knowledge])];
+    if (merged.length !== now.knowledge.length) {
+      text = setTopBlock(text, "knowledge", knowledgeBlock(merged));
+      changed.push("knowledge");
+    }
+  }
+  // Validated as a whole before anything touches the disk: a refused edit leaves the file as it was.
+  const after = parseAgentMd(text).definitionHash;
+  if (after !== parsed.definitionHash) fs.writeFileSync(file, text);
+  return { before: parsed.definitionHash, after, changed };
 }

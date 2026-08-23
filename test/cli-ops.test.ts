@@ -204,6 +204,30 @@ test("packs: new binds to the first room, validate checks what the supervisor wo
   assert.equal(view.binding.alias, "product");
   assert.deepEqual(view.secrets, { declared: ["RFA_TOKEN"], missing: [] });
 
+  // rfa agent edit, headless: the flags are the walkthrough's answers, one validated write.
+  const edit = await rfa(["agent", "edit", "fees", "--model", "sonnet", "--per-day", "10", "--offer", "answer-fee-question", "--offer-description", "Answers fee questions from the docs, citing the file.", "--json"]);
+  assert.equal(edit.code, 0, edit.stderr);
+  const edited = json<{ changed: string[]; definition: { before: string; after: string } }>(edit);
+  assert.deepEqual(edited.changed, ["model", "capability", "budgets"]);
+  assert.notEqual(edited.definition.before, edited.definition.after, "a change rotates the definition");
+  const shown = json<{ model: string; budgets: { per_day_usd: number; per_task_usd: number }; card: { skills: { id: string }[] } }>(await rfa(["agent", "show", "fees", "--json"]));
+  assert.equal(shown.model, "sonnet");
+  assert.equal(shown.budgets.per_day_usd, 10);
+  assert.equal(shown.budgets.per_task_usd, 0.25, "a ceiling not named keeps its value");
+  assert.equal(shown.card.skills[0].id, "answer-fee-question", "the card follows the definition");
+  const same = await rfa(["agent", "edit", "fees", "--model", "sonnet"]);
+  assert.equal(same.code, 0, same.stderr);
+  assert.match(same.stdout, /unchanged/, "the value it already has is a no-op, not an error");
+  const bare = await rfa(["agent", "edit", "fees"]);
+  assert.equal(bare.code, 2, "no flags on a pipe is the usage error, never a walkthrough");
+  assert.match(bare.stderr, /--model/);
+  const badMode = await rfa(["agent", "edit", "fees", "--mode", "plan"]);
+  assert.equal(badMode.code, 1);
+  assert.match(badMode.stderr, /no acting tool/);
+  const more = await rfa(["agent", "edit", "fees", "--knowledge", "./docs", "--json"]);
+  assert.equal(more.code, 0, more.stderr);
+  assert.deepEqual(json<{ changed: string[] }>(more).changed, [], "the folder was attached at creation: adding it again changes nothing");
+
   const design = await rfa(["room", "create", "design", "--json"]);
   const bind = await rfa(["agent", "bind", "fees", "--room", "design"]);
   assert.equal(bind.code, 0, bind.stderr);

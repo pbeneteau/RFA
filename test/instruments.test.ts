@@ -81,7 +81,7 @@ test("knowledge add attaches a directory as pack-relative globs; status counts t
   assert.ok(a.definition_changed);
   assert.ok(a.globs.every((g) => g.startsWith("../../docs-a/")), `globs are relative to the pack, got ${a.globs.join(" ")}`);
   const agentMd = fs.readFileSync(path.join(h.paths.agents, "scribe", "agent.md"), "utf8");
-  assert.match(agentMd, /knowledge:\n  - "knowledge\/\*\*\/\*\.md"\n  - "\.\.\/\.\.\/docs-a\/\*\*\/\*\.md"\n  - "\.\.\/\.\.\/docs-a\/\*\*\/\*\.mdx"/, "the new globs join the scaffold's own, quoted, in agent.md");
+  assert.match(agentMd, /knowledge:\n  # Globs are relative to this directory[^\n]*\n  - "knowledge\/\*\*\/\*\.md"\n  - "\.\.\/\.\.\/docs-a\/\*\*\/\*\.md"\n  - "\.\.\/\.\.\/docs-a\/\*\*\/\*\.mdx"/, "the new globs join the scaffold's own, quoted, under the scaffold's reason for the block, in agent.md");
 
   const again = await rfa(["knowledge", "add", "scribe", docsA, "--json"]);
   assert.equal(json<{ definition_changed: boolean }>(again).definition_changed, false, "attaching the same source twice changes nothing");

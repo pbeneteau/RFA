@@ -115,11 +115,17 @@ export const ask: CommandDef = {
 
 // ---------------------------------------------------------------- tasks
 
-async function board(ctx: CliContext, h: HubDir, ref: string | undefined): Promise<{ rec: RoomRecord; call: (args: Record<string, unknown>) => Promise<any>; close: () => Promise<void> }> {
+/** The task board of a room, from the operator membership: one hub call per command, over HTTP or in process. */
+export async function board(ctx: CliContext, h: HubDir, ref: string | undefined): Promise<{ rec: RoomRecord; call: (args: Record<string, unknown>) => Promise<any>; roster: () => Promise<any>; close: () => Promise<void> }> {
   const rec = requireRoom(h, ref, true);
   if (!rec.operator) throw new CliError(3, `no operator membership recorded for ${rec.alias}`, `rfa room adopt ${rec.handle}`);
   const hub = await openHubCall(ctx);
-  return { rec, call: (args) => hub.call("room_task", { room: rec.handle, membership_token: rec.operator!.membership_token, ...args }), close: () => hub.close() };
+  return {
+    rec,
+    call: (args) => hub.call("room_task", { room: rec.handle, membership_token: rec.operator!.membership_token, ...args }),
+    roster: () => hub.call("room_roster", { room: rec.handle, membership_token: rec.operator!.membership_token }),
+    close: () => hub.close(),
+  };
 }
 
 const TERMINAL = new Set(["completed", "failed", "cancelled", "rejected"]);

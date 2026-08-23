@@ -127,7 +127,8 @@ export function renderAgentMd(o: ScaffoldOptions): string {
       ? `knowledge:
   # Globs are relative to this directory; out-of-pack paths work too.
   - "knowledge/**/*.md"
-  - ${JSON.stringify(path.posix.join(o.knowledge.replaceAll(path.sep, "/"), "**", "*.md"))}`
+  - ${JSON.stringify(path.posix.join(o.knowledge.replaceAll(path.sep, "/"), "**", "*.md"))}
+  - ${JSON.stringify(path.posix.join(o.knowledge.replaceAll(path.sep, "/"), "**", "*.mdx"))}`
       : `knowledge:
   # Globs are relative to this directory; out-of-pack paths work too.
   - "knowledge/**/*.md"`;

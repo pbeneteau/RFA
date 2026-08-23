@@ -13,7 +13,9 @@ import { daemonState } from "../../daemon.js";
 import { findRoom, roomsStore, secretsStore, type HubDir, type RoomRecord } from "../../hubdir.js";
 import { packageVersion } from "../../pkg.js";
 import { belongsTo, residentProcessesSync } from "../../procscan.js";
-import { bindPack, setAgentMode } from "../agentmd.js";
+import { bindPack, currentSettings, editPack, setAgentMode, type EditResult, type PackChanges } from "../agentmd.js";
+import { attachKnowledge, AttachError } from "../attach.js";
+import { createRoomRecord } from "./init.js";
 import { effectiveMode, isMode, MODE_SUMMARY, MODES, type AgentMode } from "../../posture.js";
 import { CliError, type CliContext } from "../context.js";
 import type { CommandDef } from "../router.js";
@@ -303,28 +305,136 @@ export const agentStart = lifecycle("start");
 export const agentStop = lifecycle("stop");
 export const agentRestart = lifecycle("restart");
 
+// ---------------------------------------------------------------- edit
+
+export interface EditOutcome extends EditResult {
+  /** What happened beside agent.md: a room created, a clone made. */
+  notes: string[];
+  room: { alias: string; handle: string } | null;
+}
+
+/**
+ * The one implementation behind `rfa agent edit`'s flags and its walkthrough:
+ * the room and the clone first, because they must exist to be named, then one
+ * validated write of agent.md through `editPack`.
+ */
+export async function applyPackEdit(ctx: CliContext, h: HubDir, name: string, changes: PackChanges, extras: { newRoom?: { alias: string; topic: string } | null; knowledge?: { source: string; docs?: string } | null } = {}): Promise<EditOutcome> {
+  const dir = path.join(h.paths.agents, name);
+  const file = path.join(dir, "agent.md");
+  if (!fs.existsSync(file)) throw new Error(`no pack agents/${name}`);
+  const c: PackChanges = { ...changes };
+  const notes: string[] = [];
+  let room: EditOutcome["room"] = null;
+  if (extras.newRoom) {
+    const rec = await createRoomRecord(ctx, h, extras.newRoom.alias, extras.newRoom.topic);
+    c.room = rec.handle;
+    room = { alias: rec.alias, handle: rec.handle };
+    notes.push(`room ${rec.alias} (${rec.handle}): you host it; the pack joins it with the bearer`);
+  }
+  if (extras.knowledge) {
+    const att = attachKnowledge(h, { name, dir }, extras.knowledge.source, { docs: extras.knowledge.docs });
+    c.knowledge = [...(c.knowledge ?? []), ...att.globs];
+    notes.push(att.clone ? `cloned ${extras.knowledge.source} at ${att.clone.head.slice(0, 10)}: ${att.clone.docs} document(s); rfa knowledge sync pulls it` : `reads ${att.attached}`);
+  }
+  return { ...editPack(file, c), notes, room };
+}
+
+/** `--editor`: agent.md in $EDITOR, validated on save; what `rfa agent edit` did before it had a walkthrough. */
+export async function editInEditor(ctx: CliContext, name: string, file: string): Promise<number> {
+  const editor = ctx.env.VISUAL || ctx.env.EDITOR;
+  if (!editor) throw new CliError(2, "no $EDITOR set", `edit ${path.relative(process.cwd(), file)} by hand; rfa agent validate ${name} checks it`);
+  const before = parseAgentMd(fs.readFileSync(file, "utf8")).definitionHash;
+  const [cmd, ...args] = editor.split(/\s+/);
+  const code = await new Promise<number>((resolve) => spawn(cmd, [...args, file], { stdio: "inherit" }).on("exit", (c) => resolve(c ?? 1)));
+  if (code !== 0) throw new CliError(1, `${editor} exited ${code}`);
+  try {
+    const after = parseAgentMd(fs.readFileSync(file, "utf8")).definitionHash;
+    if (after === before) ctx.ui.step("unchanged");
+    else ctx.ui.done(`${name} edited`, `definition ${before.slice(7, 15)} -> ${after.slice(7, 15)}; a running supervisor drains and respawns it`);
+  } catch (err) {
+    throw new CliError(1, `agent.md is now INVALID and the supervisor keeps the running resident: ${(err as Error).message}`, `fix it: rfa agent edit ${name} --editor`);
+  }
+  return 0;
+}
+
+const EDIT_FLAGS = ["model", "description", "offer", "offer-description", "per-task", "per-day", "max-turns", "mode", "room", "knowledge"] as const;
+
+/** The flags of `rfa agent edit` as the changes `editPack` takes; null when no flag was given. */
+export function changesFromFlags(h: HubDir, current: ReturnType<typeof currentSettings>, v: Record<string, string | boolean | undefined>): PackChanges | null {
+  if (!EDIT_FLAGS.some((f) => v[f] !== undefined)) return null;
+  const c: PackChanges = {};
+  if (v.model !== undefined) c.model = String(v.model);
+  if (v.description !== undefined) c.description = String(v.description);
+  if (v.offer !== undefined || v["offer-description"] !== undefined) {
+    const id = v.offer !== undefined ? String(v.offer) : current.offer?.id;
+    const description = v["offer-description"] !== undefined ? String(v["offer-description"]) : current.offer?.description;
+    if (!id || !description) throw new CliError(2, "a capability needs both --offer <id> and --offer-description \"<text>\" when the pack advertises none yet");
+    if (!/^[a-z][a-z0-9-]{1,63}$/.test(id)) throw new CliError(2, `--offer ${JSON.stringify(id)}: lowercase letters, digits and hyphens; make it a verb`);
+    c.offer = { id, description };
+  }
+  const money = (flag: string): number | undefined => {
+    if (v[flag] === undefined) return undefined;
+    const n = Number(v[flag]);
+    if (!Number.isFinite(n) || n <= 0) throw new CliError(2, `--${flag} takes dollars, like 0.25`);
+    return n;
+  };
+  const perTask = money("per-task");
+  const perDay = money("per-day");
+  let maxTurns: number | undefined;
+  if (v["max-turns"] !== undefined) {
+    maxTurns = Number(v["max-turns"]);
+    if (!Number.isInteger(maxTurns) || maxTurns < 1 || maxTurns > 200) throw new CliError(2, "--max-turns takes a whole number from 1 to 200");
+  }
+  if (perTask !== undefined || perDay !== undefined || maxTurns !== undefined) c.budgets = { ...(perTask !== undefined ? { per_task_usd: perTask } : {}), ...(perDay !== undefined ? { per_day_usd: perDay } : {}), ...(maxTurns !== undefined ? { max_turns: maxTurns } : {}) };
+  if (v.mode !== undefined) {
+    if (!isMode(String(v.mode))) throw new CliError(2, `--mode takes ${MODES.join(", ")}`);
+    c.mode = String(v.mode) as AgentMode;
+  }
+  if (v.room !== undefined) {
+    const rec = resolveRoom(h, String(v.room));
+    if (!rec) throw new CliError(2, "--room takes an alias or a handle");
+    c.room = rec.handle;
+  }
+  return c;
+}
+
 export const agentEdit: CommandDef = {
   path: ["agent", "edit"],
-  summary: "Open agent.md in $EDITOR, validate on save",
-  usage: "<name>",
+  summary: "Change a pack's settings: alone on a terminal the walkthrough, with flags headless, --editor opens agent.md",
+  usage: '<name> [--model haiku|sonnet|opus] [--description "<text>"] [--offer <id>] [--offer-description "<text>"] [--per-task <usd>] [--per-day <usd>] [--max-turns <n>] [--mode ask|plan|bypass] [--room <alias|handle>] [--knowledge <dir|git remote> [--docs <subdir>]] [--editor]',
+  options: { model: { type: "string" }, description: { type: "string" }, offer: { type: "string" }, "offer-description": { type: "string" }, "per-task": { type: "string" }, "per-day": { type: "string" }, "max-turns": { type: "string" }, mode: { type: "string" }, room: { type: "string" }, knowledge: { type: "string" }, docs: { type: "string" }, editor: { type: "boolean", default: false } },
+  why: "Every setting rfa agent new asks for can be changed afterwards on the same screen, pre-filled with what the pack has; the flags are the headless form of every answer, and --editor is agent.md itself for the prompt and everything else. Each change rewrites only its line or block (the rest of the file byte for byte) and the whole is validated through the supervisor's own schema before a single write, so an edit can never produce a pack the platform refuses. A change rotates the definition: a running supervisor drains the resident and respawns it, and the room sees the digest change.",
+  examples: ["rfa agent edit pm-agent", "rfa agent edit pm-agent --model sonnet --per-day 10", 'rfa agent edit pm-agent --offer answer-fee-question --offer-description "Answers fee questions from the handbook, citing the page."', "rfa agent edit pm-agent --knowledge ./handbook", "rfa agent edit pm-agent --editor"],
   run: async (ctx, a) => {
     const h = ctx.hubdir();
-    const name = await packArg(ctx, h, a.positionals[0], "rfa agent edit <name>");
-    const file = path.join(h.paths.agents, name, "agent.md");
-    if (!fs.existsSync(file)) throw new CliError(2, `no pack agents/${name}`);
-    const editor = ctx.env.VISUAL || ctx.env.EDITOR;
-    if (!editor) throw new CliError(2, "no $EDITOR set", `edit ${path.relative(process.cwd(), file)} by hand; rfa agent validate ${name} checks it`);
-    const before = parseAgentMd(fs.readFileSync(file, "utf8")).definitionHash;
-    const [cmd, ...args] = editor.split(/\s+/);
-    const code = await new Promise<number>((resolve) => spawn(cmd, [...args, file], { stdio: "inherit" }).on("exit", (c) => resolve(c ?? 1)));
-    if (code !== 0) throw new CliError(1, `${editor} exited ${code}`);
-    try {
-      const after = parseAgentMd(fs.readFileSync(file, "utf8")).definitionHash;
-      if (after === before) ctx.ui.step("unchanged");
-      else ctx.ui.done(`${name} edited`, `definition ${before.slice(7, 15)} -> ${after.slice(7, 15)}; a running supervisor drains and respawns it`);
-    } catch (err) {
-      throw new CliError(1, `agent.md is now INVALID and the supervisor keeps the running resident: ${(err as Error).message}`, `fix it: rfa agent edit ${name}`);
+    const name = await packArg(ctx, h, a.positionals[0], "rfa agent edit <name> [--model …]");
+    const dir = path.join(h.paths.agents, name);
+    const file = path.join(dir, "agent.md");
+    if (!fs.existsSync(file)) throw new CliError(2, `no pack agents/${name}`, "rfa agent ls");
+    if (a.values.editor) return editInEditor(ctx, name, file);
+    const pack = loadPack(dir);
+    const changes = changesFromFlags(h, currentSettings(pack.def), a.values);
+    const knowledge = a.values.knowledge !== undefined ? { source: String(a.values.knowledge), docs: a.values.docs as string | undefined } : null;
+    if (!changes && !knowledge) {
+      if (ctx.interactive) {
+        const { runAgentEdit } = await import("../tui/agentedit.js");
+        return runAgentEdit(ctx, h, name);
+      }
+      throw new CliError(2, `rfa agent edit ${name} needs a change on a pipe: ${EDIT_FLAGS.map((f) => `--${f}`).join(", ")}; alone on a terminal it is the walkthrough, --editor opens agent.md`);
     }
+    let r: EditOutcome;
+    try {
+      r = await applyPackEdit(ctx, h, name, changes ?? {}, { knowledge });
+    } catch (err) {
+      if (err instanceof AttachError) throw new CliError(1, err.message, err.hint);
+      throw new CliError(1, (err as Error).message);
+    }
+    if (ctx.flags.json) return void ctx.ui.json({ name, changed: r.changed, definition: { before: r.before, after: r.after }, notes: r.notes });
+    for (const n of r.notes) ctx.ui.note(n);
+    if (r.before === r.after) return void ctx.ui.step(`${name} unchanged: every value given is what the pack already has`);
+    const sup = daemonState(h.paths.supervisorPid);
+    ctx.ui.done(`${name} edited: ${r.changed.join(", ")}`, `definition ${r.before.slice(7, 15)} -> ${r.after.slice(7, 15)}`);
+    ctx.ui.note(sup.alive ? "the supervisor drains the resident and respawns it on the new definition" : "nothing is running: the next rfa up reads it");
   },
 };
 

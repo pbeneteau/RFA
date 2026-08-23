@@ -18,7 +18,7 @@ import { doctor } from "./commands/doctor.js";
 import { completionCommands } from "./commands/completion.js";
 import { dashboardCommands } from "./commands/dash.js";
 import { init } from "./commands/init.js";
-import { evalsLabel, evalsLs, evalsParity, evalsPromote, evalsRun, knowledgeAdd, knowledgePin, knowledgeStatusCmd, knowledgeSync, logVerify } from "./commands/instruments.js";
+import { evalsFlag, evalsLabel, evalsLs, evalsParity, evalsPromote, evalsRun, knowledgeAdd, knowledgePin, knowledgeStatusCmd, knowledgeSync, logVerify } from "./commands/instruments.js";
 import { demo, docs, migrate, version } from "./commands/misc.js";
 import { backupLs, backupNow, backupRestore, serviceInstall, serviceStatus, serviceUninstall } from "./commands/ops.js";
 import { consoleCmd, down, hubRun, logs, restart, status, supervisorRun, up } from "./commands/procs.js";
@@ -43,7 +43,7 @@ router.register(
   ask, taskLs, taskShow, taskCreate, taskCancel, taskVerify, approvalsLs, approvalsShow, approvalsApprove, approvalsReject,
   humanAdd, humanLs, humanRotate, humanRemove, tokenMint, tokenLs, tokenRevoke, secretsSet, secretsLs, secretsUnset, configShow, configGet, configSet, keyNew, keySign,
   connectClaude, connectCursor, connectMcp, peerAdd, peerLs, peerShow, peerRevoke, hubExpose,
-  knowledgeAdd, knowledgeSync, knowledgeStatusCmd, knowledgePin, evalsRun, evalsLs, evalsPromote, evalsLabel, evalsParity, logVerify,
+  knowledgeAdd, knowledgeSync, knowledgeStatusCmd, knowledgePin, evalsRun, evalsLs, evalsPromote, evalsLabel, evalsFlag, evalsParity, logVerify,
   backupNow, backupLs, backupRestore, serviceInstall, serviceUninstall, serviceStatus,
   server,
 );
