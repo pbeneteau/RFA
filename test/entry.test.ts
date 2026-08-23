@@ -44,3 +44,17 @@ test("procscan: only a node process whose script IS resident.ts/.js with --agent
   const found = parseResidentProcesses(table);
   assert.deepEqual(found.map((p) => [p.pid, p.agent]), [[501, "spec-expert"], [502, "pm"]]);
 });
+
+test("a resident carries its hub directory on argv, and belongs only to that directory", async () => {
+  const { belongsTo, parseResidentProcesses } = await import("../src/procscan.js");
+  const ps = [
+    "101 1 /opt/homebrew/bin/node --import /x/tsx/loader.mjs /x/src/resident.ts --agent spec-expert --dir /Users/me/Dev/rfa-test",
+    "102 1 /opt/homebrew/bin/node /x/dist/resident.js --agent spec-expert",
+  ].join("\n");
+  const [withDir, without] = parseResidentProcesses(ps);
+  assert.equal(withDir.dir, "/Users/me/Dev/rfa-test");
+  assert.equal(without.dir, null);
+  assert.ok(belongsTo(withDir, "/Users/me/Dev/rfa-test"));
+  assert.ok(!belongsTo(withDir, "/tmp/other-hub"), "the same agent name in another directory is not this supervisor's orphan");
+  assert.ok(belongsTo(without, "/tmp/other-hub"), "a resident that cannot say still counts, conservatively");
+});

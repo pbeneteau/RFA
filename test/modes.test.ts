@@ -44,14 +44,12 @@ test("ask is the default for a tool user; read-only for a pack with nothing to g
   assert.deepEqual(agentPosture(reader).allowedTools, ["Read", "Grep"]);
 });
 
-test("plan proposes and never acts; auto defers to the classifier and keeps the card as the fallback; bypass allows the acting tool outright", () => {
+test("plan proposes and never acts; bypass allows the acting tool outright; auto is no longer a mode", () => {
   const plan = agentPosture(toolPack("plan"));
   assert.equal(plan.permissionMode, "default", "our plan mode is not the SDK's: that one wants a plan file and ExitPlanMode, which a room has no use for");
   assert.equal(plan.onActing, "refuse-plan");
   assert.ok(!plan.allowedTools.includes("mcp__linear__save_document"), "the acting tool is still not pre-allowed in plan mode");
-  const auto = agentPosture(toolPack("auto"));
-  assert.equal(auto.permissionMode, "auto");
-  assert.equal(auto.onActing, "card");
+  assert.throws(() => toolPack("auto"), /mode/, "auto was withdrawn: the SDK's classifier approved a gated call with no card");
   const bypass = agentPosture(toolPack("bypass"));
   assert.equal(bypass.permissionMode, "bypassPermissions");
   assert.equal(bypass.onActing, "allow");

@@ -5,8 +5,13 @@
  *
  *   ask     every acting tool pauses on a card a human approves, edits or rejects (the default)
  *   plan    proposes, never acts: an acting tool is refused with "put the call in your answer"
- *   auto    the SDK's own classifier decides; in every live run so far it approved without a card
  *   bypass  acts without asking; the room gate, budgets, hold and quarantine still apply
+ *
+ * `auto` (the SDK's classifier deciding) was offered for a day and withdrawn:
+ * characterized live on 2026-08-23, it approved the pack's gated tool with no
+ * card, writing a file outside the server's own root, and the model refused
+ * the dangerous request by itself before the classifier saw it. A mode whose
+ * refusals cannot be observed is not a second opinion anyone can rely on.
  *
  * "Acting tools" are the ones `interrupt_on` names. A pack with none (an
  * answerer) has nothing a mode could change, and reports `read-only`.
@@ -18,13 +23,12 @@
 import type { AgentDef } from "./agentdef.js";
 import { interruptMatch } from "./bridge.js";
 
-export const MODES = ["ask", "plan", "auto", "bypass"] as const;
+export const MODES = ["ask", "plan", "bypass"] as const;
 export type AgentMode = (typeof MODES)[number];
 
 export const MODE_SUMMARY: Record<AgentMode, string> = {
   ask: "every acting tool pauses on a card you approve, edit or reject",
   plan: "proposes, never acts: the answer is the plan",
-  auto: "the SDK decides for itself; so far it has approved every acting call without a card, so treat it as bypass with a second opinion",
   bypass: "acts without asking; the room gate, budgets, hold and quarantine still apply",
 };
 
@@ -65,8 +69,6 @@ export function agentPosture(def: AgentDef): Posture {
       // the default posture with the acting tools refused and the answer named
       // as the plan.
       return { mode, permissionMode: base, allowedTools: allow.filter((t) => !acting.includes(t)), acting, onActing: "refuse-plan" };
-    case "auto":
-      return { mode, permissionMode: "auto", allowedTools: allow.filter((t) => !acting.includes(t)), acting, onActing: "card" };
     case "bypass":
       return { mode, permissionMode: "bypassPermissions", allowedTools: allow, acting, onActing: "allow" };
     case "ask":

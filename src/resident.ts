@@ -563,7 +563,13 @@ async function brain(
   const q = query({
     prompt,
     options: {
-      cwd: HUB_ROOT,
+      // The pack's own folder, never the hub root: the SDK advertises its cwd as
+      // an MCP root, and a server that honours roots (the filesystem server does,
+      // and says roots REPLACE its own arguments) would otherwise be handed the
+      // hub directory, .rfa/secrets.json included. Found live on 2026-08-23:
+      // a server started on agents/filer/scratch reported the hub root as its
+      // only allowed directory and wrote there.
+      cwd: pack.def.sandbox?.cwd ? path.resolve(HUB_ROOT, pack.def.sandbox.cwd) : pack.dir,
       model: pack.def.model,
       ...(pack.def.effort ? { effort: pack.def.effort } : {}),
       // In plan mode the SDK expects a plan file and ExitPlanMode, neither of

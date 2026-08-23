@@ -10,7 +10,7 @@ import { matchDigest, parsePrincipalsFile, parseTokensFile } from "../../credent
 import { daemonState } from "../../daemon.js";
 import { readJsonFile, roomsStore, secretsStore, type HubDir } from "../../hubdir.js";
 import { PrincipalSet } from "../../principals.js";
-import { residentProcesses } from "../../procscan.js";
+import { belongsTo, residentProcesses } from "../../procscan.js";
 import { genesisFor, verifyChain } from "../../chain.js";
 import { type CliContext } from "../context.js";
 import { checkEnvironment, realProbe } from "../environment.js";
@@ -137,7 +137,6 @@ export async function runChecks(ctx: CliContext, opts: { deep?: boolean } = {}):
       if ((pack.def.knowledge ?? []).length > 0 && files === 0) problems.push("knowledge globs resolve to zero files");
       checks.push(problems.length ? warn(`pack-${pack.name}`, `${pack.name}: ${problems.join("; ")}`, "rfa agent show / rfa agent bind / rfa agent edit") : ok(`pack-${pack.name}`, `${pack.name}: valid, ${files} knowledge file${files === 1 ? "" : "s"}, room ${binding?.room ?? "-"}${effectiveMode(pack.def) === "read-only" ? "" : `, mode ${effectiveMode(pack.def)}`}`));
       if (effectiveMode(pack.def) === "bypass") checks.push(warn(`mode-${pack.name}`, `${pack.name} is in bypass mode: its acting tools run without a human`, `rfa agent mode ${pack.name} ask`));
-      if (effectiveMode(pack.def) === "auto") checks.push(skip(`mode-${pack.name}`, `${pack.name} is in auto mode: the SDK decides, and so far it has approved every acting call without a card`));
     } catch (err) {
       checks.push(fail(`pack-${entry.name}`, `agents/${entry.name}/agent.md: ${(err as Error).message}`, "rfa agent validate " + entry.name));
     }
@@ -162,7 +161,7 @@ export async function runChecks(ctx: CliContext, opts: { deep?: boolean } = {}):
 
   // Strays and the supervisor's view.
   const names = new Set(listPacks(packsDir).map((p) => p.name));
-  const residents = await residentProcesses();
+  const residents = (await residentProcesses()).filter((p) => belongsTo(p, h.root));
   let supFile: { agents?: Record<string, { pid: number | null; status: string }>; account?: { paused_until?: string | null } } | null = null;
   try {
     supFile = JSON.parse(fs.readFileSync(h.paths.supervisorState, "utf8"));

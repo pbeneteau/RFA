@@ -36,7 +36,7 @@ import { minimalEnv } from "./env.js";
 import { ensureRuntime, HubDirError, requireHubDir, roomsStore, type HubDir } from "./hubdir.js";
 import { ObsStore, evaluateAlerts, formatReviewDigest } from "./obs.js";
 import { spawnEntry, stopTree } from "./proc.js";
-import { residentProcessesSync } from "./procscan.js";
+import { belongsTo, residentProcessesSync } from "./procscan.js";
 import { backupPlan, runBackup } from "./platform.js";
 import { loadSecrets, pickSecrets, transportToken } from "./secrets.js";
 
@@ -159,7 +159,7 @@ function foreignResident(name: string): number | null {
   // with `--agent <name>`. A substring match once took a shell script that
   // mentioned both strings for a running resident and refused to start the
   // real one.
-  for (const p of residentProcessesSync()) {
+  for (const p of residentProcessesSync().filter((p) => belongsTo(p, hubdir.root))) {
     if (p.agent !== name) continue;
     // Ours, or a descendant of ours, is not a stray.
     if (p.ppid === process.pid || p.pid === process.pid) continue;
@@ -223,7 +223,7 @@ function start(child: Child): void {
   // an unsupervised process still serving its membership while this supervisor
   // recorded it as dead and started a replacement. The group also covers the
   // Agent SDK's `claude` child, which a pid-directed kill would orphan mid-answer.
-  const proc = spawnEntry(import.meta.url, "resident", ["--agent", child.pack.name], {
+  const proc = spawnEntry(import.meta.url, "resident", ["--agent", child.pack.name, "--dir", hubdir.root], {
     cwd: hubdir.root,
     stdio: ["ignore", fd, fd],
     env: residentEnv(child.pack),
@@ -274,6 +274,7 @@ async function drain(child: Child): Promise<void> {
 /** A definition edit: validate first, then versioned drain + respawn. */
 async function redeploy(child: Child): Promise<void> {
   let fresh: AgentPack;
+  if (!fs.existsSync(path.join(child.pack.dir, "agent.md"))) return; // moved aside by a retire: the registry pass drains it
   try {
     fresh = loadPack(child.pack.dir);
   } catch (err) {
@@ -348,6 +349,11 @@ async function reconcile(): Promise<void> {
       log(`${name} removed from the registry; draining`);
       await drain(child);
       children.delete(name);
+      // A retired name forgets its manual stop: `rfa agent retire x` stops x
+      // through the command channel, and a pack re-created under the same name
+      // minutes later was kept "stopped" by the flag of a pack that no longer
+      // exists (found live: the new filer never started).
+      manualStopped.delete(name);
       // Close the definition watcher with the child, or a later write to that
       // path fires a callback whose child no longer exists.
       watchers.get(name)?.close();

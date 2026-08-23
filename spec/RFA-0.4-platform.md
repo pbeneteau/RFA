@@ -98,16 +98,17 @@ Two fields are deliberate RFA differentiators with no industry precedent: `budge
 
 ### 3.12 Agent modes (amendment, 2026-08-22)
 
-A pack MAY carry `mode: ask | plan | auto | bypass` at the top level of `agent.md`. It sets how the pack's **acting tools**, the ones `interrupt_on` names, are treated; a pack with no acting tool has nothing a mode changes and reports `read-only`. The mapping is the pure function `agentPosture()` in `src/posture.ts`; the resident passes its result to the Agent SDK as `allowedTools` and `permissionMode` and consults `canUseTool` for whatever is not pre-allowed.
+A pack MAY carry `mode: ask | plan | bypass` at the top level of `agent.md`. It sets how the pack's **acting tools**, the ones `interrupt_on` names, are treated; a pack with no acting tool has nothing a mode changes and reports `read-only`. The mapping is the pure function `agentPosture()` in `src/posture.ts`; the resident passes its result to the Agent SDK as `allowedTools` and `permissionMode` and consults `canUseTool` for whatever is not pre-allowed.
 
 | mode | acting tools at the SDK | `canUseTool` on an acting tool | SDK `permissionMode` |
 |---|---|---|---|
 | `ask` (default) | not pre-allowed | the approval card of 7.3: approve, edit, reject | `default` |
 | `plan` | not pre-allowed | refused with "the answer is the plan"; the system prompt says so | `default` (deliberately not the SDK's `plan`: it demands a plan file and `ExitPlanMode`, which a room has no use for, and the model spent its answer on them) |
-| `auto` | not pre-allowed | the card, if the SDK ever asks; in every live run so far the SDK approved the call itself | `auto` |
 | `bypass` | pre-allowed | not consulted | `bypassPermissions` |
 
-What a mode does NOT change: `tools.allow` and `tools.deny`, the room's policy gate (12.2), the pack's budgets (18.1), and the human's `hold`, `quarantine` and `evict`. A mode is one line in the definition, so changing it rotates the definition hash: a running supervisor drains and respawns the resident, and the room sees the card digest rotate. `rfa agent mode <name> [mode]` reads and sets it (`bypass` is confirmed on a terminal and needs `--yes` on a pipe); `rfa agent new --kind tool --mode <mode>` scaffolds it; the dashboard cycles it with `m`; `rfa doctor` warns for every pack in `bypass` and notes `auto`.
+What a mode does NOT change: `tools.allow` and `tools.deny`, the room's policy gate (12.2), the pack's budgets (18.1), and the human's `hold`, `quarantine` and `evict`. A mode is one line in the definition, so changing it rotates the definition hash: a running supervisor drains and respawns the resident, and the room sees the card digest rotate. `rfa agent mode <name> [mode]` reads and sets it (`bypass` is confirmed on a terminal and needs `--yes` on a pipe); `rfa agent new --kind tool --mode <mode>` scaffolds it; the dashboard cycles it with `m`; `rfa doctor` warns for every pack in `bypass`.
+
+**Withdrawn (2026-08-23): `auto`**, the SDK's own classifier deciding. Characterized live with a filesystem tool user: the classifier approved the pack's gated `write_file` with no card (the transcript records `permissionMode: auto` and the call executing), the file landed outside the server's root, and the dangerous request that should have exercised a refusal was declined by the model itself before the classifier saw it. A mode whose refusals cannot be observed is not a second opinion an operator can rely on, and a mode that skips the card is `bypass` with a kinder name.
 
 ## 4. Runtime engine
 

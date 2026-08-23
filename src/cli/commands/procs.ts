@@ -13,7 +13,7 @@ import { listPacks } from "../../agentdef.js";
 import { daemonState, DaemonError, runForeground, startDaemon, stopDaemon, logTail } from "../../daemon.js";
 import { minimalEnv } from "../../env.js";
 import { ensureRuntime, roomsStore, type HubDir } from "../../hubdir.js";
-import { residentProcesses } from "../../procscan.js";
+import { belongsTo, residentProcesses } from "../../procscan.js";
 import { CliError, type CliContext } from "../context.js";
 import { effectiveMode } from "../../posture.js";
 import { nativeBindingProblem } from "../preflight.js";
@@ -134,7 +134,7 @@ export async function downAll(ctx: CliContext): Promise<{ supervisor: string; hu
 async function strayResidents(h: HubDir): Promise<string[]> {
   const names = new Set(listPacks(h.paths.agents).map((p) => p.name));
   if (names.size === 0) return [];
-  return (await residentProcesses()).filter((p) => names.has(p.agent)).map((p) => `${p.pid} ${p.agent}`);
+  return (await residentProcesses()).filter((p) => names.has(p.agent) && belongsTo(p, h.root)).map((p) => `${p.pid} ${p.agent}`);
 }
 
 export const down: CommandDef = {

@@ -200,7 +200,7 @@ offers:
 memory:
   scope: pack
   gate: memory-gate   # peer content cannot become memory unexamined
-${kind === "tool" ? `mode: ${o.mode ?? "ask"}   # ask: cards for every acting tool · plan: proposes, never acts · auto: the SDK's classifier decides · bypass: acts without asking
+${kind === "tool" ? `mode: ${o.mode ?? "ask"}   # ask: cards for every acting tool · plan: proposes, never acts · bypass: acts without asking
 ` : ""}sandbox:
   isolation: none     # worktree or container once it runs code
   permission_mode: default
@@ -211,7 +211,7 @@ secrets: [RFA_TOKEN${o.tool?.envSecrets?.length ? `, ${o.tool.envSecrets.join(",
 budgets:
   max_turns: ${o.budgets?.max_turns ?? (kind === "tool" ? 20 : 8)}
   per_task_usd: ${(o.budgets?.per_task_usd ?? (kind === "tool" ? 1 : 0.25)).toFixed(2)}
-  per_day_usd: ${(o.budgets?.per_day_usd ?? (kind === "tool" ? 5 : 3)).toFixed(2)}
+  per_day_usd: ${(o.budgets?.per_day_usd ?? 5).toFixed(2)}
 ${roomsBlock(o.room)}
 ---
 
@@ -323,8 +323,13 @@ specific enough that the agent should follow it exactly rather than improvise.
 `,
   );
   const skillId = parsed.def.offers?.[0]?.id ?? "answer-question";
+  // A spec-expert has a true answer to assert, so its case runs. Any other kind
+  // gets the same file as an EXAMPLE the runner ignores: a placeholder case that
+  // runs fails the gate by construction, and for a tool user it makes the agent
+  // act on every gate run (found live: the gate asked a Linear agent the
+  // placeholder question, with its key set).
   write(
-    path.join("evals", "cases", `${o.name}-01`, "case.yaml"),
+    path.join("evals", "cases", `${o.name}-01`, o.kind === "spec-expert" ? "case.yaml" : "case.yaml.example"),
     `id: ${o.name}-01
 kind: live
 subject_capability: ${skillId}

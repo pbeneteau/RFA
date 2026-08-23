@@ -106,10 +106,10 @@ export function setTopScalar(text: string, key: string, line: string): string {
 }
 
 /** Set a pack's mode in its agent.md, validated before the write. */
-export function setAgentMode(file: string, mode: "ask" | "plan" | "auto" | "bypass"): { before: string; after: string } {
+export function setAgentMode(file: string, mode: "ask" | "plan" | "bypass"): { before: string; after: string } {
   const text = fs.readFileSync(file, "utf8");
   const before = parseAgentMd(text).definitionHash;
-  const next = setTopScalar(text, "mode", `mode: ${mode}   # ask: cards for every acting tool · plan: proposes, never acts · auto: the SDK's classifier decides · bypass: acts without asking`);
+  const next = setTopScalar(text, "mode", `mode: ${mode}   # ask: cards for every acting tool · plan: proposes, never acts · bypass: acts without asking`);
   const after = parseAgentMd(next).definitionHash;
   if (after !== before) fs.writeFileSync(file, next);
   return { before, after };

@@ -46,13 +46,14 @@ export interface Draft {
 }
 
 export function defaultDraft(): Draft {
-  return { name: "", kind: "answerer", knowledge: null, tool: null, mode: "ask", model: "haiku", offer: { id: "answer-question", description: "" }, budgets: { per_task_usd: 0.25, per_day_usd: 3, max_turns: 8 }, room: null };
+  return { name: "", kind: "answerer", knowledge: null, tool: null, mode: "ask", model: "haiku", offer: { id: "answer-question", description: "" }, budgets: { per_task_usd: 0.25, per_day_usd: 5, max_turns: 8 }, room: null };
 }
 
 /** The defaults that follow from the kind, applied when the kind is chosen. */
 export function forKind(d: Draft, kind: PackKind): Draft {
   const offer = kind === "tool" ? { id: `${d.name}-action`, description: `Performs the ${d.name} action after a human approves it.` } : kind === "spec-expert" ? { id: "answer-protocol-question", description: "Answers a question about the RFA protocol from the specification, citing the section." } : { id: "answer-question", description: `Answers a question from the ${d.name} knowledge pack, citing its source.` };
-  const budgets = kind === "tool" ? { per_task_usd: 1, per_day_usd: 5, max_turns: 20 } : { per_task_usd: 0.25, per_day_usd: 3, max_turns: 8 };
+  // $5 a day: a pass^4 gate run over four cases costs about $1.60 on haiku, and the first live gate run stopped at a $3 ceiling halfway through.
+  const budgets = kind === "tool" ? { per_task_usd: 1, per_day_usd: 5, max_turns: 20 } : { per_task_usd: 0.25, per_day_usd: 5, max_turns: 8 };
   return { ...d, kind, offer, budgets, model: kind === "tool" ? "sonnet" : "haiku", knowledge: kind === "answerer" ? d.knowledge : null, tool: kind === "tool" ? d.tool : null };
 }
 
@@ -73,7 +74,7 @@ const WHY: Record<Step, { title: string; lines: string[] }> = {
   kind: { title: "three kinds of pack", lines: ["An answerer reads markdown and answers with citations; it has no side effects.", "A tool user acts through an MCP server; every acting call pauses for a human unless you set its mode otherwise.", "A spec-expert answers about the RFA protocol from the spec shipped in this package; a demo, not a colleague."] },
   knowledge: { title: "what it answers from", lines: ["A folder is attached as a glob; nothing is copied.", "A git repository is cloned under the pack and tracked: provenance for free, fresh on every push, no credential at answer time.", "Later: fill agents/<name>/knowledge/ or run rfa knowledge add."] },
   server: { title: "what it acts through", lines: ["A built-in server ships in this package and starts beside the agent.", "Any MCP server works: a command and the tool id to gate.", "Secrets are names; the supervisor injects their values from .rfa/secrets.json."] },
-  mode: { title: "how it acts", lines: ["ask pauses every acting tool on a card you decide.", "plan proposes and never acts: the answer is the plan.", "auto lets the SDK decide; so far it has approved everything, so treat it as bypass with a second opinion.", "bypass acts without asking; the room gate, budgets, hold and quarantine still apply."] },
+  mode: { title: "how it acts", lines: ["ask pauses every acting tool on a card you decide.", "plan proposes and never acts: the answer is the plan.", "bypass acts without asking; the room gate, budgets, hold and quarantine still apply."] },
   model: { title: "the model", lines: ["haiku: fast and cheap; enough to read knowledge and answer with citations.", "sonnet: composes and acts; the default for a tool user.", "opus: the most capable and the most expensive; for reasoning that keeps failing on sonnet.", "Budgets cap the spend whatever the model."] },
   capability: { title: "what it advertises", lines: ["Discovery is by capability, never by name: the id is what an asker matches on (rfa ask --capability).", "Make it a verb. Two agents may offer the same id; the asker picks."] },
   budgets: { title: "the ceilings", lines: ["per task: the most one answer may cost; the SDK stops the turn there.", "per day: the pack's daily total; answers are refused past it.", "max turns: how many model turns one answer may take before it is cut off."] },

@@ -1,3 +1,5 @@
+import * as path from "node:path";
+import * as fs from "node:fs";
 /**
  * Finding resident processes in the process table, strictly.
  *
@@ -16,6 +18,8 @@ export interface ResidentProcess {
   pid: number;
   ppid: number | null;
   agent: string;
+  /** The hub directory it was spawned for (`--dir`), null for a resident started before 0.7.1 spawned with it. */
+  dir: string | null;
 }
 
 /** Parse `ps ax -o pid=,ppid=,command=` (or `pid=,command=`) output. */
@@ -43,7 +47,9 @@ export function parseResidentProcesses(psOutput: string, hasPpid = true): Reside
     const at = argv.indexOf("--agent", i + 1);
     const agent = at >= 0 ? argv[at + 1] : undefined;
     if (!agent) continue;
-    out.push({ pid, ppid: Number.isFinite(ppid as number) ? (ppid as number) : null, agent });
+    const dt = argv.indexOf("--dir", i + 1);
+    const dir = dt >= 0 ? (argv[dt + 1] ?? null) : null;
+    out.push({ pid, ppid: Number.isFinite(ppid as number) ? (ppid as number) : null, agent, dir });
   }
   return out;
 }
@@ -58,4 +64,23 @@ export function residentProcessesSync(): ResidentProcess[] {
 
 export function residentProcesses(): Promise<ResidentProcess[]> {
   return new Promise((resolve) => execFile("ps", ["ax", "-o", "pid=,ppid=,command="], { encoding: "utf8" }, (_e, stdout) => resolve(parseResidentProcesses(stdout ?? ""))));
+}
+
+/**
+ * Whether a resident belongs to this hub directory. Two hub directories on one
+ * machine each run a `spec-expert`; a supervisor that matched on the name alone
+ * refused to start its own (found live: the cold-start test failed because the
+ * test project's resident was running). A resident spawned without `--dir`
+ * (before 0.7.1) cannot say, and still counts.
+ */
+export function belongsTo(p: { dir: string | null }, root: string): boolean {
+  if (p.dir === null) return true;
+  const real = (f: string) => {
+    try {
+      return fs.realpathSync(f);
+    } catch {
+      return path.resolve(f);
+    }
+  };
+  return real(p.dir) === real(root);
 }

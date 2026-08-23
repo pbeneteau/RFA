@@ -12,7 +12,7 @@ import { RoomMember } from "../../client.js";
 import { daemonState } from "../../daemon.js";
 import { findRoom, roomsStore, secretsStore, type HubDir, type RoomRecord } from "../../hubdir.js";
 import { packageVersion } from "../../pkg.js";
-import { residentProcessesSync } from "../../procscan.js";
+import { belongsTo, residentProcessesSync } from "../../procscan.js";
 import { bindPack, setAgentMode } from "../agentmd.js";
 import { effectiveMode, isMode, MODE_SUMMARY, MODES, type AgentMode } from "../../posture.js";
 import { CliError, type CliContext } from "../context.js";
@@ -33,7 +33,7 @@ function resolveRoom(h: HubDir, ref: string | undefined): RoomRecord | { handle:
 export const agentNew: CommandDef = {
   path: ["agent", "new"],
   summary: "Scaffold a pack, validated, bound to a room; alone on a terminal, the walkthrough",
-  usage: "<name> [--kind spec-expert|answerer|tool] [--room <alias|handle>] [--knowledge <dir>] [--model haiku|sonnet] [--server <name> --command <cmd> --tool <id> | --builtin linear [--tool <id>]] [--mode ask|plan|auto|bypass] [--dry-run]",
+  usage: "<name> [--kind spec-expert|answerer|tool] [--room <alias|handle>] [--knowledge <dir>] [--model haiku|sonnet] [--server <name> --command <cmd> --tool <id> | --builtin linear [--tool <id>]] [--mode ask|plan|bypass] [--dry-run]",
   why: "Everything the scaffold writes is something a hand-written pack got wrong at least once here: RFA_TOKEN in secrets, a skill on the card, budgets, allow_subagents: false, a room binding. It is validated through the supervisor's own schema, so it either loads or says why before the supervisor sees it. A tool user names the MCP server it brings; the runtime loads it from the pack's own declaration.",
   options: { kind: { type: "string" }, room: { type: "string" }, knowledge: { type: "string" }, model: { type: "string" }, server: { type: "string" }, command: { type: "string" }, builtin: { type: "string" }, tool: { type: "string" }, mode: { type: "string" }, "dry-run": { type: "boolean", default: false } },
   examples: ["rfa agent new pm --kind answerer --knowledge ./docs --room product", "rfa agent new scribe --kind tool --builtin linear", "rfa agent new filer --kind tool --server filesystem --command 'npx -y @modelcontextprotocol/server-filesystem /tmp/scratch' --tool write_file"],
@@ -338,13 +338,13 @@ async function packArg(ctx: CliContext, h: HubDir, given: string | undefined, us
 
 export const agentMode: CommandDef = {
   path: ["agent", "mode"],
-  summary: "Show or set how an agent's acting tools are treated: ask, plan, auto or bypass",
-  usage: "<name> [ask|plan|auto|bypass]",
-  why: "The same idea as Claude Code's permission modes, for a resident. ask (the default) pauses every acting tool on a card you decide; plan proposes and never acts; auto lets the SDK's classifier wave through what it judges safe and sends the rest to you; bypass acts without asking, and the room gate, budgets, hold and quarantine still apply. A mode is one line in agent.md, so changing it rotates the definition: a running supervisor drains and respawns the resident, and the room sees the digest change.",
+  summary: "Show or set how an agent's acting tools are treated: ask, plan or bypass",
+  usage: "<name> [ask|plan|bypass]",
+  why: "The same idea as Claude Code's permission modes, for a resident. ask (the default) pauses every acting tool on a card you decide; plan proposes and never acts; bypass acts without asking, and the room gate, budgets, hold and quarantine still apply. An auto mode (the SDK's classifier deciding) was tried and withdrawn: it approved a gated call with no card. A mode is one line in agent.md, so changing it rotates the definition: a running supervisor drains and respawns the resident, and the room sees the digest change.",
   examples: ["rfa agent mode linear-agent", "rfa agent mode linear-agent plan", "rfa agent mode linear-agent bypass --yes"],
   run: async (ctx, a) => {
     const h = ctx.hubdir();
-    const name = await packArg(ctx, h, a.positionals[0], "rfa agent mode <name> [ask|plan|auto|bypass]");
+    const name = await packArg(ctx, h, a.positionals[0], "rfa agent mode <name> [ask|plan|bypass]");
     const pack = listPacks(h.paths.agents).find((p) => p.name === name);
     if (!pack) throw new CliError(2, `no pack agents/${name}`, "rfa agent ls");
     const current = effectiveMode(pack.def);
@@ -415,7 +415,7 @@ export const agentRetire: CommandDef = {
       return { [name]: { pid: -1, status: "unreadable supervisor state" } };
     };
     const stoppedIn = (s: ReturnType<typeof readSup>): boolean => !s?.[name] || s[name].pid === null;
-    const residentAlive = (): boolean => residentProcessesSync().some((p) => p.agent === name);
+    const residentAlive = (): boolean => residentProcessesSync().some((p) => p.agent === name && belongsTo(p, h.root));
     say(`stop ${name} through the supervisor command channel`);
     const before = readSup();
     if (!before || stoppedIn(before)) {

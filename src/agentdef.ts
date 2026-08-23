@@ -87,8 +87,8 @@ export const agentDefSchema = z.object({
       ]),
     )
     .optional(),
-  /** How the acting tools are treated (src/posture.ts): ask (default), plan, auto, bypass. */
-  mode: z.enum(["ask", "plan", "auto", "bypass"]).optional(),
+  /** How the acting tools are treated (src/posture.ts): ask (default), plan, bypass. `auto` was withdrawn 2026-08-23. */
+  mode: z.enum(["ask", "plan", "bypass"]).optional(),
   knowledge: z.array(z.string()).optional(),
   offers: z
     .array(

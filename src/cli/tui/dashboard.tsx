@@ -153,7 +153,7 @@ export function Dashboard(props: { ctx: CliContext; hub: HubDir; commands: Comma
         }
         if (input === "m") {
           if (agent.mode === "read-only") return say(`${agent.name} has no acting tool; a mode would change nothing`, "info");
-          const order = ["ask", "plan", "auto", "bypass"] as const;
+          const order = ["ask", "plan", "bypass"] as const;
           const next = order[(Math.max(0, order.indexOf(agent.mode as (typeof order)[number])) + 1) % order.length];
           const apply = async () => {
             const { setAgentMode } = await import("../agentmd.js");
@@ -306,7 +306,7 @@ function Help(props: { onClose: () => void }): React.JSX.Element {
     ["u / d", "start / stop the hub and the supervisor"],
     ["D / o", "rfa doctor / the console in the browser"],
     ["r s x", "restart / start / stop the selected agent"],
-    ["m", "cycle the agent's mode: ask → plan → auto → bypass (bypass is confirmed first)"],
+    ["m", "cycle the agent's mode: ask → plan → bypass (bypass is confirmed first)"],
     ["l e v n", "logs / edit / show / new agent"],
     ["t v i", "tail / show / inject into the selected room"],
     ["y n", "approve / reject the selected card"],

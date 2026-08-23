@@ -82,6 +82,10 @@ interface CaseResult {
   id: string;
   kind: string;
   trials: boolean[];
+  /** Trials the subject REFUSED (budget, overloaded, busy): infrastructure, not quality; excluded from pass^k. */
+  refused?: string[];
+  /** Set when every trial was refused: the case did not run, and the gate says so instead of calling it a regression. */
+  blocked?: string;
   score: number; // pass^1
   passk: { k: number; value: number } | null;
   comments: string[];
@@ -209,11 +213,22 @@ async function runLive(def: CaseDef, env: LiveEnv, obs: ObsStore | null, judged:
     const subjectRec = probe.roster.find((r) => def.subject_capability && r.card_summary.skill_ids.includes(def.subject_capability));
     if (!subjectRec) throw new Error(`no roster member offers ${def.subject_capability}`);
     const trials: boolean[] = [];
+    const refused: string[] = [];
     const comments: string[] = [];
     let judge: CaseResult["judge"];
     for (let i = 0; i < (def.trials ?? 1); i++) {
       const asker = i === 0 ? probe : await newProbe(i + 1);
       const answer = await asker.ask(subjectRec.id, def.ask!, { timeoutMs: def.timeout_ms ?? 120_000 });
+      // A refusal is the subject saying it cannot run the trial (a budget
+      // exhausted, overloaded, busy), which is the stack's state and not the
+      // answer's quality. Found live: a $3/day answerer hit its ceiling halfway
+      // through a gate run and the gate reported two REGRESSIONS.
+      if (answer.kind === "refuse") {
+        const why = `${answer.refusal?.reason ?? "refused"}${answer.refusal?.detail ? `: ${answer.refusal.detail}` : ""}`;
+        refused.push(why);
+        comments.push(`trial ${i + 1}: REFUSED ${why}`);
+        continue;
+      }
       // Reconstruct the exchange as an event slice (live Q&A cases score messages, not board state).
       const asked: RfaEvent = {
         seq: 1, ts: new Date().toISOString(), type: "message",
@@ -248,8 +263,11 @@ async function runLive(def: CaseDef, env: LiveEnv, obs: ObsStore | null, judged:
       }
     }
     const k = Math.min(4, trials.length);
+    if (trials.length === 0) {
+      return { id: def.id, kind: "live", trials, refused, blocked: refused[0] ?? "every trial refused", definition_hash: subjectRec.digest ?? null, score: 0, passk: null, comments, judge };
+    }
     return {
-      id: def.id, kind: "live", trials,
+      id: def.id, kind: "live", trials, ...(refused.length ? { refused } : {}),
       // The capability digest identifies the definition this was measured
       // against: without it a "regression" cannot be told from a pack edit.
       definition_hash: subjectRec.digest ?? null,
@@ -302,7 +320,7 @@ async function main(): Promise<void> {
     "",
     "| case | kind | score | pass^k | judge | notes |",
     "|---|---|---|---|---|---|",
-    ...results.map((r) => `| ${r.id} | ${r.kind} | ${r.score.toFixed(2)} | ${r.passk ? `${r.passk.value.toFixed(2)} (k=${r.passk.k})` : "-"} | ${r.judge?.score ?? "-"} | ${r.comments.at(-1)?.slice(0, 80) ?? ""} |`),
+    ...results.map((r) => `| ${r.id} | ${r.kind} | ${r.blocked ? "BLOCKED" : r.score.toFixed(2)} | ${r.passk ? `${r.passk.value.toFixed(2)} (k=${r.passk.k})` : "-"} | ${r.judge?.score ?? "-"} | ${(r.blocked ?? r.comments.at(-1))?.slice(0, 80) ?? ""} |`),
   ].join("\n");
   fs.writeFileSync(path.join(reportDir, "latest.md"), md);
 
@@ -330,7 +348,12 @@ async function main(): Promise<void> {
       ? { value: passHatK([r.trials], GATE_K), estimated: true }
       : { value: r.score, estimated: false };
 
-  const rows = results.map((r) => {
+  const blocked = results.filter((r) => r.blocked);
+  for (const r of blocked) {
+    console.error(`BLOCKED ${r.id}: ${r.blocked}`);
+    if (/budget/i.test(r.blocked ?? "")) console.error("  the subject's budget, not its quality: raise budgets.per_day_usd in its agent.md, or run the gate tomorrow");
+  }
+  const rows = results.filter((r) => !r.blocked).map((r) => {
     const { value, estimated } = gateValue(r);
     const base = baseCases[r.id];
     const drop = base ? base.passk - value : 0;
@@ -350,8 +373,13 @@ async function main(): Promise<void> {
       : `measured flake rate ${(flakeRate * 100).toFixed(1)}% over ${flakeTrials.length} trials`;
 
   if (updateBaseline) {
+    // A blocked case keeps whatever baseline it had: a refusal is not a measurement.
     const next: Record<string, CaseBaseline> = {};
     for (const r of results) {
+      if (r.blocked) {
+        if (baseCases[r.id]) next[r.id] = baseCases[r.id];
+        continue;
+      }
       next[r.id] = { passk: gateValue(r).value, k: GATE_K, definition_hash: r.definition_hash ?? null };
     }
     fs.writeFileSync(
@@ -379,7 +407,12 @@ async function main(): Promise<void> {
     }
   }
   const pass = results.filter((r) => r.score === 1).length;
-  console.log(`evals: ${pass}/${results.length} clean at pass^${GATE_K} band ${GATE_BAND} · ${flakeNote} · report: ${path.relative(hubdir.root, path.join(reportDir, "latest.md"))}`);
+  const refusedTrials = results.reduce((n, r) => n + (r.refused?.length ?? 0), 0);
+  console.log(`evals: ${pass}/${results.length} clean at pass^${GATE_K} band ${GATE_BAND} · ${flakeNote}${refusedTrials ? ` · ${refusedTrials} trial(s) refused by the subject, excluded` : ""} · report: ${path.relative(hubdir.root, path.join(reportDir, "latest.md"))}`);
+  if (blocked.length) {
+    console.error(`gate incomplete: ${blocked.length} case(s) did not run (${blocked.map((r) => r.id).join(", ")})`);
+    process.exit(3);
+  }
   if (pass === results.length) {
     // Anti-ossification (spec 20.4): a clean sweep is only meaningful if someone
     // writes down that it was reviewed. The instrument cannot tell whether it

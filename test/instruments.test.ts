@@ -214,11 +214,12 @@ test("service install --print renders both units for launchd and systemd, naming
   assert.ok(units.every((u) => !u.installed), "nothing was installed by --print");
 });
 
-test("evals ls finds the scaffold's example case under the pack, and promote refuses an unlinked conversation", async () => {
+test("evals ls ignores the scaffold's example case (a placeholder that runs fails the gate), and promote refuses an unlinked conversation", async () => {
   const ls = await rfa(["evals", "ls", "--json"]);
   assert.equal(ls.code, 0, ls.stderr);
   const cases = json<{ cases: { id: string; kind: string; where: string }[] }>(ls).cases;
-  assert.deepEqual(cases.map((c) => [c.id, c.kind, c.where]), [["scribe-01", "live", "agents/scribe/evals/cases/scribe-01"]], "cases live beside their pack as well as under evals/cases");
+  assert.deepEqual(cases, [], "an answerer's scaffolded case is an example the runner ignores");
+  assert.ok(fs.existsSync(path.join(h.paths.agents, "scribe", "evals", "cases", "scribe-01", "case.yaml.example")), "the template is there to edit into a real case");
   const nothing = await rfa(["evals", "promote", "product", "--conversation", "c_none", "--id", "c1"]);
   assert.equal(nothing.code, 1, "nothing linked to that conversation is an error, not an empty case");
   assert.match(nothing.stderr, /nothing linked to c_none/);
