@@ -55,6 +55,10 @@ export interface ScaffoldOptions {
   tool?: ToolSpec;
   /** For a tool user: how its acting tools are treated (src/posture.ts). Default ask. */
   mode?: AgentMode;
+  /** The one capability the card advertises; defaults per kind. */
+  offer?: { id: string; description: string };
+  /** Ceilings; defaults per kind. */
+  budgets?: { max_turns?: number; per_task_usd?: number; per_day_usd?: number };
 }
 
 export interface ToolSpec {
@@ -110,7 +114,7 @@ const ANSWERER_RULES = `- Be concise and decisive. Cite the file you relied on b
 
 export function renderAgentMd(o: ScaffoldOptions): string {
   const { name, kind } = o;
-  const skillId = kind === "tool" ? `${name}-action` : kind === "spec-expert" ? "answer-protocol-question" : "answer-question";
+  const skillId = o.offer?.id ?? (kind === "tool" ? `${name}-action` : kind === "spec-expert" ? "answer-protocol-question" : "answer-question");
   const description =
     kind === "tool"
       ? "Acts on requests in the room; every external write pauses for a human decision."
@@ -192,7 +196,7 @@ offers:
   # What this agent advertises in the room. Discovery is by capability, so the
   # id is what an asker matches on: make it a verb, not a noun.
   - id: ${skillId}
-    description: ${kind === "tool" ? `Performs the ${name} action after a human approves it.` : kind === "spec-expert" ? "Answers a question about the RFA protocol from the specification, citing the section." : `Answers a question from the ${name} knowledge pack, citing its source.`}
+    description: ${o.offer?.description ?? (kind === "tool" ? `Performs the ${name} action after a human approves it.` : kind === "spec-expert" ? "Answers a question about the RFA protocol from the specification, citing the section." : `Answers a question from the ${name} knowledge pack, citing its source.`)}
 memory:
   scope: pack
   gate: memory-gate   # peer content cannot become memory unexamined
@@ -205,9 +209,9 @@ ${kind === "tool" ? `mode: ${o.mode ?? "ask"}   # ask: cards for every acting to
 # RFA_TOKEN: the bearer that reaches the hub; residents join their room with it.
 secrets: [RFA_TOKEN${o.tool?.envSecrets?.length ? `, ${o.tool.envSecrets.join(", ")}` : ""}]
 budgets:
-  max_turns: ${kind === "tool" ? 20 : 8}
-  per_task_usd: ${kind === "tool" ? "1.00" : "0.25"}
-  per_day_usd: ${kind === "tool" ? "5.00" : "3.00"}
+  max_turns: ${o.budgets?.max_turns ?? (kind === "tool" ? 20 : 8)}
+  per_task_usd: ${(o.budgets?.per_task_usd ?? (kind === "tool" ? 1 : 0.25)).toFixed(2)}
+  per_day_usd: ${(o.budgets?.per_day_usd ?? (kind === "tool" ? 5 : 3)).toFixed(2)}
 ${roomsBlock(o.room)}
 ---
 

@@ -12,12 +12,13 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Box, Text, useApp, useInput } from "ink";
+import { Box, Text, useApp, useInput, useWindowSize } from "ink";
 import { TextInput } from "@inkjs/ui";
 import type { HubDir } from "../../hubdir.js";
 import { packageVersion } from "../../pkg.js";
 import type { CliContext } from "../context.js";
 import { defaultAnswers, provision, type InitAnswers, type ProvisionResult, type Reporter } from "../commands/init.js";
+import { checkEnvironment, environmentBlocks, type EnvCheck } from "../environment.js";
 import { nextFreePort, portFree } from "../preflight.js";
 import { BUILTIN_SERVERS, builtinTool, nameProblem } from "../scaffold.js";
 import { firstAsk, type AskOutcome } from "./data.js";
@@ -31,7 +32,7 @@ export interface OnboardingResult {
   hub: HubDir | null;
 }
 
-type Screen = "welcome" | "mode" | "name" | "port" | "remote" | "human" | "agent" | "agentName" | "knowledge" | "toolServer" | "room" | "roomHandle" | "start" | "provision" | "ask" | "done";
+type Screen = "welcome" | "checks" | "mode" | "name" | "port" | "remote" | "human" | "agent" | "agentName" | "knowledge" | "toolServer" | "room" | "roomHandle" | "start" | "provision" | "ask" | "done";
 
 interface Line {
   kind: "done" | "step" | "warn" | "note";
@@ -39,7 +40,7 @@ interface Line {
   detail?: string;
 }
 
-const ORDER: Screen[] = ["welcome", "mode", "name", "port", "remote", "human", "agent", "agentName", "knowledge", "toolServer", "room", "roomHandle", "start", "provision", "ask", "done"];
+const ORDER: Screen[] = ["welcome", "checks", "mode", "name", "port", "remote", "human", "agent", "agentName", "knowledge", "toolServer", "room", "roomHandle", "start", "provision", "ask", "done"];
 
 /** Which screens apply, given the answers so far and whether the directory already exists. */
 export function applicable(screen: Screen, a: InitAnswers, existing: boolean): boolean {
@@ -74,6 +75,7 @@ export function nextScreen(from: Screen, a: InitAnswers, existing: boolean, dir:
 
 const WHY: Record<Screen, { title: string; lines: string[] }> = {
   welcome: { title: "", lines: [] },
+  checks: { title: "before anything is written", lines: ["The Node this runs on and the native SQLite binding: a hub that cannot open its store dies at boot.", "The model credential: a logged-in `claude`, or ANTHROPIC_API_KEY. Without one, agents join and sit ready but refuse every answer.", "git, for knowledge cloned from a repository. tailscale and a service manager, for later.", "Other model CLIs are reported if seen; rfa does not run residents on them today."] },
   mode: { title: "one folder, three parts", lines: ["The hub is the room server: agents and people talk through it, over MCP.", "The supervisor keeps your local agents running and restarts them when they die.", "agents/ holds one folder per agent; a markdown file is the whole definition.", "", "Hosting agents for a hub elsewhere needs that hub's URL and a bearer from its operator."] },
   name: { title: "the instance name", lines: ["It names the process titles, the backup folder and the service label.", "Lowercase letters, digits, dots and hyphens, like a hostname."] },
   port: { title: "where the hub listens", lines: ["Loopback only, until you expose it on purpose (rfa hub expose).", "Nothing here phones home."] },
@@ -104,7 +106,20 @@ export function Onboarding(props: { ctx: CliContext; target: string; existing: H
   const [asking, setAsking] = useState(false);
   const [outcome, setOutcome] = useState<AskOutcome | null>(null);
   const [askError, setAskError] = useState<string | null>(null);
+  const [checks, setChecks] = useState<EnvCheck[] | null>(null);
   const started = useRef(false);
+  const { columns } = useWindowSize();
+  const narrow = columns < 96;
+  const leftWidth = narrow ? Math.max(40, columns - 2) : Math.min(64, Math.floor(columns * 0.56));
+  const rightWidth = narrow ? Math.max(40, columns - 2) : Math.max(30, columns - leftWidth - 4);
+  const fullWidth = Math.max(40, Math.min(columns - 2, 110));
+  const runChecks = () => {
+    setChecks(null);
+    setTimeout(() => setChecks(checkEnvironment()), 30);
+  };
+  useEffect(() => {
+    if (screen === "checks" && checks === null) runChecks();
+  }, [screen, checks]);
 
   useEffect(() => {
     void (async () => {
@@ -153,6 +168,11 @@ export function Onboarding(props: { ctx: CliContext; target: string; existing: H
         if (input === "q") return exit({ code: 0, openDashboard: false, hub: null } satisfies OnboardingResult);
         if (key.return || input === " ") return go(1);
       }
+      if (screen === "checks") {
+        if (input === "r") return runChecks();
+        if (input === "q") return exit({ code: 3, openDashboard: false, hub: null } satisfies OnboardingResult);
+        if (key.return && checks && !environmentBlocks(checks)) return go(1);
+      }
       if (screen === "done") {
         if (input === "q" || key.escape) return exit({ code: 0, openDashboard: false, hub: result?.h ?? null } satisfies OnboardingResult);
         if (key.return) return exit({ code: 0, openDashboard: true, hub: result?.h ?? null } satisfies OnboardingResult);
@@ -173,14 +193,14 @@ export function Onboarding(props: { ctx: CliContext; target: string; existing: H
       <Box marginBottom={1}>
         <Wordmark />
       </Box>
-      <Box gap={2}>
-        <Panel title={label} active width={54}>
+      <Box gap={narrow ? 0 : 2} flexDirection={narrow ? "column" : "row"}>
+        <Panel title={label} active width={leftWidth}>
           {body}
           <Box marginTop={1}>
             <Keys items={footer ?? [["enter", "next"], ["esc", "back"]]} />
           </Box>
         </Panel>
-        <Panel title={why.title} width={50}>
+        <Panel title={why.title} width={rightWidth}>
           {why.lines.map((l, i) => (
             <Text key={i} dimColor={l !== ""} wrap="wrap">
               {l || " "}
@@ -209,6 +229,23 @@ export function Onboarding(props: { ctx: CliContext; target: string; existing: H
             <Keys items={[["enter", "begin"], ["q", "not now"]]} />
           </Box>
         </Box>
+      );
+    case "checks":
+      return question_(
+        checks === null ? "Checking this machine" : environmentBlocks(checks) ? "Fix the ✖ first" : "This machine is ready",
+        <Box flexDirection="column">
+          {checks === null ? <Spin label="looking at node, sqlite, git, the model CLIs" /> : null}
+          {(checks ?? []).map((c) => (
+            <Box key={c.id} flexDirection="column">
+              <Text wrap="wrap">
+                <Text color={c.verdict === "ok" ? GOOD : c.verdict === "warn" ? WARN : c.verdict === "fail" ? BAD : MUTED}>{c.verdict === "ok" ? "✔" : c.verdict === "warn" ? "!" : c.verdict === "fail" ? "✖" : "·"}</Text>
+                <Text dimColor={c.verdict === "skip"}> {c.text}</Text>
+              </Text>
+              {c.fix ? <Text dimColor wrap="wrap">    → {c.fix}</Text> : null}
+            </Box>
+          ))}
+        </Box>,
+        checks && environmentBlocks(checks) ? [["r", "check again"], ["q", "quit"]] : [["enter", "continue"], ["r", "check again"], ["esc", "back"]],
       );
     case "mode":
       return question_(
@@ -347,8 +384,8 @@ export function Onboarding(props: { ctx: CliContext; target: string; existing: H
           <Box marginBottom={1}>
             <Wordmark />
           </Box>
-          <Box gap={2}>
-            <Panel title={failure ? "stopped" : result ? "written" : "writing"} active width={70}>
+          <Box gap={narrow ? 0 : 2} flexDirection={narrow ? "column" : "row"}>
+            <Panel title={failure ? "stopped" : result ? "written" : "writing"} active width={narrow ? leftWidth : Math.max(50, columns - rightWidth - 4)}>
               {lines.map((l, i) => (
                 <Box key={i} flexDirection="column">
                   <Text>
@@ -374,7 +411,7 @@ export function Onboarding(props: { ctx: CliContext; target: string; existing: H
                 </Box>
               ) : null}
             </Panel>
-            <Panel title={why.title} width={44}>
+            <Panel title={why.title} width={rightWidth}>
               {why.lines.map((l, i) => (
                 <Text key={i} dimColor wrap="wrap">
                   {l}
@@ -390,7 +427,7 @@ export function Onboarding(props: { ctx: CliContext; target: string; existing: H
           <Box marginBottom={1}>
             <Wordmark />
           </Box>
-          <Panel title={`${result?.agent?.name} is ready in ${answers.room}. Ask it something?`} active width={100}>
+          <Panel title={`${result?.agent?.name} is ready in ${answers.room}. Ask it something?`} active width={fullWidth}>
             {!asking && !outcome && !askError ? (
               <Box>
                 <Text color={ACCENT}>? </Text>
@@ -445,7 +482,7 @@ export function Onboarding(props: { ctx: CliContext; target: string; existing: H
             ) : null}
           </Panel>
           <Box marginTop={1}>
-            <Panel title={why.title} width={100}>
+            <Panel title={why.title} width={fullWidth}>
               {why.lines.map((l, i) => (
                 <Text key={i} dimColor>
                   {l}
@@ -456,11 +493,11 @@ export function Onboarding(props: { ctx: CliContext; target: string; existing: H
         </Box>
       );
     case "done":
-      return <Done result={result} answers={answers} />;
+      return <Done result={result} answers={answers} width={fullWidth} />;
   }
 }
 
-function Field(props: { value: string; placeholder?: string; allowEmpty?: boolean; validate: (v: string) => string | null | undefined; onSubmit: (v: string) => void | Promise<void> }): React.JSX.Element {
+export function Field(props: { value: string; placeholder?: string; allowEmpty?: boolean; validate: (v: string) => string | null | undefined; onSubmit: (v: string) => void | Promise<void> }): React.JSX.Element {
   const [err, setErr] = useState<string | null>(null);
   return (
     <Box flexDirection="column">
@@ -511,7 +548,7 @@ function RemoteFields(props: { url: string; onSubmit: (url: string, token: strin
 }
 
 /** A command line, the tool id, then the server's name with a default derived from the command. */
-function ToolServerFields(props: { initial?: InitAnswers["toolServer"]; onSubmit: (t: NonNullable<InitAnswers["toolServer"]>) => void }): React.JSX.Element {
+export function ToolServerFields(props: { initial?: InitAnswers["toolServer"]; onSubmit: (t: NonNullable<InitAnswers["toolServer"]>) => void }): React.JSX.Element {
   const [kind, setKind] = useState<"builtin" | "custom" | null>(props.initial ? (props.initial.builtin ? "builtin" : "custom") : null);
   const [command, setCommand] = useState<string | null>(props.initial?.command ? [props.initial.command, ...(props.initial.args ?? [])].join(" ") : null);
   const [tool, setTool] = useState<string | null>(props.initial?.tool ?? null);
@@ -580,7 +617,7 @@ function ToolServerFields(props: { initial?: InitAnswers["toolServer"]; onSubmit
   );
 }
 
-function Done(props: { result: ProvisionResult | null; answers: InitAnswers }): React.JSX.Element {
+function Done(props: { result: ProvisionResult | null; answers: InitAnswers; width: number }): React.JSX.Element {
   const r = props.result;
   const next = useMemo(() => {
     const rows: [string, string][] = [];
@@ -598,7 +635,7 @@ function Done(props: { result: ProvisionResult | null; answers: InitAnswers }): 
       <Box marginBottom={1}>
         <Wordmark />
       </Box>
-      <Panel title="your hub directory is ready" active width={100}>
+      <Panel title="your hub directory is ready" active width={props.width}>
         <Text>
           {r?.h.root} <Text dimColor>({r?.h.manifest.name}, {r?.h.mode}){props.answers.start ? "" : " · nothing is running yet"}</Text>
         </Text>

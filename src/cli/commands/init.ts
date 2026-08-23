@@ -34,6 +34,7 @@ import { packageFile, packageVersion } from "../../pkg.js";
 import { principalRecordFor } from "../../principals.js";
 import { CliError, type CliContext } from "../context.js";
 import { openHubCall } from "../hubaccess.js";
+import { checkEnvironment, realProbe } from "../environment.js";
 import { credentialAdvice, modelCredentialStatus, nextFreePort, portFree } from "../preflight.js";
 import type { CommandDef } from "../router.js";
 import { builtinTool, nameProblem, PACK_KINDS, scaffoldPack, type PackKind, type ToolSpec } from "../scaffold.js";
@@ -383,6 +384,15 @@ export const init: CommandDef = {
       ui.box([ui.bold("rfa · Rooms for Agents") + `  ${ui.dim(packageVersion())}`, "", "One room. Agents from more than one place. One log you", "can verify. One human who can stop it."]);
       ui.blank();
     }
+    // The machine first, as the onboarding's first screen does.
+    const env = checkEnvironment(realProbe(ctx.env));
+    for (const c of env) {
+      if (c.verdict === "ok") ui.done(c.text);
+      else if (c.verdict === "warn") ui.warn(c.text, c.fix);
+      else if (c.verdict === "fail") ui.fail(c.text, c.fix);
+    }
+    const blocking = env.filter((c) => c.verdict === "fail" && c.id !== "claude");
+    if (blocking.length) throw new CliError(3, `${blocking.length} check${blocking.length === 1 ? "" : "s"} must pass before anything is written`, blocking.map((c) => c.fix).filter(Boolean).join("; "));
     const answers = await defaultAnswers(ctx, a.values, target, existing);
     if (answers.mode === "hub" && !(await portFree(answers.port)) && !(await ctx.healthz())) throw new CliError(3, `port ${answers.port} is in use by something that is not this hub`, "pass --port, or stop what holds it");
     const r = await provision(ctx, target, answers, { report: ui, force: Boolean(a.values.force), roomGiven: Boolean(a.values.room), headless: true });

@@ -10,7 +10,7 @@
  */
 import * as path from "node:path";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Box, Text, useApp, useInput, useWindowSize } from "ink";
+import { Box, Text, useApp, useInput, useStdout, useWindowSize } from "ink";
 import { TextInput } from "@inkjs/ui";
 import type { HubDir, RoomRecord } from "../../hubdir.js";
 import type { CliContext } from "../context.js";
@@ -37,6 +37,7 @@ interface Flash {
 export function Dashboard(props: { ctx: CliContext; hub: HubDir; commands: CommandDef[]; runChild: RunChild }): React.JSX.Element {
   const { ctx, hub: h } = props;
   const { exit, suspendTerminal } = useApp();
+  const { stdout } = useStdout();
   const { columns, rows } = useWindowSize();
   const [tab, setTab] = useState<Tab>("Overview");
   const [snap, setSnap] = useState<Snapshot | null>(null);
@@ -67,6 +68,14 @@ export function Dashboard(props: { ctx: CliContext; hub: HubDir; commands: Comma
     const t = setTimeout(() => setFlash(null), 6000);
     return () => clearTimeout(t);
   }, [flash]);
+  // Ink clears the screen when the terminal gets narrower, not when it gets
+  // shorter; a frame taller than the new window leaves its tail behind. Clear
+  // it ourselves on any shrink and let the next render repaint from the top.
+  const lastSize = useRef({ columns, rows });
+  useEffect(() => {
+    if (rows < lastSize.current.rows || columns < lastSize.current.columns) stdout.write("\x1b[2J\x1b[3J\x1b[H");
+    lastSize.current = { columns, rows };
+  }, [columns, rows, stdout]);
 
   const run = useCallback(
     async (argv: string[]) => {
@@ -135,7 +144,7 @@ export function Dashboard(props: { ctx: CliContext; hub: HubDir; commands: Comma
         if (down) setSel((s) => ({ ...s, agent: Math.min(agents.length - 1, s.agent + 1) }));
         if (up) setSel((s) => ({ ...s, agent: Math.max(0, s.agent - 1) }));
         if (!agent) {
-          if (input === "n") setOverlay({ kind: "palette", query: "agent new" });
+          if (input === "n") void run(["agent", "new"]);
           return;
         }
         if (input === "s" || input === "x" || input === "r") {
@@ -157,7 +166,7 @@ export function Dashboard(props: { ctx: CliContext; hub: HubDir; commands: Comma
         if (input === "l") return void run(["logs", agent.name, "-f"]);
         if (input === "e") return void run(["agent", "edit", agent.name]);
         if (input === "v") return void run(["agent", "show", agent.name]);
-        if (input === "n") return setOverlay({ kind: "palette", query: "agent new" });
+        if (input === "n") return void run(["agent", "new"]);
       }
       if (tab === "Rooms") {
         if (down) setSel((s) => ({ ...s, room: Math.min(roomViews.length - 1, s.room + 1) }));
@@ -255,13 +264,13 @@ export function Dashboard(props: { ctx: CliContext; hub: HubDir; commands: Comma
             });
           }} />
         ) : tab === "Overview" ? (
-          <Overview snap={snap} hub={h} aliasOf={aliasOf} />
+          <Overview snap={snap} hub={h} aliasOf={aliasOf} columns={columns} />
         ) : tab === "Agents" ? (
-          <AgentsTab agents={agents} selected={sel.agent} aliasOf={aliasOf} />
+          <AgentsTab agents={agents} selected={sel.agent} aliasOf={aliasOf} columns={columns} />
         ) : tab === "Rooms" ? (
-          <RoomsTab rooms={roomViews} selected={sel.room} />
+          <RoomsTab rooms={roomViews} selected={sel.room} columns={columns} />
         ) : tab === "Approvals" ? (
-          <ApprovalsTab cards={cards} selected={sel.card} aliasOf={aliasOf} />
+          <ApprovalsTab cards={cards} selected={sel.card} aliasOf={aliasOf} columns={columns} />
         ) : (
           <FeedTab hub={h} handle={feedRoom ?? roomViews.find((r) => r.alias !== "ops")?.handle ?? roomViews[0]?.handle ?? null} aliasOf={aliasOf} height={bodyHeight - 3} />
         )}
@@ -360,15 +369,18 @@ const since = (iso: string) => fmtMs(Math.max(0, Date.now() - Date.parse(iso)));
 
 // ---------------------------------------------------------------- tabs
 
-function Overview(props: { snap: Snapshot | null; hub: HubDir; aliasOf: (h: string | null | undefined) => string }): React.JSX.Element {
+function Overview(props: { snap: Snapshot | null; hub: HubDir; aliasOf: (h: string | null | undefined) => string; columns: number }): React.JSX.Element {
+  // Two columns side by side when there is room, one under the other when there is not.
+  const stacked = props.columns < 100;
+  const half = stacked ? "100%" : "50%";
   const s = props.snap?.status ?? null;
   const sum = props.snap?.summary ?? null;
   const alerts = props.snap?.alerts ?? [];
   const recent = props.snap?.recent ?? [];
   const acct = s?.supervisor.account ?? null;
   return (
-    <Box width="100%" gap={1}>
-      <Box flexDirection="column" width="50%">
+    <Box width="100%" gap={stacked ? 0 : 1} flexDirection={stacked ? "column" : "row"}>
+      <Box flexDirection="column" width={half}>
         <Panel title="processes">
           <Box>
             <Box width={14}>
@@ -410,7 +422,7 @@ function Overview(props: { snap: Snapshot | null; hub: HubDir; aliasOf: (h: stri
           ))}
         </Panel>
       </Box>
-      <Box flexDirection="column" width="50%">
+      <Box flexDirection="column" width={half}>
         <Panel title={`rooms (${s?.rooms.length ?? 0})`}>
           {s && s.rooms.length === 0 ? <Empty>no room yet: rfa room create &lt;alias&gt;</Empty> : null}
           {(s?.rooms ?? []).filter((r) => !r.ended).slice(0, 6).map((r) => (
@@ -479,15 +491,17 @@ function Overview(props: { snap: Snapshot | null; hub: HubDir; aliasOf: (h: stri
   );
 }
 
-function AgentsTab(props: { agents: AgentView[]; selected: number; aliasOf: (h: string | null | undefined) => string }): React.JSX.Element {
+function AgentsTab(props: { agents: AgentView[]; selected: number; aliasOf: (h: string | null | undefined) => string; columns: number }): React.JSX.Element {
   const a = props.agents[props.selected];
+  const stacked = props.columns < 100;
   return (
-    <Box width="100%" gap={1}>
-      <Panel title="agents" active width="60%">
+    <Box width="100%" gap={stacked ? 0 : 1} flexDirection={stacked ? "column" : "row"}>
+      <Panel title="agents" active width={stacked ? "100%" : "60%"}>
         {props.agents.length === 0 ? <Empty>no agents yet: press n. An agent is a folder with one markdown file.</Empty> : null}
         <Table
           header={["name", "state", "mode", "room", "model", "today", "heartbeat"]}
           widths={[16, 11, 9, 10, 8, 8, 12]}
+          available={Math.floor(props.columns * (stacked ? 1 : 0.6)) - 6}
           selected={props.selected}
           rows={props.agents.map((x) => [
             x.name,
@@ -504,7 +518,7 @@ function AgentsTab(props: { agents: AgentView[]; selected: number; aliasOf: (h: 
           ])}
         />
       </Panel>
-      <Panel title={a ? a.name : "agent"} width="40%">
+      <Panel title={a ? a.name : "agent"} width={stacked ? "100%" : "40%"}>
         {a ? (
           <>
             <Text>
@@ -539,15 +553,17 @@ function AgentsTab(props: { agents: AgentView[]; selected: number; aliasOf: (h: 
   );
 }
 
-function RoomsTab(props: { rooms: RoomView[]; selected: number }): React.JSX.Element {
+function RoomsTab(props: { rooms: RoomView[]; selected: number; columns: number }): React.JSX.Element {
   const r = props.rooms[props.selected];
+  const stacked = props.columns < 100;
   return (
-    <Box width="100%" gap={1}>
-      <Panel title="rooms" active width="60%">
+    <Box width="100%" gap={stacked ? 0 : 1} flexDirection={stacked ? "column" : "row"}>
+      <Panel title="rooms" active width={stacked ? "100%" : "60%"}>
         {props.rooms.length === 0 ? <Empty>no room yet: press n</Empty> : null}
         <Table
           header={["alias", "handle", "online", "tasks", "approvals", ""]}
           widths={[12, 14, 10, 6, 10, 8]}
+          available={Math.floor(props.columns * (stacked ? 1 : 0.6)) - 6}
           selected={props.selected}
           rows={props.rooms.map((x) => [
             x.alias ?? "-",
@@ -561,7 +577,7 @@ function RoomsTab(props: { rooms: RoomView[]; selected: number }): React.JSX.Ele
           ])}
         />
       </Panel>
-      <Panel title={r ? (r.alias ?? r.handle) : "room"} width="40%">
+      <Panel title={r ? (r.alias ?? r.handle) : "room"} width={stacked ? "100%" : "40%"}>
         {r ? (
           <>
             <Text wrap="wrap">{r.topic}</Text>
@@ -587,20 +603,22 @@ function RoomsTab(props: { rooms: RoomView[]; selected: number }): React.JSX.Ele
   );
 }
 
-function ApprovalsTab(props: { cards: CardView[]; selected: number; aliasOf: (h: string | null | undefined) => string }): React.JSX.Element {
+function ApprovalsTab(props: { cards: CardView[]; selected: number; aliasOf: (h: string | null | undefined) => string; columns: number }): React.JSX.Element {
   const c = props.cards[props.selected];
+  const stacked = props.columns < 100;
   return (
-    <Box width="100%" gap={1}>
-      <Panel title="pending approvals" active width="55%">
+    <Box width="100%" gap={stacked ? 0 : 1} flexDirection={stacked ? "column" : "row"}>
+      <Panel title="pending approvals" active width={stacked ? "100%" : "55%"}>
         {props.cards.length === 0 ? <Empty>nothing waits for you. A card appears here the moment an agent asks to act.</Empty> : null}
         <Table
           header={["id", "from", "action", "room", "expires"]}
           widths={[14, 14, 22, 10, 10]}
+          available={Math.floor(props.columns * (stacked ? 1 : 0.55)) - 6}
           selected={props.selected}
           rows={props.cards.map((x) => [x.request_id, x.requester_name, x.action, props.aliasOf(x.room), x.expires_at ? `in ${fmtMs(Math.max(0, Date.parse(x.expires_at) - Date.now()))}` : "-"])}
         />
       </Panel>
-      <Panel title={c ? c.request_id : "card"} width="45%">
+      <Panel title={c ? c.request_id : "card"} width={stacked ? "100%" : "45%"}>
         {c ? (
           <>
             <Text>

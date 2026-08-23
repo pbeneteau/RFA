@@ -57,8 +57,11 @@ export function Spin(props: { label?: string; color?: string }): React.JSX.Eleme
   );
 }
 
-/** Rows of cells laid out in fixed columns; the selected row is inverted. */
-export function Table(props: { widths: number[]; rows: React.ReactNode[][]; selected?: number; header?: string[] }): React.JSX.Element {
+/** Rows of cells in columns; `available` shrinks them proportionally when the terminal is narrower than they ask for. */
+export function Table(props: { widths: number[]; rows: React.ReactNode[][]; selected?: number; header?: string[]; available?: number }): React.JSX.Element {
+  const asked = props.widths.reduce((a, b) => a + b, 0) + props.widths.length + 2;
+  const factor = props.available && asked > props.available ? Math.max(0.3, (props.available - props.widths.length - 2) / (asked - props.widths.length - 2)) : 1;
+  props = { ...props, widths: props.widths.map((x) => Math.max(4, Math.floor(x * factor))) };
   return (
     <Box flexDirection="column">
       {props.header ? (

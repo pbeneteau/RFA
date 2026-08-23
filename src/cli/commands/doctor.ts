@@ -13,6 +13,7 @@ import { PrincipalSet } from "../../principals.js";
 import { residentProcesses } from "../../procscan.js";
 import { genesisFor, verifyChain } from "../../chain.js";
 import { type CliContext } from "../context.js";
+import { checkEnvironment, realProbe } from "../environment.js";
 import { effectiveMode } from "../../posture.js";
 import { credentialAdvice, modelCredentialStatus, nativeBindingProblem, portFree } from "../preflight.js";
 import type { CommandDef } from "../router.js";
@@ -32,12 +33,7 @@ const skip = (id: string, text: string): Check => ({ id, verdict: "skip", text }
 
 export async function runChecks(ctx: CliContext, opts: { deep?: boolean } = {}): Promise<Check[]> {
   const checks: Check[] = [];
-  const major = Number(process.versions.node.split(".")[0]);
-  checks.push(major >= 22 ? ok("node", `node ${process.version}`) : fail("node", `node ${process.version} is below 22`, "Node 20 reached end of life in April 2026; install 22 or newer"));
-  const binding = nativeBindingProblem();
-  checks.push(binding ? fail("sqlite", binding.message, binding.hint) : ok("sqlite", `better-sqlite3 opens a database under node ${process.version}`));
-  const cred = modelCredentialStatus(ctx.env);
-  checks.push(cred.ok === true ? ok("model-credential", cred.detail) : cred.ok === false ? fail("model-credential", cred.detail, credentialAdvice(cred).join(" ")) : warn("model-credential", cred.detail, credentialAdvice(cred).join(" ")));
+  checks.push(...checkEnvironment(realProbe(ctx.env)));
 
   let h: HubDir;
   try {

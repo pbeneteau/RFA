@@ -32,13 +32,18 @@ function resolveRoom(h: HubDir, ref: string | undefined): RoomRecord | { handle:
 
 export const agentNew: CommandDef = {
   path: ["agent", "new"],
-  summary: "Scaffold a pack, validated, bound to a room",
+  summary: "Scaffold a pack, validated, bound to a room; alone on a terminal, the walkthrough",
   usage: "<name> [--kind spec-expert|answerer|tool] [--room <alias|handle>] [--knowledge <dir>] [--model haiku|sonnet] [--server <name> --command <cmd> --tool <id> | --builtin linear [--tool <id>]] [--mode ask|plan|auto|bypass] [--dry-run]",
   why: "Everything the scaffold writes is something a hand-written pack got wrong at least once here: RFA_TOKEN in secrets, a skill on the card, budgets, allow_subagents: false, a room binding. It is validated through the supervisor's own schema, so it either loads or says why before the supervisor sees it. A tool user names the MCP server it brings; the runtime loads it from the pack's own declaration.",
   options: { kind: { type: "string" }, room: { type: "string" }, knowledge: { type: "string" }, model: { type: "string" }, server: { type: "string" }, command: { type: "string" }, builtin: { type: "string" }, tool: { type: "string" }, mode: { type: "string" }, "dry-run": { type: "boolean", default: false } },
   examples: ["rfa agent new pm --kind answerer --knowledge ./docs --room product", "rfa agent new scribe --kind tool --builtin linear", "rfa agent new filer --kind tool --server filesystem --command 'npx -y @modelcontextprotocol/server-filesystem /tmp/scratch' --tool write_file"],
   run: async (ctx, a) => {
     const h = ctx.hubdir();
+    if (!a.positionals[0] && ctx.interactive) {
+      // No name, a terminal: the walkthrough, every setting a pack has, one screen each.
+      const { runAgentWizard } = await import("../tui/agentwizard.js");
+      return runAgentWizard(ctx, h);
+    }
     const name = a.positionals[0] ?? (await askLine(ctx, "Name the new agent", "rfa agent new <name> [--kind …]", { placeholder: "pm-agent" }));
     const problem = nameProblem(name);
     if (problem) throw new CliError(2, problem);

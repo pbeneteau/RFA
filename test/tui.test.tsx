@@ -79,7 +79,8 @@ test("the palette runs a command with no required argument on enter, and asks fo
 
 test("the onboarding asks only the questions that apply, in order, and steps back over the ones it skipped", () => {
   const base: InitAnswers = { mode: "hub", name: "x", port: 8790, human: "paul", agentKind: "spec-expert", agentName: "spec-expert", room: "main", topic: "t", start: true };
-  assert.equal(nextScreen("welcome", base, false), "mode");
+  assert.equal(nextScreen("welcome", base, false), "checks", "the machine is checked before any question");
+  assert.equal(nextScreen("checks", base, false), "mode");
   assert.equal(nextScreen("name", base, false), "port", "a local hub asks for a port");
   assert.equal(nextScreen("name", { ...base, mode: "remote" }, false), "remote", "a remote one asks for the URL and the bearer");
   assert.equal(nextScreen("agent", { ...base, agentKind: "none" }, false), "start", "no agent: no name, no knowledge, no room");
@@ -87,7 +88,7 @@ test("the onboarding asks only the questions that apply, in order, and steps bac
   assert.equal(nextScreen("agentName", base, false), "room", "a spec-expert is not");
   assert.equal(nextScreen("agentName", { ...base, agentKind: "tool" }, false), "toolServer", "a tool user names the server it acts through");
   assert.equal(nextScreen("toolServer", { ...base, agentKind: "tool" }, false), "room");
-  assert.equal(nextScreen("welcome", base, true), "human", "an existing directory skips mode, name and port");
+  assert.equal(nextScreen("checks", base, true), "human", "an existing directory skips mode, name and port");
   assert.equal(nextScreen("room", base, false, -1), "agentName", "back skips the same screens");
   assert.ok(!applicable("knowledge", base, false) && applicable("knowledge", { ...base, agentKind: "answerer" }, false));
 });

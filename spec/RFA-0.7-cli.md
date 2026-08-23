@@ -615,6 +615,7 @@ On a pipe, or with `--json`, `rfa` alone prints the help it always printed and e
 
 `rfa init` on a terminal IS the onboarding; `rfa init --yes` and every flag are the same provisioning with no screen. The onboarding is a way to fill the answers `rfa init` takes (`InitAnswers`) and nothing more, so it can never do something the headless path cannot, and `provision()` is the one implementation behind both.
 
+- The first screen checks the machine before anything is written (`src/cli/environment.ts`): the Node version, the native SQLite binding opened once, git, the model credential (a logged-in `claude` or ANTHROPIC_API_KEY; without one agents join and refuse every answer), the other model CLIs if present (codex, gemini: named, with whether they are logged in, and the plain note that rfa does not run residents on them today), tailscale and the service manager for later, and whether the folder is writable. A ✖ blocks with its fix and `r` re-checks; `rfa doctor` prints the same lines first and `rfa init --yes` prints them before provisioning.
 - One question per screen, the reason for the question in a panel beside it, the default pre-filled, escape goes back (over the screens that did not apply: an answerer is asked what it reads, a tool user what it acts through, a spec-expert neither; an existing directory skips the manifest questions).
 - A tool user names its MCP server before anything is written: one of the servers shipped in the package (`builtin: linear` today, with the secret it needs named on the done screen) or a command plus the tool id that pauses for approval, the server's name derived from the command. A pack with a placeholder server validates and acts on nothing, which is the trap this screen exists to close; `rfa agent new --kind tool --builtin <name>` and `rfa init --builtin <name>` are the headless forms.
 - Before the stack is started, the native SQLite binding is opened once in process: a machine with two Nodes runs `rfa` under whichever is on PATH, and a hub spawned under the other dies on its first database with a reason only its log sees. The refusal names both ABIs and the fix, before anything is spawned; `rfa up` and `rfa doctor` do the same.
@@ -645,9 +646,17 @@ Five tabs over one snapshot refreshed every two seconds: **Overview** (processes
 
 No mouse, no web rendering of the dashboard (the console is the browser's view), no global state, no dashboard-only feature: anything the dashboard can do has a command.
 
-### 13.7 Testing
+### 13.7 The agent walkthrough
 
-The pure parts (the palette's search and argument form, the onboarding's screen order, completion candidates, did-you-mean) and the components rendered headless with `ink-testing-library` run under `npm test`. The other half runs the front door inside a real pseudo-terminal: `npm run tui:smoke` (`scripts/tui-drive.py`, Python's stdlib pty, the one non-TypeScript file under `scripts/`) drives the dashboard through its tabs, help and palette and the onboarding through every default to the done screen, and reads back what was painted. It exists because it found the bug no headless render could: a select that fires only on CHANGE left the onboarding stuck on its own default, which is the common case.
+`rfa agent new` with no name on a terminal, and `n` on the dashboard, open the walkthrough (`src/cli/tui/agentwizard.tsx`): every setting a pack has, one screen each with the reason beside it: the name, the kind, what an answerer reads (a folder, a git repository cloned and tracked, or later), what a tool user acts through (a built-in server or a command and a tool id) and its mode, the model, the capability it advertises (the id an asker matches on, and its description), the budgets (per task, per day, max turns), the room (a recorded one, a new one created on the spot, or none yet), a review screen, then the same `scaffoldPack` the one-line command runs. The flags of `rfa agent new` remain the headless form of every answer; the walkthrough can never produce a pack the flags could not.
+
+### 13.8 Following the terminal
+
+Every screen reads the terminal's size and follows it: the onboarding and the walkthrough put the reason panel beside the question above 96 columns and below it otherwise; the dashboard's two-column tabs become one column under 100 and its tables shrink their columns proportionally to the width they have. Ink clears the screen when the terminal gets narrower but not when it gets shorter; the dashboard clears it on any shrink so the next frame repaints from the top.
+
+### 13.9 Testing
+
+The pure parts (the palette's search and argument form, the onboarding's screen order, completion candidates, did-you-mean) and the components rendered headless with `ink-testing-library` run under `npm test`. The other half runs the front door inside a real pseudo-terminal: `npm run tui:smoke` (`scripts/tui-drive.py`, Python's stdlib pty, the one non-TypeScript file under `scripts/`) drives the dashboard through its tabs, help and palette and two window resizes, the walkthrough through an answerer end to end, and the onboarding through its checks and every default to the done screen, and reads back what was painted. It exists because it found the bug no headless render could: a select that fires only on CHANGE left the onboarding stuck on its own default, which is the common case.
 
 ---
 

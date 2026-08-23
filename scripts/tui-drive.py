@@ -62,8 +62,15 @@ def drive(target, script, keys, extra_args=(), tail=60, quiet=False):
             except OSError:
                 alive = False
         if due and time.time() >= due:
-            k = keys[i][1].replace("<ESC>", "\x1b").replace("<CR>", "\r").replace("<C-c>", "\x03")
-            os.write(fd, k.encode())
+            k = keys[i][1]
+            if k.startswith("<RESIZE:"):
+                # "<RESIZE:cols,rows>": change the pty's window and tell the child, as a terminal would.
+                c, r = k[len("<RESIZE:"):-1].split(",")
+                fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", int(r), int(c), 0, 0))
+                os.kill(pid, signal.SIGWINCH)
+            else:
+                k = k.replace("<ESC>", "\x1b").replace("<CR>", "\r").replace("<C-c>", "\x03")
+                os.write(fd, k.encode())
             i += 1
             due = time.time() + keys[i][0] / 1000 if i < len(keys) else None
         try:
@@ -112,15 +119,27 @@ def smoke():
         r = headless(d, "init", "--yes", "--no-start", "--name", "smoke", "--port", str(free_port()), "--human", "paul", "--agent", "spec-expert", "--room", "protocol", "--json")
         if r.returncode != 0:
             failures.append(f"headless init failed: {r.stderr[-400:]}")
-        painted = drive(d, ["dashboard"], [[1800, "2"], [600, "3"], [600, "4"], [600, "5"], [600, "1"], [600, "?"], [600, " "], [600, ":"], [700, "agent re"], [900, "<ESC>"], [600, "q"]], quiet=True)
+        painted = drive(d, ["dashboard"], [[1800, "2"], [600, "3"], [600, "4"], [600, "5"], [600, "1"], [600, "?"], [600, " "], [600, ":"], [700, "agent re"], [900, "<ESC>"], [800, "<RESIZE:160,50>"], [1200, "<RESIZE:80,30>"], [1200, "q"]], quiet=True)
         for want in ["1 Overview", "2 Agents", "3 Rooms", "4 Approvals", "5 Feed", "spec-expert", "protocol", "not running · press u", "keys", "runs: rfa agent restart <name>", "pending approvals", "feed ·"]:
             if want not in painted:
                 failures.append(f"dashboard never painted: {want!r}")
+        borders = [len(l.rstrip()) for l in painted.split("\n") if "╭" in l]
+        if not any(w >= 150 for w in borders):
+            failures.append("dashboard did not widen to the 160-column terminal")
+        if not any(w <= 80 for w in borders[-12:]):
+            failures.append("dashboard did not narrow to the 80-column terminal")
+        # the walkthrough: an answerer with every default, knowledge later, bound to the room
+        painted = drive(d, ["agent", "new"], [[1800, "helper"], [400, "<CR>"], [900, "<CR>"], [900, "j"], [300, "j"], [400, "<CR>"], [900, "<CR>"], [900, "<CR>"], [600, "<CR>"], [900, "<CR>"], [600, "<CR>"], [600, "<CR>"], [900, "<CR>"], [900, "<CR>"], [2500, "<CR>"]], quiet=True)
+        for want in ["Name the agent", "What kind of agent?", "What does it answer from?", "Which model?", "The capability it advertises", "Budgets", "Which room does it serve in?", "Create it?", "helper is ready"]:
+            if want not in painted:
+                failures.append(f"walkthrough never painted: {want!r}")
+        if not os.path.exists(os.path.join(d, "agents", "helper", "agent.md")):
+            failures.append("walkthrough did not write agents/helper/agent.md")
         # 2. the onboarding with every default and 'not yet' for the start
         o = os.path.join(base, "onboard")
         os.makedirs(o)
-        painted = drive(o, ["init"], [[1800, "<CR>"], [900, "<CR>"], [900, "<CR>"], [900, "<CR>"], [900, "<CR>"], [900, "<CR>"], [900, "<CR>"], [900, "<CR>"], [900, "j"], [500, "<CR>"], [7000, "q"]], extra_args=["--port", str(free_port())], quiet=True)
-        for want in ["Rooms for Agents", "Run a hub here", "Name this hub", "Your name", "Your first agent?", "A room for it", "Start the hub and the supervisor now?", "rfa.json", "human principal", "your hub directory is ready", "Your human key, shown once"]:
+        painted = drive(o, ["init"], [[1800, "<CR>"], [2500, "<CR>"], [900, "<CR>"], [900, "<CR>"], [900, "<CR>"], [900, "<CR>"], [900, "<CR>"], [900, "<CR>"], [900, "<CR>"], [900, "j"], [500, "<CR>"], [7000, "q"]], extra_args=["--port", str(free_port())], quiet=True)
+        for want in ["Rooms for Agents", "This machine is ready", "better-sqlite3 opens a database", "Run a hub here", "Name this hub", "Your name", "Your first agent?", "A room for it", "Start the hub and the supervisor now?", "rfa.json", "human principal", "your hub directory is ready", "Your human key, shown once"]:
             if want not in painted:
                 failures.append(f"onboarding never painted: {want!r}")
         for f in ["rfa.json", ".rfa/secrets.json", ".rfa/rooms.json", "agents/spec-expert/agent.md", "policies/gate.json"]:
@@ -133,7 +152,7 @@ def smoke():
         for f in failures:
             print(f"  - {f}")
         return 1
-    print("TUI SMOKE PASS: dashboard (5 tabs, help, palette) and onboarding (defaults, provisioning, done screen) painted what they should")
+    print("TUI SMOKE PASS: dashboard (5 tabs, help, palette, two resizes), the walkthrough (an answerer end to end) and the onboarding (checks, defaults, provisioning, done screen) painted what they should")
     return 0
 
 
