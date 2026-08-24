@@ -13,6 +13,7 @@ import { daemonState } from "../../daemon.js";
 import { findRoom, roomsStore, secretsStore, type HubDir, type RoomRecord } from "../../hubdir.js";
 import { packageVersion } from "../../pkg.js";
 import { belongsTo, residentProcessesSync } from "../../procscan.js";
+import { reflect } from "../../reflect.js";
 import { bindPack, currentSettings, editPack, setAgentMode, type EditResult, type PackChanges } from "../agentmd.js";
 import { attachKnowledge, AttachError } from "../attach.js";
 import { createRoomRecord } from "./init.js";
@@ -443,6 +444,36 @@ async function packArg(ctx: CliContext, h: HubDir, given: string | undefined, us
   if (given) return given;
   return pickOne(ctx, "Which agent?", listPacks(h.paths.agents).map((p) => ({ value: p.name, hint: (p.def.offers ?? []).map((o) => o.id).join(", ") })), usage);
 }
+
+// ---------------------------------------------------------------- reflect
+
+export const agentReflect: CommandDef = {
+  path: ["agent", "reflect"],
+  summary: "Distill the judged record (labels, gold sources, failed trials) into lessons: propose by default, --apply commits",
+  usage: "<name> [--apply [<proposal file>]] [--model haiku] [--batch <n>]",
+  options: { apply: { type: "boolean", default: false }, model: { type: "string" }, batch: { type: "string" } },
+  why: "Consolidation (RFA-0.4 sect. 5.3) distills what was said; reflection (5.4) distills what was JUDGED: the labelling sitting's labels and gold-source corrections, human flags, failed eval and parity trials, each with what the answer actually retrieved. Without it the flywheel improves detection and never the agent: a human wrote the gold source and nothing carried it into the next answer. Propose-only by default, because a background pass that edits what shapes every answer is a behaviour change nobody reviewed: the proposal is a file under the pack's memory/proposals/ with the lessons embedded, and applying commits exactly what was reviewed, as facts, through the same gated store as consolidation (a lesson that parrots an asker's words dies at the door; lessons judged only by humans carry the human origin tag). An applied change moves behaviour like a definition change: run rfa evals parity (twice) before trusting it. Costs one or two small model calls; runs in the background account lane and defers to live work.",
+  examples: ["rfa agent reflect pm-agent", "rfa agent reflect pm-agent --apply", "rfa agent reflect pm-agent --apply agents/pm-agent/memory/proposals/reflection-2026-08-24-10-30.md"],
+  run: async (ctx, a) => {
+    const h = ctx.hubdir();
+    const name = await packArg(ctx, h, a.positionals[0], "rfa agent reflect <name>");
+    if (!fs.existsSync(path.join(h.paths.agents, name, "agent.md"))) throw new CliError(2, `no pack agents/${name}`, "rfa agent ls");
+    const batch = numberFlag(a.values.batch, "batch", { int: true, min: 1 });
+    const applyFile = a.values.apply ? a.positionals[1] : undefined;
+    if (applyFile && !fs.existsSync(applyFile)) throw new CliError(2, `no proposal at ${applyFile}`, "rfa agent reflect <name> writes one under the pack's memory/proposals/");
+    const r = await reflect(name, { hubdir: h, model: a.values.model as string | undefined, batch, apply: Boolean(a.values.apply), applyFile });
+    if (ctx.flags.json) return void ctx.ui.json(r);
+    if (r.deferred) return void ctx.ui.step(`nothing done: ${r.deferred}`);
+    if (r.incidents === 0 && !r.applied) return void ctx.ui.done(`nothing judged negatively in the ${r.scanned} feedback record(s) scanned`, "the watermark moved; the next pass starts after them");
+    if (r.applied) {
+      ctx.ui.done(`${name}: ${r.lessons} lesson(s) committed: +${r.applied.added} added, ~${r.applied.updated} updated, -${r.applied.invalidated} invalidated, ${r.applied.skipped} skipped`, `$${r.cost_usd.toFixed(4)}${r.proposal ? ` · ${path.relative(h.root, r.proposal)}` : ""}`);
+      ctx.ui.note("a memory change moves behaviour like a definition change: run `rfa evals parity`, twice, before trusting it");
+    } else {
+      ctx.ui.done(`${name}: ${r.incidents} incident(s) -> ${r.lessons} lesson(s) proposed`, `$${r.cost_usd.toFixed(4)} · ${path.relative(h.root, r.proposal!)}`);
+      ctx.ui.note(`review it (edit the JSON block if a lesson is wrong), then: rfa agent reflect ${name} --apply ${path.relative(process.cwd(), r.proposal!)}`);
+    }
+  },
+};
 
 // ---------------------------------------------------------------- mode
 

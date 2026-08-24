@@ -95,7 +95,7 @@ export function complete(router: Router, words: string[], opts: { packs?: string
     if (previous === "--token") return (opts.tokens ?? []).map((value) => ({ value }));
   }
   if (positional === 0) {
-    if (/^agent (start|stop|restart|show|edit|retire|validate|bind)$|^knowledge (add|sync|pin)$|^logs$/.test(head)) return [...(opts.packs ?? []).map((value) => ({ value })), ...(head === "logs" ? [{ value: "hub" }, { value: "supervisor" }] : [])];
+    if (/^agent (start|stop|restart|show|edit|reflect|retire|validate|bind)$|^knowledge (add|sync|pin)$|^logs$/.test(head)) return [...(opts.packs ?? []).map((value) => ({ value })), ...(head === "logs" ? [{ value: "hub" }, { value: "supervisor" }] : [])];
     if (/^room (show|tail|allow|disallow|policy|secret|evict|hold|release|quarantine|inject|end|adopt)$|^log verify$|^task (ls|create)$|^evals promote$/.test(head)) return (opts.rooms ?? []).map((value) => ({ value }));
     if (head === "completion") return SHELLS.map((value) => ({ value }));
     if (head === "docs") return ["interop", "spec", "platform", "plan", "readme", "client"].map((value) => ({ value }));

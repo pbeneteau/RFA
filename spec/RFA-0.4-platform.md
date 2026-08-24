@@ -159,6 +159,18 @@ The agent-facing interface is the memory-tool verb set (view/create/str_replace/
 
 Background only, never in the answer path: after N gated exchanges or on a timer, a separate tool-less cheap model call runs extraction + reconciliation over recent episodes. Standard working protocol (Anthropic pattern): start by reading memory, end by updating it. Conversation memory implements the 4-method session protocol (`get_items/add_items/pop_item/clear_session`).
 
+### 5.4 Reflection (amendment, 2026-08-24)
+
+Consolidation distills what was said; reflection distills what was JUDGED. A reflection pass reads the operational record since its own watermark — human labels with their failure modes, gold-source corrections, human flags, failed eval and parity trials, each beside what the answer actually retrieved — and extracts lessons: imperative, evidence-grounded sentences about how to answer better (which file a topic lives in, what must be cited, what to verify before acting). Like consolidation it runs NEVER in the answer path, and in the background account lane (18.6).
+
+Rules, each load-bearing:
+
+- **The output is a PROPOSAL by default** (`memory/proposals/<stamp>.md`, the lessons embedded so applying commits exactly what was reviewed); committing is explicit. A background pass that edits what shapes every answer is a behaviour change, and a wrong generalization persists across every future session — the default posture is the same as an acting tool's: a human looks first.
+- **Applied lessons are facts in the same gated store as 5.3.** The MemoryGate is primed with the incidents' third-party material (the askers' questions), so a "lesson" that is really someone's words verbatim dies at the door; lessons judged only by humans carry the `human` origin tag, everything else `agent`. Lessons land as facts, not blocks, because facts are retrieved per question: the lesson about fee files surfaces exactly when a fee question arrives.
+- **A commit is an attribution event.** Quality moved by a memory change must not read as a spontaneous regression: an applied proposal is stamped in place with what was committed and when, and applying is treated like a definition change wherever quality is measured (the parity gate runs after).
+- The pass is manual in its first rung; a cadence is spend, and spend is the operator's decision. Per-rung status lives in STATUS.md, as everywhere.
+
+
 ## 6. Sandboxes
 
 ### 6.1 Tiers

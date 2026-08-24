@@ -15,7 +15,7 @@ import { reviewQueueCounts, type QueueCounts } from "../../evals/label.js";
 import type { CliContext } from "../context.js";
 import { listCases } from "../commands/instruments.js";
 import { collectStatus } from "../commands/procs.js";
-import { board, speaker } from "../commands/talk.js";
+import { board, memberFor, recordLastAsk, speaker } from "../commands/talk.js";
 
 export interface AgentView {
   name: string;
@@ -402,6 +402,8 @@ export interface AskOutcome {
   elapsed_ms: number;
   cost_usd: number | null;
   run_id: string | null;
+  /** The thread this answer opened or continued: what a reply carries back. */
+  conversation: string | null;
   refusal: string | null;
 }
 
@@ -424,17 +426,18 @@ export async function offersIn(ctx: CliContext, h: HubDir, rec: RoomRecord): Pro
   }
 }
 
-export async function askInRoom(ctx: CliContext, h: HubDir, rec: RoomRecord, capability: string, question: string, timeoutMs = 1800_000): Promise<AskOutcome> {
+export async function askInRoom(ctx: CliContext, h: HubDir, rec: RoomRecord, capability: string, question: string, opts: { timeoutMs?: number; conversationId?: string; prefer?: string } = {}): Promise<AskOutcome> {
   const { me, ephemeral } = await speaker(ctx, h, rec);
   try {
     const roster = await me.refreshRoster();
-    const eligible = roster.filter((r) => r.id !== me.memberId && r.role === "participant" && r.state !== "offline" && r.card_summary.skill_ids.includes(capability));
-    const target = eligible.find((r) => r.state === "ready") ?? eligible[0];
+    const target = memberFor(roster, me.memberId, capability, opts.prefer);
     if (!target) throw new Error(`nobody in ${rec.alias} offers ${capability} right now`);
     const t0 = Date.now();
-    const a = await me.ask(target.id, question, { timeoutMs });
+    const a = await me.ask(target.id, question, { timeoutMs: opts.timeoutMs ?? 1800_000, conversationId: opts.conversationId });
     const meta = a.parts.find((p) => p.type === "json")?.value as { cost_usd?: number; run_id?: string } | undefined;
-    return { kind: a.kind, text: a.text, target: target.name, capability, elapsed_ms: Date.now() - t0, cost_usd: meta?.cost_usd ?? null, run_id: meta?.run_id ?? null, refusal: a.refusal ? `${a.refusal.reason}${a.refusal.detail ? `: ${a.refusal.detail}` : ""}` : null };
+    const conversation = a.envelope.conversation_id ?? opts.conversationId ?? null;
+    if (conversation) recordLastAsk(h, rec.handle, { conversation, capability, target: target.name });
+    return { kind: a.kind, text: a.text, target: target.name, capability, elapsed_ms: Date.now() - t0, cost_usd: meta?.cost_usd ?? null, run_id: meta?.run_id ?? null, conversation, refusal: a.refusal ? `${a.refusal.reason}${a.refusal.detail ? `: ${a.refusal.detail}` : ""}` : null };
   } finally {
     if (ephemeral) await me.leave().catch(() => {});
   }
@@ -450,7 +453,7 @@ export async function firstAsk(ctx: CliContext, room: RoomRecord, skillId: strin
   const t0 = Date.now();
   const a = await me.ask(target.id, question, { timeoutMs: 180_000 });
   const meta = a.parts.find((p) => p.type === "json")?.value as { cost_usd?: number; run_id?: string } | undefined;
-  return { kind: a.kind, text: a.text, target: target.name, capability: skillId, elapsed_ms: Date.now() - t0, cost_usd: meta?.cost_usd ?? null, run_id: meta?.run_id ?? null, refusal: a.refusal ? a.refusal.reason : null };
+  return { kind: a.kind, text: a.text, target: target.name, capability: skillId, elapsed_ms: Date.now() - t0, cost_usd: meta?.cost_usd ?? null, run_id: meta?.run_id ?? null, conversation: a.envelope.conversation_id ?? null, refusal: a.refusal ? a.refusal.reason : null };
 }
 
 export function recordedRooms(h: HubDir): RoomRecord[] {

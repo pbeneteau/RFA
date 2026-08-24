@@ -120,7 +120,7 @@ def smoke():
         if r.returncode != 0:
             failures.append(f"headless init failed: {r.stderr[-400:]}")
         painted = drive(d, ["dashboard"], [[1800, "2"], [600, "3"], [600, "4"], [600, "5"], [600, "6"], [900, "7"], [1500, "1"], [600, "?"], [600, " "], [600, "a"], [900, "<ESC>"], [600, ":"], [700, "agent re"], [900, "<ESC>"], [800, "<RESIZE:160,50>"], [1200, "<RESIZE:80,30>"], [1200, "q"]], quiet=True)
-        for want in ["1 Overview", "2 Agents", "3 Rooms", "4 Approvals", "5 Feed", "6 Evals", "spec-expert", "protocol", "not running · press u", "keys", "runs: rfa agent restart <name>", "pending approvals", "feed ·", "review queue", "no observability store yet", "the gate", "spec-expert-01", "7 Tasks", "tasks · protocol", "no tasks in protocol yet", "ask · protocol"]:
+        for want in ["1 Overview", "2 Agents", "3 Rooms", "4 Approvals", "5 Feed", "6 Evals", "spec-expert", "protocol", "not running · press u", "keys", "runs: rfa agent reflect <name>", "pending approvals", "feed ·", "review queue", "no observability store yet", "the gate", "spec-expert-01", "7 Tasks", "tasks · protocol", "no tasks in protocol yet", "ask · protocol"]:
             if want not in painted:
                 failures.append(f"dashboard never painted: {want!r}")
         borders = [len(l.rstrip()) for l in painted.split("\n") if "╭" in l]

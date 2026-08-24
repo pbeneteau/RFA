@@ -3,7 +3,7 @@
  * board, and the approval cards.
  */
 import { RoomMember } from "../../client.js";
-import { principalsStore, roomsStore, type HubDir, type RoomRecord } from "../../hubdir.js";
+import { JsonStore, principalsStore, roomsStore, type HubDir, type RoomRecord } from "../../hubdir.js";
 import { TERMINAL_TASK_STATES, type TaskState } from "../../model.js";
 import { packageVersion } from "../../pkg.js";
 import { CliError, numberFlag, type CliContext } from "../context.js";
@@ -81,9 +81,33 @@ const answerers = (roster: RosterEntry[], selfId: string) => roster.filter((r) =
  * `ask` always resolved this way, and `task create --capability` uses the same
  * rule so the board is not the one place that couples work to a name.
  */
-export function memberFor<T extends { id: string; role: string; state: string; card_summary: { skill_ids: string[] } }>(roster: T[], selfId: string | null, capability: string): T | null {
+export function memberFor<T extends { id: string; name?: string; role: string; state: string; card_summary: { skill_ids: string[] } }>(roster: T[], selfId: string | null, capability: string, prefer?: string): T | null {
   const eligible = roster.filter((r) => r.id !== selfId && r.role === "participant" && r.state !== "offline" && r.card_summary.skill_ids.includes(capability));
-  return eligible.find((r) => r.state === "ready") ?? eligible[0] ?? null;
+  // A reply prefers the member that answered last time: a conversation is with
+  // someone, and two agents offering one capability must not split a thread.
+  const preferred = prefer ? eligible.find((r) => r.name === prefer) : undefined;
+  return preferred ?? eligible.find((r) => r.state === "ready") ?? eligible[0] ?? null;
+}
+
+/** What `rfa ask --reply` continues: the last conversation per room, with who answered it and under which capability. */
+export interface LastAsk {
+  conversation: string;
+  capability: string;
+  target: string;
+  at: string;
+}
+
+export const lastAskStore = (h: HubDir) => new JsonStore<Record<string, LastAsk>>(h.paths.lastAsk, () => ({}));
+
+/** Record the thread an answer opened (or continued), so the next --reply and the ask box's r find it. */
+export function recordLastAsk(h: HubDir, room: string, thread: Omit<LastAsk, "at">): void {
+  try {
+    lastAskStore(h).update((f) => {
+      f[room] = { ...thread, at: new Date().toISOString() };
+    });
+  } catch {
+    /* a store this process cannot write costs only the convenience */
+  }
 }
 
 /** `answer-product-question (pm-agent), draft-linear-document (linear-scribe)`: the choice --capability makes, with who is behind each. */
@@ -94,22 +118,29 @@ export function describeOffers(candidates: { name: string; card_summary: { skill
 export const ask: CommandDef = {
   path: ["ask"],
   summary: "Ask an agent by capability, as a human principal, and wait for the answer",
-  usage: '"<question>" [--room <alias|handle>] [--capability <skill id>] [--timeout <seconds>]',
-  options: { room: { type: "string" }, capability: { type: "string" }, timeout: { type: "string" } },
-  why: "Discovery is by capability, never by name: the roster's skill ids are what an asker matches on. With one capability in the room it is chosen; with several, --capability picks. The 30-minute default deadline is the asker's own: a resident's approval window derives from it, so it is what buys 'I stepped away'.",
-  examples: ['rfa ask "how do presence leases work?"', 'rfa ask --room product --capability draft-linear-document "draft an expression de besoin from: …"'],
+  usage: '"<question>" [--room <alias|handle>] [--capability <skill id>] [--reply | --conversation <c_…>] [--timeout <seconds>]',
+  options: { room: { type: "string" }, capability: { type: "string" }, reply: { type: "boolean", default: false }, conversation: { type: "string" }, timeout: { type: "string" } },
+  why: "Discovery is by capability, never by name: the roster's skill ids are what an asker matches on. With one capability in the room it is chosen; with several, --capability picks. --reply continues the room's last conversation (recorded in .rfa/last-ask.json with who answered): the resident resumes the same brain session, so it argues with the context of what it just said; --conversation names any thread explicitly. The 30-minute default deadline is the asker's own: a resident's approval window derives from it, so it is what buys 'I stepped away'.",
+  examples: ['rfa ask "how do presence leases work?"', 'rfa ask --reply "that contradicts wire 7.2: which is it?"', 'rfa ask --room product --capability draft-linear-document "draft an expression de besoin from: …"'],
   run: async (ctx, a) => {
     const h = ctx.hubdir();
     const question = a.positionals.join(" ").trim() || (await askLine(ctx, "Your question", 'rfa ask "<question>"', { placeholder: "how do presence leases work?" }));
     const timeoutS = numberFlag(a.values.timeout, "timeout", { min: 1 }) ?? 1800;
+    if (a.values.reply && a.values.conversation) throw new CliError(2, "--reply continues the last conversation; --conversation names one: pass one or the other");
     if (!(await ctx.healthz())) throw new CliError(3, `the hub at ${ctx.hubUrl()} is not answering`, "rfa up");
     const rec = requireRoom(h, a.values.room as string | undefined, true);
+    let thread: LastAsk | null = null;
+    if (a.values.reply) {
+      thread = lastAskStore(h).read()[rec.handle] ?? null;
+      if (!thread) throw new CliError(2, `no previous ask recorded in ${rec.alias}`, "ask once without --reply; every answer prints the conversation it opened");
+    }
+    const conversationId = (a.values.conversation as string | undefined) ?? thread?.conversation;
     const { me, ephemeral } = await speaker(ctx, h, rec);
     try {
       const roster = (await me.refreshRoster()) as RosterEntry[];
       const candidates = answerers(roster, me.memberId);
       const offered = [...new Set(candidates.flatMap((r) => r.card_summary.skill_ids))];
-      const explicit = a.values.capability as string | undefined;
+      const explicit = (a.values.capability as string | undefined) ?? thread?.capability;
       let capability = explicit ?? (offered.length === 1 ? offered[0] : null);
       if (!capability && offered.length > 1 && ctx.interactive) {
         capability = await pickOne(ctx, `${rec.alias} offers ${offered.length} capabilities`, offered.map((c) => ({ value: c, hint: candidates.filter((r) => r.card_summary.skill_ids.includes(c)).map((r) => r.name).join(", ") })), "rfa ask --capability <id>");
@@ -118,7 +149,7 @@ export const ask: CommandDef = {
         if (offered.length === 0) throw new CliError(3, `nobody in ${rec.alias} is present to answer`, candidates.length ? "" : "rfa status shows whether the agents are up");
         throw new CliError(2, `${rec.alias} offers ${offered.length} capabilities: ${describeOffers(candidates, offered)}`, "pick one with --capability <id>");
       }
-      const target = memberFor(roster, me.memberId, capability);
+      const target = memberFor(roster, me.memberId, capability, thread?.target);
       if (!target) throw new CliError(3, `nobody in ${rec.alias} offers ${capability}`, `present: ${candidates.map((r) => `${r.name} [${r.card_summary.skill_ids.join(",")}]`).join(" · ") || "nobody"}`);
       const sp = ctx.ui.spinner(`asking ${target.name} (${capability}, ${target.state})`);
       const t0 = Date.now();
@@ -139,17 +170,23 @@ export const ask: CommandDef = {
       watch?.unref?.();
       let answer;
       try {
-        answer = await me.ask(target.id, question, { timeoutMs: timeoutS * 1000 });
+        answer = await me.ask(target.id, question, { timeoutMs: timeoutS * 1000, conversationId });
       } finally {
         if (watch) clearInterval(watch);
       }
       const meta = answer.parts.find((p) => p.type === "json")?.value as { cost_usd?: number; run_id?: string } | undefined;
+      const convo = answer.envelope.conversation_id ?? conversationId ?? null;
+      if (convo) recordLastAsk(h, rec.handle, { conversation: convo, capability, target: target.name });
       const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
       sp.stop({ ok: answer.kind === "response", text: answer.kind === "response" ? `${target.name} answered` : `${target.name} refused: ${answer.refusal?.reason ?? "?"}${answer.refusal?.detail ? ` (${answer.refusal.detail})` : ""}`, detail: `${elapsed}s${meta?.cost_usd != null ? ` · $${meta.cost_usd}` : ""}${meta?.run_id ? ` · ${meta.run_id}` : ""}` });
-      if (ctx.flags.json) ctx.ui.json({ room: rec.handle, asked: target.name, capability, kind: answer.kind, refusal: answer.refusal ?? null, text: answer.text, elapsed_s: Number(elapsed), cost_usd: meta?.cost_usd ?? null, run_id: meta?.run_id ?? null });
+      if (ctx.flags.json) ctx.ui.json({ room: rec.handle, conversation_id: convo, asked: target.name, capability, kind: answer.kind, refusal: answer.refusal ?? null, text: answer.text, elapsed_s: Number(elapsed), cost_usd: meta?.cost_usd ?? null, run_id: meta?.run_id ?? null });
       else {
         ctx.ui.blank();
         process.stdout.write(answer.text + "\n");
+        if (convo) {
+          ctx.ui.blank();
+          ctx.ui.note(`conversation ${convo}${conversationId ? " (continued)" : ""} · rfa ask --reply argues back with the context kept`);
+        }
       }
       if (answer.kind !== "response") return 1;
     } finally {

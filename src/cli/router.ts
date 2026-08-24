@@ -50,7 +50,7 @@ export const GROUPS: { name: string; summary: string }[] = [
   { name: "ask", summary: "Ask an agent by capability, as a human principal" },
   { name: "hub", summary: "The hub process: run in the foreground, expose it" },
   { name: "supervisor", summary: "The supervisor process, in the foreground" },
-  { name: "agent", summary: "Packs: new, ls, show, validate, bind, start, stop, restart, mode, edit, retire" },
+  { name: "agent", summary: "Packs: new, ls, show, validate, bind, start, stop, restart, mode, edit, reflect, retire" },
   { name: "room", summary: "Rooms: create, ls, show, tail, allow, policy, secret, evict, end, adopt" },
   { name: "task", summary: "The task board of a room" },
   { name: "approvals", summary: "Pending approval cards and their decision" },

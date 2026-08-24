@@ -11,7 +11,7 @@ import { CliContext, CliError } from "./context.js";
 import { GLOBAL_OPTIONS, GROUPS, Router, UsageError } from "./router.js";
 import { suggestCommands } from "./suggest.js";
 import { Ui } from "./ui.js";
-import { agentBind, agentEdit, agentLs, agentMode, agentNew, agentRestart, agentRetire, agentShow, agentStart, agentStop, agentValidate } from "./commands/agent.js";
+import { agentBind, agentEdit, agentLs, agentMode, agentNew, agentReflect, agentRestart, agentRetire, agentShow, agentStart, agentStop, agentValidate } from "./commands/agent.js";
 import { connectClaude, connectCursor, connectMcp, hubExpose, peerAdd, peerLs, peerRevoke, peerShow } from "./commands/connect.js";
 import { configGet, configSet, configShow, humanAdd, humanLs, humanRemove, humanRotate, keyNew, keySign, secretsLs, secretsSet, secretsUnset, tokenLs, tokenMint, tokenRevoke } from "./commands/creds.js";
 import { doctor } from "./commands/doctor.js";
@@ -38,7 +38,7 @@ for (const stream of [process.stdout, process.stderr]) {
 const router = new Router();
 router.register(
   init, up, down, restart, status, doctor, logs, consoleCmd, hubRun, supervisorRun, migrate, demo, docs, version,
-  agentNew, agentLs, agentShow, agentValidate, agentBind, agentStart, agentStop, agentRestart, agentEdit, agentMode, agentRetire,
+  agentNew, agentLs, agentShow, agentValidate, agentBind, agentStart, agentStop, agentRestart, agentEdit, agentMode, agentReflect, agentRetire,
   roomCreate, roomLs, roomShow, roomTail, roomAllow, roomDisallow, roomPolicy, roomSecret, roomEvict, roomHold, roomRelease, roomQuarantine, roomInject, roomEnd, roomAdopt,
   ask, taskLs, taskShow, taskCreate, taskCancel, taskVerify, approvalsLs, approvalsShow, approvalsApprove, approvalsReject,
   humanAdd, humanLs, humanRotate, humanRemove, tokenMint, tokenLs, tokenRevoke, secretsSet, secretsLs, secretsUnset, configShow, configGet, configSet, keyNew, keySign,

@@ -213,6 +213,8 @@ Groups first, then the commands that need more than a line. Every command: `--di
 | `rfa agent bind <name> --room <alias\|handle> [--observer] [--no-serve]` | Edits the `rooms:` block in place, the only editor that touches agent.md | new |
 | `rfa agent start\|stop\|restart <name>` | Through the supervisor command channel, waits for the state change | `data/supervisor-commands.ndjson` |
 | `rfa agent edit <name> [--model] [--description] [--offer] [--offer-description] [--per-task] [--per-day] [--max-turns] [--mode] [--room] [--knowledge] [--editor]` | Alone on a terminal, the walkthrough over the pack's settings (13.7); with flags, the same changes headless; `--editor` opens agent.md for the prompt and everything else. Every change rewrites its own line or block, validated before one write; the supervisor drains and respawns | new |
+| `rfa agent mode <name> [ask\|plan\|bypass]` | Shows or sets how the acting tools are treated (RFA-0.4 sect. 3.12); bypass confirmed; a change rotates the definition | amendment 2026-08-22 |
+| `rfa agent reflect <name> [--apply [<proposal>]] [--model] [--batch]` | Distills the judged record into lessons (RFA-0.4 sect. 5.4): propose by default, `--apply` commits them as gated facts; parity runs after | amendment 2026-08-24 |
 | `rfa agent retire <name> [--dry-run] [--timeout]` | Stop, release leases, leave, evict remnants, archive, deregister: eight re-runnable steps | `scripts/retire-agent.ts` |
 
 **`--kind tool` requires pack-declared MCP servers.** The scaffold cannot keep promising a tool the runner cannot load (section 1). Rung 2 adds `mcp_servers` to `src/agentdef.ts` in the shape RFA-0.4 sect. 3.2 already lists (stdio or HTTP, with `secrets` by name injected into the server's environment), the resident builds its `mcpServers` map from it, and the Linear server leaves `src/resident.ts` for the owner's `scribe` pack's own declaration. Until that lands, `--kind tool` prints what it would scaffold and says why it refuses.
@@ -236,7 +238,7 @@ Groups first, then the commands that need more than a line. Every command: `--di
 
 | Command | Does | Wraps / status |
 |---|---|---|
-| `rfa ask "<question>" [--room] [--capability] [--timeout 1800]` | Asks by capability as a human principal; the default-capability rule stays exactly as `scripts/ask.ts` has it | `scripts/ask.ts` |
+| `rfa ask "<question>" [--room] [--capability] [--reply\|--conversation] [--timeout 1800]` | Asks by capability as a human principal; `--reply` continues the room's last conversation with the member that answered it (residents resume the brain session per conversation, so the follow-up argues in context) | `scripts/ask.ts` |
 | `rfa task ls\|show\|create\|cancel\|verify [--room]` | The task board from the operator membership; `create --capability` assigns by what a member offers (ask's rule); `verify` is a human principal's verb (wire 10.4) | `room_task` |
 | `rfa approvals ls\|show\|approve\|reject <request_id> [--edit key=value]` | Pending approval cards and their decision, landing as human-origin interventions carrying the principal | `/api/approvals`, `/api/approvals/decide` |
 
@@ -625,7 +627,7 @@ On a pipe, or with `--json`, `rfa` alone prints the help it always printed and e
 
 ### 13.3 The dashboard
 
-One snapshot refreshed every two seconds, under a tab per concern: **Overview** (processes, agents, rooms, the last 24 hours with answers per hour, alerts, what waits to be labelled, recent answers), **Agents**, **Rooms**, **Approvals**, **Feed** (a room's log followed live, from the file, as `rfa room tail -f` reads it), **Evals** (the labelling sitting in place and the gate; 13.10), **Tasks** (a room's board; 13.11). Single-key verbs on each tab do what the matching command does, by calling the same function the command calls: `r s x` restart/start/stop an agent through the supervisor's command channel, `m` cycle its mode (RFA-0.4 sect. 3.12: ask, plan, bypass; bypass confirmed first), `y n` approve (confirmed first: it executes the agent's action, and the CLI's own approve confirms) / reject a card through the same workbench route the console uses, `u d` are `rfa up` and `rfa down`, `a` opens the ask box (discovery by capability, the choice shown when more than one is offered). The keys are the ones operators already have in their fingers from lazygit and k9s: `?` help, `:` (or `/`, or ctrl-k) the palette, numbers and tab for tabs, j/k or arrows to move, q to leave.
+One snapshot refreshed every two seconds, under a tab per concern: **Overview** (processes, agents, rooms, the last 24 hours with answers per hour, alerts, what waits to be labelled, recent answers), **Agents**, **Rooms**, **Approvals**, **Feed** (a room's log followed live, from the file, as `rfa room tail -f` reads it), **Evals** (the labelling sitting in place and the gate; 13.10), **Tasks** (a room's board; 13.11). Single-key verbs on each tab do what the matching command does, by calling the same function the command calls: `r s x` restart/start/stop an agent through the supervisor's command channel, `m` cycle its mode (RFA-0.4 sect. 3.12: ask, plan, bypass; bypass confirmed first), `y n` approve (confirmed first: it executes the agent's action, and the CLI's own approve confirms) / reject a card through the same workbench route the console uses, `u d` are `rfa up` and `rfa down`, `a` opens the ask box (discovery by capability, the choice shown when more than one is offered; `r` on an answer replies in the same conversation, so the resident argues with the context of what it just said). The keys are the ones operators already have in their fingers from lazygit and k9s: `?` help, `:` (or `/`, or ctrl-k) the palette, numbers and tab for tabs, j/k or arrows to move, q to leave.
 
 **The palette is how the long commands get learned.** Every command, fuzzy-searched by path and summary (a prefix match outranks a scattered one; what was run last is listed first). It ALWAYS shows the exact command line it is about to run, asks in place for the arguments a command requires (one field per `<token>` in its usage), then runs it as an ordinary `rfa` child with the terminal handed over (ctrl-c belongs to the child, so `rfa logs -f` ends the way it always did), waits for a key, and takes the terminal back. Nothing is reimplemented for the dashboard; a verb that is not a thin call into a command's own code is a bug.
 
@@ -734,6 +736,9 @@ const manifest = z.object({
     "speaker": { "member_id": "m_…", "membership_token": "mt_…", "name": "paul-cli" },
     "created_at": "…" } ] }
 
+// last-ask.json  (0600)  the thread `rfa ask --reply` continues, per room
+{ "r_3f9a1c2e7b": { "conversation": "c_ab12cd34", "capability": "answer-product-question", "target": "pm-agent", "at": "…" } }
+
 // secrets.json  (0600)  unchanged shape: NAME -> value
 { "RFA_TOKEN": "tok_…", "RFA_HUMAN_KEY": "hk_…", "LINEAR_API_KEY": "lin_…" }
 
@@ -774,6 +779,7 @@ rfa agent new <name> [--kind spec-expert|answerer|tool] [--room <alias|handle>] 
               [--server <name> --command <cmd> --tool <id> | --builtin linear [--tool <id>]] [--mode ask|plan|bypass] [--dry-run]
 rfa agent ls | show <name> | validate [<name>] | bind <name> --room <alias|handle> [--observer] [--no-serve]
 rfa agent start|stop|restart <name> | mode <name> [ask|plan|bypass] | retire <name> [--dry-run] [--timeout <s>]
+rfa agent reflect <name> [--apply [<proposal file>]] [--model haiku] [--batch <n>]
 rfa agent edit <name> [--model] [--description] [--offer <id>] [--offer-description] [--per-task] [--per-day] [--max-turns]
               [--mode] [--room] [--knowledge <dir|git remote> [--docs <subdir>]] [--editor]
 
@@ -784,7 +790,7 @@ rfa room policy <alias|handle> set <k>=<v> … | secret show <alias|handle>
 rfa room evict|hold|release|quarantine <alias|handle> <member> [--reason] | inject <alias|handle> "<text>" [--to <member>]
 rfa room end <alias|handle> [--summary] | adopt <alias|handle> [--alias <alias>] [--secret <join secret>] [--no-allow]
 
-rfa ask "<question>" [--room <alias|handle>] [--capability <skill id>] [--timeout <seconds>]
+rfa ask "<question>" [--room <alias|handle>] [--capability <skill id>] [--reply | --conversation <c_…>] [--timeout <seconds>]
 rfa task ls [--room] [--all] | show <id> [--room]
 rfa task create "<title>" [--room] [--description] [--owner <member> | --capability <skill id>] [--reply-by <ISO|+minutes>] [--evidence-required] [--blocked-by <id,id>] [--max-attempts <n>]
 rfa task cancel <id> [--room] | verify <id> --verdict accept|reject [--note] [--room]

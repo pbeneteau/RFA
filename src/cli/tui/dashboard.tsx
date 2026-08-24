@@ -1460,6 +1460,9 @@ export function AskBox(props: { ctx: CliContext; hub: HubDir; room: RoomRecord; 
   const [pending, setPending] = useState<CardView | null>(null);
   const [deciding, setDeciding] = useState<string | null>(null);
   const [flagged, setFlagged] = useState<string | null>(null);
+  /** The thread the last answer opened: what r continues, with the same responder. */
+  const [thread, setThread] = useState<{ conversation: string; capability: string; target: string } | null>(null);
+  const [replying, setReplying] = useState(false);
   const t0 = useRef(0);
   const [tick, setTick] = useState(0);
 
@@ -1493,12 +1496,13 @@ export function AskBox(props: { ctx: CliContext; hub: HubDir; room: RoomRecord; 
     }
   };
 
-  const askWith = async (capability: string, q: string) => {
+  const askWith = async (capability: string, q: string, reply?: { conversation: string; target: string }) => {
     setStage("asking");
     t0.current = Date.now();
     try {
-      const out = await askInRoom(props.ctx, props.hub, props.room, capability, q);
+      const out = await askInRoom(props.ctx, props.hub, props.room, capability, q, reply ? { conversationId: reply.conversation, prefer: reply.target } : {});
       setOutcome(out);
+      if (out.conversation) setThread({ conversation: out.conversation, capability, target: out.target });
       setStage("answer");
       props.onDone();
     } catch (err) {
@@ -1511,6 +1515,11 @@ export function AskBox(props: { ctx: CliContext; hub: HubDir; room: RoomRecord; 
     async (q: string) => {
       if (!q.trim()) return props.onClose();
       setQuestion(q.trim());
+      if (replying && thread) {
+        // A reply skips discovery: the conversation is with someone already.
+        setReplying(false);
+        return void askWith(thread.capability, q.trim(), thread);
+      }
       setStage("capability");
       try {
         const found = await offersIn(props.ctx, props.hub, props.room);
@@ -1535,6 +1544,16 @@ export function AskBox(props: { ctx: CliContext; hub: HubDir; room: RoomRecord; 
         if (input === "n") return void decide("reject");
       }
       if (stage === "answer") {
+        if (input === "r" && thread) {
+          // Argue back in the SAME conversation: the resident resumes its brain
+          // session, so it answers knowing what it just claimed.
+          setOutcome(null);
+          setError(null);
+          setScroll(0);
+          setFlagged(null);
+          setReplying(true);
+          return setStage("question");
+        }
         if (key.downArrow || input === "j") setScroll((s) => s + 1);
         if (key.upArrow || input === "k") setScroll((s) => Math.max(0, s - 1));
         // The flywheel's human entry: a wrong answer goes to the sitting from
@@ -1562,10 +1581,12 @@ export function AskBox(props: { ctx: CliContext; hub: HubDir; room: RoomRecord; 
     <Panel title={`ask · ${props.room.alias}`} active width="100%">
       {stage === "question" ? (
         <>
-          <Text dimColor>Discovery is by capability: the room's roster says who can answer what. Enter sends, blank cancels.</Text>
+          <Text dimColor wrap="wrap">
+            {replying && thread ? `Replying to ${thread.target} in the same conversation (${thread.conversation}): it answers with the context of what it just said. Enter sends, blank cancels.` : "Discovery is by capability: the room's roster says who can answer what. Enter sends, blank cancels."}
+          </Text>
           <Box marginTop={1}>
-            <Text color={ACCENT}>? </Text>
-            <TextInput placeholder="your question" onSubmit={(v) => void submitQuestion(v)} />
+            <Text color={ACCENT}>{replying ? "↩ " : "? "}</Text>
+            <TextInput key={replying ? "reply" : "first"} placeholder={replying ? "your follow-up" : "your question"} onSubmit={(v) => void submitQuestion(v)} />
           </Box>
         </>
       ) : null}
@@ -1633,7 +1654,7 @@ export function AskBox(props: { ctx: CliContext; hub: HubDir; room: RoomRecord; 
           </Box>
           <Box marginTop={1} flexDirection="column">
             <Text dimColor>
-              {answerLines.length > 14 ? "j/k scroll · " : ""}enter or esc closes{outcome?.run_id && !flagged ? " · ! flags it for the labelling sitting if it was wrong" : ""}
+              {answerLines.length > 14 ? "j/k scroll · " : ""}enter or esc closes{thread ? " · r replies in this conversation" : ""}{outcome?.run_id && !flagged ? " · ! flags it for the labelling sitting if it was wrong" : ""}
             </Text>
             {flagged ? <Text color={WARN}>{flagged}</Text> : null}
           </Box>

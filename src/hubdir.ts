@@ -124,6 +124,8 @@ export interface HubPaths {
   principals: string;
   tokens: string;
   rooms: string;
+  /** The CLI's last ask per room (conversation, capability, target): what `rfa ask --reply` continues. */
+  lastAsk: string;
   data: string;
   roomLogs: string;
   runsDb: string;
@@ -190,6 +192,7 @@ export function pathsFor(root: string, m: Manifest): HubPaths {
     principals: path.join(runtime, "principals.json"),
     tokens: path.join(runtime, "tokens.json"),
     rooms: path.join(runtime, "rooms.json"),
+    lastAsk: path.join(runtime, "last-ask.json"),
     data,
     roomLogs: path.join(data, "rooms"),
     runsDb: path.join(data, "runs.db"),
