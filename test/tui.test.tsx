@@ -10,7 +10,7 @@ import { render } from "ink-testing-library";
 import { Router, type CommandDef } from "../src/cli/router.js";
 import { complete } from "../src/cli/commands/completion.js";
 import { suggestCommands } from "../src/cli/suggest.js";
-import { describeVerdict, EvalsTab, evidenceWord, fmtDeadline, sittingSummary, TasksTab, verdictMark, type Verdict } from "../src/cli/tui/dashboard.js";
+import { AskBox, describeVerdict, EvalsTab, evidenceWord, fmtDeadline, sittingSummary, TaskBox, TasksTab, verdictMark, type Verdict } from "../src/cli/tui/dashboard.js";
 import type { RfaTask } from "../src/model.js";
 import type { GateView } from "../src/cli/tui/data.js";
 import type { Trace } from "../src/evals/label.js";
@@ -171,7 +171,7 @@ const taskOf = (over: Partial<RfaTask>): RfaTask => ({
 });
 
 test("the Tasks tab lists the board with owners by name and the evidence each task waits on, and says what an empty board is", () => {
-  const members = [{ id: "m_pm", name: "pm-agent", origin: "agent", state: "ready" }, { id: "m_paul", name: "paul", origin: "human", state: "ready" }];
+  const members = [{ id: "m_pm", name: "pm-agent", origin: "agent", state: "ready", role: "participant", skills: ["answer-question"] }, { id: "m_paul", name: "paul", origin: "human", state: "ready", role: "participant", skills: [] }];
   const pending = taskOf({ id: "t_2", title: "collect the fee table", state: "working", evidence: { summary: "table attached", artifacts: ["fees.csv"] }, verification: { pending: true, verifier: null, verdict: null, note: null }, reply_by: new Date(Date.now() + 30 * 60_000).toISOString() });
   const tasks = [taskOf({}), pending];
   const room = { alias: "product", handle: "r_room", topic: "t", join_secret: "js", operator: { member_id: "m_paul", membership_token: "mt", name: "paul", role: "participant" as const, host: true }, created_at: "" };
@@ -189,6 +189,39 @@ test("the Tasks tab lists the board with owners by name and the evidence each ta
   assert.equal(evidenceWord(taskOf({ verification: { pending: false, verifier: "m_paul", verdict: "reject", note: null, rejections: 2 } })), "sent back ×2");
   assert.equal(fmtDeadline(null), "-");
   assert.match(fmtDeadline(new Date(Date.now() - 120_000).toISOString()), /^2m \d+s late$/);
+});
+
+test("the task box offers capabilities beside names, and an unassigned task stays a choice", async () => {
+  const members = [
+    { id: "m_linear", name: "linear-agent", origin: "agent", state: "ready", role: "participant", skills: ["draft-linear-document"] },
+    { id: "m_watch", name: "watcher", origin: "agent", state: "ready", role: "observer", skills: ["spy"] },
+  ];
+  const room = { alias: "product", handle: "r_room", operator: { member_id: "m_paul" } } as never;
+  const { stdin, lastFrame } = render(<TaskBox ctx={{} as never} hub={{} as never} room={room} members={members as never} onClose={() => {}} onCreated={() => {}} />);
+  await tick();
+  stdin.write("draft the note");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  const frame = strip(lastFrame());
+  assert.ok(frame.includes("nobody yet"), "unowned stays first: the board is also a backlog");
+  assert.ok(frame.includes("draft-linear-document") && frame.includes("capability · linear-agent"), "the capability row, with who is behind it — ask's discovery rule on the board");
+  assert.ok(!frame.includes("spy"), "an observer offers nothing: it cannot own work");
+});
+
+test("the ask box goes back on escape from its very first screen, and typing never closes it", async () => {
+  // The regression: the key handler was gated off on the question stage (the
+  // text field owns typing there), so escape was dead on exactly the screen
+  // the footer promises "esc back" for.
+  let closed = 0;
+  const { stdin } = render(<AskBox ctx={{} as never} hub={{ paths: { obsDb: "/nowhere" } } as never} room={{ alias: "product", handle: "r_room" } as never} onClose={() => closed++} onDone={() => {}} />);
+  await tick();
+  stdin.write("what are the fees?");
+  await tick();
+  assert.equal(closed, 0, "letters belong to the question field");
+  stdin.write("\x1b");
+  await tick();
+  assert.equal(closed, 1, "escape goes back from the question stage");
 });
 
 function tick(ms = 60): Promise<void> {

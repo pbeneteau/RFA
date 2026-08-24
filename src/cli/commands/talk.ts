@@ -75,6 +75,17 @@ type RosterEntry = { id: string; name: string; role: string; state: string; card
 /** Members this CLI could get an answer from: other participants whose lease has not expired. */
 const answerers = (roster: RosterEntry[], selfId: string) => roster.filter((r) => r.id !== selfId && r.role === "participant" && r.state !== "offline");
 
+/**
+ * The member a capability means right now: a present participant offering it,
+ * the ready one first. Discovery is by capability, never by name (wire 3.2);
+ * `ask` always resolved this way, and `task create --capability` uses the same
+ * rule so the board is not the one place that couples work to a name.
+ */
+export function memberFor<T extends { id: string; role: string; state: string; card_summary: { skill_ids: string[] } }>(roster: T[], selfId: string | null, capability: string): T | null {
+  const eligible = roster.filter((r) => r.id !== selfId && r.role === "participant" && r.state !== "offline" && r.card_summary.skill_ids.includes(capability));
+  return eligible.find((r) => r.state === "ready") ?? eligible[0] ?? null;
+}
+
 /** `answer-product-question (pm-agent), draft-linear-document (linear-scribe)`: the choice --capability makes, with who is behind each. */
 export function describeOffers(candidates: { name: string; card_summary: { skill_ids: string[] } }[], offered: string[]): string {
   return offered.map((c) => `${c} (${candidates.filter((r) => r.card_summary.skill_ids.includes(c)).map((r) => r.name).join(", ")})`).join(", ");
@@ -107,8 +118,7 @@ export const ask: CommandDef = {
         if (offered.length === 0) throw new CliError(3, `nobody in ${rec.alias} is present to answer`, candidates.length ? "" : "rfa status shows whether the agents are up");
         throw new CliError(2, `${rec.alias} offers ${offered.length} capabilities: ${describeOffers(candidates, offered)}`, "pick one with --capability <id>");
       }
-      const eligible = candidates.filter((r) => r.card_summary.skill_ids.includes(capability));
-      const target = eligible.find((r) => r.state === "ready") ?? eligible[0];
+      const target = memberFor(roster, me.memberId, capability);
       if (!target) throw new CliError(3, `nobody in ${rec.alias} offers ${capability}`, `present: ${candidates.map((r) => `${r.name} [${r.card_summary.skill_ids.join(",")}]`).join(" · ") || "nobody"}`);
       const sp = ctx.ui.spinner(`asking ${target.name} (${capability}, ${target.state})`);
       const t0 = Date.now();
@@ -205,23 +215,39 @@ export const taskShow: CommandDef = {
 
 export const taskCreate: CommandDef = {
   path: ["task", "create"],
-  summary: "Put a task on the board (optionally assigned: an assigned resident wakes and does it)",
-  usage: '"<title>" [--room] [--description <text>] [--owner <member>] [--reply-by <ISO|+minutes>] [--evidence-required] [--blocked-by <id,id>] [--max-attempts <n>]',
-  options: { room: { type: "string" }, description: { type: "string" }, owner: { type: "string" }, "reply-by": { type: "string" }, "evidence-required": { type: "boolean", default: false }, "blocked-by": { type: "string" }, "max-attempts": { type: "string" } },
+  summary: "Put a task on the board: assigned by name, found by capability, or unowned for a claimer",
+  usage: '"<title>" [--room] [--description <text>] [--owner <member> | --capability <skill id>] [--reply-by <ISO|+minutes>] [--evidence-required] [--blocked-by <id,id>] [--max-attempts <n>]',
+  options: { room: { type: "string" }, description: { type: "string" }, owner: { type: "string" }, capability: { type: "string" }, "reply-by": { type: "string" }, "evidence-required": { type: "boolean", default: false }, "blocked-by": { type: "string" }, "max-attempts": { type: "string" } },
+  why: "An assigned resident wakes and does the task; an unowned one waits on the board for a claimer. --capability assigns without naming: the present participant offering that skill (ready first), resolved at create time by the same rule `rfa ask` uses, because discovery is by capability and the board must not be the one place that couples work to a name.",
+  examples: ['rfa task create "draft the release note" --owner linear-agent --evidence-required', 'rfa task create "draft the release note" --capability draft-linear-document', 'rfa task create "collect the fee table" --reply-by +60'],
   run: async (ctx, a) => {
     const h = ctx.hubdir();
     const title = a.positionals.join(" ").trim();
     if (!title) throw new CliError(2, 'rfa task create "<title>"');
+    const capability = a.values.capability as string | undefined;
+    if (capability && a.values.owner) throw new CliError(2, "--owner names the agent; --capability finds it by what it offers: pass one or the other");
     const maxAttempts = numberFlag(a.values["max-attempts"], "max-attempts", { int: true, min: 1, max: 20 });
     const replyRaw = a.values["reply-by"] as string | undefined;
     const replyBy = replyRaw ? (/^\+\d+$/.test(replyRaw) ? new Date(Date.now() + Number(replyRaw.slice(1)) * 60_000).toISOString() : replyRaw) : undefined;
     const b = await board(ctx, h, a.values.room as string | undefined);
     try {
+      let owner = a.values.owner ? String(a.values.owner) : undefined;
+      if (capability) {
+        const roster = ((await b.roster()) as { roster: RosterEntry[] }).roster;
+        const target = memberFor(roster, b.rec.operator?.member_id ?? null, capability);
+        if (!target) {
+          const candidates = answerers(roster, b.rec.operator?.member_id ?? "");
+          const offered = [...new Set(candidates.flatMap((r) => r.card_summary.skill_ids))];
+          throw new CliError(3, `nobody in ${b.rec.alias} offers ${capability} right now`, offered.length ? `offered: ${describeOffers(candidates, offered)}` : "rfa status shows whether the agents are up");
+        }
+        owner = target.id;
+        ctx.ui.step(`${capability} -> ${target.name} (${target.state})`, "resolved at create time, ready first: the same rule rfa ask uses");
+      }
       const t = await b.call({
         action: "create",
         title,
         ...(a.values.description ? { description: String(a.values.description) } : {}),
-        ...(a.values.owner ? { owner: String(a.values.owner) } : {}),
+        ...(owner ? { owner } : {}),
         ...(replyBy ? { reply_by: replyBy } : {}),
         ...(a.values["evidence-required"] ? { evidence_required: true } : {}),
         ...(a.values["blocked-by"] ? { blocked_by: String(a.values["blocked-by"]).split(",").map((s) => s.trim()).filter(Boolean) } : {}),

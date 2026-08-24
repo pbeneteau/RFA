@@ -284,6 +284,12 @@ test("numeric flags are strict, and evals run refuses --json by name: NaN and si
   const l = await rfa(["logs", "-n", "abc"]);
   assert.equal(l.code, 2);
   assert.match(l.stderr, /--lines takes a whole number of at least 1/);
+  const both = await rfa(["task", "create", "t", "--owner", "x", "--capability", "y"]);
+  assert.equal(both.code, 2);
+  assert.match(both.stderr, /pass one or the other/);
+  const nobody = await rfa(["task", "create", "t", "--room", "product", "--capability", "answer-question"]);
+  assert.equal(nobody.code, 3, nobody.stderr);
+  assert.match(nobody.stderr, /nobody in product offers answer-question right now/, "resolved at create time against the live roster, and said plainly when it cannot be");
   const e = await rfa(["evals", "run", "--json"]);
   assert.equal(e.code, 2);
   const refusal = JSON.parse(e.stdout) as { error: string; exit: number };

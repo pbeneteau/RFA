@@ -701,7 +701,13 @@ async function brain(
             costUsd,
           );
         }
-        throw new Error(`brain error: ${msg.subtype}${"result" in msg ? `: ${String(msg.result).slice(0, 200)}` : ""}`);
+        // The SDK can report a failure as a result whose subtype is "success"
+        // (is_error true, the failure in the text: the expired-OAuth case), and
+        // printing the subtype verbatim made the refusal read "brain error:
+        // success: Failed to authenticate…" at the worst possible moment. The
+        // subtype is plumbing; name it only when it says something.
+        const detail = "result" in msg ? String(msg.result).slice(0, 200) : "";
+        throw new Error(`brain error: ${[msg.subtype === "success" ? "" : msg.subtype, detail].filter(Boolean).join(": ") || "the SDK reported an error with no detail"}`);
       }
       text = msg.result.trim();
       numTurns = msg.num_turns ?? 0;

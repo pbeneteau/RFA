@@ -23,6 +23,7 @@ import type { HubDir, RoomRecord } from "../../hubdir.js";
 import type { RfaTask } from "../../model.js";
 import type { CliContext } from "../context.js";
 import { supervisorCommand } from "../commands/agent.js";
+import { memberFor } from "../commands/talk.js";
 import { downAll, upAll } from "../commands/procs.js";
 import type { CommandDef } from "../router.js";
 import { askInRoom, followFile, gateView, isOpenTask, offersIn, readBoard, recordedRooms, roomLogFile, snapshot, tailLines, taskAction, type AgentView, type AskOutcome, type Board, type CardView, type FeedLine, type GateView, type Member, type Offer, type RoomView, type Snapshot } from "./data.js";
@@ -1149,8 +1150,8 @@ export function TasksTab(props: { state: BoardState; tasks: RfaTask[]; selected:
   );
 }
 
-/** A task put on the board from the dashboard: the title, who does it, whether it ends in evidence; the same `room_task create` as `rfa task create`. */
-function TaskBox(props: { ctx: CliContext; hub: HubDir; room: RoomRecord; members: Member[]; onClose: () => void; onCreated: (t: RfaTask) => void }): React.JSX.Element {
+/** A task put on the board from the dashboard: the title, who does it (a name, a capability, or nobody), whether it ends in evidence; the same `room_task create` as `rfa task create`. */
+export function TaskBox(props: { ctx: CliContext; hub: HubDir; room: RoomRecord; members: Member[]; onClose: () => void; onCreated: (t: RfaTask) => void }): React.JSX.Element {
   const [title, setTitle] = useState<string | null>(null);
   const [owner, setOwner] = useState<string | null | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
@@ -1158,7 +1159,9 @@ function TaskBox(props: { ctx: CliContext; hub: HubDir; room: RoomRecord; member
   useInput((_i, key) => {
     if (key.escape && !creating) props.onClose();
   });
-  const candidates = props.members.filter((m) => m.id !== props.room.operator?.member_id && m.state !== "offline");
+  const candidates = props.members.filter((m) => m.id !== props.room.operator?.member_id && m.state !== "offline" && m.role === "participant");
+  const capabilities = [...new Set(candidates.flatMap((m) => m.skills))];
+  const offerers = (skill: string) => candidates.filter((m) => m.skills.includes(skill));
   const create = async (evidence: boolean) => {
     setCreating(true);
     try {
@@ -1182,15 +1185,22 @@ function TaskBox(props: { ctx: CliContext; hub: HubDir; room: RoomRecord; member
       ) : owner === undefined ? (
         <>
           <Text dimColor wrap="wrap">
-            "{title}" · Who does it? An assigned resident wakes and does it; an unassigned task waits on the board for anyone to claim.
+            "{title}" · Who does it? A member by name, a capability (whoever offers it, ready first, resolved now: the rule ask uses), or nobody — an unassigned task waits on the board for a claimer.
           </Text>
           <Box marginTop={1}>
             <Choice
               options={[
                 { value: "", label: "nobody yet", hint: "stays on the board for anyone to claim" },
+                ...capabilities.map((c) => ({ value: `cap:${c}`, label: c, hint: `capability · ${offerers(c).map((m) => m.name).join(", ")}` })),
                 ...candidates.map((m) => ({ value: m.id, label: m.name, hint: `${m.origin} · ${m.state}` })),
               ]}
-              onChoose={(v) => setOwner(v || null)}
+              onChoose={(v) => {
+                if (v.startsWith("cap:")) {
+                  const target = memberFor(offerers(v.slice(4)).map((m) => ({ ...m, card_summary: { skill_ids: m.skills } })), null, v.slice(4));
+                  return setOwner(target?.id ?? null);
+                }
+                setOwner(v || null);
+              }}
             />
           </Box>
         </>
@@ -1440,7 +1450,7 @@ function AppliedView(props: { result: ApplyResult; hub: HubDir; onClose: () => v
 
 // ---------------------------------------------------------------- ask
 
-function AskBox(props: { ctx: CliContext; hub: HubDir; room: RoomRecord; onClose: () => void; onDone: () => void }): React.JSX.Element {
+export function AskBox(props: { ctx: CliContext; hub: HubDir; room: RoomRecord; onClose: () => void; onDone: () => void }): React.JSX.Element {
   const [stage, setStage] = useState<"question" | "capability" | "asking" | "answer">("question");
   const [question, setQuestion] = useState("");
   const [offers, setOffers] = useState<Offer[] | null>(null);
@@ -1532,7 +1542,7 @@ function AskBox(props: { ctx: CliContext; hub: HubDir; room: RoomRecord; onClose
         if (input === "!" && outcome?.run_id && !flagged) {
           try {
             flagForReview({ obsDb: props.hub.paths.obsDb, runId: outcome.run_id, note: "flagged from the ask box" });
-            setFlagged(`flagged for the sitting: the Evals tab (6) lists ${outcome.run_id}`);
+            setFlagged(`flagged for the sitting: the Evals tab lists ${outcome.run_id}`);
             props.onDone();
           } catch (err) {
             setFlagged(`could not flag it: ${(err as Error).message}`);
@@ -1540,7 +1550,11 @@ function AskBox(props: { ctx: CliContext; hub: HubDir; room: RoomRecord; onClose
         }
       }
     },
-    { isActive: stage !== "question" },
+    // Active on EVERY stage. This was gated off on the question stage (the text
+    // field owns typing there), which killed escape on exactly the screen the
+    // footer promises "esc back" for; handlers coexist in Ink, and on that
+    // stage this one acts on escape alone, so typing is untouched.
+    { isActive: true },
   );
 
   const answerLines = (outcome?.text ?? error ?? "").split("\n");

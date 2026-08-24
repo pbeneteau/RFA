@@ -356,6 +356,9 @@ export interface Member {
   name: string;
   origin: string;
   state: string;
+  role: string;
+  /** The card's skill ids, so a task can be aimed at a capability instead of a name. */
+  skills: string[];
 }
 
 export interface Board {
@@ -371,8 +374,8 @@ export async function readBoard(ctx: CliContext, h: HubDir, rec: RoomRecord): Pr
   const b = await board(ctx, h, rec.alias ?? rec.handle);
   try {
     const tasks = (((await b.call({ action: "list" })) as { tasks?: RfaTask[] }).tasks ?? []).sort((x, y) => Number(x.id.replace(/^t_/, "")) - Number(y.id.replace(/^t_/, "")));
-    const raw = (await b.roster()) as { roster?: Member[] };
-    const members = (raw.roster ?? []).map((m) => ({ id: m.id, name: m.name, origin: m.origin, state: m.state }));
+    const raw = (await b.roster()) as { roster?: (Member & { card_summary?: { skill_ids?: string[] } })[] };
+    const members = (raw.roster ?? []).map((m) => ({ id: m.id, name: m.name, origin: m.origin, state: m.state, role: m.role, skills: m.card_summary?.skill_ids ?? [] }));
     return { tasks, members };
   } finally {
     await b.close();

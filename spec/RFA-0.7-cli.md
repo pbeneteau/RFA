@@ -237,7 +237,7 @@ Groups first, then the commands that need more than a line. Every command: `--di
 | Command | Does | Wraps / status |
 |---|---|---|
 | `rfa ask "<question>" [--room] [--capability] [--timeout 1800]` | Asks by capability as a human principal; the default-capability rule stays exactly as `scripts/ask.ts` has it | `scripts/ask.ts` |
-| `rfa task ls\|show\|create\|cancel\|verify [--room]` | The task board from the operator membership; `verify` is a human principal's verb (wire 10.4) | `room_task` |
+| `rfa task ls\|show\|create\|cancel\|verify [--room]` | The task board from the operator membership; `create --capability` assigns by what a member offers (ask's rule); `verify` is a human principal's verb (wire 10.4) | `room_task` |
 | `rfa approvals ls\|show\|approve\|reject <request_id> [--edit key=value]` | Pending approval cards and their decision, landing as human-origin interventions carrying the principal | `/api/approvals`, `/api/approvals/decide` |
 
 `rfa approvals approve` makes the CLI a verdict surface, and v0.5 sect. 17.2 says the console is the sole one. The sentence was written against push channels that carry a button over a broadcast transport; a CLI on the operator's machine holding the human key is the console's equal (same `/auth`, same per-principal membership, same intervention event with `refs.principal`), and `npm run ask` has been a human-origin channel since v0.4.6. Section 11 proposes the amendment; until the owner accepts it, `rfa approvals` ships read-only and prints the console link.
@@ -673,7 +673,7 @@ RFA-0.5 sect. 20.4 makes labelling one sitting: the binary label, the gold sourc
 
 ### 13.11 The Tasks tab (amendment, 2026-08-23)
 
-The board of one room, as `rfa task ls` lists it, with the selected task in full beside it: title and description, owner and creator by name (the roster is read with the board, so a member id never shows where a name exists), the deadline as a countdown, what blocks it and what it blocks, the evidence it ended with and the verdict it waits for. `[` `]` move between rooms, `f` shows every state rather than the open ones, `n` puts a task on the board (the title, who does it from the room's present members or nobody, whether it ends in evidence a different member must accept), `y` accepts pending evidence and `r` rejects it with a note (the task goes back to working), `x` cancels after a confirm, `v` runs `rfa task show`. Every verb is the `room_task` call the task commands make, from the same operator membership (`board()` in `src/cli/commands/talk.ts`), so the tab can do nothing a command cannot.
+The board of one room, as `rfa task ls` lists it, with the selected task in full beside it: title and description, owner and creator by name (the roster is read with the board, so a member id never shows where a name exists), the deadline as a countdown, what blocks it and what it blocks, the evidence it ended with and the verdict it waits for. `[` `]` move between rooms, `f` shows every state rather than the open ones, `n` puts a task on the board (the title; who does it: a present member by name, a capability resolved to its ready offerer at create time — the rule ask uses — or nobody; whether it ends in evidence a different member must accept), `y` accepts pending evidence and `r` rejects it with a note (the task goes back to working), `x` cancels after a confirm, `v` runs `rfa task show`. Every verb is the `room_task` call the task commands make, from the same operator membership (`board()` in `src/cli/commands/talk.ts`), so the tab can do nothing a command cannot.
 
 The board is read when the tab opens or its room changes, then every three seconds while the hub serves. With the hub down the read opens the store in this process, and a store held open at the moment `rfa up` starts the hub would refuse the hub its lock; so, down, the board is read once and on `R` only, and the panel says so.
 
@@ -786,7 +786,7 @@ rfa room end <alias|handle> [--summary] | adopt <alias|handle> [--alias <alias>]
 
 rfa ask "<question>" [--room <alias|handle>] [--capability <skill id>] [--timeout <seconds>]
 rfa task ls [--room] [--all] | show <id> [--room]
-rfa task create "<title>" [--room] [--description] [--owner <member>] [--reply-by <ISO|+minutes>] [--evidence-required] [--blocked-by <id,id>] [--max-attempts <n>]
+rfa task create "<title>" [--room] [--description] [--owner <member> | --capability <skill id>] [--reply-by <ISO|+minutes>] [--evidence-required] [--blocked-by <id,id>] [--max-attempts <n>]
 rfa task cancel <id> [--room] | verify <id> --verdict accept|reject [--note] [--room]
 rfa approvals ls | show <request_id> | approve <request_id> [--edit k=v …] | reject <request_id> [--reason]
 

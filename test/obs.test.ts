@@ -174,7 +174,7 @@ test("a credential failure alerts with NO minimum-volume guard, because it is a 
   obs.record({
     id: "run_auth1", name: "serve:pm-agent", run_type: "agent_span",
     start_time: now - 2000, end_time: now - 500, status: "error",
-    error: "brain error: success: Failed to authenticate: OAuth session expired and could not be refreshed",
+    error: "brain error: Failed to authenticate: OAuth session expired and could not be refreshed",
   });
 
   const s = obs.summary(15 * 60_000, now);
@@ -212,17 +212,22 @@ test("the SQL classifier and isAuthError agree, so they cannot drift apart", asy
   const { dir, obs } = fresh();
   const now = Date.now();
   const cases = [
+    // The pre-2026-08-24 shape: the resident once printed the SDK's "success"
+    // subtype verbatim, and rows already in obs.db keep that text forever.
     "brain error: success: Failed to authenticate: OAuth session expired and could not be refreshed",
+    // What the resident writes now (the subtype is dropped when it says nothing).
+    "brain error: Failed to authenticate: OAuth session expired and could not be refreshed",
     "Failed to authenticate: OAuth session expired",
     "invalid_api_key: your key is not valid",
     "authentication_error",
     "could not be refreshed",
-    // A host that never authenticated at all, measured on a fresh clone 2026-08-21.
+    // A host that never authenticated at all, measured on a fresh clone 2026-08-21
+    // (one in the pre-2026-08-24 shape, one in the current one).
     "brain error: success: Not logged in · Please run /login",
-    "brain error: success: Not logged in · Run /login",
+    "brain error: Not logged in · Run /login",
     // Prose that contains ONE of the two required phrases must NOT classify:
     // model-authored result text reaches the classifier via the brain error.
-    "brain error: success: the GitHub CLI is not logged in, so I could not fetch the PR",
+    "brain error: the GitHub CLI is not logged in, so I could not fetch the PR",
     "Run /login after upgrading to use your new plan.",
     "brain error: error_max_turns",
     "429 rate_limited: too many requests",
