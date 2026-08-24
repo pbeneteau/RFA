@@ -123,6 +123,18 @@ export function checkEnvironment(p: Probe = realProbe()): EnvCheck[] {
   return out;
 }
 
+/**
+ * A ✖ that must stop provisioning. The missing model credential is a real ✖
+ * (agents join, sit ready and refuse every answer) but not a blocker: the hub,
+ * the rooms and the packs all work without it and `rfa init --yes` has always
+ * proceeded past it, so the onboarding must not be stricter than the headless
+ * truth. It once was, and a machine without `claude` dead-ended on the checks
+ * screen with only "check again" and "quit" to press.
+ */
+export function blocksProvisioning(c: EnvCheck): boolean {
+  return c.verdict === "fail" && c.id !== "claude";
+}
+
 export function environmentBlocks(checks: EnvCheck[]): boolean {
-  return checks.some((c) => c.verdict === "fail");
+  return checks.some(blocksProvisioning);
 }

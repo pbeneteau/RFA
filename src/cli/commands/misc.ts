@@ -8,7 +8,7 @@ import { RFA_SPEC_VERSION } from "../../hub.js";
 import { detectLegacyLayout, MANIFEST_VERSION } from "../../hubdir.js";
 import { applyMigration, planMigration } from "../../migrate.js";
 import { packageFile, packageVersion } from "../../pkg.js";
-import { CliError, type CliContext } from "../context.js";
+import { CliError, numberFlag, type CliContext } from "../context.js";
 import type { CommandDef } from "../router.js";
 import { runDemo } from "../demo.js";
 
@@ -64,7 +64,7 @@ export const migrate: CommandDef = {
     if (!detectLegacyLayout(from)) throw new CliError(3, `${from} has no pre-0.7 layout (no data/, dogfood/ROOM.md or dogfood/state/)`, "pass --from <checkout>");
     const plan = planMigration(from, to, {
       name: a.values.name as string | undefined,
-      port: a.values.port ? Number(a.values.port) : undefined,
+      port: numberFlag(a.values.port, "port", { int: true, min: 1, max: 65535 }),
       human: a.values.human as string | undefined,
       roomAlias: a.values["room-alias"] as string | undefined,
     });

@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { parseArgs } from "node:util";
 import { detectLegacyLayout, HubDirError } from "../hubdir.js";
 import { CliContext, CliError } from "./context.js";
-import { GLOBAL_OPTIONS, Router, UsageError } from "./router.js";
+import { GLOBAL_OPTIONS, GROUPS, Router, UsageError } from "./router.js";
 import { suggestCommands } from "./suggest.js";
 import { Ui } from "./ui.js";
 import { agentBind, agentEdit, agentLs, agentMode, agentNew, agentRestart, agentRetire, agentShow, agentStart, agentStop, agentValidate } from "./commands/agent.js";
@@ -76,13 +76,20 @@ async function main(argv: string[]): Promise<number> {
       process.stdout.write(router.help(words.slice(0, 2)) + "\n");
       return argv.length === 0 || g.help ? 0 : 2;
     }
+    if (words.length === 1 && GROUPS.some((x) => x.name === words[0])) {
+      // `rfa agent` names a group, not a command: the group's own listing is
+      // the answer (the same text `rfa agent --help` prints), never a guess at
+      // a typo. Exit 2 because nothing ran; --help is the exit-0 form.
+      process.stdout.write(router.help(words) + "\n");
+      return 2;
+    }
     const guesses = suggestCommands(words, router.all());
     if (guesses.length) {
       ui.fail(`no such command: rfa ${words.join(" ")}`, `did you mean: ${guesses.map((g) => `rfa ${g}`).join("  ·  ")}`);
       process.stderr.write(`   rfa --help lists everything; rfa alone opens the dashboard\n`);
       return 2;
     }
-    process.stderr.write(router.help(words.slice(0, 2)) + "\n");
+    process.stderr.write(router.help(GROUPS.some((x) => x.name === words[0]) ? words.slice(0, 1) : words.slice(0, 2)) + "\n");
     return 2;
   }
   if (g.help) {
@@ -96,6 +103,7 @@ async function main(argv: string[]): Promise<number> {
   } catch (err) {
     if (err instanceof UsageError) {
       ui.fail(err.message, err.usage ? `usage: ${err.usage}` : undefined);
+      if (ctx.flags.json) ui.json({ error: err.message, usage: err.usage ?? null, exit: 2 });
       return 2;
     }
     if (err instanceof CliError) {
@@ -105,6 +113,7 @@ async function main(argv: string[]): Promise<number> {
     }
     if (err instanceof HubDirError) {
       ui.fail(err.message, err.hint);
+      if (ctx.flags.json) ui.json({ error: err.message, hint: err.hint ?? null, exit: 3 });
       return 3;
     }
     const e = err as Error & { code?: string; hint?: string };

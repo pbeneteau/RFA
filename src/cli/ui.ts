@@ -168,8 +168,11 @@ export class Spinner {
   }
 
   update(text: string): void {
+    const changed = text !== this.text;
     this.text = text;
-    if (!this.timer && !this.ui.opts.tty && !this.ui.opts.quiet && !this.ui.opts.json) process.stdout.write(` ${SYMBOL.spin[0]} ${text}\n`);
+    // On a pipe every update is a printed line, and a poll re-affirming the same
+    // wait (the ask's approval watch, every 3s) must not become a line per tick.
+    if (changed && !this.timer && !this.ui.opts.tty && !this.ui.opts.quiet && !this.ui.opts.json) process.stdout.write(` ${SYMBOL.spin[0]} ${text}\n`);
   }
 
   /** Replace the spinner line with the result; never leave it above. */

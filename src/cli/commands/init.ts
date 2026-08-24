@@ -32,10 +32,10 @@ import {
 } from "../../hubdir.js";
 import { packageFile, packageVersion } from "../../pkg.js";
 import { principalRecordFor } from "../../principals.js";
-import { CliError, type CliContext } from "../context.js";
+import { CliError, numberFlag, type CliContext } from "../context.js";
 import { openHubCall } from "../hubaccess.js";
-import { checkEnvironment, realProbe } from "../environment.js";
-import { credentialAdvice, modelCredentialStatus, nextFreePort, portFree } from "../preflight.js";
+import { blocksProvisioning, checkEnvironment, realProbe } from "../environment.js";
+import { credentialAdvice, modelCredentialStatus, portFree } from "../preflight.js";
 import type { CommandDef } from "../router.js";
 import { builtinTool, nameProblem, PACK_KINDS, scaffoldPack, type PackKind, type ToolSpec } from "../scaffold.js";
 import { firstAsk } from "../tui/data.js";
@@ -374,6 +374,7 @@ export const init: CommandDef = {
     }
     const agentFlag = a.values.agent as string | undefined;
     if (agentFlag && !PACK_KINDS.includes(agentFlag as PackKind) && agentFlag !== "none") throw new CliError(2, `--agent takes ${PACK_KINDS.join(", ")} or none`);
+    numberFlag(a.values.port, "port", { int: true, min: 1, max: 65535 });
 
     if (ctx.interactive) {
       const { runOnboarding } = await import("../tui/index.js");
@@ -391,7 +392,7 @@ export const init: CommandDef = {
       else if (c.verdict === "warn") ui.warn(c.text, c.fix);
       else if (c.verdict === "fail") ui.fail(c.text, c.fix);
     }
-    const blocking = env.filter((c) => c.verdict === "fail" && c.id !== "claude");
+    const blocking = env.filter(blocksProvisioning);
     if (blocking.length) throw new CliError(3, `${blocking.length} check${blocking.length === 1 ? "" : "s"} must pass before anything is written`, blocking.map((c) => c.fix).filter(Boolean).join("; "));
     const answers = await defaultAnswers(ctx, a.values, target, existing);
     if (answers.mode === "hub" && !(await portFree(answers.port)) && !(await ctx.healthz())) throw new CliError(3, `port ${answers.port} is in use by something that is not this hub`, "pass --port, or stop what holds it");

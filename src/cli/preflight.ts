@@ -71,10 +71,16 @@ export function portFree(port: number, host = "127.0.0.1"): Promise<boolean> {
   });
 }
 
-/** The first free port at or above `from`. */
+/** The first free port at or above `from`; with the whole range taken, one the OS hands out, never a port known to be busy. */
 export async function nextFreePort(from: number): Promise<number> {
   for (let p = from; p < from + 200; p++) if (await portFree(p)) return p;
-  return from;
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.listen(0, "127.0.0.1", () => {
+      const p = (srv.address() as net.AddressInfo).port;
+      srv.close(() => resolve(p));
+    });
+  });
 }
 
 /**

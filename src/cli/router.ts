@@ -152,7 +152,10 @@ export class Router {
       const { values, positionals } = parseArgs({ args: [...argv], options, allowPositionals: true, allowNegative: true, strict: true });
       return { values: values as Parsed["values"], positionals };
     } catch (err) {
-      throw new UsageError((err as Error).message.replace(/^Unknown option '(.+)'.*$/s, "unknown option $1"), this.usageOf(def));
+      // Non-greedy on purpose: Node's message continues after the quoted option
+      // (". To specify a positional argument…"), and a greedy capture swallowed
+      // it into the flag name.
+      throw new UsageError((err as Error).message.replace(/^Unknown option '([^']+)'[\s\S]*$/, "unknown option $1"), this.usageOf(def));
     }
   }
 

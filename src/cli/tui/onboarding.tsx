@@ -232,7 +232,7 @@ export function Onboarding(props: { ctx: CliContext; target: string; existing: H
       );
     case "checks":
       return question_(
-        checks === null ? "Checking this machine" : environmentBlocks(checks) ? "Fix the ✖ first" : "This machine is ready",
+        checks === null ? "Checking this machine" : environmentBlocks(checks) ? "Fix the ✖ first" : checks.some((c) => c.verdict === "fail") ? "Ready to write (the ✖ can wait: agents refuse answers until it is fixed)" : "This machine is ready",
         <Box flexDirection="column">
           {checks === null ? <Spin label="looking at node, sqlite, git, the model CLIs" /> : null}
           {(checks ?? []).map((c) => (

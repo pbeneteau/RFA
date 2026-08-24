@@ -96,6 +96,54 @@ test("ui: tables align on visible width, ignoring color codes", () => {
   assert.equal(visibleLength("\x1b[32m●\x1b[0m"), 1);
 });
 
+test("a spinner on a pipe prints a line per CHANGE, never a line per poll", () => {
+  const lines: string[] = [];
+  const write = process.stdout.write.bind(process.stdout);
+  process.stdout.write = ((chunk: string | Uint8Array) => {
+    lines.push(String(chunk));
+    return true;
+  }) as typeof process.stdout.write;
+  try {
+    const ui = new Ui({ color: false, json: false, quiet: false, tty: false });
+    const sp = ui.spinner("waiting for an answer");
+    sp.update("waiting for an answer"); // the ask's approval watch re-affirms every 3s
+    sp.update("waiting for an answer");
+    sp.update("pm-agent is waiting for YOUR decision");
+    sp.update("pm-agent is waiting for YOUR decision");
+    sp.stop({ ok: true, text: "answered" });
+  } finally {
+    process.stdout.write = write;
+  }
+  const spins = lines.filter((l) => l.includes("◐"));
+  assert.equal(spins.length, 2, `the start line and the one real change, not one per poll: ${JSON.stringify(spins)}`);
+  assert.ok(spins[1].includes("YOUR decision"));
+});
+
+test("a bare group is its own listing, a typo a real guess, a wrong flag one clean line (JSON included), a NaN port refused", async () => {
+  const group = await rfa(["agent"]);
+  assert.equal(group.code, 2, "nothing ran");
+  assert.ok(group.stdout.includes("rfa agent new") && group.stdout.includes("rfa agent retire"), "the group's own listing, on stdout, never a typo guess");
+  assert.ok(!(group.stdout + group.stderr).includes("did you mean"));
+  const typo = await rfa(["agnet", "restrt"]);
+  assert.equal(typo.code, 2);
+  assert.match(typo.stderr, /did you mean: rfa agent restart/);
+  assert.ok(!typo.stderr.includes("evals flag"), "fuzzysort 4 scores in [0,1]: the old negative threshold accepted every candidate and this guess with it");
+  const flag = await rfa(["version", "--bogus"]);
+  assert.equal(flag.code, 2);
+  assert.ok(flag.stderr.includes("unknown option --bogus") && !flag.stderr.includes("positional"), `one clean line, not Node's whole paragraph: ${flag.stderr}`);
+  const j = await rfa(["version", "--bogus", "--json"]);
+  assert.equal(j.code, 2);
+  const parsed = JSON.parse(j.stdout) as { error: string; exit: number };
+  assert.equal(parsed.exit, 2);
+  assert.match(parsed.error, /unknown option --bogus/, "a script that asked for JSON gets its error as JSON, usage errors included");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-badport-"));
+  const port = await rfa(["init", "--yes", "--no-start", "--agent", "none", "--port", "abc"], { cwd: tmp });
+  assert.equal(port.code, 2);
+  assert.match(port.stderr, /--port takes a whole number from 1 to 65535/);
+  assert.ok(!fs.existsSync(path.join(tmp, "rfa.json")), "refused at the door: nothing was written");
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
 test("rfa --help lists the groups; an unknown command exits 2 with a guess; bare rfa on a pipe is the help, never the dashboard", async () => {
   const help = await rfa(["--help"]);
   assert.equal(help.code, 0);

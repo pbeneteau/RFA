@@ -45,7 +45,8 @@ export function requiredArgs(usage: string): string[] {
 export function searchPalette(items: PaletteItem[], query: string, limit = 12): PaletteItem[] {
   const q = query.trim().toLowerCase();
   if (!q) return items.slice(0, limit);
-  const hits = fuzzysort.go(q, items, { keys: ["id", "summary"], limit: limit * 2, threshold: -10_000 }).map((r) => r.obj);
+  // fuzzysort 4 scores in [0, 1]; a negative threshold accepts everything (see src/cli/suggest.ts).
+  const hits = fuzzysort.go(q, items, { keys: ["id", "summary"], limit: limit * 2, threshold: 0.3 }).map((r) => r.obj);
   // What the operator typed as a prefix of a command beats a scattered match of
   // the same letters, and among prefix matches the order is alphabetical, so
   // "agent re" lists restart before retire every time rather than by score.

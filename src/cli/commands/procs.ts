@@ -14,7 +14,7 @@ import { daemonState, DaemonError, runForeground, startDaemon, stopDaemon, logTa
 import { minimalEnv } from "../../env.js";
 import { ensureRuntime, roomsStore, type HubDir } from "../../hubdir.js";
 import { belongsTo, residentProcesses } from "../../procscan.js";
-import { CliError, type CliContext } from "../context.js";
+import { CliError, numberFlag, type CliContext } from "../context.js";
 import { effectiveMode } from "../../posture.js";
 import { nativeBindingProblem } from "../preflight.js";
 import type { CommandDef } from "../router.js";
@@ -310,10 +310,10 @@ export const logs: CommandDef = {
   run: async (ctx, a) => {
     const h = ctx.hubdir();
     const which = a.positionals[0] ?? "hub";
+    const n = numberFlag(a.values.lines, "lines", { int: true, min: 1 }) ?? 40;
     const file = which === "hub" ? h.paths.hubLog : which === "supervisor" ? h.paths.supervisorLog : path.join(h.paths.agents, which, "state", "resident.log");
     if (!fs.existsSync(file)) throw new CliError(3, `no log for ${which} yet (${path.relative(h.root, file)})`, which === "hub" || which === "supervisor" ? "rfa up starts it" : "the supervisor writes it once the agent starts");
-    const n = Number(a.values.lines ?? 40);
-    for (const line of logTail(file, Number.isFinite(n) ? n : 40)) process.stdout.write(line + "\n");
+    for (const line of logTail(file, n)) process.stdout.write(line + "\n");
     if (!a.values.follow) return;
     let offset = fs.statSync(file).size;
     await new Promise<void>((resolve) => {

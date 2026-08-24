@@ -6,8 +6,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { tokenDigest } from "../../credentials.js";
 import { findRoom, roomsStore, secretsStore, tokensStore, type HubDir, type RoomRecord } from "../../hubdir.js";
-import { packageVersion } from "../../pkg.js";
-import { CliError, type CliContext } from "../context.js";
+import { TERMINAL_TASK_STATES, type TaskState } from "../../model.js";
+import { CliError, numberFlag, type CliContext } from "../context.js";
 import { openHubCall, type HubCall } from "../hubaccess.js";
 import { pickOne } from "../prompts.js";
 import type { CommandDef } from "../router.js";
@@ -155,7 +155,7 @@ export const roomShow: CommandDef = {
     ui.note(`join ${String(p.join ?? "?")} · attention ${String(p.attention ?? "?")} · mode ${String(p.mode ?? "?")} · history ${String(p.history_visibility ?? "?")} · max_members ${String(p.max_members ?? "?")} · bearers admitted: ${((p.join_bearer_sha256 as string[] | undefined) ?? []).length}`);
     ui.blank();
     ui.line(`tasks  ${ui.dim(`${tasks.length} on the board`)}`);
-    const open = tasks.filter((t) => !["completed", "failed", "cancelled", "rejected"].includes(String(t.state)));
+    const open = tasks.filter((t) => !TERMINAL_TASK_STATES.has(String(t.state) as TaskState));
     if (open.length) ui.table(open.slice(0, 20).map((t) => [String(t.id), String(t.state), String(t.owner ?? ui.dim("unowned")), String(t.title).slice(0, 60)]));
   },
 };
@@ -168,6 +168,7 @@ export const roomTail: CommandDef = {
   run: async (ctx, a) => {
     const h = ctx.hubdir();
     const rec = await roomArg(ctx, h, a.positionals[0], "rfa room tail <alias|handle>");
+    const n = numberFlag(a.values.lines, "lines", { int: true, min: 1 }) ?? 40;
     const file = path.join(h.paths.roomLogs, `${rec.handle}.ndjson`);
     if (!fs.existsSync(file)) throw new CliError(3, `no log yet for ${rec.alias} (${path.relative(h.root, file)})`);
     const ui = ctx.ui;
@@ -206,8 +207,7 @@ export const roomTail: CommandDef = {
       process.stdout.write(`${ui.dim(String(e.seq).padStart(5))} ${ui.dim(e.ts)} ${(paint[e.type] ?? ((s: string) => s))(String(e.type).padEnd(12))} ${summarize(e)}\n`);
     };
     const all = fs.readFileSync(file, "utf8").split("\n");
-    const n = Number(a.values.lines ?? 40);
-    for (const line of all.filter((l) => l.trim()).slice(-(Number.isFinite(n) ? n : 40))) render(line);
+    for (const line of all.filter((l) => l.trim()).slice(-n)) render(line);
     if (!a.values.follow) return;
     let offset = fs.statSync(file).size;
     await new Promise<void>((resolve) => {
@@ -431,7 +431,6 @@ export const roomAdopt: CommandDef = {
     });
     ctx.ui.done(`adopted ${handle} as ${alias}`, `operator membership ${you.id} (supervisor)${a.values.allow !== false ? "; the operator bearer is admitted" : ""}`);
     ctx.ui.note(`rfa room show ${alias}`);
-    void packageVersion;
   },
 };
 

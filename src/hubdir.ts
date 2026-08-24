@@ -413,6 +413,13 @@ export interface RoomRecord {
   join_secret: string | null;
   /** The operator's own membership in the room, resumed for admin verbs. Null for a room adopted without one. */
   operator: { member_id: string; membership_token: string; name: string; role: "participant" | "observer" | "supervisor"; host: boolean } | null;
+  /**
+   * A participant membership the CLI records to SPEAK in a room whose operator
+   * membership cannot (an adopted room's operator is a supervisor, and wire
+   * 12.1 gives a supervisor no voice but inject): `rfa ask`, parity and the
+   * dashboard resume it instead of joining ephemerally per question.
+   */
+  speaker?: { member_id: string; membership_token: string; name: string } | null;
   created_at: string;
 }
 export interface RoomsFile {

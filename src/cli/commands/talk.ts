@@ -3,9 +3,10 @@
  * board, and the approval cards.
  */
 import { RoomMember } from "../../client.js";
-import { roomsStore, type HubDir, type RoomRecord } from "../../hubdir.js";
+import { principalsStore, roomsStore, type HubDir, type RoomRecord } from "../../hubdir.js";
+import { TERMINAL_TASK_STATES, type TaskState } from "../../model.js";
 import { packageVersion } from "../../pkg.js";
-import { CliError, type CliContext } from "../context.js";
+import { CliError, numberFlag, type CliContext } from "../context.js";
 import { openHubCall } from "../hubaccess.js";
 import { askLine, pickOne } from "../prompts.js";
 import type { CommandDef } from "../router.js";
@@ -14,7 +15,21 @@ import { requireRoom } from "./room.js";
 
 const clientInfo = () => ({ name: "rfa-cli", version: packageVersion() });
 
-/** A participant membership to speak with: the operator's own when it is one, else an ephemeral one that leaves afterwards. */
+/**
+ * A participant membership to speak with: the operator's own when it is one,
+ * else ONE recorded speaker membership, created the first time and resumed
+ * after.
+ *
+ * The else-branch is every adopted room: `rfa room adopt` joins as a
+ * supervisor for the admin verbs, and a supervisor cannot send (wire 12.1: its
+ * only voice is inject). Joining ephemerally per ask put a join/leave pair in
+ * the room log on every question and left a corpse in the roster whenever the
+ * CLI died mid-ask, so the membership is recorded in rooms.json (the CLI's own
+ * file, like the operator's) and resumed like a resident's. Two concurrent
+ * first asks race the record; the loser's membership lapses at its lease,
+ * once. `ephemeral` remains for the one case recording is impossible: a room
+ * rooms.json does not list.
+ */
 export async function speaker(ctx: CliContext, h: HubDir, rec: RoomRecord): Promise<{ me: RoomMember; ephemeral: boolean }> {
   ctx.armTransport();
   const hubUrl = ctx.hubUrl();
@@ -22,7 +37,15 @@ export async function speaker(ctx: CliContext, h: HubDir, rec: RoomRecord): Prom
     const me = await RoomMember.resume({ hubUrl, room: rec.handle, membershipToken: rec.operator.membership_token, memberId: rec.operator.member_id, name: rec.operator.name, clientInfo: clientInfo() });
     return { me, ephemeral: false };
   }
-  const label = (await import("../../hubdir.js")).principalsStore(h).read().principals[0]?.label ?? "operator";
+  if (rec.speaker) {
+    try {
+      const me = await RoomMember.resume({ hubUrl, room: rec.handle, membershipToken: rec.speaker.membership_token, memberId: rec.speaker.member_id, name: rec.speaker.name, clientInfo: clientInfo() });
+      return { me, ephemeral: false };
+    } catch {
+      /* evicted, expired, or the room was rebuilt: join anew below and re-record */
+    }
+  }
+  const label = principalsStore(h).read().principals[0]?.label ?? "operator";
   const me = await RoomMember.create({
     hubUrl,
     room: rec.handle,
@@ -32,7 +55,19 @@ export async function speaker(ctx: CliContext, h: HubDir, rec: RoomRecord): Prom
     card: { name: `${label}-cli`, description: "the operator, from the terminal", skills: [{ id: "operate", description: "asks and decides" }] },
     clientInfo: clientInfo(),
   });
-  return { me, ephemeral: true };
+  let recorded = false;
+  try {
+    roomsStore(h).update((f) => {
+      const r = f.rooms.find((x) => x.handle === rec.handle);
+      if (r) {
+        r.speaker = { member_id: me.memberId, membership_token: me.membershipToken, name: me.name };
+        recorded = true;
+      }
+    });
+  } catch {
+    /* a store this process cannot write: fall back to leave-after-use */
+  }
+  return { me, ephemeral: !recorded };
 }
 
 type RosterEntry = { id: string; name: string; role: string; state: string; card_summary: { skill_ids: string[] } };
@@ -55,9 +90,9 @@ export const ask: CommandDef = {
   run: async (ctx, a) => {
     const h = ctx.hubdir();
     const question = a.positionals.join(" ").trim() || (await askLine(ctx, "Your question", 'rfa ask "<question>"', { placeholder: "how do presence leases work?" }));
+    const timeoutS = numberFlag(a.values.timeout, "timeout", { min: 1 }) ?? 1800;
     if (!(await ctx.healthz())) throw new CliError(3, `the hub at ${ctx.hubUrl()} is not answering`, "rfa up");
     const rec = requireRoom(h, a.values.room as string | undefined, true);
-    const timeoutS = Number(a.values.timeout ?? 1800);
     const { me, ephemeral } = await speaker(ctx, h, rec);
     try {
       const roster = (await me.refreshRoster()) as RosterEntry[];
@@ -128,8 +163,6 @@ export async function board(ctx: CliContext, h: HubDir, ref: string | undefined)
   };
 }
 
-const TERMINAL = new Set(["completed", "failed", "cancelled", "rejected"]);
-
 export const taskLs: CommandDef = {
   path: ["task", "ls"],
   summary: "The task board (open tasks; --all for every state)",
@@ -140,7 +173,7 @@ export const taskLs: CommandDef = {
     const b = await board(ctx, h, a.values.room as string | undefined);
     try {
       const tasks = ((await b.call({ action: "list" })) as { tasks: Record<string, unknown>[] }).tasks ?? [];
-      const shown = a.values.all ? tasks : tasks.filter((t) => !TERMINAL.has(String(t.state)));
+      const shown = a.values.all ? tasks : tasks.filter((t) => !TERMINAL_TASK_STATES.has(String(t.state) as TaskState));
       if (ctx.flags.json) return void ctx.ui.json(shown);
       if (shown.length === 0) return void ctx.ui.note(`no ${a.values.all ? "" : "open "}tasks in ${b.rec.alias}`);
       ctx.ui.table(shown.map((t) => [String(t.id), String(t.state), String(t.owner ?? ctx.ui.dim("unowned")), t.evidence_required ? "evidence" : "", t.reply_by ? `by ${String(t.reply_by).slice(0, 16)}` : "", String(t.title).slice(0, 70)]));
@@ -179,6 +212,7 @@ export const taskCreate: CommandDef = {
     const h = ctx.hubdir();
     const title = a.positionals.join(" ").trim();
     if (!title) throw new CliError(2, 'rfa task create "<title>"');
+    const maxAttempts = numberFlag(a.values["max-attempts"], "max-attempts", { int: true, min: 1, max: 20 });
     const replyRaw = a.values["reply-by"] as string | undefined;
     const replyBy = replyRaw ? (/^\+\d+$/.test(replyRaw) ? new Date(Date.now() + Number(replyRaw.slice(1)) * 60_000).toISOString() : replyRaw) : undefined;
     const b = await board(ctx, h, a.values.room as string | undefined);
@@ -191,7 +225,7 @@ export const taskCreate: CommandDef = {
         ...(replyBy ? { reply_by: replyBy } : {}),
         ...(a.values["evidence-required"] ? { evidence_required: true } : {}),
         ...(a.values["blocked-by"] ? { blocked_by: String(a.values["blocked-by"]).split(",").map((s) => s.trim()).filter(Boolean) } : {}),
-        ...(a.values["max-attempts"] ? { max_attempts: Number(a.values["max-attempts"]) } : {}),
+        ...(maxAttempts !== undefined ? { max_attempts: maxAttempts } : {}),
       });
       ctx.ui.done(`task ${t.id} created in ${b.rec.alias}`, `${t.state}${t.owner ? `, assigned to ${t.owner}` : ""}`);
       if (ctx.flags.json) ctx.ui.json(t);

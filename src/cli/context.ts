@@ -22,6 +22,21 @@ export class CliError extends Error {
   }
 }
 
+/**
+ * A numeric flag parsed strictly: `--timeout abc` must be a usage error at the
+ * door, because downstream it becomes NaN arithmetic that LOOKS like behaviour
+ * (an ask with `--timeout abc` "timed out" instantly: the deadline was NaN, and
+ * `Date.now() < NaN` is false on the first check).
+ */
+export function numberFlag(v: unknown, flag: string, opts: { int?: boolean; min?: number; max?: number } = {}): number | undefined {
+  if (v === undefined) return undefined;
+  const n = Number(v);
+  const ok = Number.isFinite(n) && (!opts.int || Number.isInteger(n)) && (opts.min === undefined || n >= opts.min) && (opts.max === undefined || n <= opts.max);
+  if (ok) return n;
+  const range = opts.min !== undefined && opts.max !== undefined ? ` from ${opts.min} to ${opts.max}` : opts.min !== undefined ? ` of at least ${opts.min}` : opts.max !== undefined ? ` of at most ${opts.max}` : "";
+  throw new CliError(2, `--${flag} takes a ${opts.int ? "whole number" : "number"}${range}, not ${JSON.stringify(String(v))}`);
+}
+
 export interface GlobalFlags {
   dir?: string;
   json: boolean;

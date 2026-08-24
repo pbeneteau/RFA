@@ -9,7 +9,7 @@ import * as path from "node:path";
 import { RoomMember } from "../../client.js";
 import type { HubDir, RoomRecord } from "../../hubdir.js";
 import { roomsStore } from "../../hubdir.js";
-import type { RfaTask } from "../../model.js";
+import { TERMINAL_TASK_STATES, type RfaTask } from "../../model.js";
 import { packageVersion } from "../../pkg.js";
 import { reviewQueueCounts, type QueueCounts } from "../../evals/label.js";
 import type { CliContext } from "../context.js";
@@ -364,8 +364,7 @@ export interface Board {
   members: Member[];
 }
 
-const TERMINAL = new Set(["completed", "failed", "cancelled", "rejected"]);
-export const isOpenTask = (t: RfaTask): boolean => !TERMINAL.has(t.state);
+export const isOpenTask = (t: RfaTask): boolean => !TERMINAL_TASK_STATES.has(t.state);
 
 /** A room's board and roster, through the operator membership: what `rfa task ls` reads, one hub call each. */
 export async function readBoard(ctx: CliContext, h: HubDir, rec: RoomRecord): Promise<Board> {

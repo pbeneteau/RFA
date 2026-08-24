@@ -73,6 +73,13 @@ test("the environment checks read a described machine: what blocks, what warns, 
   assert.equal(seen.tailscale.verdict, "ok");
   const readonly = byId(checkEnvironment(machine({ writable: () => false, env: { ANTHROPIC_API_KEY: "k" } })));
   assert.equal(readonly.cwd.verdict, "fail");
+
+  // The missing model credential is a real ✖ and NOT a provisioning blocker:
+  // headless init has always proceeded past it, and the onboarding once
+  // dead-ended here with only "check again" and "quit" to press.
+  const credless = checkEnvironment(machine({ which: (cmd) => (cmd === "git" ? `/usr/bin/${cmd}` : null) }));
+  assert.equal(byId(credless).claude.verdict, "fail", "said as a ✖, honestly");
+  assert.equal(environmentBlocks(credless), false, "and still not a blocker: the screen must offer continue");
 });
 
 test("the scaffold takes the capability and the budgets the walkthrough chose", () => {

@@ -260,7 +260,7 @@ Groups first, then the commands that need more than a line. Every command: `--di
 | `rfa peer add <name> [--room <alias>...] [--expires 90d] [--home <org>]` | Mints a `peer` bearer, allows it in the rooms, prints the one-time credential block: hub URL (`public_url` or the loopback with a note that it needs a proxy), room handles, the bearer, the `rfa_min.py` invocation, and where `INTEROP.md` is. `--home` other than `local` is refused with the reason until rung 5 | rung 3 (own-org); rung 5 (guests) |
 | `rfa peer ls` / `show <name>` / `revoke <name>` | Peers with their rooms, last seen, live memberships; revoke removes the hash from `tokens.json` and every room policy, then evicts live memberships | rung 3 |
 | `rfa peer invite <name> --room <alias> [--ttl]` | `room_admin invite` for an admitted guest | rung 5, gated on RFA-0.6 v0.6.0b |
-| `rfa docs interop\|spec\|readme [--path]` | Opens or prints the documents shipped in the package | rung 3 |
+| `rfa docs interop\|spec\|platform\|plan\|readme\|client [--path] [--open]` | Opens or prints the documents shipped in the package | rung 3 |
 
 `rfa init --hub-url <url> --token <bearer>` is the other half of `peer add`: it creates a remote-hub directory (2.6) on the machine that will host the agents. Between the two, "connect an agent running elsewhere" is two commands, one on each side, for agents built on this tool; `INTEROP.md` and `rfa_min.py` cover agents built on anything else.
 
@@ -625,7 +625,7 @@ On a pipe, or with `--json`, `rfa` alone prints the help it always printed and e
 
 ### 13.3 The dashboard
 
-Seven tabs over one snapshot refreshed every two seconds: **Overview** (processes, agents, rooms, the last 24 hours with answers per hour, alerts, what waits to be labelled, recent answers), **Agents**, **Rooms**, **Approvals**, **Feed** (a room's log followed live, from the file, as `rfa room tail -f` reads it), **Evals** (the labelling sitting in place and the gate; 13.10), **Tasks** (a room's board; 13.11). Single-key verbs on each tab do what the matching command does, by calling the same function the command calls: `r s x` restart/start/stop an agent through the supervisor's command channel, `m` cycle its mode (RFA-0.4 sect. 3.12: ask, plan, bypass; bypass confirmed first), `y n` approve/reject a card through the same workbench route the console uses, `u d` are `rfa up` and `rfa down`, `a` opens the ask box (discovery by capability, the choice shown when more than one is offered). The keys are the ones operators already have in their fingers from lazygit and k9s: `?` help, `:` (or `/`, or ctrl-k) the palette, numbers and tab for tabs, j/k or arrows to move, q to leave.
+One snapshot refreshed every two seconds, under a tab per concern: **Overview** (processes, agents, rooms, the last 24 hours with answers per hour, alerts, what waits to be labelled, recent answers), **Agents**, **Rooms**, **Approvals**, **Feed** (a room's log followed live, from the file, as `rfa room tail -f` reads it), **Evals** (the labelling sitting in place and the gate; 13.10), **Tasks** (a room's board; 13.11). Single-key verbs on each tab do what the matching command does, by calling the same function the command calls: `r s x` restart/start/stop an agent through the supervisor's command channel, `m` cycle its mode (RFA-0.4 sect. 3.12: ask, plan, bypass; bypass confirmed first), `y n` approve (confirmed first: it executes the agent's action, and the CLI's own approve confirms) / reject a card through the same workbench route the console uses, `u d` are `rfa up` and `rfa down`, `a` opens the ask box (discovery by capability, the choice shown when more than one is offered). The keys are the ones operators already have in their fingers from lazygit and k9s: `?` help, `:` (or `/`, or ctrl-k) the palette, numbers and tab for tabs, j/k or arrows to move, q to leave.
 
 **The palette is how the long commands get learned.** Every command, fuzzy-searched by path and summary (a prefix match outranks a scattered one; what was run last is listed first). It ALWAYS shows the exact command line it is about to run, asks in place for the arguments a command requires (one field per `<token>` in its usage), then runs it as an ordinary `rfa` child with the terminal handed over (ctrl-c belongs to the child, so `rfa logs -f` ends the way it always did), waits for a key, and takes the terminal back. Nothing is reimplemented for the dashboard; a verb that is not a thin call into a command's own code is a bug.
 
@@ -662,7 +662,7 @@ The pure parts (the palette's search and argument form, the onboarding's screen 
 
 ### 13.10 The Evals tab: the labelling sitting in place (amendment, 2026-08-23)
 
-RFA-0.5 sect. 20.4 makes labelling one sitting: the binary label, the gold source and the promotion together, over the same traces. `rfa evals label --prepare|--apply` does it through a worksheet; the sixth tab does it in the dashboard, over the same queue, through the same function.
+RFA-0.5 sect. 20.4 makes labelling one sitting: the binary label, the gold source and the promotion together, over the same traces. `rfa evals label --prepare|--apply` does it through a worksheet; the Evals tab does it in the dashboard, over the same queue, through the same function.
 
 - **The queue** is the review queue of sect. 20.5 (flagged `needs_review`, or carrying feedback at or below zero, without a human label yet; newest first), exactly what `--prepare` would write: `reviewQueue()` in `src/evals/label.ts` is the one query, and the worksheet is a file written over its result. It is read when the tab opens and on `R`, never on the two-second tick: rows moving under a hand that is judging them is how a verdict lands on the wrong trace. The whole answer is read from the room log when it is at hand, matched by the run id every response carries in its json part (residents store a 300-char excerpt in obs.db, and a sitting that judges the fragment as the answer produces anchors that are subtly wrong); the worksheet gets the same, and the excerpt note remains only when the log cannot be read.
 - **Per trace**: `p` pass; `f` fail, asking the failure mode in place (in the words the findings ledger will use: it names the case if the trace is cut into one); `g` the gold source (the file#section that should have been cited, with what was cited shown beside the question); `c` cut it into a case (a judged trace only, with a room and a conversation); `x` clear the verdict; `v` the whole answer, scrolled.
@@ -728,6 +728,10 @@ const manifest = z.object({
 { "version": 1, "rooms": [
   { "alias": "product", "handle": "r_3f9a1c2e7b", "topic": "product questions", "join_secret": "js_…",
     "operator": { "member_id": "m_…", "membership_token": "mt_…", "name": "paul", "role": "participant", "host": true },
+    // Only where the operator membership cannot send (an adopted room's operator is a
+    // supervisor, and wire 12.1 gives a supervisor no voice but inject): the ONE
+    // participant membership `rfa ask` records and resumes instead of joining per question.
+    "speaker": { "member_id": "m_…", "membership_token": "mt_…", "name": "paul-cli" },
     "created_at": "…" } ] }
 
 // secrets.json  (0600)  unchanged shape: NAME -> value
@@ -753,39 +757,56 @@ const manifest = z.object({
 ## Appendix D: command reference
 
 ```
-rfa init [--yes] [--name] [--port] [--human] [--agent <kind>] [--room] [--no-start] [--hub-url <url>] [--force]
-rfa up | down | restart | status [--json] | doctor [--deep] [--json] | logs [hub|supervisor|<agent>] [-f] [-n] | console [--room]
-rfa hub run [--stdio] | rfa hub expose --tailscale [--off] | rfa supervisor run
-rfa service install | uninstall | status
-rfa demo | rfa version | rfa docs interop|spec|readme [--path]
+rfa                                    # the front door: the onboarding (no hub directory yet) or the dashboard; the help on a pipe
+rfa init [--yes] [--name] [--port] [--human] [--agent spec-expert|answerer|tool|none] [--agent-name] [--knowledge <dir>]
+         [--server <name> --command <cmd> --tool <id> | --builtin linear] [--room <alias>] [--topic] [--no-start]
+         [--ask "<question>"] [--hub-url <url> --token <bearer> --room-handle <r_…>] [--force]
+rfa dashboard                          # by name; refuses a pipe (rfa status --json is the script's form)
+rfa up [--only hub|supervisor] | down | restart | status [--json] | doctor [--deep] [--json]
+rfa logs [hub|supervisor|<agent>] [-f] [-n <lines>] | console [--room <alias|handle>] [--no-open]
+rfa hub run [--stdio] | hub expose --tailscale [--off] [--dry-run] | supervisor run
+rfa service install [--print] [--platform darwin|linux] | uninstall | status
+rfa demo | version | docs interop|spec|platform|plan|readme|client [--path] [--open]
+rfa completion zsh|bash|fish [--install]
+rfa migrate [--from <checkout>] [--to <dir>] [--name] [--port] [--human <label>] [--room-alias <alias>] [--dry-run]
 
-rfa agent new <name> [--kind answerer|tool|spec-expert] [--room] [--knowledge <path>] [--model] [--dry-run]
+rfa agent new <name> [--kind spec-expert|answerer|tool] [--room <alias|handle>] [--knowledge <dir>] [--model haiku|sonnet|opus]
+              [--server <name> --command <cmd> --tool <id> | --builtin linear [--tool <id>]] [--mode ask|plan|bypass] [--dry-run]
 rfa agent ls | show <name> | validate [<name>] | bind <name> --room <alias|handle> [--observer] [--no-serve]
-rfa agent start|stop|restart <name> | retire <name> [--dry-run] [--timeout]
-rfa agent edit <name> [--model] [--description] [--offer <id>] [--offer-description] [--per-task] [--per-day] [--max-turns] [--mode] [--room] [--knowledge <dir|git> [--docs]] [--editor]
+rfa agent start|stop|restart <name> | mode <name> [ask|plan|bypass] | retire <name> [--dry-run] [--timeout <s>]
+rfa agent edit <name> [--model] [--description] [--offer <id>] [--offer-description] [--per-task] [--per-day] [--max-turns]
+              [--mode] [--room] [--knowledge <dir|git remote> [--docs <subdir>]] [--editor]
 
-rfa room create <alias> [--topic] [--history] [--mode] | ls | show <alias> | tail <alias> [-f]
-rfa room allow <alias> --token <label> | disallow … | policy <alias> set <k>=<v> | secret show <alias>
-rfa room evict|hold|release|quarantine|inject <alias> … | end <alias> [--summary] | adopt <handle> [--alias] [--secret]
+rfa room create <alias> [--topic] [--history member|joined_after] [--mode open|sequential|moderator]
+rfa room ls | show <alias|handle> | tail <alias|handle> [-f] [-n <lines>]
+rfa room allow <alias|handle> --token <label> | disallow <alias|handle> (--token <label> | --sha256 <hex>)
+rfa room policy <alias|handle> set <k>=<v> … | secret show <alias|handle>
+rfa room evict|hold|release|quarantine <alias|handle> <member> [--reason] | inject <alias|handle> "<text>" [--to <member>]
+rfa room end <alias|handle> [--summary] | adopt <alias|handle> [--alias <alias>] [--secret <join secret>] [--no-allow]
 
-rfa ask "<question>" [--room] [--capability] [--timeout]
-rfa task ls|show|create|cancel|verify [--room] …
-rfa approvals ls | show <id> | approve <id> [--edit k=v] | reject <id> [--reason]
+rfa ask "<question>" [--room <alias|handle>] [--capability <skill id>] [--timeout <seconds>]
+rfa task ls [--room] [--all] | show <id> [--room]
+rfa task create "<title>" [--room] [--description] [--owner <member>] [--reply-by <ISO|+minutes>] [--evidence-required] [--blocked-by <id,id>] [--max-attempts <n>]
+rfa task cancel <id> [--room] | verify <id> --verdict accept|reject [--note] [--room]
+rfa approvals ls | show <request_id> | approve <request_id> [--edit k=v …] | reject <request_id> [--reason]
 
-rfa human add <label> | ls | rotate <label> | remove <label>
-rfa token mint <label> [--kind client|peer] [--expires] | ls | revoke <label>
-rfa secrets set <NAME> [--stdin|--from-env VAR] | ls | unset <NAME>
+rfa human add <label> | ls | rotate <label> | remove <label> [--force]
+rfa token mint <label> [--kind client|peer|operator] [--expires 90d] | ls | revoke <label>
+rfa secrets set <NAME> [--stdin | --from-env VAR] | ls | unset <NAME>
 rfa key new [--alg es256] [--out <prefix>] | sign <card.json> <key.json>
 
-rfa connect claude-code [--room] [--scope user|project] [--skill] | cursor | mcp --print
-rfa peer add <name> [--room …] [--expires] [--home] | ls | show <name> | revoke <name> | invite <name> --room [--ttl]
+rfa connect claude-code [--room <alias|handle> …] [--scope user|project|local] [--label] [--skill] [--print] | cursor | mcp
+rfa peer add <name> [--room <alias|handle> …] [--expires 90d] [--home <org>] | ls | show <name> | revoke <name>
+                                       # rung 5 (gated) adds: rfa peer invite <name> --room [--ttl]
 
-rfa knowledge add <agent> <path|git-url> [--docs] | sync [<agent>] | status | pin
-rfa evals run [--judged] [--update-baseline] | ls | promote <room> (--conversation|--task) --id [--failure-mode] | label --prepare|--apply | flag <run id> ["<why>"] | parity [--capture]
-rfa log verify [<alias|handle>|all] [--json]
-rfa backup now | ls | restore <date> [--dry-run]
+rfa knowledge add <agent> <path|git remote> [--docs <subdir>] [--name <clone name>] | sync [<agent>] [--pin] | status | pin [<agent>] [--sha <sha>]
+rfa evals run [--judged] [--update-baseline] [--room] | ls
+rfa evals promote <room> (--conversation <id> | --task <id>) --id <case id> [--failure-mode] [--out <dir>] [--log <file>]
+rfa evals label --prepare [--limit <n>] [--out <file>] | --apply <worksheet> [--out <cases dir>]   [--db <obs.db>]
+rfa evals flag <run id> ["<why>"] [--db <obs.db>] | parity [--room] [--capability] [--fixtures <file>] [--capture] [--timeout]
+rfa log verify [<alias|handle> …] [--file <log.ndjson | directory>] [--json]
+rfa backup now [--keep <n>] | ls | restore <day> [--dry-run]
 rfa config show | get <key> | set <key> <value>
-rfa migrate [--from <checkout>] [--dry-run]
 ```
 
 Global flags on every command: `--dir <hub directory>`, `--json`, `--yes`, `--quiet`, `--no-color`, `--debug`, `--help`.

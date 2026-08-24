@@ -274,6 +274,23 @@ test("packs: new binds to the first room, validate checks what the supervisor wo
   assert.deepEqual(json<{ name: string }[]>(after).map((a) => a.name).sort(), ["fees", "handmade"]);
 });
 
+test("numeric flags are strict, and evals run refuses --json by name: NaN and silence never become behaviour", async () => {
+  const t = await rfa(["ask", "x", "--timeout", "abc"]);
+  assert.equal(t.code, 2, t.stderr);
+  assert.match(t.stderr, /--timeout takes a number of at least 1, not "abc"/, "validated before the hub is even asked: NaN made a deadline that expired instantly");
+  const m = await rfa(["task", "create", "t", "--max-attempts", "many"]);
+  assert.equal(m.code, 2);
+  assert.match(m.stderr, /--max-attempts takes a whole number from 1 to 20/);
+  const l = await rfa(["logs", "-n", "abc"]);
+  assert.equal(l.code, 2);
+  assert.match(l.stderr, /--lines takes a whole number of at least 1/);
+  const e = await rfa(["evals", "run", "--json"]);
+  assert.equal(e.code, 2);
+  const refusal = JSON.parse(e.stdout) as { error: string; exit: number };
+  assert.match(refusal.error, /no --json view/, "the runner never sees the flag, so swallowing it silently would lie to the script that passed it");
+  assert.equal(refusal.exit, 2, "and under --json the refusal itself is JSON");
+});
+
 test("connect and peer: a client bearer is minted, admitted by hash, printed once; a guest home is refused with the gate named; revoke removes the admission", async () => {
   const c = await rfa(["connect", "mcp", "--room", "product", "--label", "laptop-mcp", "--json"]);
   assert.equal(c.code, 0, c.stderr);

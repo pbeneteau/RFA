@@ -14,7 +14,7 @@ export function dashboardCommands(router: Router): CommandDef[] {
     return runDashboard(ctx, h, { commands: router.all(), runChild: makeChildRunner() });
   };
   return [
-    { path: ["dashboard"], summary: "The live dashboard: what `rfa` alone opens in a hub directory", why: "Five tabs over the same data every command prints, single-key verbs that run the same code the commands run, and a palette that shows the command line before running it. It exists because the long forms were being forgotten; it teaches them while doing the work.", run },
+    { path: ["dashboard"], summary: "The live dashboard: what `rfa` alone opens in a hub directory", why: "A tab per concern (status, agents, rooms, approvals, the live feed, the labelling sitting, the task board) over the same data every command prints; single-key verbs that run the same code the commands run; a palette that shows the command line before running it. It exists because the long forms were being forgotten; it teaches them while doing the work.", run },
     { path: ["ui"], summary: "Alias of rfa dashboard", hidden: true, run },
   ];
 }

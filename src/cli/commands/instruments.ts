@@ -20,7 +20,7 @@ import { countDocs, fileProvenance, isGitRemote, knowledgeStatus, packClones, pi
 import { describeReport, expandLogTargets, verifyLogFile, type LogReport } from "../../logverify.js";
 import { addKnowledge } from "../agentmd.js";
 import { attachKnowledge, AttachError, type Attachment } from "../attach.js";
-import { CliError } from "../context.js";
+import { CliError, numberFlag } from "../context.js";
 import { askLine, pickOne } from "../prompts.js";
 import type { CommandDef } from "../router.js";
 import { daemonEnv } from "./procs.js";
@@ -169,6 +169,10 @@ export const evalsRun: CommandDef = {
   examples: ["rfa evals run", "rfa evals run --update-baseline", "rfa evals run --judged --room product"],
   run: async (ctx, a) => {
     const h = ctx.hubdir();
+    // The runner streams human verdicts and writes its own machine-readable
+    // report; --json silently swallowed by a child that never saw it would be
+    // a lie to the script that passed it.
+    if (ctx.flags.json) throw new CliError(2, "evals run has no --json view: the runner streams its verdicts and writes the report itself", `read ${path.join(".rfa", "reports", "evals")}/<ts>.json after the run (latest.md beside it)`);
     const args: string[] = ["--dir", h.root];
     if (a.values.judged) args.push("--judged");
     if (a.values["update-baseline"]) args.push("--update-baseline");
@@ -266,7 +270,7 @@ export const evalsLabel: CommandDef = {
   summary: "The labelling sitting: prepare a worksheet from the review queue, then apply it (the dashboard's Evals tab is the same sitting in place)",
   usage: "--prepare [--limit <n>] [--out <file>] | --apply <worksheet> [--out <cases dir>]   [--db <obs.db>]",
   options: { prepare: { type: "boolean", default: false }, apply: { type: "string" }, limit: { type: "string" }, out: { type: "string" }, db: { type: "string" } },
-  why: "Labelling is the scarce resource (RFA-0.5 sect. 20.4): ONE pass over the same traces produces the binary label, the gold source and the promotion together. The worksheet has the fetching and formatting done so the sitting is only judgement (the full answer is read from the room log when it is at hand, so nobody judges obs.db's 300-char excerpt as if it were the answer); applying it writes the human feedback rows (no rubric hash: that is how a person's verdict is told from a model's) and cuts the promoted cases. An all-passing sitting prints the exact ledger line the spec requires, because an instrument that has finished and one that has gone blind look the same without it. The dashboard's Evals tab (6) holds the same queue in memory and applies it through the same function.",
+  why: "Labelling is the scarce resource (RFA-0.5 sect. 20.4): ONE pass over the same traces produces the binary label, the gold source and the promotion together. The worksheet has the fetching and formatting done so the sitting is only judgement (the full answer is read from the room log when it is at hand, so nobody judges obs.db's 300-char excerpt as if it were the answer); applying it writes the human feedback rows (no rubric hash: that is how a person's verdict is told from a model's) and cuts the promoted cases. An all-passing sitting prints the exact ledger line the spec requires, because an instrument that has finished and one that has gone blind look the same without it. The dashboard's Evals tab holds the same queue in memory and applies it through the same function.",
   examples: ["rfa evals label --prepare", "rfa evals label --apply .rfa/reports/labelling-2026-08-22.yaml"],
   run: async (ctx, a) => {
     const h = ctx.maybe();
@@ -279,7 +283,7 @@ export const evalsLabel: CommandDef = {
       const r = prepareWorksheet({
         obsDb,
         out: path.resolve(out),
-        limit: a.values.limit ? Number(a.values.limit) : undefined,
+        limit: numberFlag(a.values.limit, "limit", { int: true, min: 1 }),
         rubric: h ? path.relative(h.root, h.paths.evalRubric) : "evals/rubric.md",
         roomLogFile: h ? (room) => path.join(h.paths.roomLogs, `${room}.ndjson`) : undefined,
       });
@@ -343,7 +347,7 @@ export const evalsFlag: CommandDef = {
     }
     if (ctx.flags.json) return void ctx.ui.json({ run_id: runId, flagged: true, note });
     ctx.ui.done(`${runId} flagged for the sitting`, note ? `"${note}"` : "no reason given; the sitting can still name the failure mode");
-    ctx.ui.note("rfa evals label --prepare lists it, and so does the dashboard's Evals tab (6)");
+    ctx.ui.note("rfa evals label --prepare lists it, and so does the dashboard's Evals tab");
   },
 };
 
@@ -364,6 +368,7 @@ export const evalsParity: CommandDef = {
       throw new CliError(2, (err as Error).message, `write ${path.relative(h.root, fixturesFile)} as [{ "question": "...", "must_mention": ["..."] }]`);
     }
     if (fixtures.length === 0) throw new CliError(2, `${path.relative(h.root, fixturesFile)} lists no questions`);
+    const timeoutS = numberFlag(a.values.timeout, "timeout", { min: 1 });
     if (!(await ctx.healthz())) throw new CliError(3, `the hub at ${ctx.hubUrl()} is not answering`, "rfa up");
     const rec = requireRoom(h, a.values.room as string | undefined, true);
     const { me, ephemeral } = await speaker(ctx, h, rec);
@@ -383,7 +388,7 @@ export const evalsParity: CommandDef = {
         fixtures,
         obsDb: h.paths.obsDb,
         capture: Boolean(a.values.capture),
-        timeoutMs: a.values.timeout ? Number(a.values.timeout) * 1000 : undefined,
+        timeoutMs: timeoutS !== undefined ? timeoutS * 1000 : undefined,
         onVerdict: (v) => {
           ctx.ui.line(`${v.ok ? ctx.ui.good("PASS") : ctx.ui.bad("FAIL")}  ${(v.ms / 1000).toFixed(1).padStart(5)}s  ${v.question.slice(0, 70)}`);
           if (!v.ok) {

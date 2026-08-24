@@ -1,7 +1,8 @@
 /**
  * The dashboard (RFA-0.7 sect. 11.2): what `rfa` opens in a hub directory.
  *
- * Six tabs over one snapshot refreshed every two seconds; single-key verbs
+ * One snapshot refreshed every two seconds, a tab per concern (status,
+ * agents, rooms, approvals, the feed, the sitting, the board); single-key verbs
  * that do what the matching command does; a palette for everything else. The
  * conventions are the ones operators already have in their fingers from
  * lazygit and k9s: `?` for help, `:` for a command, j/k or arrows to move,
@@ -344,10 +345,16 @@ export function Dashboard(props: { ctx: CliContext; hub: HubDir; commands: Comma
         if (down) setSel((s) => ({ ...s, card: Math.min(cards.length - 1, s.card + 1) }));
         if (up) setSel((s) => ({ ...s, card: Math.max(0, s.card - 1) }));
         if (!card) return;
-        if (input === "y") return void act(`approve ${card.request_id}`, async () => {
-          await ctx.workbench("/api/approvals/decide", { method: "POST", body: { room: card.room, request_id: card.request_id, verb: "approve" } });
-          return `approved ${card.action} from ${card.requester_name}`;
-        });
+        if (input === "y") {
+          // Approving EXECUTES the agent's action; the CLI's approve confirms on
+          // a terminal, and one mis-keyed y here must not out-privilege it. The
+          // ask box keeps its direct y: the card is the whole of what it shows,
+          // so the confirm would repeat the screen the operator is reading.
+          return setOverlay({ kind: "confirm", label: `approve ${card.request_id}`, text: `Approve "${card.action}" (${card.tool_name}) from ${card.requester_name} in ${aliasOf(card.room)}? The agent then performs it.`, run: async () => {
+            await ctx.workbench("/api/approvals/decide", { method: "POST", body: { room: card.room, request_id: card.request_id, verb: "approve" } });
+            return `approved ${card.action} from ${card.requester_name}`;
+          } });
+        }
         if (input === "n") return setOverlay({ kind: "reject", card });
       }
       if (tab === "Feed") {
@@ -589,7 +596,7 @@ function Help(props: { onClose: () => void }): React.JSX.Element {
     ["m", "cycle the agent's mode: ask → plan → bypass (bypass is confirmed first)"],
     ["l e v n", "logs / edit / show / new agent"],
     ["t v i", "tail / show / inject into the selected room"],
-    ["y n", "approve / reject the selected card"],
+    ["y n", "approve (confirmed first) / reject the selected card"],
     ["[ ]", "previous / next room in the feed"],
     ["p f g c x", "the sitting: pass / fail (and its failure mode) / gold source / cut a case / clear the verdict"],
     ["v enter r", "the whole answer / apply the sitting (confirmed) / run the gate (confirmed: it costs)"],
@@ -776,7 +783,7 @@ function Overview(props: { snap: Snapshot | null; hub: HubDir; aliasOf: (h: stri
                   <Text>
                     <Text dimColor>to label </Text>
                     <Text color={review.queued ? WARN : GOOD}>{review.queued}</Text>
-                    <Text dimColor>{review.queued ? " · press 6" : review.labelled ? ` · ${review.labelled} labelled` : ""}</Text>
+                    <Text dimColor>{review.queued ? ` · press ${TABS.indexOf("Evals") + 1}` : review.labelled ? ` · ${review.labelled} labelled` : ""}</Text>
                   </Text>
                 ) : null}
               </Box>
@@ -956,7 +963,7 @@ function ApprovalsTab(props: { cards: CardView[]; selected: number; aliasOf: (h:
               </Box>
             ) : null}
             <Box marginTop={1}>
-              <Text dimColor>y approve · n reject (with a reason)</Text>
+              <Text dimColor>y approve (confirmed) · n reject (with a reason)</Text>
             </Box>
           </>
         ) : (

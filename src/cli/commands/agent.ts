@@ -16,8 +16,8 @@ import { belongsTo, residentProcessesSync } from "../../procscan.js";
 import { bindPack, currentSettings, editPack, setAgentMode, type EditResult, type PackChanges } from "../agentmd.js";
 import { attachKnowledge, AttachError } from "../attach.js";
 import { createRoomRecord } from "./init.js";
-import { effectiveMode, isMode, MODE_SUMMARY, MODES, type AgentMode } from "../../posture.js";
-import { CliError, type CliContext } from "../context.js";
+import { actingTools, effectiveMode, isMode, MODE_SUMMARY, MODES, type AgentMode } from "../../posture.js";
+import { CliError, numberFlag, type CliContext } from "../context.js";
 import type { CommandDef } from "../router.js";
 import { BUILTIN_SERVERS, builtinTool, knowledgeRelativeToPack, nameProblem, PACK_KINDS, renderAgentMd, scaffoldPack, type PackKind, type ToolSpec } from "../scaffold.js";
 import { askLine, pickOne } from "../prompts.js";
@@ -460,7 +460,7 @@ export const agentMode: CommandDef = {
     const current = effectiveMode(pack.def);
     const wanted = a.positionals[1];
     if (!wanted) {
-      if (ctx.flags.json) return void ctx.ui.json({ name, mode: current, acting: (pack.def.tools?.allow ?? []).filter((t) => Object.keys(pack.def.interrupt_on ?? {}).some((p) => p === t || (p.endsWith("*") && t.startsWith(p.slice(0, -1))))) });
+      if (ctx.flags.json) return void ctx.ui.json({ name, mode: current, acting: actingTools(pack.def) });
       ctx.ui.line(`${ctx.ui.bold(name)}  ${current === "bypass" ? ctx.ui.bad(current) : ctx.ui.accent(current)}${current === "read-only" ? "" : `  ${ctx.ui.dim(MODE_SUMMARY[current])}`}`);
       if (current === "read-only") ctx.ui.note("no acting tool (nothing in interrupt_on), so there is nothing a mode would change");
       else for (const m of MODES) ctx.ui.note(`${m === current ? "▸" : " "} ${m.padEnd(7)} ${MODE_SUMMARY[m]}`);
@@ -471,7 +471,7 @@ export const agentMode: CommandDef = {
     if (wanted === "bypass" && !ctx.flags.yes) {
       if (!ctx.interactive) throw new CliError(2, "bypass acts without a human; pass --yes to set it without a prompt");
       const p = await import("@clack/prompts");
-      const ok = await p.confirm({ message: `${name} will call ${(pack.def.tools?.allow ?? []).filter((t) => Object.keys(pack.def.interrupt_on ?? {}).includes(t)).join(", ") || "its acting tools"} without asking anyone. Set bypass?`, initialValue: false });
+      const ok = await p.confirm({ message: `${name} will call ${actingTools(pack.def).join(", ") || "its acting tools"} without asking anyone. Set bypass?`, initialValue: false });
       if (p.isCancel(ok) || !ok) throw new CliError(2, "mode unchanged");
     }
     const res = setAgentMode(path.join(pack.dir, "agent.md"), wanted);
@@ -495,8 +495,7 @@ export const agentRetire: CommandDef = {
     const name = a.positionals[0];
     if (!name || name.startsWith("-")) throw new CliError(2, "rfa agent retire <name>: the name is required and never inferred");
     const dryRun = Boolean(a.values["dry-run"]);
-    const timeoutS = Number(a.values.timeout ?? 60);
-    const stopTimeoutMs = (Number.isFinite(timeoutS) && timeoutS > 0 ? timeoutS : 60) * 1000;
+    const stopTimeoutMs = (numberFlag(a.values.timeout, "timeout", { min: 1 }) ?? 60) * 1000;
     const packDir = path.join(h.paths.agents, name);
     if (!fs.existsSync(packDir)) throw new CliError(2, `no pack directory agents/${name}: nothing to retire (names are case-sensitive)`);
     const defFile = path.join(packDir, "agent.md");
