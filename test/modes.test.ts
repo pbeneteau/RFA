@@ -51,10 +51,29 @@ test("plan proposes and never acts; bypass allows the acting tool outright; auto
   assert.ok(!plan.allowedTools.includes("mcp__linear__save_document"), "the acting tool is still not pre-allowed in plan mode");
   assert.throws(() => toolPack("auto"), /mode/, "auto was withdrawn: the SDK's classifier approved a gated call with no card");
   const bypass = agentPosture(toolPack("bypass"));
-  assert.equal(bypass.permissionMode, "bypassPermissions");
+  assert.notEqual(bypass.permissionMode, "bypassPermissions", "the SDK's bypassPermissions auto-approves EVERY reachable tool before canUseTool: a bypass resident used the operator's claude.ai Linear connector through it (found live 2026-08-24)");
+  assert.equal(bypass.permissionMode, "default");
   assert.equal(bypass.onActing, "allow");
-  assert.ok(bypass.allowedTools.includes("mcp__linear__save_document"), "in bypass the acting tool is pre-allowed: no card, no callback");
+  assert.ok(!bypass.allowedTools.includes("mcp__linear__save_document"), "the acting tool routes through canUseTool even in bypass, where onActing allow answers without a card and every UNDECLARED tool still dies at the deny-by-default door");
   assert.throws(() => toolPack("yolo"), /mode/, "an unknown mode is refused by the schema");
+});
+
+test("the SDK's base tool set is what the pack declared: harness-internal tools are ABSENT, not merely denied", () => {
+  // canUseTool is never consulted for harness-internal tools, so the
+  // deny-by-default callback is not a fence for them. Found live 2026-08-24
+  // under bypass: a resident ran ToolSearch, listed the operator's other Claude
+  // Code sessions with ListAgents and messaged one with SendMessage - none
+  // declared by the pack, none ever reaching the callback.
+  for (const mode of ["ask", "plan", "bypass"] as const) {
+    const p = agentPosture(toolPack(mode));
+    assert.deepEqual(p.builtins, ["Read", "Grep"], `${mode}: exactly the built-ins the pack declared, MCP names filtered out`);
+    for (const internal of ["ToolSearch", "ListAgents", "SendMessage", "Task", "Bash", "WebFetch"]) {
+      assert.ok(!p.builtins.includes(internal), `${mode}: ${internal} is not in the base set, so the model never sees it`);
+    }
+    assert.ok(!p.builtins.some((t) => t.startsWith("mcp__")), "MCP tools are not built-ins: they ride mcpServers and the allow list");
+  }
+  const bare = agentPosture({ rfa_agent: 1, name: "x", description: "d" } as never);
+  assert.deepEqual(bare.builtins, [], "a pack that declares no tools gets NO built-ins: the SDK's default preset is never inherited by accident");
 });
 
 test("the mode line is replaced in place or inserted before sandbox:, and the rest of agent.md is kept byte for byte", () => {

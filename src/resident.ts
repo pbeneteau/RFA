@@ -242,6 +242,9 @@ const memory = new GatedMemory(path.join(pack.dir, "memory"), gate, member.membe
 const asText = (v: unknown) => ({ content: [{ type: "text" as const, text: typeof v === "string" ? v : JSON.stringify(v, null, 1) }] });
 const asError = (err: unknown) => ({ content: [{ type: "text" as const, text: `error: ${(err as Error).message}` }], isError: true });
 
+/** The pack asked for a voice: `mcp__rfa__ask` in tools.allow (spec 3.12). */
+const VOICE = (pack.def.tools?.allow ?? []).includes("mcp__rfa__ask");
+
 const rfaServer = createSdkMcpServer({
   name: "rfa",
   version: "0.4.1",
@@ -290,13 +293,15 @@ const rfaServer = createSdkMcpServer({
         }
       },
     ),
-    // The voice. Deliberately NOT in MCP_TOOLS: a pack gets this only by
-    // declaring `mcp__rfa__ask` in tools.allow, because an agent that can
-    // address peers is a posture decision the operator makes per pack, not a
-    // default. Until 2026-08-21 no resident could address a peer at all: the
-    // projection layer existed one level down and was wired into nothing, so
-    // the "network of agents" was a hub-and-spoke answering service.
-    tool(
+    // The voice. Registered ONLY when the pack declares `mcp__rfa__ask` in
+    // tools.allow, because an agent that can address peers is a posture
+    // decision the operator makes per pack, not a default. Until 2026-08-21 no
+    // resident could address a peer at all: the projection layer existed one
+    // level down and was wired into nothing, so the "network of agents" was a
+    // hub-and-spoke answering service. Registration, not just an allow-list
+    // omission: a tool the pack cannot call has no business in its prompt (it
+    // costs context and invites a call that only canUseTool then refuses).
+    ...(VOICE ? [tool(
       "ask",
       "Ask another member of this room and wait for its answer. Target a capability id from the " +
         "roster (preferred: discovery is what the skill ids are for) or an exact member id/name. " +
@@ -347,7 +352,7 @@ const rfaServer = createSdkMcpServer({
           return asError(err);
         }
       },
-    ),
+    )] : []),
   ],
 });
 
@@ -577,6 +582,26 @@ async function brain(
       // plan-mode answer apologised for a tool it could not call).
       systemPrompt: systemPrompt() + (posture.mode === "plan" ? PLAN_MODE_NOTE : ""),
       settingSources: [],
+      // A resident authenticates with the OPERATOR's login, and the operator's
+      // claude.ai account carries MCP connectors (Linear, Notion, Figma …).
+      // Those are auto-fetched into the session and appear in the model's tool
+      // list, which is neither the pack's declaration nor the operator's
+      // intent for THIS agent: found live 2026-08-24, a linear-agent holding
+      // one gated document tool created real Linear projects and issues
+      // through the account's own Linear connector. `settingSources: []` does
+      // not cover them (they ride the login, not a settings file), so the
+      // suppression is passed inline, at the highest user precedence.
+      settings: { disableClaudeAiConnectors: true },
+      // The SDK's BASE tool set: the built-ins this pack declared, and nothing
+      // else (spec 3.12). `canUseTool` is never consulted for harness-internal
+      // tools, so the deny-by-default callback below does not fence them: with
+      // the default preset a resident could enumerate the operator's other
+      // Claude Code sessions (ListAgents), message them (SendMessage), and load
+      // any connector on the operator's account (ToolSearch) - all found live
+      // on 2026-08-24, none declared by the pack, none ever reaching the
+      // callback. Listing the declared built-ins makes every other one ABSENT,
+      // and makes a built-in the SDK adds tomorrow absent too.
+      tools: posture.builtins,
       mcpServers: { rfa: rfaServer, memory: memoryServer, ...packServers },
       // interrupt_on tools are EXCLUDED from the allowlist so they fall through
       // to canUseTool, where the human decision happens (spec 7.3).
