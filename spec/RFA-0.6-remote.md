@@ -316,6 +316,7 @@ A hub operator admitting any peer MUST publish an interop document containing at
 7. **Error handling**: the RFA error object and its codes, that input-validation failures are wrapped in the RFA envelope as `bad_request` (the MCP v2 SDK returns them as plain text otherwise, which is the error class a learner hits most), bounded-jitter retry for idempotent reads, and honoring `retry_after_s` and `Retry-After`.
 8. **The extension fallback rule**, as RFA's own MUST: a client that does not implement a declared extension either falls back to the documented behavior or rejects the request when the extension is mandatory. Do not attribute RFC-2119 wording for this to MCP; MCP's actual text is softer, and one fabricated verbatim quotation was found and must not propagate (W4 sect. 10).
 9. **The outbound disclosure** of sect. 7.7: what the hub logs, who can read it, the retention window, that the operator can hold, edit and inject mid-flight, that the peer's text may be quoted into a human approval card, and how to export on leave.
+10. **Claim tokens across a hub restart** (spec 10.3, added in protocol 0.1.9): a hub restart invalidates outstanding claim tokens; recovery is the still-valid membership, or re-claim.
 
 ### 6.2 The sample client
 
