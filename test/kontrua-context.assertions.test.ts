@@ -24,8 +24,8 @@ describe('kontrua context assertions', () => {
   it('CLI source lives under `src/cli/`.', () => {
     assert.ok(existsSync('src/cli'), 'src/cli should exist');
   });
-  it('Agent pack definitions live under `agents/`, with each agent in its own subdirectory containing `age', () => {
-    assert.ok(existsSync('agents/pm-agent'), 'agents/pm-agent should exist');
+  it('Agent packs live in a hub directory (`<hub>/agents/<name>/agent.md`), never in this repository; `s', () => {
+    assert.ok(existsSync('src/cli/scaffold.ts'), 'src/cli/scaffold.ts should exist');
   });
   it('Eval cases live under `evals/cases/`.', () => {
     assert.ok(existsSync('evals/cases'), 'evals/cases should exist');
