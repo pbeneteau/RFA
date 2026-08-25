@@ -27,7 +27,7 @@ acme/
 ├── rfa.json            the manifest: name, port, gate, retention. Commit it. Never holds a secret.
 ├── agents/             one folder per agent; agent.md (YAML definition + the prompt) is the whole thing
 ├── policies/gate.json  the pre-delivery policy gate (three default rules)
-├── evals/              cases, baseline, rubric
+├── evals/              the judge rubric and a first replay case, seeded by `rfa init`; baseline.json once you measure one
 └── .rfa/               runtime the tool owns, gitignored, 0700: secrets.json, principals.json,
                         tokens.json, rooms.json, data/ (the store), logs/, run/
 ```
@@ -83,8 +83,9 @@ npm run e2e               # THE fast answer: real hubs on random ports, every pr
 npm run coldstart         # npm pack, install the tarball into a fresh prefix, rfa init --ask in an empty folder (needs a model credential)
 npm run tui:smoke         # the onboarding and the dashboard driven inside a real pty (python3, stdlib only); the gate for src/cli/tui changes
 npm run demo              # the spec's worked example, in memory
-npm run evals             # = rfa evals run on the hub directory found from here (about two dollars; one per day)
-npm run parity            # = rfa evals parity, run it twice after a brain or knowledge change
+npm run evals             # = rfa evals run (about two dollars; one per day). Run it from a hub directory, or pass --dir:
+                          #   npm run evals -- --dir ~/rfa/acme   (this repository is not an instance)
+npm run parity            # = rfa evals parity, twice after a brain or knowledge change; same --dir rule
 ```
 
 `npm run e2e` boots isolated hub processes (random ports, temp data dirs; your own hub directory is untouched), exercises both MCP eras over HTTP and stdio across its scenarios (unit suite, lockfile guard, dual-era serving, the spec section 17 core flow, tasks with a real claim race, signing incl. a strict `--require-signed` hub, moderation, push notifications, restart persistence, the CLI's init/up/status/down, an approval decided from the CLI), and writes `reports/latest.md` + `latest.json`. Exit code = number of failed scenarios.

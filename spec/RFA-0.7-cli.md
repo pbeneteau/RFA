@@ -84,7 +84,9 @@ acme/                          a hub directory: any folder holding rfa.json
 ├── policies/
 │   ├── gate.json              the pre-delivery policy gate (tracked; was deploy/gate.json)
 │   └── trusted-keys.json      optional: kid -> public JWK for card verification (tracked)
-├── evals/                     cases/, baseline.json, rubric.md, parity.json (tracked)
+├── evals/                     cases/, baseline.json, rubric.md, parity.json (tracked). `rfa init` seeds
+│                               rubric.md and one tenant-neutral replay case from the package's templates/evals,
+│                               so the gate scores something true on day one; a BASELINE is measured, never seeded
 ├── peers/                     admission records, when the guest path lands (tracked: hashes and thumbprints only)
 ├── .gitignore                 written by init
 └── .rfa/                      runtime, owned by the tool. Gitignored. Mode 0700.
@@ -358,6 +360,7 @@ $ npx agent-com init
  ✔ .rfa/secrets.json  (0600)                 RFA_TOKEN, the bearer your agents and this CLI use to reach the hub
  ✔ .rfa/principals.json, .rfa/tokens.json    hashes only; plaintext never rests here
  ✔ policies/gate.json                        three default rules: alert on injection markers, refuse private keys, hold on a review marker
+ ✔ evals/rubric.md, evals/cases              the judge rubric and one protocol replay case, from templates/evals
  ✔ .gitignore                                .rfa/, agents/*/state/, knowledge clones
  ✔ model credential                          `claude` is logged in (oauth). Agents inherit it from the supervisor's shell.
 

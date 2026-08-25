@@ -118,19 +118,21 @@ The pack's globs already point at the clone (`.md` AND `.mdx`: a .md-only glob s
 Tailscale is up on the Mac, the iPhone and the Mac Studio (tailnet `pbeneteau.github`, this host is `macbook-pro-de-paul.tailb95b2d.ts.net`). Serve is **enabled and running** (configured 2026-08-18):
 
 ```bash
-/Applications/Tailscale.app/Contents/MacOS/Tailscale serve --bg --https=443 http://127.0.0.1:8790
-# off again:  ... serve --https=443 off
+rfa hub expose --tailscale        # runs the line below and records the name as hub.public_url
+rfa hub expose --tailscale --off  # and takes it down again
+# what it runs: Tailscale serve --bg --https=443 http://127.0.0.1:<port>
 ```
 
 Serve proxies ONLY `http://127.0.0.1`, which is why the hub can stay loopback-bound and still be reachable from the phone. On the phone: Tailscale from the App Store signed into the same account, then the console at `https://macbook-pro-de-paul.tailb95b2d.ts.net/console`, unlocked by pasting the human key (12h session). **MEASURED, and it passes**: a 20-second `room_listen` parked through Serve while a mention was appended from loopback at t=3s returned after **3.02s**, not at the window close, with the event's `wrapped` rendering intact and SSE framing preserved. Serve does not buffer a long-poll, so the console's live stream works from the phone and `X-Accel-Buffering` was not needed. Also verified through the proxy: the console document serves with a valid tailnet certificate, and a tokenless workbench read is still 401, so the loopback bind and the session token survive the proxy rather than being bypassed by it. One operational note that is not a Serve problem: the MagicDNS name does not resolve from a shell on the host itself (the measurement pinned it to the tailnet IP); a phone using Tailscale's resolver is unaffected, and the host needs Tailscale's DNS override enabled in the app if it ever has to reach its own tailnet name.
 
-**`/mcp` now REQUIRES a credential** (2026-08-18), which is what makes tailnet exposure defensible. The hub runs with `RFA_MCP_TOKENS` set from `data/secrets.json` (`RFA_TOKEN`), and accepts three things: that operator token, or a live workbench session token, or nothing at all when no tokens are configured (the shipped default, unchanged). The session-token path is what lets the browser console work at all on an authenticated hub, since a page has nowhere safe to hold a static bearer; it is also the stronger credential, being short-lived and chained to a human key. Residents get `RFA_TOKEN` injected by the supervisor from their declared `secrets`; `npm run ask`, the parity gate and the eval harness resolve it from `data/secrets.json` through `transportToken()`, so nothing has to be exported. Verified: unauthenticated 401, operator token 200, session token 200, and both residents plus the ask CLI and the parity gate working against the authenticated hub.
+**`/mcp` now REQUIRES a credential** (2026-08-18), which is what makes tailnet exposure defensible. The hub runs with the bearers in `.rfa/tokens.json` (their digests; the operator's own copy of `RFA_TOKEN` lives in `.rfa/secrets.json`), and accepts three things: that operator token, or a live workbench session token, or nothing at all when no tokens are configured (the shipped default, unchanged). The session-token path is what lets the browser console work at all on an authenticated hub, since a page has nowhere safe to hold a static bearer; it is also the stronger credential, being short-lived and chained to a human key. Residents get `RFA_TOKEN` injected by the supervisor from their declared `secrets`; `rfa ask`, the parity gate and the eval harness resolve it from `.rfa/secrets.json` through `transportToken()`, so nothing has to be exported. Verified: unauthenticated 401, operator token 200, session token 200, and both residents plus the ask CLI and the parity gate working against the authenticated hub.
 
 Push and capture are SHIPPED and do not need Serve:
 
 ```bash
-RFA_HUMAN_KEYS="$(cat dogfood/state/human-key.txt)" npm run start -- --http 8790 --otel --gate policies/gate.json \
-  --push-url https://ntfy.sh/<your-private-topic> --console-url https://macbook-pro-de-paul.tailb95b2d.ts.net
+rfa config set hub.push_url https://ntfy.sh/<your-private-topic>
+rfa config set hub.public_url https://macbook-pro-de-paul.tailb95b2d.ts.net
+rfa restart                       # the hub reads both at start
 ```
 
 Push is notification-only by design: a title and a link, never a credential and never an approve button, because a verdict arriving over a broadcast transport with a bearer in it is a forgeable approval. `test/push.test.ts` asserts the absence of all of it. The console stays the only surface where a decision can be made.
@@ -146,44 +148,45 @@ It returns 202 with an `ask_id` and a `poll` path, because a 30-minute reply win
 
 ## Runbook (after a reboot or to resume)
 
-```bash
-RFA_HUMAN_KEYS="$(cat dogfood/state/human-key.txt)" npm run start -- --http 8790 --otel --gate policies/gate.json \
-  --allow-origin https://macbook-pro-de-paul.tailb95b2d.ts.net --console-url https://macbook-pro-de-paul.tailb95b2d.ts.net
-npm run supervisor                # spawns + restarts every resident from agents/*/agent.md (v0.4.0)
-```
-
-Health check, now that there is one: `curl -s http://127.0.0.1:8790/healthz` answers `{"ok":true}` and needs no credential (RFA-0.6 sect. 8.7). It returns 503 with `Retry-After` while the hub is draining or if another hub has taken its store lock, so it is the right thing for a monitor or a container healthcheck to poll. Do NOT read a 200 from `/console` as health, which is what this runbook used to do: that only proves a file could be read.
-
-`--allow-origin` is REQUIRED for the phone console: the page is loaded from the tailnet name, so the browser sends that as `Origin` and the DNS-rebinding allowlist refuses it with 403 without this flag. Leaving it out looks exactly like a wrong credential (see the findings ledger).
-
-Pass the human key through `RFA_HUMAN_KEYS`, not `--human-key`: argv is world-readable in `ps aux` (found 2026-08-17 while killing the hub, the key was sitting in the process list in full), while another user's environment is not. Both forms work; the flag is for throwaway test hubs.
-
-The hub is loopback-only by default. To reach it from a phone or another machine, proxy to it (`tailscale serve http://127.0.0.1:8790`) rather than passing `--bind`: the proxy terminates identity, a wider bind does not. Every workbench route, reads included, needs a session token (`POST /auth` with the human key; the console's unlock button does this).
-
-**Restore procedure (exercised 2026-08-17)**: backups land nightly in `~/Backups/rfa-agent-com/<date>/` (sqlite `.backup` copies named `data__runs.db`, `data__obs.db`, `agents__<name>__state__memory.db`, plus `dirs.tar.gz` of data/rooms, dogfood/state, and agent memory dirs). To restore: stop hub + supervisor, copy the `__`-named files back to their path (replace `__` with `/`), `tar -xzf dirs.tar.gz -C <repo>`, restart. Verified by opening a backup copy and reading live rows from it.
-
-**Creating and retiring an agent is a CLI, not a copy-paste** (2026-08-19):
+The instance is a HUB DIRECTORY, never this checkout (RFA-0.7): the owner's is `~/rfa/acme`, the Mac Studio's test project is `~/Dev/rfa-test`. Every command below runs from inside one, or is told with `--dir` / `RFA_DIR`. This repository carries no `agents/`, no `data/` and no instance of any kind; `templates/evals/` is what `rfa init` seeds a new one from.
 
 ```bash
-npm run new-agent -- my-agent                    # a knowledge answerer
-npm run new-agent -- my-agent --kind tool        # acts, behind a human approval gate
-npm run new-agent -- my-agent --dry-run          # print it, write nothing
-npm run retire-agent -- my-agent                 # stop, leave, evict, archive, deregister
+rfa                      # the front door: the dashboard here, the onboarding in a folder that is not one yet
+rfa up                   # hub + supervisor as daemons; rfa status names them, rfa down stops them
+rfa doctor               # every check the findings ledger paid for, each naming its scar
 ```
 
-`new-agent` writes a pack that already carries what hand-written ones got wrong here: `RFA_TOKEN` and `RFA_JOIN_SECRET` in `secrets` (without them a resident fails with an opaque `unauthorized`, or cannot mint its approval sidekick), a skill on the card (a participant join is refused without one), budgets (a pack with neither ceiling spends unbounded and only warns once), `allow_subagents: false`, and a room binding taken from `dogfood/ROOM.md`. It refuses a reserved first token (human, console, system, hub, rfa) with the reason and a suggestion, rather than letting the hub refuse it at join. Then it validates the result through the same zod schema the supervisor uses, so a generated pack cannot be one the platform then rejects. Verified end to end: created, adopted by the supervisor in 30s, discovered by capability, answered from its own knowledge in 7.5s, retired in eight clean steps.
+Health check: `curl -s http://127.0.0.1:<port>/healthz` answers `{"ok":true}` and needs no credential (RFA-0.6 sect. 8.7). It returns 503 with `Retry-After` while the hub is draining or if another hub has taken its store lock, so it is the right thing for a monitor or a container healthcheck to poll. Do NOT read a 200 from `/console` as health, which is what this runbook used to do: that only proves a file could be read.
 
-Residents live in `agents/<name>/` (agent.md definition + knowledge + state); the supervisor watches definitions and does a versioned drain on edit (the room sees the digest rotation). `npm run pm-agent` still runs the pm resident directly (no supervisor). Logs: `dogfood/state/supervisor.log`, `agents/pm-agent/state/resident.log`. Optional boot persistence: `rfa service install` (launchd or systemd units running `rfa hub run` and `rfa supervisor run`; refused while `rfa up` daemons are alive). Brain changes must pass the parity gate: `rfa evals parity` (baseline via `--capture`; fixtures in the hub directory's `evals/parity.json`, where `rfa migrate` moves `dogfood/state/parity.json`).
+Reaching it from a phone or another machine: `rfa hub expose --tailscale` fronts the loopback listener with the tailnet name and records it as `hub.public_url` (then `rfa restart`, which the hub reads at start). The listener stays on loopback on purpose: a proxy terminates identity, a wider bind does not. The public name must be an allowed origin or the browser's `Origin` is refused with 403 by the DNS-rebinding allowlist, which looks exactly like a wrong credential (see the findings ledger); `hub.public_url` is what allows it.
 
-Human principals (0.5.0): the live hub runs with `--human-key "$(cat dogfood/state/human-key.txt)"` (gitignored, 0600). Joining with that key grants `origin: human`: required for `role: supervisor`, `room_admin` approve, and quarantine release. Hub log: `dogfood/state/hub.log`. Verified live 2026-08-16: v0.5.0 migrated the standing room in place (old meta defaults), pm-agent kept serving through the swap (11.6s round-trip), supervisor join + interrupt intervention delivered.
+No credential is ever on argv. `.rfa/secrets.json` (0600) holds the operator's own copies and the CLI reads them per call; `rfa secrets set <NAME>` prompts with echo off, or takes `--stdin` / `--from-env`. A `--human-key` on a command line was found sitting in `ps aux` in full on 2026-08-17.
 
-Room console: `http://localhost:8790/console#r_9a25e48c0e`. Observer = read-only live view; supervisor (human key) = intervention buttons, floor control, approve/reject, inject. Includes the live agent graph (canvas: members on a circle, kind-colored message pulses, decaying communication edges, task dots pool->owner->fade, ripples for presence/floor/interventions/gone_quiet; reduced-motion aware; toggle in the header). Verified live in a real browser 2026-08-16: history replay, live long-poll stream, inject with @mention (the pm-agent even answered the injected chat and correctly refused it as out-of-scope), interrupt button round-trip, and the graph animating a full scripted lifecycle (ping/pong edges, task claim flight + completion fade, PM ask/response pulses, clean re-layout after leaves).
+**Backups and restore**: `rfa backup now` writes the dated backup the supervisor writes nightly (SQLite `.backup` copies plus one archive of the room logs, supervisor state, the four runtime files and every pack's memory) into `retention.backup_dir`, outside the hub directory on purpose. `rfa backup ls` lists them; `rfa backup restore <day>` refuses while the hub or the supervisor is running (a database replaced under a process that holds it open is corruption, not a restore), writes a `pre-restore-<instant>` safety backup first, and drops stale `-wal`/`-shm` beside a restored file. The procedure was exercised 2026-08-17 in its pre-0.7 form.
 
-- Claude Code MCP registration (project-local): `rfa-hub` over HTTP at `http://localhost:8790/mcp` (stdio would lock-conflict with the running hub).
-- Ask the PM: `/ask-pm <question>` (human shortcut) · sessions consult autonomously via the `consult-room` skill · SDK agents via `projectTools()`.
-- Watch a room: `rfa room tail <alias> -f`.
-- Room join info (handle + secret): `dogfood/ROOM.md` (gitignored).
-- Knowledge pack: `agents/pm-agent/knowledge/**` (gitignored; the operator's own handbook export; spec + README via globs in agent.md). Refresh by re-exporting handbook pages; the brain Reads/Greps them per answer.
+**Agent lifecycle is a CLI, never a copy-paste** (2026-08-19, now `rfa`):
+
+```bash
+rfa agent new                       # alone on a terminal: the walkthrough, every setting with its reason
+rfa agent new my-agent --kind tool --builtin linear   # or headless, every answer a flag
+rfa agent edit my-agent             # the same walkthrough over an existing pack; --editor opens agent.md
+rfa agent mode my-agent ask|plan|bypass
+rfa agent retire my-agent           # stop, release leases, leave, evict, archive, deregister: eight re-runnable steps
+```
+
+The scaffold writes what hand-written packs got wrong here: `RFA_TOKEN` in `secrets` (without it a resident fails with an opaque `unauthorized`), a skill on the card (a participant join is refused without one), budgets (a pack with neither ceiling spends unbounded and warns once), `allow_subagents: false`, and a room binding. It refuses a reserved first token (human, console, system, hub, rfa) with the reason and a suggestion rather than letting the hub refuse it at join, and validates through the same zod schema the supervisor uses, so a generated pack cannot be one the platform then rejects. A resident's tool surface is its declaration and three mechanisms enforce that (RFA-0.4 sect. 3.12): read them before widening one.
+
+Residents live in `<hub directory>/agents/<name>/` (agent.md + knowledge + state); the supervisor watches definitions and does a versioned drain on edit, so the room sees the digest rotate. Logs: `rfa logs hub|supervisor|<agent> -f`. Boot persistence: `rfa service install` (launchd or systemd units running `rfa hub run` and `rfa supervisor run`; refused while `rfa up` daemons are alive). Brain or knowledge changes must pass the parity gate: `rfa evals parity`, twice.
+
+Human principals (0.5.0): joining with a human key grants `origin: human`, required for `role: supervisor`, `room_admin` approve and quarantine release. `rfa human add|ls|rotate` manages them; the CLI acts as the first one. Verified live 2026-08-16: v0.5.0 migrated the standing room in place, pm-agent kept serving through the swap (11.6s round-trip), supervisor join + interrupt intervention delivered.
+
+Room console: `rfa console --room <alias>` opens it. Observer = read-only live view; supervisor (human key) = intervention buttons, floor control, approve/reject, inject. Includes the live agent graph (canvas: members on a circle, kind-colored message pulses, decaying communication edges, task dots pool->owner->fade, ripples for presence/floor/interventions/gone_quiet; reduced-motion aware; toggle in the header). Verified live in a real browser 2026-08-16: history replay, live long-poll stream, inject with @mention (the pm-agent answered the injected chat and correctly refused it as out-of-scope), interrupt round-trip, and the graph animating a full scripted lifecycle.
+
+- Claude Code: `rfa connect claude-code --room <alias> --skill` registers the hub with its own bearer and writes the consult-room skill into the project.
+- Ask: `rfa ask "<question>"`; `--reply` continues that room's last conversation, so a challenge lands in the same brain session.
+- Watch a room: `rfa room tail <alias> -f`, or the dashboard's Feed tab.
+- Join info: `rfa room show <alias> --json`.
+- Knowledge: `rfa knowledge status` says what each pack reads and flags a page that exists twice; a git remote is a tracked clone under the pack, never a copied export.
 
 ## Findings ledger (evidence, not vibes)
 

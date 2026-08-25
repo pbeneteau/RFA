@@ -279,6 +279,23 @@ export async function provision(ctx: CliContext, target: string, answers: InitAn
     fs.copyFileSync(packageFile("templates", "gate.json"), h.paths.gate);
     ui.done("policies/gate.json", "three default rules: alert on injection markers, refuse private keys, hold on a review marker");
   }
+  // The eval corpus a new instance starts from: the versioned judge rubric and
+  // one tenant-neutral replay case over the protocol itself, so `rfa evals run`
+  // has something true to score on day one and `--judged` has a rubric whose
+  // sha is on every judge row. NOT a baseline: a baseline is MEASURED (the
+  // gate's own rule is that one captured while the stack was unhealthy is
+  // vacuous), so the first `rfa evals run --update-baseline` writes it.
+  const seededEvals: string[] = [];
+  for (const [from, to] of [
+    [packageFile("templates", "evals", "rubric.md"), h.paths.evalRubric],
+    [packageFile("templates", "evals", "cases"), h.paths.evalCases],
+  ]) {
+    if (!fs.existsSync(from) || fs.existsSync(to)) continue;
+    fs.mkdirSync(path.dirname(to), { recursive: true });
+    fs.cpSync(from, to, { recursive: true });
+    seededEvals.push(path.relative(h.root, to));
+  }
+  if (seededEvals.length) ui.done(seededEvals.join(", "), "the judge rubric and one protocol replay case; rfa evals run scores it, --update-baseline measures the first baseline");
   if (!fs.existsSync(h.paths.gitignore) || !fs.readFileSync(h.paths.gitignore, "utf8").includes(".rfa/")) {
     const prev = fs.existsSync(h.paths.gitignore) ? fs.readFileSync(h.paths.gitignore, "utf8") : "";
     fs.writeFileSync(h.paths.gitignore, (prev && !prev.endsWith("\n") ? prev + "\n" : prev) + GITIGNORE);

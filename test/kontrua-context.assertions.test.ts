@@ -27,8 +27,8 @@ describe('kontrua context assertions', () => {
   it('Agent packs live in a hub directory (`<hub>/agents/<name>/agent.md`), never in this repository; `s', () => {
     assert.ok(existsSync('src/cli/scaffold.ts'), 'src/cli/scaffold.ts should exist');
   });
-  it('Eval cases live under `evals/cases/`.', () => {
-    assert.ok(existsSync('evals/cases'), 'evals/cases should exist');
+  it('Eval cases live under a hub directory\'s `evals/cases/`; `rfa init` seeds the first from `templates/', () => {
+    assert.ok(existsSync('templates/evals/cases'), 'templates/evals/cases should exist');
   });
   it('Spec documents live under `spec/`.', () => {
     assert.ok(existsSync('spec'), 'spec should exist');

@@ -150,7 +150,7 @@ def smoke():
         for want in ["Rooms for Agents", "This machine is ready", "better-sqlite3 opens a database", "Run a hub here", "Name this hub", "Your name", "Your first agent?", "A room for it", "Start the hub and the supervisor now?", "rfa.json", "human principal", "your hub directory is ready", "Your human key, shown once"]:
             if want not in painted:
                 failures.append(f"onboarding never painted: {want!r}")
-        for f in ["rfa.json", ".rfa/secrets.json", ".rfa/rooms.json", "agents/spec-expert/agent.md", "policies/gate.json"]:
+        for f in ["rfa.json", ".rfa/secrets.json", ".rfa/rooms.json", "agents/spec-expert/agent.md", "policies/gate.json", "evals/rubric.md", "evals/cases/protocol-ask-cycle/case.yaml"]:
             if not os.path.exists(os.path.join(o, f)):
                 failures.append(f"onboarding did not write {f}")
     finally:

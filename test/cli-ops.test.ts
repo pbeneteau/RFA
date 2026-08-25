@@ -274,6 +274,21 @@ test("packs: new binds to the first room, validate checks what the supervisor wo
   assert.deepEqual(json<{ name: string }[]>(after).map((a) => a.name).sort(), ["fees", "handmade"]);
 });
 
+test("a fresh hub directory is seeded with a scoreable eval corpus, and never with a baseline", async () => {
+  // The rubric's sha rides every judge row and the replay case scores with no
+  // hub, no model and no credential, so `rfa evals run` means something on day
+  // one. A BASELINE is deliberately not seeded: it is measured, and the gate's
+  // own rule is that one captured while the stack was unhealthy is vacuous.
+  assert.ok(fs.existsSync(path.join(dir, "evals", "rubric.md")), "the versioned judge rubric");
+  const seeded = path.join(dir, "evals", "cases", "protocol-ask-cycle", "case.yaml");
+  assert.ok(fs.existsSync(seeded), "one tenant-neutral replay case over the protocol itself");
+  assert.ok(fs.existsSync(path.join(dir, "evals", "cases", "protocol-ask-cycle", "reference.ndjson")), "with the event slice it replays");
+  assert.ok(!fs.existsSync(path.join(dir, "evals", "baseline.json")), "no baseline: rfa evals run --update-baseline measures the first one");
+  const ls = await rfa(["evals", "ls", "--json"]);
+  assert.equal(ls.code, 0, ls.stderr);
+  assert.deepEqual(json<{ cases: { id: string; kind: string }[] }>(ls).cases.map((c) => [c.id, c.kind]), [["protocol-ask-cycle", "replay"]], "and the runner discovers it without being told");
+});
+
 test("numeric flags are strict, and evals run refuses --json by name: NaN and silence never become behaviour", async () => {
   const t = await rfa(["ask", "x", "--timeout", "abc"]);
   assert.equal(t.code, 2, t.stderr);

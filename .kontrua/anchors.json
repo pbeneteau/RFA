@@ -134,10 +134,10 @@
    "proof": "path"
   },
   {
-   "prose": "Eval cases live under `evals/cases/`.",
+   "prose": "Eval cases live under a hub directory's `evals/cases/`; `rfa init` seeds the first from `templates/evals/cases/`.",
    "anchor": {
     "kind": "exists",
-    "path": "evals/cases"
+    "path": "templates/evals/cases"
    },
    "proof": "path"
   },

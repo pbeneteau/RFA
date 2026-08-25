@@ -218,7 +218,8 @@ test("evals ls ignores the scaffold's example case (a placeholder that runs fail
   const ls = await rfa(["evals", "ls", "--json"]);
   assert.equal(ls.code, 0, ls.stderr);
   const cases = json<{ cases: { id: string; kind: string; where: string }[] }>(ls).cases;
-  assert.deepEqual(cases, [], "an answerer's scaffolded case is an example the runner ignores");
+  assert.deepEqual(cases.map((c) => c.id), ["protocol-ask-cycle"], "only the case rfa init seeded from templates/evals");
+  assert.ok(!cases.some((c) => c.where.includes("agents/")), "an answerer's scaffolded case is an example the runner ignores: a placeholder that runs fails the gate by construction");
   assert.ok(fs.existsSync(path.join(h.paths.agents, "scribe", "evals", "cases", "scribe-01", "case.yaml.example")), "the template is there to edit into a real case");
   const nothing = await rfa(["evals", "promote", "product", "--conversation", "c_none", "--id", "c1"]);
   assert.equal(nothing.code, 1, "nothing linked to that conversation is an error, not an empty case");
