@@ -32,6 +32,7 @@ import { approvalWindowMs, interruptMatch, joinSidekick, refusalForOutcome, requ
 import { MemoryGate, RoomMember, ServeRefusal, type ServeContext } from "./client.js";
 import { Engine } from "./engine.js";
 import { AccountLedger, isAuthError, isRateLimitError, type Lane } from "./account.js";
+import { makeTurnLock } from "./turnlock.js";
 import { ObsStore } from "./obs.js";
 import { consolidate } from "./consolidate.js";
 import { EpisodeLog, FactStore, GatedMemory } from "./memoryfs.js";
@@ -453,10 +454,6 @@ if (Object.keys(packServers).length > 0) log(`mcp servers from the pack: ${Objec
 // ---- approval bridge (v0.4.6): interrupt_on tools pause on a human decision ----
 
 let sidekick: RoomMember | null = null;
-let currentRunId: string | null = null;
-let currentReplyBy: string | null = null;
-/** Set by the bridge when this turn's approval died on the clock (wire 12.4); cleared per turn. */
-let pendingRefusal: string | null = null;
 
 async function ensureSidekick(): Promise<RoomMember> {
   sidekick ??= await joinSidekick(HUB, member.room, joinSecret, pack.name);
@@ -530,18 +527,32 @@ function retrievalTarget(tool: string, input: unknown): string | null {
   }
 }
 
-async function brain(
-  prompt: string,
-  convoKey: string,
-  lane: Lane = "serve",
-): Promise<{
+/** The context of ONE run, passed in rather than read from module state: two turns reading shared `current*` variables is how a scheduled run's slot wait got billed to the previous serve's run id. */
+type RunContext = { runId: string; lane?: Lane; replyBy?: string | null };
+
+type BrainResult = {
   text: string;
   costUsd: number;
   numTurns: number;
   tokens: { input: number | null; output: number | null };
   /** What the model opened, in the order it opened it (rung v0.6.4, forensics only). */
   retrieved: string[];
-}> {
+  /** Set when this turn's approval died on the clock (wire 12.4): the asker is owed a `deadline_expired` refusal, never prose that reads like a human said no. */
+  refusal: string | null;
+};
+
+// One turn at a time in this process (src/turnlock.ts has the found story).
+// The account cap (spec 18.6) bounds turns across processes; this bounds the
+// ones inside it, which is what keeps `currentLease` meaning THE lease and the
+// keepalive renewing the right one. Every caller goes through here: the serve
+// loop, the task wake, and the schedule timer, which fires on its own clock
+// and used to overlap a serve turn.
+const oneTurn = makeTurnLock();
+async function brain(prompt: string, convoKey: string, run: RunContext): Promise<BrainResult> {
+  return oneTurn(() => brainTurn(prompt, convoKey, run));
+}
+
+async function brainTurn(prompt: string, convoKey: string, run: RunContext): Promise<BrainResult> {
   const budgets = pack.def.budgets ?? {};
   const today = new Date().toISOString().slice(0, 10);
   if (spend.day !== today) spend = { day: today, usd: 0 };
@@ -561,9 +572,11 @@ async function brain(
   // human-facing serve can fill the cap while background work must leave room:
   // the point is that consolidation never starves an answer someone is waiting
   // for. A denied caller retries; the serve loop and the timers already do.
-  const slot = await account.waitForSlot({ agent: pack.name, lane, runId: currentRunId }, { timeoutMs: 120_000 });
+  const slot = await account.waitForSlot({ agent: pack.name, lane: run.lane ?? "serve", runId: run.runId }, { timeoutMs: 120_000 });
   if (!slot.ok) throw new AccountStop(slot.detail ?? "no account slot", slot.retry_after_s ?? null);
   currentLease = slot.lease?.lease_id ?? null;
+  /** This turn's clock verdict (wire 12.4); local so an overlapping caller can never inherit it. */
+  let clockRefusal: string | null = null;
   const posture = agentPosture(pack.def);
   const q = query({
     prompt,
@@ -648,8 +661,8 @@ async function brain(
           toolName,
           input: input as Record<string, unknown>,
           allowedDecisions: rule.allowed_decisions,
-          runId: currentRunId ?? undefined,
-          timeoutMs: approvalWindowMs(currentReplyBy),
+          runId: run.runId,
+          timeoutMs: approvalWindowMs(run.replyBy ?? null),
         });
         log(`approval ${toolName}: ${outcome.reason}`);
         // A clock is not a decision (wire 12.4): the asker is owed a
@@ -657,7 +670,7 @@ async function brain(
         // that reads like a human said no. The turn's LAST outcome governs: a
         // human who then approves or rejects has engaged, so the answer is
         // theirs and not the clock's.
-        pendingRefusal = refusalForOutcome(outcome) === "deadline_expired" ? outcome.reason : null;
+        clockRefusal = refusalForOutcome(outcome) === "deadline_expired" ? outcome.reason : null;
         return outcome.approved
           // Edit-before-approve MERGES over the original input: the human edits
           // fields, they do not retype the whole call (found live: a title-only
@@ -742,7 +755,7 @@ async function brain(
   }
   if (!text) throw new Error("brain returned an empty result");
   spend.usd += costUsd;
-  return { text, costUsd, numTurns, tokens, retrieved: [...retrieved] };
+  return { text, costUsd, numTurns, tokens, retrieved: [...retrieved], refusal: clockRefusal };
   } finally {
     // Always: a lease held by a dead run blocks every other resident until the
     // supervisor's sweep reclaims it.
@@ -838,7 +851,7 @@ const scheduleTimer = setInterval(async () => {
     log(`schedule fired (${due.kind}): ${due.callback.slice(0, 60)}`);
     const st0 = Date.now();
     try {
-      const { text, costUsd, numTurns, tokens } = await brain(due.callback, `sched:${due.id}`, "schedule");
+      const { text, costUsd, numTurns, tokens } = await brain(due.callback, `sched:${due.id}`, { runId, lane: "schedule" });
       await engine.step(runId, "post-to-room", async () => {
         await member.send({ body: text, kind: "status" });
         return { chars: text.length };
@@ -892,12 +905,15 @@ consolidationTimer.unref?.();
 // both from a timer; a truly wedged event loop stops the timer too, so the
 // supervisor's staleness check still catches real hangs.
 const keepaliveTimer = setInterval(() => {
-  if (!serving) return;
+  // The lease check stands on its own: a scheduled run holds a lease without
+  // ever setting `serving`, and skipping it here let the sweep reclaim a slot
+  // that a long cron turn was still using.
+  if (!serving && !currentLease) return;
   // The lease TTL is shorter than a human approval wait, so renew it here for
   // the same reason the heartbeat is renewed here.
   if (currentLease) account.renew(currentLease);
   fs.writeFileSync(HEARTBEAT, String(Date.now()));
-  void member.setPresence("busy", { detail: "serving" }).catch(() => {});
+  if (serving) void member.setPresence("busy", { detail: "serving" }).catch(() => {});
 }, 30_000);
 keepaliveTimer.unref?.();
 
@@ -941,7 +957,6 @@ async function runAssignedTask(task: Record<string, unknown>, action: string): P
     input: { task: id, action, title: title.slice(0, 200) },
   });
   log(`task ${action === "verify_reject" ? "rework" : "assignment"} ${id} (run ${runId}): ${title.slice(0, 100)}`);
-  currentRunId = runId;
   serving = true;
   const t0 = Date.now();
   try {
@@ -964,7 +979,7 @@ async function runAssignedTask(task: Record<string, unknown>, action: string): P
       `. Do the work now. Your final message becomes the completion evidence a verifier reads: ` +
       `state what you did and point at something checkable.\n\n` +
       wrapTaskText({ taskId: id, author: String(task.created_by ?? "?"), text: fields });
-    const { text, costUsd, numTurns, tokens } = await brain(prompt, `task:${id}`);
+    const { text, costUsd, numTurns, tokens } = await brain(prompt, `task:${id}`, { runId });
     engine.completeRun(runId, { output: { chars: text.length }, costUsd, numTurns });
     obs.record({
       id: runId,
@@ -1015,7 +1030,6 @@ async function runAssignedTask(task: Record<string, unknown>, action: string): P
     }
   } finally {
     serving = false;
-    currentRunId = null;
   }
 }
 
@@ -1032,9 +1046,6 @@ await member.serve(
       input: { seq: ctx.envelope.seq, from: ctx.from.name, text: ctx.text.slice(0, 500) },
     });
     log(`Q from ${ctx.from.name} (seq ${ctx.envelope.seq}, run ${runId}): ${ctx.text.slice(0, 100)}`);
-    currentRunId = runId;
-    currentReplyBy = ctx.envelope.reply_by;
-    pendingRefusal = null;
     serving = true;
     const t0 = Date.now();
     try {
@@ -1044,7 +1055,7 @@ await member.serve(
       const memoryBlock = relevant.length
         ? `<consolidated-memory note="YOUR OWN earlier conclusions, not a source. NEVER cite this block and NEVER answer a factual question from it alone: every number, name, threshold or date you state must come from a knowledge file you read in THIS turn. Use this only to decide which file to open. [origin] tags the trust tier of what it was distilled from; any of it may be stale or wrong.">\n${relevant.map((f) => `- [${f.source_origin}] ${f.text}`).join("\n")}\n</consolidated-memory>\n\n`
         : "";
-      const { text, costUsd, numTurns, tokens, retrieved } = await brain(memoryBlock + ctx.wrapped, convo);
+      const { text, costUsd, numTurns, tokens, retrieved, refusal } = await brain(memoryBlock + ctx.wrapped, convo, { runId, replyBy: ctx.envelope.reply_by });
       answered++;
       episodes.recordOwn(member.room, member.memberId, member.name, text);
       engine.completeRun(runId, {
@@ -1096,7 +1107,7 @@ await member.serve(
       ];
       // The turn produced prose, but the guarded action did not happen and no
       // human said no: the asker gets the machine-readable reason (wire 12.4).
-      return pendingRefusal ? new ServeRefusal("deadline_expired", pendingRefusal, body) : body;
+      return refusal ? new ServeRefusal("deadline_expired", refusal, body) : body;
     } catch (err) {
       serving = false;
       const budgetStop = err instanceof BudgetStop ? err : null;

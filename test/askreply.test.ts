@@ -90,10 +90,14 @@ before(async () => {
 });
 
 after(async () => {
+  // Every step guarded: a failed before() leaves any of these unset, and an
+  // after() that throws ahead of stopHub leaves the hub holding the process's
+  // event loop open, so the whole suite hangs instead of failing (found
+  // 2026-08-25: a missing CLI dependency became a 2.5 hour silent npm test wedge).
   stopResponder = true;
-  await responder.catch(() => {});
-  await stopHub(hub);
-  fs.rmSync(dir, { recursive: true, force: true });
+  await responder?.catch(() => {});
+  if (hub) await stopHub(hub);
+  if (dir) fs.rmSync(dir, { recursive: true, force: true });
 });
 
 test("--reply carries the first ask's conversation to the same responder; --reply with no history is refused", async () => {
