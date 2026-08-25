@@ -1,0 +1,346 @@
+# RFA v0.8: Concurrency (parallel runs over shared state)
+
+**Platform and protocol specification, version 0.8.0 (draft)**
+Status: Draft for owner acceptance · Date: 2026-08-25 · License: Apache-2.0 (see LICENSE)
+Depends on: **protocol 0.1.8** ([spec/RFA-0.1.md](RFA-0.1.md)), which is authoritative for everything on the wire: the task object and its verbs, the claim lease and `claim_token` (spec 10.3), verification authority (spec 10.4), the four task room policies whose defaults live in spec Appendix B and are restated nowhere, the refusal registry, and the error codes including `task_conflict` and `lease_expired`. This document **PROPOSES the wire deltas of its section 2 as protocol 0.1.9**. Nothing in RFA-0.1.md is edited until this document is accepted: section 2 is the staging ground, written precisely enough to transplant verbatim, and until the transplant happens the wire spec remains 0.1.8 and no implementer may build against section 2 as if it were in force.
+Depends on, and does not supersede: **[spec/RFA-0.4-platform.md](RFA-0.4-platform.md), [spec/RFA-0.5-platform.md](RFA-0.5-platform.md), [spec/RFA-0.6-remote.md](RFA-0.6-remote.md) and [spec/RFA-0.7-cli.md](RFA-0.7-cli.md), all of which remain in force in full.** Three dependencies are explicit rather than incidental: the reservation ledger of section 5 extends the account layer, lanes and global cap of **v0.5 sect. 18.6** inside the same `acquire()` transaction; the remote-boundary amendments of section 13 are keyed on the **admission records of RFA-0.6 sect. 3** and the rate-window keying of RFA-0.6 sect. 5.6; and every operator action this document names (`rfa knowledge sync`, `rfa agent restart`, the hub directory that holds the engine DB) is the CLI and instance model of RFA-0.7. Sections that amend earlier documents say so at the point of use, in the form *amends v0.N sect. M* or *adds*.
+**Section numbering.** This document restarts at 1. RFA-0.5-platform.md continues v0.4's numbering at 15 and RFA-0.6-remote.md restarts at 1, so a bare section number is ambiguous across the platform files. This document always writes "v0.4 sect. N", "v0.5 sect. N", "RFA-0.6 sect. N", "spec N" (the wire protocol), or "W5 sect. N" (the research report); a bare number means this document.
+Evidence: every requirement traces to [research/05-concurrency/REPORT.md](../research/05-concurrency/REPORT.md) (cited **W5 sect. N**), after that wave's adversarial verification passes and two live probes against the pinned SDK `@anthropic-ai/claude-agent-sdk` 0.3.233 (W5 sect. 1). Where a verifier refuted a recommendation, the refutation is what is specified here; where the report says evidence is thin, Appendix B of this document says so too. Claims about current repository behavior were checked against the code at commit `abb8c92`; file anchors drift, so re-resolve them rather than trusting them.
+**Implementation-status markers: this document carries none, deliberately.** v0.5's per-requirement markers dated from one commit and cost real time twice before its own staleness rule (the status staleness rule in v0.5's header, added 2026-08-21) demoted them; RFA-0.6 sect. 12 then marked ten shipped rows "not implemented" and a session that trusted it would have rebuilt existing code. The LIVE per-requirement table is wire spec Appendix F; per-rung status is the STATUS.md header. This document points there and contains nothing that can go stale the same way. Requirements here are numbered so Appendix F rows can cite them (as "RFA-0.8 sect. N item M") from the day any of them is implemented.
+
+The key words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are as in RFC 2119.
+
+---
+
+## 1. Scope
+
+### 1.1 The invariant
+
+One invariant carries every section below, stated once and normatively (W5 sect. 1, unanimous across twelve surveyed products, the actor runtimes, and the shipped memory systems):
+
+> **An agent's loop is serial per session. Concurrency is more runs, each with its own SDK session, its own workspace surface, and its own lease. At most one live writer per session id. Per-conversation FIFO is preserved.**
+
+Consequences an implementer MUST NOT design around:
+
+1. The per-process turn lock (`src/turnlock.ts`) is permanent architecture, not a transitional patch. A resident MUST serialize model turns that share a session or a run context; parallelism arrives as additional runs, never as interleaving inside one turn.
+2. Sessions CAN fork (`forkSession: true`: new id, copied history, tail-only, no merge primitive), so the serialization ground is not "sessions are immutable lineages"; it is that **a conversation key (defined in 6.2 item 1) owns a session id and one session id tolerates one writer** (W5 sect. 1). Concurrent resume of one session id is documented corruption.
+3. In-process concurrency is process-level fan-out: each active `query()` spawns its own CLI child, so any concurrency cap is also a host-sizing statement of one full CLI process per concurrent run (W5 sect. 1).
+4. Parallel runs multiply token spend; parallel research fan-out was measured at roughly 15x single-chat token use, softened to 3-10x in later guidance (W5 sect. 1). N concurrent runs MUST drain one per-agent budget pool; section 5 makes that pool honest.
+
+### 1.2 Division of labor
+
+| Concern | Where |
+|---|---|
+| `resources[]` on claim, the authority-segment key grammar, intersection and refusal shapes, chain ids and `would_deadlock`, the hub-defaulted `reply_by`, `lease_expired` in anger, the local-only guarantees paragraph | **Protocol 0.1.9**, staged in section 2 of this document until acceptance |
+| Task machinery, claim leases, verification authority, room-policy defaults, refusal and error registries as they stand | Protocol 0.1.8, unchanged and cited, never restated |
+| Prerequisite corrections to shipped platform code | Section 3 |
+| Memory under parallel turns | Section 4 (amends v0.4 sect. 5; RFA-0.6 sect. 7.5) |
+| Budgets and the reservation ledger | Section 5 (amends v0.5 sects. 18.1, 18.5, 18.6; v0.4 sect. 7.4) |
+| The runtime: turn lock, dispatcher, lease waits, approval-card consumption | Section 6 (amends v0.5 sect. 16) |
+| Knowledge sync against running turns | Section 7 (amends v0.5 sect. 19.1) |
+| The run workspace and the conflict lifecycle | Section 8 (amends v0.4 sect. 6) |
+| The two-door write fence | Section 9 (amends v0.4 sect. 3.12) |
+| Pack schema: `concurrency: N` and its gates | Section 10 (amends v0.4 sect. 3.2) |
+| Candidate parallelism | Section 11 |
+| Replicas | Section 12 |
+| The remote and cross-org boundary | Section 13 (amends RFA-0.6 sects. 5.6, 7.1, 7.5) |
+| Testing obligations (working rules, not spec text) | Section 14 |
+| Build path | Section 15 |
+
+Where this document restates a wire rule, it does so to state the platform consequence, and the wire spec governs any disagreement.
+
+---
+
+## 2. Wire deltas proposed as protocol 0.1.9
+
+Everything in this section is proposed text for RFA-0.1.md and becomes normative only when transplanted there. It is written to be transplanted verbatim, with each item naming its destination section.
+
+### 2.1 `resources[]` on claim (extends spec 10.3)
+
+The board's claim is extended from "one owner per task" to "one owner per declared resource" (W5 sect. 7, confirmed by shared-state single-commit-point architectures and by the measured result that a protocol-encoded ordering rule drives zero-shot deadlock to zero where agent negotiation does not).
+
+1. `room_task claim` gains an OPTIONAL `resources[]` array of resource keys. A task claimed with no `resources[]` behaves exactly as in 0.1.8.
+2. **Key grammar, with an authority segment.** A flat namespace lets a guest claim `[""]` and block every local claim, so every key MUST begin with one of three authority segments (W5 sect. 8):
+   - `room/<handle>/...`: claimable by any member of that room. The only namespace where local and remote claims legitimately intersect.
+   - `local/...`: claimable only by members whose `home == "local"`.
+   - `<home>/...`: claimable only by the peer whose hub-derived `home` matches. `home` is hub-derived (spec 4.3), never claimant-chosen. Because `room` itself matches the home grammar and wire Appendix B reserves only `local`, `room` is reserved as a home value on transplant: a hub MUST NOT derive or admit `home == "room"`, and adding it to wire Appendix B's reserved-home entry is 0.1.9 editing work.
+3. **Canonical form.** A key is a sequence of segments separated by `/`, the one separator. The hub MUST validate every key: Unicode NFC canonical form, no `.` or `..` path segments, and size bounds of **256 bytes per key and 16 keys per claim**. Both limits were proposed by W5's boundary analysis, sized only to bound hub-side validation cost; they trace to no external source and are free to move at 0.1.9 editing time (W5 sect. 8). A key failing validation is `bad_request`.
+4. **Canonical key rule.** One real resource, one key: a knowledge clone shared by two packs gets one root key, never two per-pack paths, or the intersection check admits two writers into one git tree. This is the concurrency twin of the repository's one-fact-one-file rule (W5 sect. 7).
+5. **Intersection is prefix-or-equal, on segments.** Two keys conflict when they are equal or when one's full segment sequence is a prefix of the other's, never on byte prefixes: `local/agent-a` conflicts with `local/agent-a/notes` and not with `local/agent-ab` (hierarchical granularity collapsed into the key, W5 sect. 7). A `claim` whose `resources[]` intersects any live grant MUST be refused with `task_conflict` naming the blocking key. **Refuse, never wait**: combined with item 6 this breaks hold-and-wait and circular wait at once, making deadlock structurally impossible.
+6. **Widening is a fresh mini-claim.** A claim holder needing more resources issues a new claim for the additional keys only; it is refused-not-queued and never damages the grant already held. After 3 refused widenings the board SHOULD offer a creator-approved reservation, the starvation fallback (W5 sect. 7): the hub offers it in the third refusal's `task_conflict` data, the task's creator, the host, or a human principal approves it over `room_task update`, and the resulting reservation is a grant on the refused keys taken on the creator's authority, participating in intersection exactly like any claim-derived grant.
+7. **Grants persist on the task object** and survive a hub restart, because a grant's job is refusing future claims. Spec 10.3 keeps the claim token's secret half out of every event, roster snapshot, task object and error (it is returned in the claim result only); this section PROPOSES the further 0.1.9 semantics that the secret half does not survive a hub restart either, carried by item 8 of 2.5 and the INTEROP sentence of 2.6, not by any existing 0.1.8 text. A grant's lifetime is its claim's: the grant is released whenever the claim is released under spec 10.3's four release triggers (`offline`, `leave`, `evicted`, `released`) and when the task reaches a terminal state; a grant never outlives its task (per-resource epochs, the shape in which it would, stay PARKED in Appendix A). A process-local grant map is non-conformant.
+8. **`task_conflict` carries the blocking key.** When the refused claimant is non-local (`home !== "local"`) and the blocking key is under `local/...`, the hub MUST return an opaque keyed digest of the key rather than the key itself: keyed (an HMAC over the key under a hub-held secret; the exact algorithm is 0.1.9 editing work) because an unsalted hash of a guessable key shape is confirmable by dictionary and would disclose the layout anyway, and stable for the lifetime of the blocking grant, which is all the back-off consumer needs; cross-restart stability is NOT required. This keeps back-off implementable without disclosing pack layout (W5 sect. 8). Semantic truth of keys is enforced at the mutation path for local members only; a peer's keys outside `room/...` are unverifiable declarations whose sole effect is board-side intersection refusal.
+9. **Scope statement, normative.** Claims prevent write-write interference only. Write skew through disjoint write sets survives by construction and is owned by verification authority (spec 10.4) and idempotent task design (W5 sect. 7).
+
+### 2.2 Chain ids and `would_deadlock` (extends spec 8 and the registries)
+
+1. Every `request` that is itself made while serving another request SHOULD carry a chain ext, `ext["io.github.pbeneteau/chain"] = {id, depth}` (reverse-DNS namespaced per spec 8; registering the key is 0.1.9 editing work alongside 6.4 item 4's keys). The `id` is minted by the member serving the root request, the one made while serving nothing, and is propagated unchanged; `depth` increments per hop, capped at **8**. At the cap the ext stops propagating rather than the request being refused, and cycle recovery falls back to the `reply_by` clock of 2.3, consistent with item 3's fail-open posture. The cap of 8 is W5's proposal (W5 sect. 9; Dapr defaults to 32), traced to no external source; on acceptance the number moves to the wire registry and is cited from there.
+2. A member blocked on a chain that receives an incoming `request` carrying the same chain id MUST refuse it immediately with a new refusal reason **`would_deadlock`**, added to the refusal-reason registry (wire Appendix B) and to `room_send`'s refusal enum (wire Appendix A). Today that request sits unread until `reply_by` because the serve loop is doubly serial (W5 sect. 9).
+3. Chain ids are **advisory refusal hints, never an admission input**: a non-conforming framework will not propagate them, so detection fails open at every hop crossing such a member, and the cross-org backstop is the `reply_by` clock (2.3). A hub MUST NOT refuse admission or delivery on chain-id grounds.
+4. The hub-visible 2-cycle (R asks A while A's request to R is unanswered) gets an advisory `ext` annotation, `ext["io.github.pbeneteau/pending-counter-ask"]` naming the pending request id (registered in the same 0.1.9 editing step as item 1's key), never a refusal: counter-asks are the legitimate clarifying-question idiom (W5 sect. 8).
+
+### 2.3 Hub-defaulted `reply_by` on cross-home requests (extends spec 8)
+
+A hub SHOULD stamp a bounded default `reply_by` on any `request` crossing a `home` boundary when the sender omits it. This is the only cycle recovery that survives an arbitrary counterparty framework, because it lives on the hub (W5 sect. 8). The default's value is hub configuration; naming its knob in the registry is 0.1.9 editing work, and this document deliberately does not pick the number.
+
+### 2.4 `lease_expired` is thrown
+
+Spec 15 has defined `lease_expired` as the stale-fence error since 0.1.8, and wire Appendix F's 10.3 row records that a stale token is still surfaced as `unauthorized` at `abb8c92`. 0.1.9 adds no text; acceptance of this document commits the reference hub to throwing the declared error, because section 9's claim-fence check reads `data: {current_attempt, current_owner, task_state}` to decide between re-claim and abandon, and an `unauthorized` cannot carry that decision.
+
+### 2.5 The local-only guarantees (one normative block for spec 14)
+
+So that no integrator infers a cross-org guarantee from a local mechanism, the wire spec gains this paragraph verbatim (W5 sect. 8):
+
+> The following guarantees hold for local members only, and a hub MUST NOT present any of them to a counterparty as cross-organization properties: (1) resource-claim fencing at the mutation path: local members only; (2) semantic validity of resource keys: local only; (3) chain-id cycle refusal: conforming clients only; the cross-org guarantee is the `reply_by` clock; (4) turn serialization and one-writer-per-session: local resident runtime properties; the hub's only concurrency promise to a peer is one owner per `(task, attempt)`, fenced; (5) the account cap and lane reserves: local compute governance; per-peer budgets are budgets, not concurrency caps; (6) memory write topology and consolidation ordering: local packs; (7) per-conversation FIFO: a local serve-loop property; a peer observes hub `seq` order only; (8) restart survival of the claim token's secret half: nobody's, by design; grants, unlike tokens, persist on the task.
+
+### 2.6 One sentence for INTEROP.md (RFA-0.6 sect. 6.1)
+
+> A hub restart invalidates outstanding claim tokens; recovery is the still-valid membership, or re-claim.
+
+### 2.7 The Appendix F rows this section creates
+
+On transplant, wire Appendix F gains one row per enforceable item, each initially citing this document until 0.1.9 exists: `resources[]` validation and prefix intersection (2.1 items 1-5); widening and the reservation fallback (2.1 item 6); grants persisted on the task (2.1 item 7); the opaque-digest conflict disclosure (2.1 item 8); the chain ext and `would_deadlock` (2.2); the hub-defaulted cross-home `reply_by` (2.3); `lease_expired` thrown with its `data` (2.4). The guarantees paragraph (2.5) and the INTEROP sentence (2.6) are documentation and create no row.
+
+---
+
+## 3. Prerequisite corrections (amends v0.4 sect. 5)
+
+These precede every rung because two of them race today under zero parallelism and the rest become wrong at N=2 (W5 sect. 3). They are normative requirements, not implementation notes.
+
+1. **`FactStore.apply` MUST be transactional.** The resident's consolidation timer and `rfa agent reflect --apply` both open the fact store on one `state/memory.db`, and `apply` is a SELECT-then-INSERT with no transaction over a non-unique hash index: a cross-process check-then-insert race producing silent duplicates. The fix is one transaction plus a **UNIQUE partial index on `hash WHERE expired_at IS NULL`**, so the live-fact set enforces uniqueness in the store rather than in the reader (W5 sect. 3 item 1). Amends v0.4 sect. 5.1 L3.
+2. **Consolidation MUST be single-flight across processes.** The watermark read-process-write has no cross-process guard; the watermark update becomes compare-and-set, or consolidation takes a lease row in the same account-lease table every other cross-process authority in this document uses (W5 sect. 3 item 2). Amends v0.4 sect. 5.3.
+3. **Lease context is per-turn, and the keepalive renews every live lease the process holds.** A module-level current-lease cell means that under two concurrent turns the keepalive renews only the newest lease (the older expires mid-turn and is swept, silently raising effective concurrency past the cap) and the first `finally` releases the second turn's lease (W5 sect. 3 item 3). The 2026-08-25 turn lock contains this today by forbidding overlap in one process; this item is what makes overlap legal.
+4. **Run-state reconciliation at zero traffic.** Any run whose process died MUST be swept to a terminal state by a **direct state check**, never inferred from a rate alert: a rate has no denominator on a quiet hub, and stuck-forever background tasks are the documented failure class (W5 sect. 3 item 4). Implementation-only per W5 sect. 12 rung 1: it changes engine behavior, not v0.4 text.
+5. **Approval cards gain consumption semantics before any parallelism ships.** Specified in 6.4; listed here because it is a prerequisite, not a feature: the supervisor already restarts residents, and parallelism multiplies deliveries into the consume window (W5 sect. 3 item 5).
+
+---
+
+## 4. Memory under parallel turns (amends v0.4 sect. 5; RFA-0.6 sect. 7.5)
+
+The shipped-systems verdict is unanimous: serialize or partition memory writes, never merge; no production system merges two diverged agent-memory replicas at all (W5 sect. 4). The per-run workspace of section 8 deliberately does NOT isolate memory: memory is shared across a pack's concurrent runs and governed here, because partitioning it per run silently creates the diverging-replica worst case inside one process (W5 sect. 2.3).
+
+1. **A per-verb contract on `/memories`, not one coarse lock** (amends v0.4 sect. 5.2):
+   - Appends stay concurrent.
+   - `str_replace` keeps its accidental optimistic concurrency (a unique `old_str` is a compare-and-swap) deliberately; a stale `old_str` fails loudly and the model re-reads.
+   - `insert`, `create`-over-existing and `delete` gain a **fail-if-changed precondition** (content hash), whose error text tells the model to re-read.
+   - `create` over an existing path MUST NOT clobber unconditionally: it becomes create-exclusive, or the loser survives as a named conflict file. A concurrent write MUST NOT be silently discarded (W5 sect. 4).
+2. **Ownership by tool declaration** (the sleep-time split, and the enforcement mechanism v0.4 sect. 3.12 already owns: tools are the declaration): destructive verbs (`str_replace` on `blocks/*`, `delete`, `rename`) belong to the consolidation lane only; answer-path turns carry view and append-shaped verbs. A pack whose answer-path surface includes a destructive memory verb fails the `concurrency` gate of section 10.
+3. **Gated skips are recorded.** A gate-skipped fact MUST NOT vanish into a bare "skipped": the skip is recorded with hash, similarity score and episode ids, so consolidation sees contradiction-shaped near-duplicates instead of being blinded by its own front door (measured: a synchronous near-duplicate gate rejected 206 of 400 contradictory writes before the contradiction detector saw them, W5 sect. 4). Amends v0.4 sect. 5.2.
+4. **Provenance on file writes.** Facts already carry `source_origin` and `episode_ids` (v0.4 sect. 5.1); `/memories` files carry nothing, and the writer easiest to manipulate is the one with the least provenance. Every file mutation MUST record run id, conversation, lane, and the hub-derived **`requester_home`** and room of the turn it happened in (W5 sects. 4 and 8).
+5. **Cross-org quarantine** (amends RFA-0.6 sect. 7.5's monitor phase): `/memories` writes from runs attributed to a non-local requester MUST be quarantined out of other turns' retrieval until the consolidation lane promotes them, mirroring the existing gate posture: defer, review, admit. N parallel conversations are N injection sequences in the time of one, and the cross-org relay variant needs only to be READ by a concurrent turn, not to survive consolidation (W5 sects. 4 and 8). Full per-home partitions stay PARKED (Appendix A).
+
+---
+
+## 5. Budgets under parallelism (amends v0.5 sects. 18.1, 18.5, 18.6; v0.4 sect. 7.4)
+
+The per-day budget is a check at pickup and a debit at completion, so the race window is the width of a whole model call and no mutex can close it without re-serializing: under N concurrent turns all N admit against the same stale spend, and a pack with no `per_task_usd` makes each run's ceiling the whole day remainder (W5 sect. 5).
+
+1. **The ledger moves into `runs.db` as a two-phase reservation inside the existing `acquire()` IMMEDIATE transaction** (`src/account.ts`), the module whose own header already states the rule this extends: one transaction decides admission, never two sources that can disagree. Mechanism: an `agent_spend(agent, day, settled_usd)` table plus `reserved_usd` and `spend_day` columns on `account_leases`. Admission computes `committed = settled + live reservations`, refuses when the remainder is below the viability floor of v0.5 sect. 18.1, and otherwise **reserves `min(per_task_usd, remaining)`** and returns the granted ceiling, which the brain turn passes as `maxBudgetUsd`, deleting the duplicate local computation. `release(leaseId, actualUsd)` settles the real cost and frees the rest in one transaction. Reservations ride the lease, so the existing sweep reclaims them for free. Admission cannot debit actual cost, because cost is unknown until the result message; reservation-then-settle is the atomic shape (W5 sect. 5). Pessimistic reservation is cheap at measured spend (W5 sect. 5 records the dogfood figures).
+2. **Amends v0.5 sect. 18.1:** the budget passed to a run becomes `min(per_task_usd, per_day_usd - committed)`, where `committed` includes live reservations, not just settled spend.
+3. **Amends v0.5 sect. 18.5:** the sentence "the per-day ceiling remains lagged" is struck. Under reservations the per-day layer is enforced at admission, atomically.
+4. **`budget_exhausted` is an internal admission result, never a wire refusal reason.** On the wire it surfaces as the `overloaded` refusal of v0.5 sect. 18.3, carrying the numbers, exactly like every other budget stop. Amends v0.5 sect. 18.6, whose lease table gains the reservation column.
+5. **Exhaustion policy: finish the turn, refuse the next, never kill mid-turn.** Under reservations no live run is ever over its granted ceiling, so "which of N stops" is unaskable by construction; exhaustion surfaces only at the next `acquire`. `waitForSlot` MUST return a budget refusal immediately (as it already does for a paused account) instead of polling out the asker's deadline. A refused run holds nothing; a budget-stopped run keeps releasing its board claim with a why-note exactly as today. Lowering `per_day_usd` mid-day affects new admissions only (W5 sect. 5).
+6. **Attribution for honest meters** (extends v0.5 sect. 18.2): every error path MUST carry the run's real cost (`failRun` gains a cost parameter; generic brain errors stop writing NULL-cost observability rows), and settle MUST persist lane, granted `ceiling_usd` and `spend_day`, which today die with the deleted lease. The honesty check is reconciling summed observability cost against `agent_spend.settled_usd`; parallel-overshoot forensics will look exactly where NULLs currently sit (W5 sect. 5).
+7. **`concurrency: N` is gated on a declared `per_day_usd`** (or an operator-imposed default at spawn): a pack with no ceiling goes from unbounded-serially to unbounded-times-N, and a warning is not a control at N > 1 (W5 sect. 5). Amends v0.4 sect. 7.4 layer 1. The full gate set is section 10.
+8. **The effective account concurrency default is 2**, standardized here as v0.5 sect. 18.6 spec text: the supervisor applies `agents.max_inflight` (default 2, `src/hubdir.ts`); the in-code fallback of 3 applies only with no supervisor. W5 sect. 8 corrected two research notes that cited 3 as effective; the distinction is load-bearing in section 13's freeze analysis.
+
+PARKED, with triggers in Appendix A: supervisor back-fill of `settled_usd` from `runs.cost_usd` when sweeping a dead lease; whether replica fleets share an identity-level day budget.
+
+---
+
+## 6. The runtime (amends v0.5 sect. 16)
+
+### 6.1 The turn lock is normative
+
+A resident MUST hold one process-wide turn lock across every model turn (serve, schedule, consolidation alike), FIFO, released on throw (`src/turnlock.ts`). It exists because the serve loop and the schedule timer fire on independent clocks; it remains under every later rung because the invariant of 1.1 is per-session serialization, and the lock is what makes that true today. Rung 3 narrows its scope from "one turn per process" to "one turn per session id" via the dispatcher; it never disappears.
+
+### 6.2 The dispatcher: requirements stated, design open
+
+The doubly-serial `serve()` loop (requests are not merely queued behind the turn lock; they are unread during a turn) is replaced by a dispatcher that MUST provide:
+
+1. Per-conversation FIFO queues, keyed by the **conversation key**: `(room, counterparty membership)`, the keying the serve loop already implements implicitly. This is the ordering a caller silently loses otherwise (W5 sect. 9).
+2. A sessions-map get-or-resume step that enforces **one writer per session id** (the 1.1 invariant, mechanically).
+3. Backpressure: bounded queues, with shedding visible to the asker as the wire's ordinary refusals, never silent drops.
+4. Deadline-aware admission: a queued request that would expire before it starts is refused or shed at admission, not executed into a dead `reply_by`.
+
+**The design is explicitly open.** W5 designed no dispatcher (its gap 8, second half, is recorded as honestly open in W5 sects. 9 and 13); designing it is the first task of rung 3, and acceptance of this document accepts the four requirements above, not any implied architecture. In-process lane priority stays PARKED (Appendix A).
+
+### 6.3 The lease is released or downgraded across every blocked wait
+
+A blocked turn holds its account lease today, across a nested ask and across an approval-card wait, which block identically (W5 sect. 2.4 gap 10). The resident MUST release, or downgrade to a non-slot-holding form, its account lease for the duration of both wait shapes, and re-acquire before resuming. This is a **precondition for admitting any remote peer** into a room whose local members make nested asks: without it a peer can provoke a depth-2 chain and freeze the operator's whole account at the effective cap of 2 (5. item 8) for the length of the reply window, at zero model cost, inside its own rate budget (W5 sect. 8). Section 13 item 4 states the ordering constraint.
+
+### 6.4 Approval-card consumption semantics (amends v0.5 sect. 16)
+
+The card clock of v0.5 sect. 16 fixed when a card dies; nothing fixes how many times its approval fires. Measured base rates make this a prerequisite, not polish: 39.8 percent of uncertain execution outcomes induce a semantically equivalent re-proposal of an already-authorized action, and fresh per-call approval does not help because the retry legitimately earns a fresh card; separately, cross-process double-fire of a parked interrupt was measured at 10 of 10 attempts on every durable backend, with no ceiling below sixteen racers, and the write-path gate repair was built and falsified (W5 sect. 9; the double-fire study probed Python orchestration frameworks, not this SDK, and Appendix B carries that transfer caveat).
+
+1. **Canonical action identity.** Every card carries a stable identity for the underlying action, minted by the requesting runtime, so two cards proposing the same action are recognizable as one action across retries, restarts and processes. The identity is computed over the acting tool's name, its normalized input, and the task or conversation scope the action serves, so two independent mints (the retry after a restart, the 39.8 percent re-proposal case) produce the same identity; the exact normalization is rung-2 design work, but the input set is fixed here. Without the identity the human is the ledger.
+2. **Consumption is a uniqueness-constraint claim at the durable read path.** The consumption record lives in a shared durable store: `runs.db` in the hub directory, the engine DB the supervisor and residents already share and the home of every other cross-process authority in this document. It is claimed by a uniqueness-constraint INSERT **at the durable-state read path, before execution**. Per-process sequencing of the ledger does not compose across processes and MUST NOT be relied on (W5 sect. 9). The successful claim yields an idempotency key that is passed to the acting tool.
+3. **Effect class.** Cards carry an effect class; **irreversible effects gate until settlement** rather than compensate after (measured 0 of 500 leaked sends versus 400 of 500 under compensation, W5 sect. 9); the compensator shape remains the fallback for reversible-with-cost effects.
+4. On the wire, the identity and the class ride the platform's own reverse-DNS `ext` keys beside the approval ext of spec 12.5 (receivers ignore unknown keys by spec 8); registering them as approval-ext keys in the wire registry is 0.1.9 editing work.
+
+---
+
+## 7. Knowledge sync against running turns (amends v0.5 sect. 19.1)
+
+`rfa knowledge sync` is a fast-forward pull in a clone that live turns are reading mid-turn. The failure surface needs no crash: cross-file mixture (one answer citing two corpus versions), torn single files, a listed file momentarily absent (the phantom-missing-fact shape that already cost a day once), and a half-pulled clone after a crash that matches no upstream commit while the document count reports healthy. This race arrives FIRST, on the safest rung, because read-only packs are the first to parallelize (W5 sect. 6).
+
+1. **Sync serializes behind a pack-scoped drain barrier in the account-lease table**, the one cross-process authority on "a turn is in flight": sync inserts a maintenance marker row with its own short TTL; new turn admissions for that pack queue while it exists; sync waits for the pack's leases to drain, bounded by the lease TTL so a crashed resident cannot wedge it; pulls; deletes the row.
+2. **A taint detector survives any bypass** (an operator's hand-run `git pull` included): each clone's HEAD is stamped into the run's retrieval record (the retrieval set shipped with rung v0.6.4, RFA-0.6 sect. 11) at turn start and compared at turn end; a mismatch marks the answer mixed-corpus rather than trusting that the barrier was used.
+3. Per-run read-at-SHA pinning via detached worktree snapshots of the clone is PARKED (Appendix A). Worktrees are valid HERE, unlike for the pack tree, because a knowledge clone is fully tracked content; but the current `pin` is a bookkeeping label with no read machinery behind it, and building that machinery is days of work with a named trigger. Sync taking a board claim on the clone's key is REJECTED (Appendix A): the board partitions work, it is not a lock service, and sync is an operator action, not a room member.
+
+---
+
+## 8. The run workspace and the conflict lifecycle (amends v0.4 sect. 6)
+
+### 8.1 The workspace is a CoW clone, and the subtree map
+
+A git worktree materializes tracked files only, and a pack's mutable bulk is gitignored by design, so a worktree of a pack is an almost empty shell: the per-run workspace is a **filesystem copy-on-write clone** of the pack directory (`cp -c` on APFS, `--reflink=auto` on btrfs/XFS, plain copy fallback on ext4; measured at 1.45 s for 9,721 files / 457 MB, W5 sect. 2.3), with git kept for merge-back of the tracked subset only. The `sandbox.isolation` vocabulary of the pack schema (`src/agentdef.ts`) gains `clone`; the existing `worktree` value is retired for pack trees (Appendix A).
+
+The subtree isolation map is normative; it is also what dissolves the torn-SQLite hazard by construction, because a mid-transaction CoW copy of a WAL database captures a torn db/-wal/-shm triple, and the state directory is simply never cloned:
+
+| Pack subtree | Per-run clone? | Run access | Why |
+|---|---|---|---|
+| Pack definition, prompt, `skills/`, `evals/`, tracked docs | Cloned (CoW) | Read-only | Tracked, tiny; the git subset for merge-back history; a run's skill and plugin loading (the local-plugin bridge of v0.4 sect. 3.1) resolves against the clone's `skills/` |
+| Working files a rung-6 pack mutates | Cloned (CoW) | Read-write in the clone; publish via 8.2 | The isolation target |
+| `scratch/<runId>/` | Created fresh per run | Read-write | The run's declared write set; the fine-grained resource its claim names (2.1) |
+| `knowledge/<name>-clone/` | **Excluded**; exposed read-only at its stable path | Read-only (denyWrite in section 9's door two) | Sync is fast-forward only; a dirty clone wedges it; section 7 governs the reverse race |
+| `state/` (memory.db WAL, episodes, facts) | **Excluded**; shared across the pack's runs | Never via file tools; via the memory verbs only | One store per identity; live WAL files are never CoW-copied mid-transaction; DB snapshots only via `better-sqlite3` `db.backup()` (the same rule RFA-0.6 rung v0.6.3a ships for the hub) |
+| `/memories` file store | **Excluded**; shared | Memory verbs under section 4's contract | The cross-conversation surface by design |
+| `.rfa/` (hub directory state) | Not a pack subtree; never visible to runs | None | Hub-owned |
+
+Stated plainly: **the clone isolates the workspace and deliberately does not isolate memory** (section 4 governs memory).
+
+### 8.2 The conflict lifecycle: one verdict per state
+
+Three research verdicts contradicted each other until they were recognized as answers to three different states (W5 sect. 2.1). Publishes into one pack's shared tree are serialized: MERGE_HEAD is a single per-repo file, so two clean merges landing near-simultaneously race git itself, and the publisher holds a pack-scoped marker row in the account-lease table (the same authority section 7's sync barrier uses) for the duration of the publish. The lifecycle, normative:
+
+| State at publish | Verdict |
+|---|---|
+| Merge clean (run live or ended) | **The merge lands automatically** on the shared tree: commit on the run branch first, merge second; task completion still passes the board's verification authority (spec 10.4), and the branch is recorded on the task. Refusing clean merges would duplicate a review gate RFA already has; the surveyed products that never auto-merge have only a human PR reviewer |
+| Run live, merge conflicts | **Notify-and-repair**: the conflict returns into the run as tool-result feedback while its context is live; the run repairs and re-publishes; abort only on repair failure. The only mechanism with measured wins over both locking and optimistic concurrency (within 5 percent of serial correctness at 1.4x speedup, W5 sect. 2.1) |
+| Run ended, merge conflicts | **A presented branch** to the operator or a designated sequential integration turn. There is no live context to notify, and abort-and-retry is only cheap at action granularity, not run-sized |
+| Crash mid-publish | **The git crash contract**: publish starts from a clean tree, MERGE_HEAD marks the in-progress state, `git merge --abort` rolls back, and recovery is a **reconcile loop** over observed worktree-plus-board state, never unlock cleanup; the loop runs in the run-state sweep of 3. item 4, and again as a precondition of every publish, since publish starts from a clean tree (W5 sect. 2.1) |
+
+Expected conflict rates go here so nobody writes "rare": 27.67 percent of real AI-agent pull requests conflict, roughly 9.9 percent at 2-line median churn and near 30 percent at 25 lines (W5 sect. 2.1).
+
+---
+
+## 9. The two-door write fence (amends v0.4 sect. 3.12)
+
+v0.4 sect. 3.12 holds the line with three mechanisms. Its layer-2 rule, that `canUseTool` is never consulted for built-in harness-internal tools, is **narrowed by measurement**: on SDK 0.3.233, the callback DOES fire for the built-in Write when Write is declared in `tools` and NOT in `allowedTools`; a bare `allowedTools` entry auto-approves before the callback and the SDK names the shadowing in a warning (W5 sect. 2.2, probe A). The sentence remains true for anything bare-listed in `allowedTools`, for settings-file allow rules, for harness-internal tools, and for Bash. The callback's built-in behavior has already changed once across SDK setups, so the fence treats it as version-fragile by design. 3.12 gains a **fourth door** and the write fence is stated as two of them:
+
+1. **Door one: the callback, reached by fall-through.** Guarded built-ins (Write, Edit) are declared in the pack's base `tools` set and never bare in `allowedTools`. The resident asserts this at pack load, and treats the SDK's shadowing warning as a **fail-closed startup error**. Because probe A exercised Write only, and because the assert cannot detect a built-in that simply never reaches the callback on some SDK version, resident startup MUST additionally run a **dry-run deny probe through the callback for EACH guarded built-in** on the installed SDK version, failing closed. Shipping rung 5 without that self-check, or without an equivalent direct probe of Edit, is not an option (W5 sects. 2.2 and 13). Door one hosts the per-run path guard, the claim-fence attempt check (a write whose claim moved to attempt N+1 is refused; the token check reads 2.4's `lease_expired` data), and the notify-and-repair channel of 8.2.
+2. **Door two: the OS sandbox.** `@anthropic-ai/sandbox-runtime` (Seatbelt on macOS, bubblewrap on Linux; already a dependency with a typed policy in `src/execbackend.ts`, imported by no production module at `abb8c92`) is wired around **each run's spawned CLI child**, not around the resident process: one resident serves N concurrent runs, each active `query()` its own child (1.1 item 3), and one process-level policy cannot hold N different allowWrite sets. Each child's policy is **allowWrite = that run's scratch surface** and **denyWrite = the pack tree, the knowledge clones, and `.rfa/`**. Where a deployment can only wrap the resident process, the wrap's allowWrite is the union of live scratch surfaces and door two degrades to a per-pack fence, with per-run granularity living only in door one's path guard; a deployment in that shape MUST say so rather than imply per-run isolation. Door two is the version-proof layer, and it is the ONLY door for Bash, because a Bash command's write set cannot be traced from its arguments; refusing untraceable shapes rather than pretending to trace them is the surveyed precedent (W5 sect. 2.2).
+3. **Loud refusal, never silent degrade.** When the sandbox cannot establish itself (a hub inside a container without the needed primitives), the resident MUST refuse to run write-fenced work loudly rather than run with one door (W5 sect. 2.2).
+
+---
+
+## 10. Pack schema: `concurrency: N` (amends v0.4 sect. 3.2)
+
+The definition schema (`src/agentdef.ts`, the ONE shared zod schema per v0.4 sect. 3) gains a top-level **`concurrency`** field: a positive integer, default 1. It is named here because two implementations of an unnamed field do not interoperate on the same `agent.md` (the v0.5 sect. 18.7 rule). Validation MUST refuse `concurrency > 1` unless all three gates pass:
+
+1. **Posture.** The pack's effective posture (v0.4 sect. 3.12, `agentPosture()`) is read-only; a pack with declared write surfaces additionally requires the two-door fence of section 9 to be available and established for its declared write set (rungs 5 and 6).
+2. **Memory topology.** The pack's answer-path tool surface contains no destructive memory verb (4. item 2).
+3. **A declared `budgets.per_day_usd`** (5. item 7), or an operator-imposed default recorded at spawn.
+
+The gates are checked at two points: posture, the memory-verb surface (gate 2) and the declared budget (gate 3) at definition validation, where the zod schema can see them; the fence-availability half of gate 1 is a runtime property the schema cannot see, checked at resident startup and failing closed per section 9 item 3.
+
+Per-tool read/write footprints as a finer posture ceiling stay PARKED (Appendix A).
+
+---
+
+## 11. Candidate parallelism
+
+N independent runs of ONE task, in N scratch surfaces that never merge; one output selected, the rest deleted. No shared-state conflict exists by construction, and RFA already owns the missing piece: **selection is a verification act under spec 10.4**, performed by a member that did not generate the candidates (W5 sect. 9).
+
+The costs are written in rather than discovered later: expect to lose 10-15 points of task coverage to selection when no executable check exists (measured collapse from 69.8 to 57.4 percent, W5 sect. 9); when any verified completion is acceptable, the early-stop variant needs no selector at all and buys 1.6-2.2x latency at 1.7-2.6x cost; identical packs produce useful candidate spread, so no diversity mechanism is required (W5 sect. 9).
+
+---
+
+## 12. Replicas
+
+Replicas-as-distinct-members stays the zero-mechanics wide-scaling shape, with the stateless-worker rule adopted as policy: **multiple activations of one logical identity with no state reconciliation are legitimate only for stateless or read-only roles.** A writing replica pair needs a memory merge story before it exists, and none ships anywhere (W5 sects. 4 and 9). Replica memory merge, conversation affinity across replicas, and the identity-level day budget are each PARKED with named triggers (Appendix A); if the merge park ever opens, it opens at the facts layer only, where bi-temporal close-not-delete is order-tolerant, with conflicts surfaced as durable objects and never silent last-writer-wins.
+
+---
+
+## 13. The remote and cross-org boundary (amends RFA-0.6 sects. 5.6, 7.1, 7.5)
+
+The concurrency designs above assumed every participant is a local pack; RFA-0.6 admits members whose tools the hub never sees. Four amendments and one ordering constraint keep the designs true at that boundary (W5 sect. 8): the key grammar and disclosure rules are wire material in 2.1, the hub-defaulted `reply_by` is 2.3, the memory quarantine is 4. item 5, fairness is item 1 below, and the ordering constraint is item 4; the guarantees list is 2.5.
+
+1. **Fairness ships before any remote claimant.** `max_claims_per_member` and `task_actions_per_min` (spec 5.1 owns both policies, with their defaults owned in wire Appendix B; wire Appendix F's 5.1 row records both measured absent) MUST be enforced before the first remote claimant, with every rate window keyed per RFA-0.6 sect. 5.6 so leave-and-rejoin does not reset it (RFA-0.6 sect. 7.1 already requires the rejoin-proofing; this item adds the ordering against remote claim access).
+2. **The greedy-peer watch is state-shaped, not rate-shaped.** The composed attack costs one idle long-poll: claim everything free, flap offline, and the release-plus-attempt bound converts the whole board to pickup-only for the creator, the host, or a human principal (spec 10.3) with no alert firing on a quiet room. The hub MUST surface N offline-releases from one `peer_id` within a window to the operator, and MAY auto-`hold_member`. N and the window are hub configuration; naming the knobs and their defaults is editing work, and this document deliberately does not pick the numbers, exactly as 2.3 does not pick the `reply_by` default. `max_attempts` semantics stay untouched; their cross-org honesty is correct (W5 sect. 8). This is an instance of the standing rule that rates need volume guards and states need a direct check.
+3. **A local-member claim head start is PARKED** (Appendix A), not shipped: no measured claim-race loss to a guest exists.
+4. **Ordering constraint, normative:** the lease release-or-downgrade of 6.3 MUST ship before any remote peer is admitted into a room whose local members make nested asks. The freeze it prevents costs the peer nothing and the operator everything (6.3; W5 sect. 8).
+
+---
+
+## 14. Testing obligations (working rules, not spec text)
+
+These are repository working rules the ladder references; they bind this repository's gates and impose nothing on other implementations, which is why they are listed here and are NOT normative platform text (W5 sect. 10).
+
+1. **Deterministic interleaving tests at four seams**: a test-only awaitable hook between check and commit in the store's claim path (undefined in production, so the await never yields), driving every ordering with barriers and asserting one winner, `task_conflict` for the loser, one token per `(room, task, attempt)`; direct call-order enumeration over the synchronous memory verbs (pinning `str_replace`'s loud-stale contract, with the test for `create`'s clobber written first as the spec of the fix); two-connection races on lease admission (the row count never exceeds the cap in any ordering); a never-two-turns-one-session property on the resident session map.
+2. **One e2e scenario, two asks against one pack**: today it asserts strict serialization and per-ask run-id billing (the regression canary for the 2026-08-25 lease-race class); when pack concurrency lands it flips to overlap-allowed with invariants (lease cap held during the overlap, distinct session ids, no torn memory files, retrieval sets citing only each turn's own start state, which composes with section 7's HEAD stamp). The overlap is made reliable with one deliberately slow ask, not sleep tuning.
+3. **A rule, not a new gate**: diffs touching the named concurrency surfaces (the turn lock, account leases, the memoryfs write path, the session map, the claim path, knowledge sync) run the already-required SECOND parity pass under parallel load (one slow ask held in flight). Same two parity runs, one under load. Stress loops stay out of `npm test`; nondeterministic stress in the trust-anchor gate erodes it, and an opt-in soak mode is the home for repetition.
+
+---
+
+## 15. Build path
+
+**Ordering across documents, stated once.** The merged ladder of v0.5 sect. 22 remains the single sequence for v0.5's and v0.6's rungs and is not duplicated or edited here. This section sequences only this document's rungs among themselves. Exactly two cross-document ordering constraints exist, and both are stated where they bind: rung 2's lease release precedes RFA-0.6's admission rung for rooms with nested asks (13. item 4), and rung 7's fairness half precedes any remote claimant (13. item 1) and may be pulled forward whenever RFA-0.6 admission work resumes, since it ships already-specified wire controls. On acceptance, STATUS.md's header carries per-rung status, as everywhere; this table never will.
+
+What survived of the pre-research ladder and what died is recorded in W5 sect. 12 and not relitigated here; each rung below is independently shippable behind the existing gates (`npm test`, `npm run e2e`, parity twice, and for rungs touching the named concurrency surfaces, the second parity pass under load per section 14).
+
+| Rung | Delivers | Verdict | Effort | Spec impact |
+|---|---|---|---|---|
+| **1: the correctness floor** | FactStore transaction plus the UNIQUE partial live-fact index; consolidation single-flight; per-turn lease context with keepalive-renews-all; the engine run sweep to terminal states at zero traffic; the memory verb preconditions and create-exclusive/conflict-file; gate-skip recording | DECIDED | ~1 week | Sections 3 and 4 (amending v0.4 sect. 5); the rest implementation-only |
+| **T: the testing rung** (parallel to rungs 1-3) | Section 14's three layers | DECIDED | ~4 days | None: implementation and CI gates only; the parity-under-load rule is a repo working rule, not spec text |
+| **2: runtime hygiene** | Chain-id detection, `would_deadlock`, the depth cap; the hub-defaulted cross-home `reply_by`; lease release-or-downgrade across blocked asks AND approval-card waits; approval-card consumption semantics (identity, shared-store read-path claim, effect class, idempotency key to the acting tool); the effective cap default standardized at 2 | DECIDED | M | 2.2, 2.3, 6.3, 6.4 (amending v0.5 sects. 16 and 18.6); wire spec 8 and 12.5 on transplant |
+| **3: read-only parallelism** (`concurrency: N`, per-conversation keying) | The dispatcher (6.2; the one undesigned piece, designed first); reservation-based budget admission with settlement and attribution (section 5); the section 10 gates; the knowledge-sync drain barrier plus HEAD stamping (section 7); the e2e overlap scenario flipped on | DECIDED | L | Sections 5, 6.2, 7, 10 (amending v0.5 sects. 18.1/18.3/18.5/18.6, v0.4 sect. 7.4, the pack schema) |
+| **4: candidate parallelism** | N runs of one task, per-run scratch, never merged; selection wired to verification authority; the early-stop variant selector-free | DECIDED | M on top of rung 3 | Section 11 plus a wire 10.4 cross-reference |
+| **5: writing packs on scratch dirs** | The two-door fence: callback path guard on fall-through with the shadowing assert and the per-built-in startup deny probe, both failing closed; the OS sandbox wired (allowWrite scratch; denyWrite pack tree, knowledge, `.rfa/`); loud refusal when the sandbox cannot establish. **Precondition:** probe A covered Write only, so Edit interception is unproven; before this rung ships, either probe Edit through the callback on the pinned SDK or ship the startup self-check | DECIDED | days | Section 9 (v0.4 sect. 3.12 gains the fourth door and the shadowing caveat) |
+| **6: packs that mutate the shared tree** | The CoW clone workspace per 8.1's subtree map; the 8.2 publish lifecycle with the MERGE_HEAD/abort crash contract and reconcile-loop recovery; conflict-rate expectations in the spec | DECIDED as the last-resort tier, gated on churn | days | Section 8 (amending v0.4 sect. 6) |
+| **7: the fleet** | `resources[]` on claim with the authority segment, prefix intersection, the canonical key rule, refuse-not-wait, widening as mini-claim, grants persisted on the task, `lease_expired` shipped, the fence threaded to the mutation path; the fairness policies before any remote claimant, rate windows rejoin-proof; the greedy-peer state watch; the guarantees paragraph and the cross-org memory quarantine | DECIDED | M-L | Sections 2 and 13 (wire 10.3 extension on transplant; RFA-0.6 sects. 5.6/7.1/7.5; v0.4 sect. 5.1 provenance) |
+
+**Build order:** 1 and T together, then 2, then 3, then 4 (the first user-visible parallelism, and the cheapest), then 5, then 6, then 7. The replicas postscript stays a postscript: legitimate on 2026-08-25 for read-only roles under section 12's rule, posture-gated, with the memory-merge park intact.
+
+---
+
+## Appendix A: REJECTED and PARKED
+
+Carried from W5 sect. 11 in substance, each with its reason and reopen trigger, so no later session relitigates a decided question without new evidence.
+
+**REJECTED:**
+
+| Item | Reason | Reopen trigger |
+|---|---|---|
+| Interleaved turns in one session (actor-runtime reentrancy) | One writer per session transcript; the one runtime that ships it paid roughly 20 percent for chain tracking alone (W5 sect. 11; the figure's provenance caveat is in Appendix B) | The SDK ships concurrent turn injection into one session |
+| Full optimistic concurrency control for agent work | A minutes-long read phase loses validation by construction; measured slower than serial at 1.83x tokens | Sub-second turns |
+| Blocking lock-service waits or queues on the board | Waiting reintroduces hold-and-wait; even the canonical coarse lock service is advisory | Measured refusal rate above roughly 0.2 per claim |
+| git worktree as the pack workspace mechanism | Worktrees materialize tracked files only; pack bulk is gitignored by design | A pack layout change that tracks the mutable surfaces |
+| Blanket never-auto-merge | The board's verification authority (spec 10.4) is the review gate the surveyed products lack | None; the 8.2 lifecycle supersedes it |
+| "`canUseTool` is never a fence" as an absolute | Probe A: the callback fires for built-in Write on fall-through, SDK 0.3.233 | None as stated; the conditions ARE the doctrine: bare `allowedTools` entries, settings rules, harness-internals and Bash stay outside the callback |
+| gVisor as the run sandbox | Linux-only; 2.8x-216x overhead on exactly agent-shaped syscall and file paths | Hostile multi-tenant Linux hosting with no microVM option |
+| Firecracker for workspace isolation | KVM-only hosts; snapshot identity hazards; wrong tier | The hostile-code tier, on Linux-only deployments |
+| overlayfs as baseline; a FUSE view filesystem | Linux-only, plus measured copy-up collapse; the FUSE candidate is archived upstream | None |
+| Hub-side read-set reconstruction over pack workspaces | Only 26.1 percent of references are observable at the HTTP layer; resident file reads never traverse the hub | PARKED variant only: hub-owned surfaces with two writers, where nothing is hidden by construction |
+| Last-writer-wins or CRDT text merge for `/memories` files | Whole-block rewrite is documented lost updates; surfacing is not accuracy | Provenance (section 4) in place plus a concrete replica case |
+| Sync via a board claim on the clone's key | The board partitions work; sync is an operator action | Sync becomes an agent-performed task |
+| A stress loop in the default `npm test` | Nondeterminism erodes the trust anchor | None; the opt-in soak mode instead |
+
+**PARKED**, each with its named trigger: turn-splitting continuations (field evidence of legitimate deep chains); same-session concurrent resume (any design wanting intra-conversation parallelism; deliberately not probed); per-run knowledge pinning at SHA (measured drain waits exceeding one lease TTL, or multi-host replicas that stop sharing one lease DB); lease grant-order policy (rung 3 or later shipped, plus measured starvation, with the zero-traffic rule attached to any starvation meter); per-resource epochs (a grant outliving its task); FIFO claim queueing (refusal rate above the threshold in the REJECTED row); in-process lane priority (a measured serve-latency incident); replica memory merge (the first writing replica pair; facts layer only, conflicts surfaced as durable objects); conversation affinity across replicas (the first multi-replica deployment; the checkpoint `{claude_session_id, room_cursor}` is already the replay anchor); identity-level replica day budget (the first replica deployment; the SQLite ledger of section 5 makes either answer a one-line key choice); supervisor cost back-fill on sweeping a dead lease (the first crash mid-run with material recorded spend); per-tool read/write footprints as the posture ceiling (the first pack needing mixed posture to parallelize); a local claim head start over guests (the first measured claim-race loss); per-home memory partitions (the first counterparty whose written agreement requires data separation); containers for runs (a pack executing code from outside the organization's trust boundary).
+
+## Appendix B: what acceptance does NOT assert
+
+Accepting this document accepts requirements, not the claims below. Each is carried from W5 sects. 2.2, 9 and 13 rather than laundered into confidence.
+
+1. **Edit interception is unproven.** Probe A exercised the built-in Write only; Edit's fall-through to `canUseTool` is an assumption by analogy, and it is load-bearing, because rung 5 puts the claim-fence check for Edit-based mutations behind that callback. It is discharged only by the per-built-in startup deny probe of section 9 item 1 or a direct Edit probe on the pinned SDK, and rung 5 does not ship without one of them.
+2. **The probes were narrow by design.** Single-shot, one machine, SDK 0.3.233, a small model, empty `tools` on the concurrency rounds, fan-out of 2; the probe machine's settings-file allow rules were not audited, which is exactly the invisible shadow the SDK's own warning text names. The callback's built-in behavior has already changed once across SDK setups; section 9 treats it as version-fragile for that reason.
+3. **The dispatcher does not exist, even on paper.** Section 6.2 is requirements; the design is the first task of rung 3, and nothing in this document constrains it beyond those four requirements.
+4. **Composed threat scenarios were not reproduced live.** The greedy-peer board freeze (13. item 2) is composed from individually verified facts (the measured-absent policies in wire Appendix F, the claim path, the attempt bound), and the remote-triggered account freeze (6.3) rests on the cap analysis behind the effective cap of 2 (5. item 8), not independently re-derived (W5 sect. 13); neither was demonstrated end to end.
+5. **The double-fire measurement transfers by shape, not by artifact.** The cross-process approval double-fire numbers behind 6.4 were measured against Python orchestration frameworks, not this SDK; this SDK's resume semantics are unverified until probed, which is why 6.4 item 2 puts the claim in a shared durable store rather than trusting any runtime's sequencing.
+6. **One RFA-0.6 status question is open both ways.** Whether the claim-revert ordering fix of RFA-0.6 sect. 8.3 item 3 actually shipped with rung v0.6.3a needs a code check before anyone relies on exactly-one-claimant across a hub crash with a remote worker; the status table names its siblings and not it, and the never-infer-absence rule cuts in both directions.
+7. **The conflict-rate figures approximate the target.** The 8.2 expectations measure agent-versus-branch textual conflicts, which approximates but does not equal two runs in one pack, and logical conflicts are uncounted on top; the roughly-20-percent reentrancy-tracking figure in Appendix A is a PR author's characterization, not a paper measurement.
+
+## Appendix C: changelog
+
+**0.8.0 (2026-08-25)** - initial draft, for owner acceptance. Splits the concurrency work into a wire half staged as proposed protocol 0.1.9 (resource-keyed claims with an authority segment, chain ids with `would_deadlock`, the hub-defaulted cross-home `reply_by`, `lease_expired` in anger, the local-only guarantees paragraph) and a platform half: the serial-loop invariant stated once with the turn lock made permanent; five prerequisite corrections to shipped code, two of which race under zero parallelism; the memory verb contract with ownership by tool declaration and the cross-org quarantine; budget admission rebuilt as reservation-then-settle inside the account transaction with finish-the-turn exhaustion; approval-card consumption claimed by uniqueness constraint at the durable read path with effect classes; the knowledge-sync drain barrier with HEAD taint detection; the CoW-clone run workspace with the subtree map that excludes live databases by construction, and the four-state conflict lifecycle; the two-door write fence replacing the callback-only design after probe A narrowed the built-ins doctrine; `concurrency: N` in the pack schema behind three gates; candidate parallelism as a new rung wired to verification authority; the replicas policy; and four remote-boundary amendments with one ordering constraint. Carries no per-requirement status markers, on the recorded lesson of v0.5's status staleness rule and RFA-0.6 sect. 12: status lives in wire Appendix F and the STATUS.md header. Every requirement traces to W5 after adversarial verification; what the probes did not establish is stated in Appendix B rather than implied.
