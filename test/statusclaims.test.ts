@@ -5,8 +5,10 @@
  * the same disease had regrown in RFA-0.5's headers and ladder, four Appendix F
  * rows, and README's deviations note. The process fix is single-writer status
  * (wire requirements live in RFA-0.1 Appendix F, rung status in STATUS.md's
- * header, and nothing else states implementation status as fact); this test is
- * the mechanical half: it pins the load-bearing Appendix F rows to greppable
+ * rung lists, findings in docs/LEDGER.md, completed-work narrative in
+ * docs/HISTORY.md, and nothing else states implementation status as fact);
+ * this test is the mechanical half: it pins the load-bearing Appendix F rows
+ * to greppable
  * code anchors, so flipping the code without updating the row (or the reverse)
  * fails the suite instead of waiting for the next reviewer.
  *
@@ -107,6 +109,21 @@ test("the LLM-facing surfaces advertise no credential path that does not exist",
     const strings = [...slice.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]).join(" ");
     assert.ok(!strings.includes("invite_token"), "hub instructions advertise invite_token but no tool accepts one");
   }
+});
+
+test("STATUS.md stays a working document, not an archive (restructured 2026-08-25)", () => {
+  // STATUS.md accreted to 62k tokens of finished stories before the 2026-08-25
+  // restructure, and a resuming session had to read all of it to find the six
+  // lines it could act on. The convention is one-way: a rung that flips to
+  // DONE moves its story to docs/HISTORY.md in the same commit, and findings
+  // are appended to docs/LEDGER.md with at most a one-line pointer. This cap
+  // is the mechanical half of that convention.
+  const lineCount = read("STATUS.md").split("\n").length;
+  assert.ok(
+    lineCount <= 250,
+    `STATUS.md is ${lineCount} lines (cap 250): move completed-work narrative to docs/HISTORY.md ` +
+      `and findings evidence to docs/LEDGER.md; STATUS.md keeps only what a resuming session acts on`,
+  );
 });
 
 test("README and CLAUDE.md carry no hardcoded test or scenario counts (numbers there rot)", () => {

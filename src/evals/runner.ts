@@ -417,7 +417,7 @@ async function main(): Promise<void> {
     // Anti-ossification (spec 20.4): a clean sweep is only meaningful if someone
     // writes down that it was reviewed. The instrument cannot tell whether it
     // has finished or gone blind; only the ledger entry can.
-    console.log(`  100% clean: log "reviewed ${results.length} cases, no new failure modes" in STATUS.md, or this run is an unaudited instrument`);
+    console.log(`  100% clean: log "reviewed ${results.length} cases, no new failure modes" in docs/LEDGER.md, or this run is an unaudited instrument`);
   }
 }
 
