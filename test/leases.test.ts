@@ -194,7 +194,19 @@ test("a reconnected worker finishes its own task through the claim_token, not it
   const c2 = (await hub.task({ room: handle, membership_token: worker.you.membership_token, action: "claim", id: t2.id })) as RfaTask & { claim_token: string };
   await hub.task({ room: handle, membership_token: worker.you.membership_token, action: "release", id: t2.id });
   const stale = await fails(() => hub.task({ room: handle, membership_token: reborn.you.membership_token, action: "complete", id: t2.id, claim_token: c2.claim_token }));
-  assert.equal(stale.code, "unauthorized", "releaseTask deletes the fence with the claim");
+  // `lease_expired`, not `unauthorized`, since RFA-0.8 rung 7. Spec 10.3 and
+  // spec 15 have said so since 0.1.8 and the hub threw `unauthorized` anyway,
+  // which Appendix F recorded as the defect; this assertion USED to pin the
+  // defect. The `data` is the point of the change: a caller that presented a
+  // token it believed in has to choose between re-claiming and giving up, and
+  // these three fields are exactly enough to choose without a human.
+  assert.equal(stale.code, "lease_expired", "releaseTask deletes the fence with the claim, and a stale fence says so by name");
+  assert.deepEqual(stale.data, { current_attempt: 1, current_owner: null, task_state: "submitted" }, "re-claim or abandon, decidable from the error alone");
+  // A caller presenting NO token and owning nothing still gets `unauthorized`:
+  // that is an authorization failure, not a stale fence, and merging the two
+  // would tell an unrelated member that a fence exists.
+  const nosy = await fails(() => hub.task({ room: handle, membership_token: reborn.you.membership_token, action: "complete", id: t2.id }));
+  assert.equal(nosy.code, "unauthorized");
   hub.close();
 });
 

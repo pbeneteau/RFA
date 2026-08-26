@@ -109,6 +109,18 @@ export interface TaskEvidence {
   artifacts?: string[];
 }
 
+/**
+ * One claim's resource grant (spec 10.3 items 5 to 7). Re-declared here rather
+ * than imported from `src/resources.ts` so the wire model stays a leaf module.
+ */
+export interface ResourceGrant {
+  keys: string[];
+  owner: string;
+  attempt: number;
+  source: "claim" | "reservation";
+  granted_at: string;
+}
+
 export interface RfaTask {
   id: string;
   room: string;
@@ -147,6 +159,33 @@ export interface RfaTask {
   released_at?: string | null;
   /** Claims allowed before the task becomes pickup-only for its creator, the host, or a human. */
   max_attempts?: number;
+  /**
+   * Resource grants held through this task's claim (spec 10.3's `resources[]`,
+   * added in 0.1.9).
+   *
+   * ON THE TASK on purpose, and this is the half of the fence that must persist:
+   * a grant's whole job is refusing FUTURE claims, so it has to survive a hub
+   * restart, and the spec calls a process-local grant map non-conformant. Its
+   * sibling, the `claim_token`, is exactly the opposite and lives in an
+   * in-process Map that must NOT survive (section 14 guarantee 8): a fence
+   * carried in a persisted, broadcast object is a privilege-escalation
+   * primitive. Two halves, two storage decisions.
+   *
+   * A grant never outlives its task: released on every one of 10.3's four
+   * release triggers and cleared at any terminal state.
+   */
+  resource_grants?: ResourceGrant[];
+  /**
+   * The starvation fallback's standing offer (spec 10.3 item 6). Written by the
+   * hub on the THIRD refused widening and carried in that refusal's data; the
+   * task's creator, the host or a human principal approves it over
+   * `room_task update {approve_reservation: true}`, which grants exactly these
+   * keys. The offer is on the task so the approver approves what the hub
+   * offered rather than a wish, and so the audit trail shows what was agreed.
+   */
+  reservation_offer?: { keys: string[]; offered_at: string } | null;
+  /** Refused widenings for the CURRENT attempt; three of them raise the offer above. */
+  widen_refusals?: number;
   note: string | null;
   created_at: string;
   updated_at: string;
@@ -206,6 +245,10 @@ export interface RoomPolicies {
   member_rpm?: number | null;
   /** Rejections allowed per (task, attempt) before a creator, host or human must clear the counter (spec 10.4). */
   max_rejections?: number;
+  /** Claimed, non-terminal tasks allowed per membership (spec 10.3, default 3). */
+  max_claims_per_member?: number;
+  /** Mutating `room_task` actions per minute, a window SEPARATE from member_rpm (spec 10.3, default 20). */
+  task_actions_per_min?: number;
   /** Claims allowed per task before it becomes pickup-only for its creator, the host or a human (spec 10.3). */
   max_attempts_default?: number;
   /** Max unanswered outbound requests per member; null = unlimited. */

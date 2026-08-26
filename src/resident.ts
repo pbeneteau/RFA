@@ -415,7 +415,16 @@ async function bootWithRetry(): Promise<Awaited<ReturnType<typeof boot>>> {
 }
 
 const { member, joinSecret, prevHash, created: createdRoom } = await bootWithRetry();
-const memory = new GatedMemory(path.join(pack.dir, "memory"), gate, member.memberId);
+const memory = new GatedMemory(path.join(pack.dir, "memory"), gate, member.memberId, () => {
+  // Read per write, never captured: one `GatedMemory` serves every concurrent
+  // turn in this process, and each of them may be answering a different
+  // organization (RFA-0.8 sect. 4 item 5). `turns.current()` is the rung-3
+  // AsyncLocalStorage binding, so this is THIS turn's requester and not the
+  // newest one's.
+  const t = turns.current();
+  if (!t) return null;
+  return { requester_home: t.requesterHome ?? "local", room: t.room ?? null };
+});
 
 // ---------------------------------------------------------------- in-process MCP tools
 
@@ -867,7 +876,15 @@ function dropScratchIfEmpty(dir: string | null | undefined): void {
 function claimHeldFor(task: Record<string, unknown>, id: string): ClaimHeld | null {
   const owner = task.owner;
   if (typeof owner !== "string" || !owner) return null;
-  return { taskId: id, attempt: Number(task.attempt ?? 0), owner };
+  const grants = (task.resource_grants ?? []) as { owner?: string; keys?: string[] }[];
+  return {
+    taskId: id,
+    attempt: Number(task.attempt ?? 0),
+    owner,
+    // Only the keys granted to THIS owner: a reservation taken on the creator's
+    // authority for somebody else is not this run's to lose.
+    resources: grants.filter((g) => g.owner === owner).flatMap((g) => g.keys ?? []),
+  };
 }
 
 /**
@@ -885,7 +902,7 @@ function claimHeldFor(task: Record<string, unknown>, id: string): ClaimHeld | nu
 async function claimStillOurs(run: RunContext): Promise<string | null> {
   const held = run.claim;
   if (!held) return null;
-  let now: { attempt?: number; owner?: string | null; state?: string };
+  let now: { attempt?: number; owner?: string | null; state?: string; resource_grants?: { keys?: string[] }[] };
   try {
     now = (await member.task({ action: "get", id: held.taskId })) as typeof now;
   } catch (err) {
@@ -898,6 +915,10 @@ async function claimStillOurs(run: RunContext): Promise<string | null> {
     current_attempt: Number(now.attempt ?? 0),
     current_owner: (now.owner ?? null) as string | null,
     task_state: String(now.state ?? "unknown"),
+    // Every key still granted on the task, so door one can refuse a write whose
+    // RESOURCE grant is gone and not only one whose task claim moved (wire 10.3,
+    // rung 7 item 10).
+    granted: (now.resource_grants ?? []).flatMap((g) => g.keys ?? []),
   });
   return verdict.ok ? null : verdict.message;
 }
@@ -1098,6 +1119,8 @@ type RunContext = {
   candidateSet?: string | null;
   /** This run's private working directory (`scratch/<runId>/`), named in its system prompt. */
   scratchDir?: string | null;
+  /** The hub-derived `home` of whoever asked, for the cross-org memory quarantine (RFA-0.8 sect. 4 item 5). */
+  requesterHome?: string | null;
   /**
    * The board claim this run is working under, if any (RFA-0.8 sect. 9): the
    * task, the attempt and the owner AS THEY WERE when the run started. Door
@@ -1208,6 +1231,13 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
     // module scope (RFA-0.8 sect. 11): a candidate may lose, and a losing
     // candidate must leave no trace in the fact store.
     candidateSet: run.candidateSet ?? null,
+    // Who this turn is serving (wire 4.3's hub-derived `home`), for the
+    // cross-org memory quarantine of RFA-0.8 sect. 4 item 5. Defaults to
+    // `local`, which is every requester on this hub today and is also the
+    // honest default: a turn with no attributable requester (a schedule, a
+    // consolidation pass) is the hub's own work.
+    requesterHome: run.requesterHome ?? "local",
+    room: member.room,
   };
   const myLease = binding.leaseId;
   /**
@@ -2551,6 +2581,9 @@ await member.serve(
       // turn a root and any ask it makes the chain's first hop.
       chain: readChain(ctx.envelope.ext),
       conversationId: ctx.conversationId,
+      // Hub-derived and carried on the envelope (wire 4.3); never anything the
+      // asker chose for itself.
+      requesterHome: (ctx.envelope.from as { home?: string }).home ?? "local",
     };
     /** The knowledge clones' HEADs as this turn STARTS (RFA-0.8 sect. 7 item 2). */
     const corpusAtStart = corpusHeads();

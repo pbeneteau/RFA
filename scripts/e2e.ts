@@ -322,6 +322,66 @@ await scenario("tasks: claim race, evidence gate, verifier != owner, unblock", a
   return `1 claim winner, gate enforced, ${t.id} completed, ${b.id} unblocked`;
 });
 
+// 5b. Resource claims (wire 10.3's `resources[]`, 0.1.9): one owner per RESOURCE,
+// refused and never queued, with the sibling key that a byte-prefix check breaks.
+await scenario("rfa-0.8: resource claims refuse on intersection, admit a sibling, and never wait", async () => {
+  const u = mainHub.url;
+  // Its OWN room, not the shared fixture: this scenario creates and releases
+  // tasks, and the restart-persistence scenario downstream asserts an exact task
+  // count on the shared room. A scenario that mutates a shared fixture is a
+  // landmine for whoever writes the next one.
+  const owner = await call(u, "room_create", { topic: "e2e resources", name: "res-owner", card: card("res-owner", "res") });
+  const room = owner.room;
+  const pmTok = owner.you.membership_token;
+  const other = await call(u, "room_join", { room, join_secret: owner.join_secret, name: "res-other", card: card("res-other", "res") });
+  const devTok = other.you.membership_token;
+  const mk = async (title: string) => call(u, "room_task", { room, membership_token: pmTok, action: "create", title });
+  const t1 = await mk("holds the parent key");
+  const t2 = await mk("wants the child key");
+  const t3 = await mk("wants a sibling key");
+
+  const held = await call(u, "room_task", { room, membership_token: devTok, action: "claim", id: t1.id, resources: ["local/store/alpha"] });
+  assert(held.resource_grants?.[0]?.keys?.[0] === "local/store/alpha", "the grant is ON THE TASK, where it persists");
+
+  // A key under the held one is refused, by name, with no waiting anywhere.
+  const t0 = Date.now();
+  const refused = await call(u, "room_task", { room, membership_token: pmTok, action: "claim", id: t2.id, resources: ["local/store/alpha/inner"] })
+    .then(() => null)
+    .catch((e: Error) => e.message);
+  assert(refused !== null, "an intersecting claim must be refused");
+  assert(/task_conflict/.test(String(refused)), `expected task_conflict, got ${String(refused).slice(0, 120)}`);
+  assert(/local\/store\/alpha/.test(String(refused)), "the refusal names the blocking key so a client can back off on something");
+  assert(Date.now() - t0 < 2000, "refuse-never-wait: the refusal is immediate, not a queue that timed out");
+
+  // The sibling is a DIFFERENT resource. A byte-prefix check refuses it and two
+  // unrelated packs then deadlock with nothing in the log to say why.
+  const sibling = await call(u, "room_task", { room, membership_token: pmTok, action: "claim", id: t3.id, resources: ["local/store/alphabet"] });
+  assert(sibling.state === "working", "`local/store/alphabet` is a sibling of `local/store/alpha`, not a child");
+
+  // Widening: the holder asks for more, is refused, and keeps what it had.
+  const widen = await call(u, "room_task", { room, membership_token: devTok, action: "claim", id: t1.id, resources: ["local/store/alphabet/deep"] })
+    .then(() => null)
+    .catch((e: Error) => e.message);
+  assert(widen !== null && /task_conflict/.test(String(widen)), "a refused widening is a refusal");
+  const stillHeld = await call(u, "room_task", { room, membership_token: devTok, action: "get", id: t1.id });
+  assert(stillHeld.resource_grants?.[0]?.keys?.[0] === "local/store/alpha", "a refused widening NEVER damages the grant already held");
+  assert(stillHeld.owner === held.owner && stillHeld.attempt === held.attempt, "and it does not roll the claim generation");
+
+  // Releasing the claim releases the grant, and the key frees up.
+  await call(u, "room_task", { room, membership_token: devTok, action: "release", id: t1.id });
+  const now = await call(u, "room_task", { room, membership_token: pmTok, action: "claim", id: t2.id, resources: ["local/store/alpha/inner"] });
+  assert(now.state === "working", "a grant never outlives its claim");
+
+  // A malformed key is bad_request, not a refusal: the client sent something
+  // wrong, which is a different thing from the board being busy.
+  await assertRejectsCode(
+    call(u, "room_task", { room, membership_token: pmTok, action: "claim", id: t3.id, resources: ["../escape"] }),
+    "bad_request",
+  );
+  await call(u, "room_end", { room, membership_token: pmTok });
+  return `one owner per resource, sibling admitted, widening refused without damage, grant freed on release`;
+});
+
 // 6. Signing profile: verified / tampered / strict hub
 await scenario("signing: verified card, tamper detection, --require-signed enforcement", async () => {
   const key = generateSigningKey("EdDSA");

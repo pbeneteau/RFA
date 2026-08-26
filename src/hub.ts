@@ -7,8 +7,22 @@ import { SpanStatusCode, context as otelContext, createTraceState, trace } from 
 import * as z from "zod";
 import { RfaError } from "./errors.js";
 
-/** The wire version this hub implements (spec 11.2). */
-export const RFA_SPEC_VERSION = "0.1.8";
+/**
+ * The wire version this hub implements (spec 11.2).
+ *
+ * 0.1.9 since RFA-0.8 rung 7, and the bump is GATED rather than editorial. Spec
+ * 16.1: a hub MUST NOT advertise `0.1.9` unless it implements 10.3's
+ * `resources[]` validation and intersection refusal, and section 8's
+ * `would_deadlock` refusal reason. Both are true now (`src/resources.ts` plus the
+ * claim path for the first, rung 2 for the second); the section 8 chain-stamping
+ * and `reply_by`-defaulting SHOULDs do not gate the advertisement and are
+ * shipped anyway.
+ *
+ * Anything else naming the wire version moves WITH this constant, which is the
+ * lesson INTEROP.md's own header records: a document that says 0.1.8 while the
+ * hub says 0.1.9 is a lie an integrator finds before the operator does.
+ */
+export const RFA_SPEC_VERSION = "0.1.9";
 import type { RoomHub } from "./store.js";
 
 const NAME = z.string().min(1).max(64).describe("Member name (unique in room; hub may suffix on collision)");
@@ -404,7 +418,11 @@ export function createHubServer(hub: RoomHub): McpServer {
         "back to working), complete (owner or claim_token holder; if the task requires evidence, pass evidence " +
         "{summary, artifacts} and a DIFFERENT member must then verify), verify (verdict accept -> completed and dependents unblock; " +
         "reject -> back to working for rework), release (hand a claim back; a task is also released automatically when its owner goes offline, leaves or is evicted), cancel. Task events land in the room log; owners, creators, and " +
-        "verifiers see them under the mentions filter.",
+        "verifiers see them under the mentions filter. " +
+        "claim takes an optional resources[] of keys (`room/<handle>/…`, `local/…`, or `<your home>/…`, at most 16, 256 bytes each): the board then grants one owner per RESOURCE, not just per task. " +
+        "A claim whose keys intersect a live grant is REFUSED with task_conflict naming the blocking key, never queued, so back off and retry rather than waiting. " +
+        "Intersection is on whole path segments: `local/a` conflicts with `local/a/notes` and not with `local/ab`. " +
+        "Claiming again on a task you already own WIDENS your grant with the additional keys.",
       inputSchema: {
         room: z.string(),
         membership_token: TOKEN,
@@ -427,6 +445,16 @@ export function createHubServer(hub: RoomHub): McpServer {
         // The claim fence's secret half, returned by `claim` and presented back
         // on complete/update/release. Never appears in an event or a task object.
         claim_token: z.string().min(8).optional(),
+        /**
+         * Resource keys this claim wants (spec 10.3, added in 0.1.9). Optional:
+         * a claim without it behaves exactly as 0.1.8 did, which is what keeps
+         * every existing client working. On a task you already own this is a
+         * WIDENING: the keys join the grant you hold, or the widening is refused
+         * without damaging it.
+         */
+        resources: z.array(z.string()).max(16).optional(),
+        /** `update`: approve the reservation the hub offered after three refused widenings (spec 10.3 item 6). */
+        approve_reservation: z.boolean().optional(),
         max_attempts: z.number().int().min(1).max(20).optional(),
       },
     },

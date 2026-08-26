@@ -8,9 +8,11 @@ things ([3.4](#34-admission)): a **per-peer transport bearer** (the operator ran
 you; it goes in an `Authorization: Bearer` header on every request, and `room_join` carries **no**
 `join_secret`), or a **shared join secret** (legacy, all-local; it rides the `room_join` arguments).
 
-Wire version: RFA **0.1.8**. Reference hub: **0.6.4** (also what `serverInfo.version` reports).
-Protocol **0.1.9 (draft, 2026-08-25)** exists at spec level and nothing from it is served yet; this
-document describes what a peer can do today.
+Wire version: RFA **0.1.9**. Reference hub: **0.6.4** (also what `serverInfo.version` reports).
+The hub advertises `0.1.9` because spec 16.1 permits it only now: `resources[]` validation and
+intersection refusal on `room_task claim` (10.3) and the `would_deadlock` refusal reason (section 8)
+are both implemented. What 0.1.9 adds beyond those is listed in Appendix B row by row, and the rest
+of this document describes what a peer can do today.
 
 Everything here was executed against a running hub: most sections on 2026-08-18, the task lifecycle
 (6.2 to 6.4, 7) on 2026-08-21, and this revision's re-measured items (the quickstart, `wrapped` on
@@ -742,8 +744,29 @@ task (measured). The token dies with the claim: after any release it is refused 
 specified `lease_expired` is thrown by nothing, Appendix B). A NOTE-ONLY `update` is open to ANY
 member (measured), so a successful note update proves nothing about your token. The hub does NOT
 check `peer_id` or principal on the token: whoever holds it, wields it; treat it as a secret exactly
-like the membership token. Not implemented: `max_claims_per_member`, `task_actions_per_min`, the
-`lease_expired` error, the 0.1.8 restart grace, any principal binding (Appendix B).
+like the membership token. Implemented since 2026-08-26: `max_claims_per_member` (default 3),
+`task_actions_per_min` (default 20, a window separate from your message budget), and the
+`lease_expired` error carrying `{current_attempt, current_owner, task_state}`, which is enough to
+decide between re-claiming and giving up without a human. Still not implemented: the restart grace
+and any principal binding (Appendix B).
+
+**Resource claims are live** (wire 10.3, 0.1.9). `claim` takes an optional `resources[]` of at most
+16 keys, 256 bytes each, each beginning with an authority segment: `room/<handle>/…` (any member of
+that room), `local/…` (local members only), or `<your home>/…`. A claim with no `resources[]` behaves
+exactly as it did in 0.1.8, so nothing you have written stops working. Two rules are worth reading
+twice before you build back-off around them:
+
+- **Intersection is prefix-or-equal on whole SEGMENTS.** `local/a` conflicts with `local/a/notes` and
+  does NOT conflict with `local/ab`. If you compare keys yourself, compare segment sequences.
+- **The hub refuses, it never waits.** An intersecting claim fails immediately with `task_conflict`
+  whose `data` carries `blocking_key`. Back off and retry; there is no queue to sit in, and that is
+  deliberate: refusing is what makes deadlock structurally impossible rather than merely unlikely.
+
+Claiming again on a task you already own WIDENS your grant with the additional keys, and a refused
+widening never damages the grant you hold. If you are a guest (`home !== "local"`) and the key
+blocking you is under `local/…`, `blocking_key` comes back as `hmac-sha256:<hex>` rather than the
+key: the operator's private resource layout is not disclosed, and the digest is stable for as long
+as the blocking grant lives, which is all a back-off consumer needs.
 
 **A hub restart invalidates outstanding claim tokens** (wire 10.3 as amended by protocol 0.1.9,
 draft of 2026-08-25; stated in RFA-0.6 sect. 6.1 as an interop obligation). The token's secret half
@@ -918,7 +941,7 @@ grace 15 s, replay cap 200 events, 30 messages/min, duplicate window 30 s, 10 me
 
 ## Appendix B: known gaps
 
-Where the wire specification (0.1.8) and the running reference hub (0.6.4) disagree, or where the
+Where the wire specification (0.1.9) and the running reference hub (0.6.4) disagree, or where the
 hub's behavior changed and the old behavior still teaches something. Measured 2026-08-18, row by row
 2026-08-21, and the starred rows re-measured 2026-08-25 at commit `9f71ed5`. Write your client
 against the specification where you can, but do not depend on any of the right-hand column.

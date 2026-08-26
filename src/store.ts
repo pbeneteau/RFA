@@ -16,6 +16,7 @@ import { RfaError } from "./errors.js";
 import { canonicalize, digestCard, sha256hex } from "./jcs.js";
 import { verifyCard, type Jwk, type VerificationDetail } from "./signing.js";
 import { TERMINAL_TASK_STATES } from "./model.js";
+import { discloseKey, findBlocking, validateKeys, type LiveGrant, type ResourceGrant } from "./resources.js";
 import { consoleNameFor, PrincipalSet } from "./principals.js";
 import { foldWhitespace, neutralize, renderWrapped } from "./wrap.js";
 import { bearerSha256 } from "./reqcontext.js";
@@ -71,6 +72,18 @@ export interface HubConfig {
   historyDefault: number;
   replayCap: number;
   rateMsgsPerMin: number;
+  /**
+   * The greedy-peer watch (RFA-0.8 sect. 13 item 2). Wire Appendix B names the
+   * two knobs and deliberately picks no number, so this hub picks: THREE
+   * offline-release flaps from one claimant inside TEN MINUTES. Three is the
+   * smallest count that cannot be one flapping network (two are a drop and a
+   * retry); ten minutes is long enough to catch a slow flap and short enough
+   * that the alert names a live incident rather than an archaeological one.
+   */
+  greedyReleaseCount: number;
+  greedyReleaseWindowS: number;
+  /** Hold a member the watch fires on. OFF by default: a hold is an intervention, and the operator decides. */
+  autoHoldGreedyPeer: boolean;
   dupWindowS: number;
   maxInlineBytes: number;
   maxMentions: number;
@@ -190,6 +203,9 @@ export const DEFAULT_CONFIG: HubConfig = {
   historyDefault: 0,
   replayCap: 200,
   rateMsgsPerMin: 30,
+  greedyReleaseCount: 3,
+  greedyReleaseWindowS: 600,
+  autoHoldGreedyPeer: false,
   dupWindowS: 30,
   maxInlineBytes: 262_144,
   maxMentions: 10,
@@ -332,6 +348,16 @@ interface Room {
   pendingReplies: PendingReply[];
   dedupe: Map<string, SendResult>;
   tasks: Map<string, RfaTask>;
+  /**
+   * Task-action rate windows, keyed by `peer_id ?? principal ?? member.id`
+   * (RFA-0.6 sect. 5.6) rather than by member id, so leaving and rejoining does
+   * not reset a peer's budget. In-memory on purpose: a rate window is about the
+   * last minute, and a hub that was down for that minute has no budget to
+   * enforce. NOT persisted, unlike the grants on the tasks beside it.
+   */
+  taskActionWindows: Map<string, number[]>;
+  /** Offline-release FLAP timestamps per claimant identity, for the greedy-peer watch (RFA-0.8 sect. 13 item 2). */
+  greedyReleases: Map<string, number[]>;
   taskSeq: number;
   taskOverdueNotified: Set<string>;
   quarantinedNames: Set<string>;
@@ -474,16 +500,27 @@ const DEFAULT_MAX_ATTEMPTS = 1;
 
 /** Rejections allowed per (task, attempt) before a human must intervene (spec 10.4). */
 const DEFAULT_MAX_REJECTIONS = 3;
+/** Claimed, non-terminal tasks per membership (spec 10.3; Appendix B owns the default). */
+const DEFAULT_MAX_CLAIMS_PER_MEMBER = 3;
+/** Mutating `room_task` actions per minute, a window SEPARATE from member_rpm (spec 10.3). */
+const DEFAULT_TASK_ACTIONS_PER_MIN = 20;
+/** Widenings refused before the hub offers a creator-approved reservation (spec 10.3 item 6). */
+const WIDEN_REFUSALS_BEFORE_OFFER = 3;
 
 /**
- * The secret half of the claim fence, keyed by (room, task, attempt) and held
- * OUT of the task object on purpose (spec 10.3): a fence carried inside the task
- * is broadcast to every member and observer on first legitimate use, at which
- * point "a valid fence re-binds ownership" becomes a privilege-escalation
- * primitive. Process-local, which is honest: a restart invalidates outstanding
- * tokens, and release-on-offline is what actually recovers a dead worker's task.
+ * The secret behind `task_conflict`'s opaque key digest (spec 10.3 item 8).
+ *
+ * Per PROCESS and random, and deliberately not the transport credential nor any
+ * persisted secret. The spec requires stability "for the lifetime of the
+ * blocking grant" and states cross-restart stability is NOT required, which a
+ * process-random secret satisfies exactly; a back-off consumer re-reads the
+ * digest from the refusal it just received, so a restart costs it nothing. The
+ * digest is KEYED rather than a plain hash because an unsalted hash of a
+ * guessable key shape is confirmable by dictionary and would disclose the
+ * operator's layout anyway, which is the whole thing item 8 protects.
  */
-const claimTokens = new Map<string, { token: string; memberId: string }>();
+const KEY_DIGEST_SECRET = randomBytes(32);
+
 
 /**
  * A test-only seam between the claim path's CHECK and its COMMIT
@@ -526,6 +563,22 @@ export class RoomHub {
   /** Who counts as a human here. One object for the wire join path and `POST /auth`, so a reload reaches both. */
   readonly principals: PrincipalSet;
   private rooms = new Map<string, Room>();
+  /**
+   * The claim fence's SECRET half (spec 10.3), keyed `<room>:<task>:<attempt>`.
+   *
+   * In memory and NEVER persisted, which is the guarantee itself: a hub restart
+   * invalidates outstanding claim tokens (section 14 guarantee 8, and the one
+   * sentence RFA-0.6 sect. 6.1 puts in INTEROP.md), and recovery is the
+   * still-valid membership or a re-claim. Its sibling, the resource GRANT, has
+   * the opposite requirement and lives on the persisted task object, because a
+   * grant's job is refusing future claims.
+   *
+   * PER INSTANCE since rung 7, and it was module-global before: two `RoomHub`
+   * objects in one process shared one token table, so an in-process "restart"
+   * test could present a token minted by the previous instance and be believed.
+   * One hub owns its store; it owns its fence table too.
+   */
+  private claimTokens = new Map<string, { token: string; memberId: string }>();
   private tokens = new Map<string, { room: string; memberId: string }>();
   private sweepTimer: NodeJS.Timeout | null = null;
 
@@ -695,6 +748,8 @@ export class RoomHub {
       pendingReplies: [],
       dedupe: new Map(),
       tasks: new Map(),
+      taskActionWindows: new Map(),
+      greedyReleases: new Map(),
       taskSeq: 0,
       taskOverdueNotified: new Set(),
       quarantinedNames: new Set(),
@@ -1056,7 +1111,11 @@ export class RoomHub {
     task.lease_expires = null;
     task.released_at = iso(this.cfg.now());
     task.updated_at = task.released_at;
-    claimTokens.delete(`${room.handle}:${task.id}:${task.attempt ?? 0}`);
+    this.claimTokens.delete(`${room.handle}:${task.id}:${task.attempt ?? 0}`);
+    // A grant's lifetime is its claim's (spec 10.3 item 7). All four release
+    // triggers land here, so this one line is every one of them; the terminal
+    // states are covered separately by `dropGrants`.
+    this.dropGrants(task);
     this.appendEvent(room, {
       type: "system",
       event: "task_released",
@@ -1064,10 +1123,129 @@ export class RoomHub {
     });
   }
 
+  /**
+   * Drop everything a claim generation held: the grant, the standing reservation
+   * offer, and the refused-widening counter (spec 10.3 items 6 and 7).
+   *
+   * Called on every release trigger AND at every terminal state, because a grant
+   * never outlives its task. The shape in which it would, per-resource epochs,
+   * is PARKED in RFA-0.8 Appendix A with its own trigger.
+   */
+  private dropGrants(task: RfaTask): void {
+    task.resource_grants = [];
+    task.reservation_offer = null;
+    task.widen_refusals = 0;
+  }
+
+  /**
+   * A stale claim token is `lease_expired`, not `unauthorized` (spec 10.3, and
+   * spec 15's row, both since 0.1.8; the reference hub threw `unauthorized`
+   * until rung 7).
+   *
+   * The distinction is not pedantry and the `data` is why: a caller that
+   * presented a token it believed in needs to decide between RE-CLAIMING and
+   * giving up, and `{current_attempt, current_owner, task_state}` is exactly
+   * enough to decide without a human. An `unauthorized` says only "no", which is
+   * what made a restarted worker's recovery a support question.
+   *
+   * A caller that presented NO token and is not the owner still gets
+   * `unauthorized`: that is an authorization failure, not a stale fence, and
+   * merging them would tell an unrelated member that a fence exists.
+   */
+  private leaseExpired(task: RfaTask): RfaError {
+    return new RfaError("lease_expired", `your claim token no longer matches task ${task.id} attempt ${task.attempt ?? 0}`, null, {
+      current_attempt: task.attempt ?? 0,
+      current_owner: task.owner,
+      task_state: task.state,
+    });
+  }
+
+  /**
+   * Every live grant in the room: the grants of every non-terminal task.
+   *
+   * Read fresh at each claim rather than kept in an index, because an index is a
+   * second copy of the truth and this hub has already paid for one of those (the
+   * process-local grant map the spec calls non-conformant). Room task counts are
+   * small and the check runs once per claim.
+   */
+  private liveGrants(room: Room, exceptTaskId?: string): LiveGrant[] {
+    const out: LiveGrant[] = [];
+    for (const t of room.tasks.values()) {
+      if (t.id === exceptTaskId) continue;
+      if (TERMINAL_TASK_STATES.has(t.state)) continue;
+      for (const grant of t.resource_grants ?? []) {
+        if (grant.keys.length > 0) out.push({ taskId: t.id, grant });
+      }
+    }
+    return out;
+  }
+
   /** Every non-terminal task this member owns, released with one reason. */
   private releaseTasksOf(room: Room, memberId: string, reason: "offline" | "leave" | "evicted"): void {
+    let released = 0;
     for (const task of room.tasks.values()) {
-      if (task.owner === memberId && !TERMINAL_TASK_STATES.has(task.state)) this.releaseTask(room, task, reason);
+      if (task.owner === memberId && !TERMINAL_TASK_STATES.has(task.state)) {
+        this.releaseTask(room, task, reason);
+        released++;
+      }
+    }
+    if (reason === "offline" && released > 0) this.watchGreedyRelease(room, memberId, released);
+  }
+
+  /**
+   * The greedy-peer watch (RFA-0.8 sect. 13 item 2), and it is STATE-shaped on
+   * purpose.
+   *
+   * The attack it answers costs one idle long-poll: a peer claims everything it
+   * can, flaps offline, every claim releases, and the board converts to
+   * privileged-pickup. A RATE alert cannot see this, because a rate has no
+   * denominator at zero traffic and this room is quiet by construction. So this
+   * counts STATES, not a rate, and it fires on a room with one task and no
+   * traffic. That is this project's own standing lesson: the #ops triad wanted 5
+   * runs before it would call an error rate bad, so a credential that failed 100
+   * percent of a quiet room's single run raised nothing for hours.
+   *
+   * One increment per FLAP, not per task: a member going offline while holding
+   * three tasks is one event, and counting the tasks would page an operator for
+   * a single network drop. Three flaps inside ten minutes is a pattern; two are
+   * a drop and a retry.
+   *
+   * The identity is the rate-window key of RFA-0.6 sect. 5.6, so a peer that
+   * leaves and rejoins between flaps is still the same claimant.
+   */
+  private watchGreedyRelease(room: Room, memberId: string, released: number): void {
+    const member = room.members.get(memberId);
+    if (!member) return;
+    const key = member.principal ?? member.id;
+    const now = this.cfg.now();
+    const windowMs = this.cfg.greedyReleaseWindowS * 1000;
+    const seen = (room.greedyReleases.get(key) ?? []).filter((t) => now - t < windowMs);
+    seen.push(now);
+    room.greedyReleases.set(key, seen);
+    if (seen.length < this.cfg.greedyReleaseCount) return;
+    // Surfaced to the operator as a room system event, which is where every
+    // other operator-facing hub finding already lands (`gate_alert`, `held`,
+    // `task_overdue`), so a console and `rfa room tail` show it with no new
+    // plumbing. Appendix B carries the event name.
+    this.appendEvent(room, {
+      type: "system",
+      event: "greedy_release_watch",
+      refs: {
+        member: member.id,
+        name: member.name,
+        home: member.home ?? "local",
+        releases: seen.length,
+        window_s: this.cfg.greedyReleaseWindowS,
+        tasks_released: released,
+        auto_held: this.cfg.autoHoldGreedyPeer,
+      },
+    });
+    // Auto-hold is available and OFF by default: holding a member is an
+    // intervention, and an operator who has not asked for automatic ones should
+    // get the alert and decide. Releasing a hold is `room_admin release_member`.
+    if (this.cfg.autoHoldGreedyPeer) {
+      member.held = true;
+      room.greedyReleases.delete(key);
     }
   }
 
@@ -2202,6 +2380,8 @@ export class RoomHub {
           throw new RfaError("task_conflict", `task ${task.id} is terminal (${task.state})`);
         }
         task.state = "cancelled";
+        // A grant never outlives its task (spec 10.3 item 7).
+        this.dropGrants(task);
         task.updated_at = iso(this.cfg.now());
         intervene(task.owner ?? task.created_by, { task_id: task.id });
         this.appendEvent(room, { type: "task", action: "cancel", actor: member.id, task: { ...task } });
@@ -2293,6 +2473,19 @@ export class RoomHub {
           room.policies.max_members = n;
           changes.max_members = n;
         }
+        // The two 0.1.9 task budgets, settable like every other room policy
+        // (spec 5.1). Both were MEASURED ABSENT in Appendix F, so shipping them
+        // without a way to tune them would just move the problem.
+        for (const [key, lo, hi] of [
+          ["max_claims_per_member", 1, 100],
+          ["task_actions_per_min", 1, 600],
+        ] as const) {
+          if (patch[key] === undefined) continue;
+          const n = Number(patch[key]);
+          if (!Number.isInteger(n) || n < lo || n > hi) throw new RfaError("bad_request", `${key} must be ${lo}..${hi}`);
+          room.policies[key] = n;
+          changes[key] = n;
+        }
         if (patch.member_rpm !== undefined) {
           const n = patch.member_rpm === null ? null : Number(patch.member_rpm);
           if (n !== null && (!Number.isInteger(n) || n < 1 || n > 600)) throw new RfaError("bad_request", "member_rpm must be 1..600 or null");
@@ -2332,7 +2525,10 @@ export class RoomHub {
           changes.history_visibility = patch.history_visibility;
         }
         if (Object.keys(changes).length === 0) {
-          throw new RfaError("bad_request", "set_policy accepts params.policies with mode, moderator, attention, max_members, member_rpm, max_pending_requests, join_bearer_sha256, history_visibility");
+          throw new RfaError(
+            "bad_request",
+            "set_policy accepts params.policies with mode, moderator, attention, max_members, member_rpm, max_pending_requests, join_bearer_sha256, history_visibility, max_claims_per_member, task_actions_per_min",
+          );
         }
         intervene(null, { changes });
         return done({ policies: room.policies });
@@ -2480,6 +2676,18 @@ export class RoomHub {
     /** The claim fence's secret half (spec 10.3); accepted by complete, update and release. */
     claim_token?: string;
     max_attempts?: number;
+    /**
+     * Resource keys this claim wants (spec 10.3, 0.1.9). Optional: a claim
+     * without it behaves exactly as 0.1.8 did. On a task the caller already
+     * owns, this is a WIDENING rather than a re-claim.
+     */
+    resources?: string[];
+    /**
+     * `update` only: approve the reservation the hub offered after three refused
+     * widenings (spec 10.3 item 6). Creator, host or human principal only, and it
+     * grants exactly the keys in the standing offer, never arbitrary ones.
+     */
+    approve_reservation?: boolean;
     // ASYNC since v0.6.2: the policy gate is async and it MUST cover task actions
     // (RFA-0.6 sect. 7.2). The alternative was gating in the caller, which would
     // have made a MUST depend on every call site remembering it.
@@ -2491,6 +2699,36 @@ export class RoomHub {
     }
     if (member.held && !reads) {
       throw new RfaError("held", "a supervisor holds you; keep listening for the release_member intervention");
+    }
+    if (!reads) {
+      /**
+       * The task-action budget (spec 10.3; RFA-0.6 sect. 5.6), a window SEPARATE
+       * from `member_rpm`. Sharing one window means a worker reporting progress
+       * spends the budget it needs to answer a question, which is the defect 5.6
+       * names. Appendix F measured this ABSENT: one member ran 22 unthrottled
+       * mutating calls.
+       *
+       * The counter key is `peer_id ?? principal ?? member.id`, the order 5.6
+       * fixes. Keying on `peer_id` alone would silently drop rate limiting for
+       * the operator's own residents; keying on the member id alone lets a peer
+       * reset its budget by leaving and rejoining, which is why the windows live
+       * on the ROOM and not on the member record. No admission record exists on
+       * this hub yet, so today the key resolves to the human principal hash where
+       * there is one and the member id otherwise, which is 5.6's "a local member
+       * keeps the existing per-member key".
+       */
+      const budgetKey = member.principal ?? member.id;
+      const perMin = room.policies.task_actions_per_min ?? DEFAULT_TASK_ACTIONS_PER_MIN;
+      const nowMs = this.cfg.now();
+      const window = (room.taskActionWindows.get(budgetKey) ?? []).filter((t) => nowMs - t < 60_000);
+      if (window.length >= perMin) {
+        room.taskActionWindows.set(budgetKey, window);
+        throw new RfaError("rate_limited", `task-action rate limit reached (${perMin}/min); this window is separate from your message budget`, 30, {
+          task_actions_per_min: perMin,
+        });
+      }
+      window.push(nowMs);
+      room.taskActionWindows.set(budgetKey, window);
     }
     if (!reads) {
       // Size cap before anything else, including the gate: an unbounded field is a
@@ -2589,6 +2827,80 @@ export class RoomHub {
         return { tasks: [...room.tasks.values()].map((t) => ({ ...t })) };
       case "claim": {
         const task = get(args.id);
+        /**
+         * `resources[]` (spec 10.3, added in 0.1.9), validated FIRST because a
+         * malformed key is `bad_request` and not a refusal: the client sent
+         * something wrong, which is a different thing from the board being busy,
+         * and conflating them teaches a client to back off from a bug.
+         *
+         * A claim with no `resources[]` behaves exactly as it did in 0.1.8,
+         * which is what keeps every existing client working.
+         */
+        const asked = Array.isArray(args.resources) ? (args.resources as unknown[]).filter((k): k is string => typeof k === "string") : null;
+        let wanted: string[] = [];
+        if (asked !== null) {
+          if (asked.length !== (args.resources as unknown[]).length) {
+            throw new RfaError("bad_request", "resources[] must be an array of strings");
+          }
+          const v = validateKeys(asked, { home: member.home ?? "local", roomHandle: room.handle });
+          if (!v.ok) throw new RfaError("bad_request", v.reason);
+          wanted = v.keys;
+        }
+        /** What a refusal may say about a key, given who is being refused (item 8). */
+        const disclose = (key: string): string => discloseKey(key, { claimantHome: member.home ?? "local", secret: KEY_DIGEST_SECRET });
+
+        /**
+         * WIDENING (spec 10.3 item 6), and it is the branch that makes the item
+         * mean anything.
+         *
+         * A holder needing more resources "issues a new claim for the additional
+         * keys only", refused-not-queued, and it "never damages the grant
+         * already held". A second `claim` would otherwise die at
+         * `requireClaimable()` below, so a claim BY THE CURRENT OWNER of a
+         * non-terminal task is a widening rather than a re-claim: it does not
+         * touch `attempt` and does not mint a new `claim_token`, both of which
+         * would invalidate the fence the holder is still using, which is the
+         * literal damage the item forbids.
+         */
+        if (task.owner === member.id && !TERMINAL_TASK_STATES.has(task.state)) {
+          if (wanted.length === 0) {
+            throw new RfaError("task_conflict", `task ${task.id} is already yours; a re-claim adds nothing. Pass resources[] to widen the grant you hold.`);
+          }
+          const held = new Set((task.resource_grants ?? []).flatMap((g) => g.keys));
+          const fresh = wanted.filter((k) => !held.has(k));
+          if (fresh.length === 0) return { ...task } as RfaTask;
+          const blocker = findBlocking(fresh, this.liveGrants(room, task.id));
+          if (blocker) {
+            const refusals = (task.widen_refusals ?? 0) + 1;
+            task.widen_refusals = refusals;
+            // The starvation fallback: the hub OFFERS at the third refusal, in
+            // that refusal's data, and a creator, host or human principal
+            // approves it over `update`. The offer is recorded on the task so
+            // the approver approves what was offered rather than a wish.
+            const offered = refusals >= WIDEN_REFUSALS_BEFORE_OFFER;
+            if (offered) task.reservation_offer = { keys: fresh, offered_at: iso(this.cfg.now()) };
+            throw new RfaError(
+              "task_conflict",
+              `widening task ${task.id} is refused: ${disclose(blocker.wanted)} intersects a live grant on ${disclose(blocker.blocking)}` +
+                (offered ? `. This is refusal ${refusals}; the task's creator, the host or a human principal may now approve a reservation with \`room_task update {approve_reservation: true}\`` : ""),
+              null,
+              {
+                blocking_key: disclose(blocker.blocking),
+                requested_key: disclose(blocker.wanted),
+                widen_refusals: refusals,
+                ...(offered ? { reservation_offered: fresh.map(disclose) } : {}),
+              },
+            );
+          }
+          // The grant already held is untouched: the fresh keys join it.
+          task.resource_grants = [
+            ...(task.resource_grants ?? []),
+            { keys: fresh, owner: member.id, attempt: task.attempt ?? 0, source: "claim", granted_at: iso(this.cfg.now()) },
+          ];
+          task.widen_refusals = 0;
+          return emit("claim", task) as RfaTask;
+        }
+
         const requireClaimable = (): void => {
           if (task.state !== "submitted" || task.owner !== null) {
             throw new RfaError("task_conflict", `task ${task.id} is not claimable (state=${task.state}, owner=${task.owner ?? "none"})`);
@@ -2626,6 +2938,43 @@ export class RoomHub {
             );
           }
         }
+        /**
+         * Concurrent claims per membership (spec 10.3, Appendix B default 3).
+         * Measured ABSENT in Appendix F: one member held four at once. Counted
+         * here rather than at the door because it is a property of what this
+         * member already holds, not of how fast it is calling.
+         */
+        const maxClaims = room.policies.max_claims_per_member ?? DEFAULT_MAX_CLAIMS_PER_MEMBER;
+        const mine = [...room.tasks.values()].filter((t) => t.owner === member.id && !TERMINAL_TASK_STATES.has(t.state)).length;
+        if (mine >= maxClaims) {
+          throw new RfaError("rate_limited", `you already hold ${mine} claimed task(s); this room's limit is ${maxClaims}`, 30, {
+            claims: mine,
+            max_claims_per_member: maxClaims,
+          });
+        }
+        /**
+         * REFUSE, NEVER WAIT (spec 10.3 item 5). This sits after the seam and
+         * the re-check and before the commit, which is the same window rung T's
+         * claim seam already drives every ordering through.
+         *
+         * There is deliberately no queue, no block and no retry here: combined
+         * with widening-as-a-fresh-mini-claim, refusing breaks hold-and-wait and
+         * circular wait at once, which is what makes deadlock structurally
+         * impossible rather than merely unlikely. The parked FIFO-queue variant
+         * has a named trigger (a refusal rate above roughly 0.2 per claim) and
+         * this is not it.
+         */
+        if (wanted.length > 0) {
+          const blocker = findBlocking(wanted, this.liveGrants(room, task.id));
+          if (blocker) {
+            throw new RfaError(
+              "task_conflict",
+              `claim on task ${task.id} is refused: ${disclose(blocker.wanted)} intersects a live grant on ${disclose(blocker.blocking)}`,
+              null,
+              { blocking_key: disclose(blocker.blocking), requested_key: disclose(blocker.wanted) },
+            );
+          }
+        }
         task.owner = member.id;
         task.state = "working";
         task.attempt = attempt;
@@ -2639,7 +2988,13 @@ export class RoomHub {
         // The fence's secret half: the claim RESULT only, never an event, a task
         // object, a roster snapshot or an error.
         const claimToken = `ct_${randomBytes(24).toString("base64url")}`;
-        claimTokens.set(`${room.handle}:${task.id}:${attempt}`, { token: claimToken, memberId: member.id });
+        this.claimTokens.set(`${room.handle}:${task.id}:${attempt}`, { token: claimToken, memberId: member.id });
+        // The grant, on the task, where it persists (item 7). A fresh claim
+        // generation starts from nothing held: a previous attempt's grant died
+        // with its release.
+        task.resource_grants = wanted.length > 0 ? [{ keys: wanted, owner: member.id, attempt, source: "claim", granted_at: iso(this.cfg.now()) }] : [];
+        task.reservation_offer = null;
+        task.widen_refusals = 0;
         const claimed = emit("claim", task) as RfaTask;
         return { ...claimed, claim_token: claimToken };
       }
@@ -2647,8 +3002,9 @@ export class RoomHub {
         const task = get(args.id);
         const holdsToken =
           typeof args.claim_token === "string" &&
-          claimTokens.get(`${room.handle}:${task.id}:${task.attempt ?? 0}`)?.token === args.claim_token;
+          this.claimTokens.get(`${room.handle}:${task.id}:${task.attempt ?? 0}`)?.token === args.claim_token;
         if (task.owner !== member.id && !holdsToken) {
+          if (typeof args.claim_token === "string") throw this.leaseExpired(task);
           throw new RfaError("unauthorized", "only the owner, or a valid claim_token holder, can release a task");
         }
         if (TERMINAL_TASK_STATES.has(task.state)) {
@@ -2664,7 +3020,7 @@ export class RoomHub {
         // the claim_token it was handed, not the member id it lost.
         const updatesWithToken =
           typeof args.claim_token === "string" &&
-          claimTokens.get(`${room.handle}:${task.id}:${task.attempt ?? 0}`)?.token === args.claim_token;
+          this.claimTokens.get(`${room.handle}:${task.id}:${task.attempt ?? 0}`)?.token === args.claim_token;
         const isOwner = task.owner === member.id || updatesWithToken;
         const isCreator = task.created_by === member.id;
         const privileged = isCreator || member.isHost || member.origin === "human";
@@ -2678,11 +3034,48 @@ export class RoomHub {
         if (args.note && privileged && (task.verification.rejections ?? 0) > 0) {
           task.verification = { ...task.verification, rejections: 0 };
         }
+        /**
+         * The starvation fallback's approval (spec 10.3 item 6): after three
+         * refused widenings the hub OFFERED a reservation in that refusal's
+         * data, and the task's creator, the host or a human principal approves
+         * it here. The resulting reservation is a grant taken on the CREATOR's
+         * authority and participates in intersection exactly like any
+         * claim-derived grant.
+         *
+         * It grants exactly what the hub offered and never arbitrary keys: an
+         * approver who could name their own would be granting something nobody
+         * offered, and the audit trail would not show what was agreed. It is
+         * re-checked against live grants at approval time, because the offer may
+         * be minutes old and the board moves.
+         */
+        if (args.approve_reservation) {
+          if (!privileged) throw new RfaError("unauthorized", "only the creator, the host or a human principal can approve a reservation");
+          const offer = task.reservation_offer;
+          if (!offer || offer.keys.length === 0) {
+            throw new RfaError("task_conflict", `task ${task.id} has no standing reservation offer; the hub offers one after ${WIDEN_REFUSALS_BEFORE_OFFER} refused widenings`);
+          }
+          const blocker = findBlocking(offer.keys, this.liveGrants(room, task.id));
+          if (blocker) {
+            throw new RfaError(
+              "task_conflict",
+              `the reservation cannot be granted: ${discloseKey(blocker.wanted, { claimantHome: member.home ?? "local", secret: KEY_DIGEST_SECRET })} is now held by another claim`,
+              null,
+              { blocking_key: discloseKey(blocker.blocking, { claimantHome: member.home ?? "local", secret: KEY_DIGEST_SECRET }) },
+            );
+          }
+          task.resource_grants = [
+            ...(task.resource_grants ?? []),
+            { keys: offer.keys, owner: task.owner ?? member.id, attempt: task.attempt ?? 0, source: "reservation", granted_at: iso(this.cfg.now()) },
+          ];
+          task.reservation_offer = null;
+          task.widen_refusals = 0;
+        }
         if (args.state) {
           if (args.state === "rejected" && !(isCreator || member.isHost)) {
             throw new RfaError("unauthorized", "only the creator or host can reject a task");
           }
           if (args.state !== "rejected" && !isOwner && !isCreator) {
+            if (typeof args.claim_token === "string") throw this.leaseExpired(task);
             throw new RfaError("unauthorized", "only the owner or creator can change task state");
           }
           // Answering an input_required task flips it back to working for anyone present.
@@ -2691,9 +3084,11 @@ export class RoomHub {
           } else {
             task.state = args.state as TaskState;
           }
+          // `failed` and `rejected` are terminal, so the grant goes with them.
+          if (TERMINAL_TASK_STATES.has(task.state)) this.dropGrants(task);
           if (task.verification.pending) task.verification = { pending: false, verifier: null, verifier_home: null, verdict: null, note: null, rejections: task.verification.rejections ?? 0 };
-        } else if (!args.note && args.max_attempts === undefined) {
-          throw new RfaError("bad_request", "update requires state, note and/or max_attempts");
+        } else if (!args.note && args.max_attempts === undefined && !args.approve_reservation) {
+          throw new RfaError("bad_request", "update requires state, note, max_attempts and/or approve_reservation");
         }
         if (args.note !== undefined) task.note = args.note;
         return emit("update", task);
@@ -2709,8 +3104,9 @@ export class RoomHub {
         // it), so it never outlives the attempt it fences.
         const completesWithToken =
           typeof args.claim_token === "string" &&
-          claimTokens.get(`${room.handle}:${task.id}:${task.attempt ?? 0}`)?.token === args.claim_token;
+          this.claimTokens.get(`${room.handle}:${task.id}:${task.attempt ?? 0}`)?.token === args.claim_token;
         if (task.owner !== member.id && !completesWithToken) {
+          if (typeof args.claim_token === "string") throw this.leaseExpired(task);
           throw new RfaError("unauthorized", "only the owner, or a valid claim_token holder, can complete a task");
         }
         if (task.evidence_required) {
@@ -2724,6 +3120,8 @@ export class RoomHub {
         }
         task.evidence = args.evidence ?? null;
         task.state = "completed";
+        // A grant never outlives its task (spec 10.3 item 7).
+        this.dropGrants(task);
         this.unblockDependents(room, member.id, task);
         return emit("complete", task);
       }
@@ -2798,6 +3196,10 @@ export class RoomHub {
         };
         if (args.verdict === "accept") {
           task.state = "completed";
+          // A grant never outlives its task (spec 10.3 item 7).
+          this.dropGrants(task);
+        // A grant never outlives its task (spec 10.3 item 7).
+        this.dropGrants(task);
           this.unblockDependents(room, member.id, task);
           return emit("verify_accept", task);
         }
@@ -2811,6 +3213,8 @@ export class RoomHub {
           throw new RfaError("unauthorized", "only the owner, creator, or host can cancel a task");
         }
         task.state = "cancelled";
+        // A grant never outlives its task (spec 10.3 item 7).
+        this.dropGrants(task);
         return emit("cancel", task);
       }
     }
@@ -3365,6 +3769,8 @@ export class RoomHub {
           pendingReplies: [],
           dedupe: new Map(),
           tasks: new Map((meta.tasks ?? []).map((t: RfaTask) => [t.id, t])),
+          taskActionWindows: new Map(),
+          greedyReleases: new Map(),
           taskSeq: meta.taskSeq ?? 0,
           taskOverdueNotified: new Set(meta.taskOverdueNotified ?? []),
           quarantinedNames: new Set(meta.quarantinedNames ?? []),
@@ -3525,6 +3931,8 @@ export class RoomHub {
       pendingReplies: [],
       dedupe: new Map(),
       tasks: new Map(),
+      taskActionWindows: new Map(),
+      greedyReleases: new Map(),
       taskSeq: 0,
       taskOverdueNotified: new Set(),
       quarantinedNames: new Set(),

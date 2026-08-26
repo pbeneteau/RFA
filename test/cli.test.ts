@@ -16,6 +16,7 @@ import { Router, type CommandDef } from "../src/cli/router.js";
 import { Ui, visibleLength } from "../src/cli/ui.js";
 import { nodeArgsFor } from "../src/proc.js";
 import * as net from "node:net";
+import { RFA_SPEC_VERSION } from "../src/hub.js";
 
 function freePort(): Promise<number> {
   return new Promise((resolve) => {
@@ -169,7 +170,12 @@ test("rfa --help lists the groups; an unknown command exits 2 with a guess; bare
   const v = await rfa(["version", "--json"]);
   assert.equal(v.code, 0);
   const parsed = JSON.parse(v.stdout) as { protocol: string; manifest: number };
-  assert.equal(parsed.protocol, "0.1.8");
+  // Against the CONSTANT, not a literal. This assertion said "0.1.8" and had to
+  // be edited by hand when rung 7 bumped the wire version, which is the same
+  // shape as the stated counts this repository has already watched rot twice:
+  // what is being tested is that `rfa version` reports the hub's protocol
+  // version, not which version that happens to be today.
+  assert.equal(parsed.protocol, RFA_SPEC_VERSION);
   assert.equal(parsed.manifest, 1);
 });
 

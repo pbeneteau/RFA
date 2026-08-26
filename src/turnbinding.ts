@@ -50,6 +50,16 @@ export interface TurnBinding {
    * is set, and the episode log's guard throws on an own-answer write.
    */
   candidateSet?: string | null;
+  /**
+   * The hub-derived `home` of whoever this turn is serving (wire 4.3), and the
+   * room it is serving in. Travels with the turn so the memory write path can
+   * read it from module scope, which is what RFA-0.8 sect. 4 item 5's cross-org
+   * quarantine needs: a write is quarantined by WHO ASKED, and under
+   * `concurrency: N` the process is serving several requesters at once, so the
+   * answer cannot be a process-wide variable.
+   */
+  requesterHome?: string | null;
+  room?: string | null;
 }
 
 export class TurnRegister {

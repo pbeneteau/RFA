@@ -223,18 +223,26 @@ export function pathGuard(input: { toolName: string; input: unknown; scratchDir:
 
 // ---------------------------------------------------------------- the claim fence
 
-/** What the run held when it started: the task's identity and the attempt it was working. */
+/** What the run held when it started: the task's identity, the attempt, and any resource grant. */
 export interface ClaimHeld {
   taskId: string;
   attempt: number;
   owner: string;
+  /**
+   * The resource keys this run's claim was granted (wire 10.3, rung 7). Empty
+   * for a task claimed without `resources[]`, which is every task on a hub whose
+   * clients have not adopted them and is why the check below is conditional.
+   */
+  resources?: string[];
 }
 
-/** What the board says NOW. Sect. 2.4's `lease_expired` data, read locally. */
+/** What the board says NOW. Wire 10.3's `lease_expired` data, read locally, plus the live grant. */
 export interface ClaimNow {
   current_attempt: number;
   current_owner: string | null;
   task_state: string;
+  /** Every resource key still granted on the task, whoever holds it. */
+  granted?: string[];
 }
 
 const TERMINAL_STATES = new Set(["completed", "cancelled", "failed", "rejected"]);
@@ -282,6 +290,31 @@ export function claimFence(held: ClaimHeld, now: ClaimNow): { ok: true } | { ok:
       message:
         `write refused: task ${held.taskId} is owned by ${now.current_owner} now, not by you. Stop and report it.`,
     };
+  }
+  /**
+   * The fence threaded to the MUTATION path (wire 10.3, rung 7 item 10).
+   *
+   * The attempt check above answers "is this task still mine". This answers the
+   * finer question the board can now express: "is the RESOURCE still mine". A
+   * write whose grant is gone is refused at the tool, where the model can act on
+   * it, instead of being discovered at publish, where nobody is listening.
+   *
+   * Only keys the run actually holds are checked. A task claimed without
+   * `resources[]` behaves exactly as it did before this rung, which is the same
+   * compatibility promise the wire makes for the claim itself.
+   */
+  const held_keys = held.resources ?? [];
+  if (held_keys.length > 0) {
+    const live = new Set(now.granted ?? []);
+    const lost = held_keys.filter((k) => !live.has(k));
+    if (lost.length > 0) {
+      return {
+        ok: false,
+        message:
+          `write refused: this run held a resource grant on ${lost.join(", ")} and the board no longer shows it. ` +
+          `The grant went with a release or a re-claim, so another worker may be writing there now. Stop and report it.`,
+      };
+    }
   }
   return { ok: true };
 }

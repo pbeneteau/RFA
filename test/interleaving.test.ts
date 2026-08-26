@@ -19,6 +19,7 @@
  * unconditional `writeFileSync` before the fix existed.
  */
 import { strict as assert } from "node:assert";
+import type { RfaTask } from "../src/model.js";
 import { test } from "node:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -336,6 +337,123 @@ test("seam 1: every ordering of two concurrent claims yields one winner, one tas
       setClaimSeam(undefined);
       hub.close?.();
     }
+  }
+});
+
+test("seam 1: two claims on INTERSECTING resource keys yield one winner in every ordering, and a sibling key is untouched", async () => {
+  const { RoomHub, setClaimSeam } = await import("../src/store.js");
+  const skill = (id: string) => ({ name: id, description: `${id} agent`, skills: [{ id, description: id }] });
+
+  // Two genuine orderings over the same barrier the claim seam already installs,
+  // because the intersection check lands between the re-check and the commit for
+  // exactly this reason. "natural" lets the first arrival commit first;
+  // "inverted" holds it at the seam until the second has run all the way
+  // through, so the LATE claim commits first. Neither "the first caller wins"
+  // nor "the second caller wins" can pass by accident.
+  for (const ordering of ["natural", "inverted"] as const) {
+    const hub = new RoomHub({ dataDir: null, sweepIntervalMs: 0 });
+    const host = hub.createRoom({ topic: "resources", name: "host", card: skill("hosting") });
+    const room = host.room;
+    const a = await hub.join({ room, join_secret: host.join_secret!, name: "worker-a", card: skill("work") });
+    const b = await hub.join({ room, join_secret: host.join_secret!, name: "worker-b", card: skill("work") });
+    const c = await hub.join({ room, join_secret: host.join_secret!, name: "worker-c", card: skill("work") });
+    const mk = async (title: string) =>
+      (await hub.task({ room, membership_token: host.contract.you.membership_token, action: "create", title })) as { id: string };
+    // THREE tasks: two claims that must intersect, and one that must not. A
+    // single task could only ever prove "one owner per task", which 0.1.8 had.
+    const t1 = await mk("parent key");
+    const t2 = await mk("child key");
+    const t3 = await mk("sibling key");
+
+    let release: (() => void) | null = null;
+    const holdFirst = new Promise<void>((r) => (release = r));
+    let seen = 0;
+    setClaimSeam(async () => {
+      seen++;
+      if (ordering === "inverted" && seen === 1) await holdFirst;
+    });
+    try {
+      const claim = (tok: string, id: string, resources: string[]) =>
+        hub
+          .task({ room, membership_token: tok, action: "claim", id, resources })
+          .then(() => ({ ok: true as const, code: undefined, data: undefined as Record<string, unknown> | undefined }))
+          .catch((e: { code?: string; data?: Record<string, unknown> }) => ({ ok: false as const, code: e.code, data: e.data }));
+
+      const first = claim(a.you.membership_token, t1.id, ["local/agent-a"]);
+      await new Promise((r) => setTimeout(r, 5));
+      const second = claim(b.you.membership_token, t2.id, ["local/agent-a/notes"]);
+      // The sibling goes through the same seam and MUST be admitted: it is a
+      // different resource, and a byte-prefix check would refuse it.
+      const sibling = claim(c.you.membership_token, t3.id, ["local/agent-ab"]);
+      await new Promise((r) => setTimeout(r, 5));
+      (release as unknown as () => void)();
+
+      const [ra, rb, rs] = await Promise.all([first, second, sibling]);
+      const winners = [ra, rb].filter((r) => r.ok).length;
+      assert.equal(winners, 1, `exactly one of two intersecting claims wins (${ordering}): ${JSON.stringify([ra, rb])}`);
+      const loser = [ra, rb].find((r) => !r.ok)!;
+      assert.equal(loser.code, "task_conflict", "the loser is REFUSED, never queued: refuse-never-wait is what makes deadlock impossible");
+      assert.equal(typeof loser.data?.blocking_key, "string", "and the refusal names the blocking key, so a client can back off on something");
+      assert.equal(rs.ok, true, "`local/agent-ab` is a SIBLING of `local/agent-a`, not a child: a byte-prefix check would have refused it");
+    } finally {
+      setClaimSeam(undefined);
+      hub.close();
+    }
+  }
+});
+
+test("seam 1: a grant outlives the process and keeps refusing; its claim token does not", async () => {
+  const { RoomHub } = await import("../src/store.js");
+  const skill = (id: string) => ({ name: id, description: `${id} agent`, skills: [{ id, description: id }] });
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-grant-restart-"));
+
+  // The two halves of the fence have OPPOSITE persistence requirements, and this
+  // is the test that says so out loud: the grant MUST survive, because its job is
+  // refusing future claims and spec 10.3 item 7 calls a process-local grant map
+  // non-conformant; the claim token MUST NOT, because a fence that survives is a
+  // fence somebody else can find (section 14 guarantee 8).
+  let handle = "";
+  let secret = "";
+  let taskId = "";
+  let token = "";
+  {
+    const hub = new RoomHub({ dataDir, sweepIntervalMs: 0 });
+    const host = hub.createRoom({ topic: "restart", name: "host", card: skill("hosting") });
+    handle = host.room;
+    secret = host.join_secret!;
+    const a = await hub.join({ room: handle, join_secret: secret, name: "worker-a", card: skill("work") });
+    const t = (await hub.task({ room: handle, membership_token: host.contract.you.membership_token, action: "create", title: "held" })) as { id: string };
+    taskId = t.id;
+    token = ((await hub.task({
+      room: handle, membership_token: a.you.membership_token, action: "claim", id: t.id, resources: ["local/store/alpha"],
+    })) as { claim_token: string }).claim_token;
+    hub.close();
+  }
+
+  const hub = new RoomHub({ dataDir, sweepIntervalMs: 0 });
+  try {
+    const b = await hub.join({ room: handle, join_secret: secret, name: "worker-b", card: skill("work") });
+    const list = (await hub.task({ room: handle, membership_token: b.you.membership_token, action: "list" })) as { tasks: RfaTask[] };
+    const reloaded = list.tasks.find((t) => t.id === taskId);
+    assert.deepEqual(reloaded?.resource_grants?.[0]?.keys, ["local/store/alpha"], "the grant came back off disk with the task");
+
+    // The whole reason a grant persists: it still refuses.
+    const t2 = (await hub.task({ room: handle, membership_token: b.you.membership_token, action: "create", title: "wants the same store" })) as { id: string };
+    const refused = await hub
+      .task({ room: handle, membership_token: b.you.membership_token, action: "claim", id: t2.id, resources: ["local/store/alpha/inner"] })
+      .then(() => null)
+      .catch((e: { code?: string }) => e.code);
+    assert.equal(refused, "task_conflict", "a grant that survived the restart still refuses an intersecting claim");
+
+    // And the token did not survive. The error names which of the two it is.
+    const stale = await hub
+      .task({ room: handle, membership_token: b.you.membership_token, action: "complete", id: taskId, claim_token: token, evidence: { summary: "x" } })
+      .then(() => null)
+      .catch((e: { code?: string }) => e.code);
+    assert.equal(stale, "lease_expired", "a claim token never survives a restart, and a stale fence says so by name");
+  } finally {
+    hub.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
   }
 });
 

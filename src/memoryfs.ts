@@ -46,14 +46,105 @@ import type { MemoryGate } from "./client.js";
 
 // ---------------------------------------------------------------- gated root
 
+/**
+ * Who a turn was serving when it wrote to `/memories` (RFA-0.8 sect. 4 item 5,
+ * shipped with rung 7). Hub-derived, exactly like the `home` it carries: a
+ * requester does not get to say which organization it is.
+ */
+export interface WriteProvenance {
+  /** The requester's hub-derived home; `"local"` is this hub's own organization. */
+  requester_home: string;
+  /** The room the turn was serving. */
+  room: string | null;
+}
+
+/** One recorded write: its provenance plus whether it is quarantined and when it was promoted. */
+interface ProvenanceRecord extends WriteProvenance {
+  at: string;
+  /** Withheld from OTHER turns' automatic retrieval until the consolidation lane promotes it. */
+  quarantined: boolean;
+}
+
+/** The sidecar index, in the memory root beside what it describes. */
+const PROVENANCE_FILE = ".provenance.json";
+
 export class GatedMemory {
   constructor(
     private root: string,
     private gate: MemoryGate,
     private selfId: string,
+    /**
+     * Who the CURRENT turn is serving, read per write rather than captured, so
+     * one `GatedMemory` serves N concurrent turns correctly. Absent means a
+     * local, unattributed write (a schedule, a consolidation pass), which is the
+     * pre-rung-7 behaviour and is never quarantined.
+     */
+    private provenance?: () => WriteProvenance | null,
   ) {
     fs.mkdirSync(path.join(root, "blocks"), { recursive: true });
     fs.mkdirSync(path.join(root, "notes"), { recursive: true });
+  }
+
+  private readProvenance(): Record<string, ProvenanceRecord> {
+    try {
+      return JSON.parse(fs.readFileSync(path.join(this.root, PROVENANCE_FILE), "utf8")) as Record<string, ProvenanceRecord>;
+    } catch {
+      return {};
+    }
+  }
+
+  private writeProvenance(index: Record<string, ProvenanceRecord>): void {
+    fs.writeFileSync(path.join(this.root, PROVENANCE_FILE), JSON.stringify(index, null, 1));
+  }
+
+  /**
+   * Stamp a write with the requester's home and room, and QUARANTINE it when
+   * that requester is not local (RFA-0.8 sect. 4 item 5).
+   *
+   * The reason is specific to concurrency and worth stating where the code is: N
+   * parallel conversations are N injection sequences in the time of one, and the
+   * cross-org variant only needs to be READ by a concurrent turn to work. It
+   * does not need to survive consolidation. So a quarantined write stays fully
+   * readable by the turn that made it and by `view`, and is withheld only from
+   * the automatic injection that reaches OTHER turns, until the consolidation
+   * lane promotes it.
+   *
+   * Full per-home memory partitions stay PARKED, with their own trigger (a
+   * counterparty whose written agreement requires data separation).
+   */
+  private stamp(abs: string): void {
+    const p = this.provenance?.();
+    if (!p) return;
+    const rel = path.relative(this.root, abs);
+    const index = this.readProvenance();
+    index[rel] = { ...p, at: new Date().toISOString(), quarantined: p.requester_home !== "local" };
+    this.writeProvenance(index);
+  }
+
+  /** Is this path withheld from other turns' automatic retrieval? */
+  private isQuarantined(abs: string): boolean {
+    return this.readProvenance()[path.relative(this.root, abs)]?.quarantined === true;
+  }
+
+  /** What the operator and the consolidation lane read: every recorded write, quarantined or not. */
+  provenanceIndex(): Record<string, ProvenanceRecord> {
+    return this.readProvenance();
+  }
+
+  /**
+   * The consolidation lane's promotion (RFA-0.8 sect. 4 item 5): a quarantined
+   * write becomes ordinarily retrievable. Deliberately NOT reachable from an
+   * answer-path turn: promotion is the consolidation lane's, exactly like the
+   * destructive memory verbs of sect. 4 item 2, or a guest could promote its own
+   * injection by asking twice.
+   */
+  promote(relPath: string): boolean {
+    const index = this.readProvenance();
+    const rec = index[relPath];
+    if (!rec?.quarantined) return false;
+    index[relPath] = { ...rec, quarantined: false };
+    this.writeProvenance(index);
+    return true;
   }
 
   /** Resolve a tool path ("/memories/..." or relative) inside the root, or throw. */
@@ -147,6 +238,7 @@ export class GatedMemory {
       if (opts.expectedHash !== undefined) {
         this.requireUnchanged(abs, p, opts.expectedHash);
         fs.writeFileSync(abs, content);
+        this.stamp(abs);
         return `overwrote ${p} (${content.length} chars, precondition held)`;
       }
       const conflict = conflictPath(abs);
@@ -159,6 +251,7 @@ export class GatedMemory {
     }
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, content);
+    this.stamp(abs);
     return `created ${p} (${content.length} chars)`;
   }
 
@@ -171,6 +264,7 @@ export class GatedMemory {
     const next = cur.replace(oldStr, newStr);
     this.guardWrite(abs, next);
     fs.writeFileSync(abs, next);
+    this.stamp(abs);
     return `replaced in ${p}`;
   }
 
@@ -183,6 +277,7 @@ export class GatedMemory {
     const next = lines.join("\n");
     this.guardWrite(abs, next);
     fs.writeFileSync(abs, next);
+    this.stamp(abs);
     return `inserted at line ${line} in ${p}`;
   }
 
@@ -212,7 +307,12 @@ export class GatedMemory {
       .readdirSync(dir)
       // A conflict file is a preserved LOSER, not a block: compiling it would put
       // two versions of one block in the system prompt.
-      .filter((f) => f.endsWith(".md") && !f.includes(CONFLICT_MARKER))
+      // A conflict file is a preserved LOSER and a quarantined block is a write
+      // this turn is not the audience for (RFA-0.8 sect. 4 item 5): both are
+      // readable through `view` and neither is compiled into ANOTHER turn's
+      // system prompt. The cross-org injection variant only needs to be read by
+      // a concurrent turn to work, and this is the read it needs.
+      .filter((f) => f.endsWith(".md") && !f.includes(CONFLICT_MARKER) && !this.isQuarantined(path.join(dir, f)))
       .map((f) => parseBlock(fs.readFileSync(path.join(dir, f), "utf8"), f.replace(/\.md$/, "")));
     if (blocks.length === 0) return "";
     const body = blocks
