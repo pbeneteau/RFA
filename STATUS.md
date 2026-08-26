@@ -16,7 +16,7 @@ The spec is [spec/RFA-0.8-concurrency.md](spec/RFA-0.8-concurrency.md), drafted 
 - Rung 2, runtime hygiene: NOT STARTED, and it is next.
 - Rung 3, read-only parallelism: NOT STARTED.
 - Rung 4, candidate parallelism: NOT STARTED.
-- Rung 5, writing packs (precondition: the Edit interception probe): NOT STARTED.
+- Rung 5, writing packs: NOT STARTED, but its precondition is DISCHARGED: the Edit interception probe ran 2026-08-26 on the pinned SDK 0.3.233 and Edit does fall through to `canUseTool` (method and raw output in [research/05-concurrency/notes/07-live-probes.md](research/05-concurrency/notes/07-live-probes.md), probes C-E). The same probes found the fall-through is per-tool AND per-path, so sect. 9's startup deny probe is still owed.
 - Rung 6, shared-tree mutation (last-resort tier, gated on churn): NOT STARTED.
 - Rung 7, the fleet: NOT STARTED.
 

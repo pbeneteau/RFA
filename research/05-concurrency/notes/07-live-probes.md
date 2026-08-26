@@ -53,6 +53,43 @@ Process model: a third run listed the parent's children 4 s into two concurrent 
 
 One `claude` CLI child per active `query()` (the esbuild process belongs to tsx, not the SDK). The SDK imposes no in-process lock; isolation between concurrent runs comes from the OS process boundary, and the per-run cost is a full CLI process.
 
+## Probe C: does canUseTool intercept the built-in EDIT? (added 2026-08-26)
+
+Run because RFA-0.8 Appendix B item 1 names Edit's interception as UNPROVEN and load-bearing (rung 5 puts the claim-fence check for Edit-based mutations behind the callback and does not ship without either this probe or the per-built-in startup deny probe). Same SDK, 0.3.233, same machine, model `claude-haiku-4-5`, scratch cwd outside any hub directory. Method is probe A's, verbatim, with `tools: ['Read', 'Edit']` so the model can read before it edits.
+
+Case 1, `allowedTools: []`. **The callback FIRED for the built-in Edit, the deny stuck, and the file was unchanged.**
+
+```
+"canUseToolInvocations": [ { "toolName": "Edit", "file": ".../fees.txt" } ],
+"editIntercepted": true, "events": [ "tool_use:Read", "tool_use:Edit", "text" ],
+"fileChanged": false, "fileNow": "the fee is 1 percent"
+```
+
+Case 2, `allowedTools: ['Edit']`. The callback never fired, the edit went through, and the SDK emitted `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED` naming Edit, with the same text it printed for Write.
+
+```
+"canUseToolInvocations": [], "editIntercepted": false, "fileChanged": true, "fileNow": "the fee is 2 percent"
+```
+
+**So Edit behaves exactly as Write does, and Appendix B item 1's assumption-by-analogy is now a measurement.** Rung 5's stated precondition is discharged by this probe.
+
+## Probes D and E: the fall-through is PATH-dependent for Read (added 2026-08-26)
+
+Probe C recorded `readIntercepted: false` while `events` showed a Read had executed, with Read in `tools` and absent from `allowedTools`, i.e. exactly the configuration that makes Edit fall through. Two follow-up probes isolated it, and the first reading (that Read is simply exempt) was wrong.
+
+Probe D, Read alone with a deny callback and a relative path the model resolved to `/fees.txt`: **intercepted**, deny stuck, the canary never reached the model.
+
+Probe E, the decisive one: same tool, same deny callback, two absolute paths, one inside the session cwd and one outside it.
+
+```
+inside cwd:  "intercepted": false, "contentsLeaked": true    <- the canary reached the model past the deny
+outside cwd: "intercepted": true,  "contentsLeaked": false
+```
+
+**A read INSIDE the session's working directory is auto-approved without the callback being consulted; a read outside it falls through.** Edit is not path-dependent this way: probe C case 1's Edit target was inside the cwd and was still intercepted. The coherent reading, which matches Claude Code's own permission model: read-only built-ins are auto-approved within the working directory, write-shaped built-ins never are.
+
+The RFA consequence is concrete, because a resident's cwd IS its pack directory: a pack that declares Read can read anything under `agents/<name>/`, its own `state/member.json` (which holds the membership token) and `state/memory.db` included, and `canUseTool` cannot fence it. The hub's `.rfa/secrets.json` is NOT reachable this way, because it sits in the hub root outside the pack directory, which is what the 2026-08-23 cwd change bought. This also strengthens the case for RFA-0.8 sect. 9 item 1's per-built-in startup deny probe: the doctrine is per-tool AND per-path, and the only safe way to know a given built-in is fenced on a given SDK is to probe it and fail closed.
+
 ## What these probes do not establish
 
-These are single-shot probes on one machine against SDK 0.3.233 with a Haiku model; they establish existence, not guarantees. Not established: that `canUseTool` fires for every built-in (only Write was probed; Bash, Edit and the harness-internal tools named in CLAUDE.md were not), that the interception behavior is stable across SDK versions (the CLAUDE.md rule recorded the opposite behavior for an earlier setup, so this has already changed once), what settings-file allow rules exist on a given deployment (the warning says they shadow invisibly, and the probe machine's user settings were not audited), whether two turns resuming the SAME session id concurrently are safe (deliberately not probed, see recommendation 5), how concurrency behaves at higher fan-out than 2 or under the account-wide lease cap, and whether resource contention (cwd file locks, /memories writes) stays clean when the concurrent runs actually use tools, since round 1 and 2 ran with `tools: []`. The APPLE non-answer in round 1 is also a reminder that a 1-turn Haiku run does not reliably follow "reply with exactly" instructions; the probe conclusions rest on session ids and interference, not on answer quality.
+These are single-shot probes on one machine against SDK 0.3.233 with a Haiku model; they establish existence, not guarantees. Not established: that `canUseTool` fires for every built-in (Write, Edit and Read are now probed, the last of them path-dependent; Bash and the harness-internal tools named in CLAUDE.md are not, and Read's path-dependence is a warning against generalizing from any of them), that the interception behavior is stable across SDK versions (the CLAUDE.md rule recorded the opposite behavior for an earlier setup, so this has already changed once), what settings-file allow rules exist on a given deployment (the warning says they shadow invisibly, and the probe machine's user settings were not audited), whether two turns resuming the SAME session id concurrently are safe (deliberately not probed, see recommendation 5), how concurrency behaves at higher fan-out than 2 or under the account-wide lease cap, and whether resource contention (cwd file locks, /memories writes) stays clean when the concurrent runs actually use tools, since round 1 and 2 ran with `tools: []`. The APPLE non-answer in round 1 is also a reminder that a 1-turn Haiku run does not reliably follow "reply with exactly" instructions; the probe conclusions rest on session ids and interference, not on answer quality.
