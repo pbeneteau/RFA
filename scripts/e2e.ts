@@ -670,6 +670,157 @@ await scenario("rfa: a connect bearer joins with no secret; a revoked peer is re
   }
 });
 
+// 13. RFA-0.8 rung T item 2: two asks against ONE pack. The regression canary for
+// the 2026-08-25 lease-race class (a shared current-lease cell, so whichever turn
+// finished first released the OTHER's lease and freed a slot still in use).
+//
+// Today it asserts STRICT SERIALIZATION and per-ask run-id billing. At rung 3,
+// when pack concurrency lands, it flips to overlap-allowed with invariants (the
+// lease cap held during the overlap, distinct session ids, no torn memory files).
+// The overlap is made reliable with one deliberately SLOW ask, never sleep tuning.
+//
+// It drives the real concurrency modules (the turn lock, the account ledger across
+// two connections to one runs.db, the engine's run rows, the session book) in a
+// child process against a real hub directory. It deliberately does NOT call a
+// model: `npm run e2e` must not need a credential or cost money, and the machinery
+// this canary guards is the machinery around the model call, not the call.
+await scenario("rfa-0.8: two asks against one pack serialize, each billed to its own run id", async () => {
+  const dir = tmpDir("rfa-concurrency");
+  const port = await freePort();
+  const { execFile } = await import("node:child_process");
+  const { nodeArgsFor } = await import("../src/proc.js");
+  const cli = path.join(ROOT, "src", "cli", "main.ts");
+  const rfa = (args: string[]): Promise<{ code: number; stdout: string; stderr: string }> =>
+    new Promise((resolve) =>
+      execFile(process.execPath, [...nodeArgsFor(cli), ...args], { cwd: dir, env: { ...process.env, RFA_DIR: "", NO_COLOR: "1" }, encoding: "utf8", timeout: 120_000 }, (err, stdout, stderr) =>
+        resolve({ code: err ? ((err as { code?: number }).code ?? 1) : 0, stdout, stderr }),
+      ),
+    );
+  const init = await rfa(["init", "--yes", "--no-start", "--name", "conc", "--port", String(port), "--human", "e2e", "--agent", "none", "--json"]);
+  assert(init.code === 0, `init failed: ${init.stderr.trim()}`);
+
+  // The driver runs in its own process so the modules under test are loaded the
+  // way a resident loads them, and so the run rows are written by a pid this
+  // harness does not own.
+  // `.mts`, not `.ts`: a loose file outside a package with `"type": "module"` is
+  // treated as CJS and top-level await fails to transform (the same trap
+  // STATUS.md records for scratchpad scripts).
+  const driver = path.join(dir, "two-asks.mts");
+  fs.writeFileSync(
+    driver,
+    `import { AccountLedger } from ${JSON.stringify(path.join(ROOT, "src", "account.js"))};
+import { Engine } from ${JSON.stringify(path.join(ROOT, "src", "engine.js"))};
+import { makeTurnLock } from ${JSON.stringify(path.join(ROOT, "src", "turnlock.js"))};
+import { SessionBook } from ${JSON.stringify(path.join(ROOT, "src", "sessions.js"))};
+import { loadHubDir } from ${JSON.stringify(path.join(ROOT, "src", "hubdir.js"))};
+
+const h = loadHubDir(process.argv[2]);
+const engine = new Engine(h.paths.runsDb);
+// Two connections to one file: the multi-process case, which is what a lease is for.
+const account = new AccountLedger(h.paths.runsDb);
+const other = new AccountLedger(h.paths.runsDb);
+const oneTurn = makeTurnLock();
+const sessions = new SessionBook();
+const live = new Set<string>();
+const trace: string[] = [];
+let maxOverlap = 0;
+let maxLeases = 0;
+
+/** The resident's turn shape: run row, slot, lease into the set, session entered, settle, release exactly your own. */
+async function ask(label: string, slowMs: number) {
+  const { runId } = engine.createRun({ agent: 'pm-agent', threadId: 'convo-' + label, kind: 'serve' });
+  return oneTurn(async () => {
+    const slot = await account.waitForSlot({ agent: 'pm-agent', lane: 'serve', runId }, { timeoutMs: 30_000 });
+    if (!slot.ok) throw new Error('no slot for ' + label + ': ' + slot.detail);
+    const mine = slot.lease!.lease_id;
+    live.add(mine);
+    sessions.enter('convo-' + label);
+    trace.push(label + ':start');
+    maxOverlap = Math.max(maxOverlap, live.size);
+    try {
+      // The keepalive's job, from the other connection: renew EVERY lease held.
+      const renew = setInterval(() => account.renewAll(live), 20);
+      try {
+        sessions.adopt('convo-' + label, 'sess_' + label);
+        await new Promise((r) => setTimeout(r, slowMs));
+        maxLeases = Math.max(maxLeases, other.leases().length);
+      } finally {
+        clearInterval(renew);
+      }
+      // Per-ask billing: this run's cost, on this run's row.
+      engine.completeRun(runId, { output: { label }, costUsd: label === 'slow' ? 0.11 : 0.02, numTurns: 1, checkpoint: { claude_session_id: sessions.resumeFor('convo-' + label) } });
+      trace.push(label + ':end');
+      return runId;
+    } finally {
+      live.delete(mine);
+      account.release(mine);
+      sessions.leave('convo-' + label);
+    }
+  });
+}
+
+// One deliberately SLOW ask and one fast one, entered concurrently. Sleep tuning
+// is not the mechanism: the slow ask is slow by construction.
+const [slowRun, fastRun] = await Promise.all([ask('slow', 700), ask('fast', 0)]);
+const runs = engine.runs({ agent: 'pm-agent' });
+console.log(JSON.stringify({
+  trace,
+  maxOverlap,
+  maxLeases,
+  leasesLeft: other.leases().length,
+  liveConversations: sessions.liveCount(),
+  runs: runs.map((r) => ({ id: r.run_id, status: r.status, cost: r.cost_usd, session: (r.checkpoint as { claude_session_id?: string } | null)?.claude_session_id, owner: r.owner_pid })),
+  slowRun,
+  fastRun,
+}));
+engine.close();
+account.close();
+other.close();
+`,
+  );
+  const out = await new Promise<{ code: number; stdout: string; stderr: string }>((resolve) =>
+    execFile(process.execPath, [...nodeArgsFor(driver), dir], { cwd: ROOT, encoding: "utf8", timeout: 120_000 }, (err, stdout, stderr) =>
+      resolve({ code: err ? ((err as { code?: number }).code ?? 1) : 0, stdout, stderr }),
+    ),
+  );
+  assert(out.code === 0, `driver failed: ${out.stderr.trim().slice(0, 400)}`);
+  const res = JSON.parse(out.stdout.trim().split("\n").pop()!) as {
+    trace: string[];
+    maxOverlap: number;
+    maxLeases: number;
+    leasesLeft: number;
+    liveConversations: number;
+    runs: { id: string; status: string; cost: number | null; session?: string; owner: number | null }[];
+    slowRun: string;
+    fastRun: string;
+  };
+
+  // STRICT SERIALIZATION: the two turns never interleave, and the trace proves it
+  // by shape rather than by timing (start,end,start,end and never start,start).
+  assert(res.maxOverlap === 1, `at most one turn in flight, saw ${res.maxOverlap} (trace ${res.trace.join(" ")})`);
+  assert(res.trace.length === 4, `four trace points, got ${res.trace.join(" ")}`);
+  assert(res.trace[0].endsWith(":start") && res.trace[1].endsWith(":end"), `the first turn finished before the second began: ${res.trace.join(" ")}`);
+  assert(res.trace[0].split(":")[0] === res.trace[1].split(":")[0], `no interleaving: ${res.trace.join(" ")}`);
+  assert(res.maxLeases <= 1, `one turn per pack means one lease at a time, saw ${res.maxLeases}`);
+
+  // PER-ASK RUN-ID BILLING: two runs, distinct ids, each carrying its OWN cost.
+  // This is the assertion the lease-race class would have broken: the bug billed a
+  // slot wait to the previous turn's run id.
+  assert(res.slowRun !== res.fastRun, "each ask got its own run id");
+  const byId = new Map(res.runs.map((r) => [r.id, r]));
+  assert(byId.get(res.slowRun)?.cost === 0.11, `the slow ask is billed 0.11, got ${byId.get(res.slowRun)?.cost}`);
+  assert(byId.get(res.fastRun)?.cost === 0.02, `the fast ask is billed 0.02, got ${byId.get(res.fastRun)?.cost}`);
+  assert(res.runs.every((r) => r.status === "success"), `both runs settled: ${JSON.stringify(res.runs)}`);
+  assert(res.runs.every((r) => r.owner === null), "a settled run owns nothing, so the zero-traffic sweep cannot mistake it for a corpse");
+  const sessionIds = res.runs.map((r) => r.session);
+  assert(new Set(sessionIds).size === sessionIds.length, `distinct session ids per conversation: ${sessionIds.join(", ")}`);
+
+  // NOTHING LEFT BEHIND: no lease outlives its turn, and no conversation stays held.
+  assert(res.leasesLeft === 0, `every lease released by its own turn, ${res.leasesLeft} left`);
+  assert(res.liveConversations === 0, "every conversation released");
+  return `serialized (${res.trace.join(" ")}), 2 run ids billed 0.11/0.02, max ${res.maxLeases} lease and ${res.maxOverlap} turn in flight`;
+});
+
 // ---------------------------------------------------------------- report
 
 const pass = results.filter((r) => r.ok).length;

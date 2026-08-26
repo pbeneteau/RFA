@@ -113,7 +113,11 @@ test("v0.5.3 migration: provenance columns land behind user_version, idempotentl
   for (const c of ["source_uri", "source_author", "observed_at", "revalidate_after"]) {
     assert.ok(cols.has(c), `${c} was added`);
   }
-  assert.equal(after.pragma("user_version", { simple: true }), 1, "the version records that it ran");
+  // The version records that every migration ran; provenance was 1, the unique
+  // live-fact index of RFA-0.8 sect. 3 item 1 is 2, and each new one bumps it.
+  assert.ok((after.pragma("user_version", { simple: true }) as number) >= 1, "the version records that it ran");
+  const indexes = new Set((after.prepare("PRAGMA index_list(facts)").all() as { name: string }[]).map((i) => i.name));
+  assert.ok(indexes.has("idx_facts_live_hash"), "an old file gains the unique live-hash index on open");
   const row = after.prepare("SELECT text, source_uri FROM facts").get() as { text: string; source_uri: string | null };
   assert.equal(row.text, "an existing fact", "existing rows survive");
   assert.equal(row.source_uri, null, "and NULL means no provenance, not unverified");

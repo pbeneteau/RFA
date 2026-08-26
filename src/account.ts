@@ -185,6 +185,19 @@ export class AccountLedger {
         value TEXT,
         updated_at TEXT NOT NULL
       );
+      -- Named cross-process single-flight (RFA-0.8 sect. 3 item 2). It lives beside
+      -- the leases because it is the same kind of authority over the same file: a
+      -- read-process-write that spans two model calls needs ONE holder, and the
+      -- lease table is where every other cross-process authority in v0.8 lives.
+      -- Distinct from a lease: a lease is a counted slot, this is a named mutex.
+      CREATE TABLE IF NOT EXISTS account_locks (
+        name TEXT PRIMARY KEY,
+        token TEXT NOT NULL,
+        holder TEXT,
+        pid INTEGER NOT NULL,
+        acquired_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS account_rate_limits (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         agent TEXT NOT NULL,
@@ -301,6 +314,32 @@ export class AccountLedger {
     );
   }
 
+  /**
+   * Renew EVERY lease the caller still holds, and say which ones are already
+   * gone (RFA-0.8 sect. 3 item 3).
+   *
+   * A keepalive that renews one lease is correct only while a process can hold
+   * one. Under two concurrent turns a single current-lease cell means the
+   * keepalive renews the newest and the older expires MID-TURN, is swept, and its
+   * slot is handed out again: effective concurrency silently rises past the cap,
+   * which is the failure the cap exists to prevent. This is what makes overlap
+   * legal rather than merely forbidden.
+   */
+  renewAll(leaseIds: Iterable<string>): { renewed: string[]; lost: string[] } {
+    const renewed: string[] = [];
+    const lost: string[] = [];
+    const stmt = this.db.prepare(`UPDATE account_leases SET expires_at = ? WHERE lease_id = ?`);
+    const until = new Date(Date.now() + this.ttlMs).toISOString();
+    const tx = this.db.transaction(() => {
+      for (const id of leaseIds) {
+        if (stmt.run(until, id).changes > 0) renewed.push(id);
+        else lost.push(id);
+      }
+    });
+    tx.immediate();
+    return { renewed, lost };
+  }
+
   /** Idempotent: releasing an already-swept lease is not an error. */
   release(leaseId: string): void {
     this.db.prepare(`DELETE FROM account_leases WHERE lease_id = ?`).run(leaseId);
@@ -309,6 +348,65 @@ export class AccountLedger {
   /** Every lease an agent holds: the supervisor's drain and retirement path. */
   releaseAgent(agent: string): number {
     return this.db.prepare(`DELETE FROM account_leases WHERE agent = ?`).run(agent).changes;
+  }
+
+  // ---------------------------------------------------------------- named single-flight
+
+  /**
+   * Take a NAMED cross-process lock, or be refused (RFA-0.8 sect. 3 item 2).
+   *
+   * Consolidation is a read-process-write around two model calls: it reads a
+   * watermark, spends money, then writes the watermark back. Two processes doing
+   * that at once both pay and both apply; single-flight-by-hope is what the
+   * resident's timer and `rfa agent reflect --apply` relied on. Refused rather
+   * than queued, because every caller is an idle timer that comes back.
+   *
+   * Staleness is decided by a DIRECT state check first (is the holder's pid
+   * alive) and the TTL only as the backstop, the same order the lease sweep uses:
+   * a holder that died must not hold a name for the length of a TTL, and a holder
+   * that is alive must not lose one just because a turn ran long.
+   */
+  takeSingleFlight(name: string, opts: { ttlMs?: number; holder?: string } = {}): { ok: boolean; token: string | null; heldBy?: string; detail?: string } {
+    const ttl = opts.ttlMs ?? this.ttlMs;
+    const tx = this.db.transaction((): { ok: boolean; token: string | null; heldBy?: string; detail?: string } => {
+      const now = Date.now();
+      const row = this.db.prepare(`SELECT * FROM account_locks WHERE name = ?`).get(name) as
+        | { name: string; token: string; holder: string | null; pid: number; expires_at: string }
+        | undefined;
+      if (row) {
+        const dead = !pidAlive(row.pid);
+        const expired = Date.parse(row.expires_at) <= now;
+        if (!dead && !expired) {
+          return {
+            ok: false,
+            token: null,
+            heldBy: row.holder ?? String(row.pid),
+            detail: `${name} is held by pid ${row.pid}${row.holder ? ` (${row.holder})` : ""} until ${row.expires_at}`,
+          };
+        }
+        this.db.prepare(`DELETE FROM account_locks WHERE name = ?`).run(name);
+      }
+      const token = `sfl_${randomBytes(8).toString("hex")}`;
+      this.db
+        .prepare(`INSERT INTO account_locks (name, token, holder, pid, acquired_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)`)
+        .run(name, token, opts.holder ?? null, process.pid, new Date(now).toISOString(), new Date(now + ttl).toISOString());
+      return { ok: true, token };
+    });
+    return tx.immediate();
+  }
+
+  /** Extend a held name. False means it was taken away (dead pid or lapsed TTL), so the holder must stop. */
+  renewSingleFlight(name: string, token: string, ttlMs?: number): boolean {
+    return (
+      this.db
+        .prepare(`UPDATE account_locks SET expires_at = ? WHERE name = ? AND token = ?`)
+        .run(new Date(Date.now() + (ttlMs ?? this.ttlMs)).toISOString(), name, token).changes > 0
+    );
+  }
+
+  /** Idempotent, and token-fenced: a lapsed holder cannot release the name its successor now holds. */
+  releaseSingleFlight(name: string, token: string): void {
+    this.db.prepare(`DELETE FROM account_locks WHERE name = ? AND token = ?`).run(name, token);
   }
 
   inFlight(rows: Lease[] = this.leases()): { total: number; byLane: Record<Lane, number>; byAgent: Record<string, number> } {
@@ -339,6 +437,13 @@ export class AccountLedger {
       for (const row of this.db.prepare(`SELECT lease_id, pid FROM account_leases`).all() as { lease_id: string; pid: number }[]) {
         if (alive(row.pid)) continue;
         dropped += this.db.prepare(`DELETE FROM account_leases WHERE lease_id = ?`).run(row.lease_id).changes;
+      }
+      // Named locks whose holder is gone, on the same direct state check. Without
+      // this a killed consolidation holds its name until the TTL lapses, and at
+      // zero traffic nothing else would ever look.
+      for (const row of this.db.prepare(`SELECT name, pid, expires_at FROM account_locks`).all() as { name: string; pid: number; expires_at: string }[]) {
+        if (alive(row.pid) && Date.parse(row.expires_at) > Date.now()) continue;
+        dropped += this.db.prepare(`DELETE FROM account_locks WHERE name = ?`).run(row.name).changes;
       }
       // Handled reports are kept a fortnight so a pattern is still readable.
       this.db

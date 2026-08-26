@@ -35,6 +35,8 @@ export interface Run {
   ended_at: string | null;
   cost_usd: number | null;
   num_turns: number | null;
+  /** The pid that owns this run while it is `running`; NULL once it settles, or on a pre-0.8 row. */
+  owner_pid: number | null;
 }
 
 /** The subprocess-resident checkpoint payload (spec 4.3). */
@@ -114,6 +116,28 @@ export class Engine {
         created_at TEXT NOT NULL
       );
     `);
+    this.migrate();
+  }
+
+  /**
+   * Schema migrations, additive and idempotent, recorded in `user_version`: the
+   * same mechanism the per-pack memory store uses, for the same reason (a
+   * supervisor may run an older build against a newer file after a rollback).
+   */
+  private migrate(): void {
+    const current = (this.db.pragma("user_version", { simple: true }) as number) ?? 0;
+    if (current < 1) {
+      // RFA-0.8 sect. 3 item 4: who owns a `running` run. Without it "did the
+      // process running this die" is not answerable from the row, so the only
+      // sweep possible was `reconcileOrphans` at the one moment the supervisor
+      // knows nothing owns a pack (its start), and a run whose resident is never
+      // restarted stays `running` and holds its thread `busy` forever. NULL means
+      // a pre-0.8 row or a settled run, and is never read as "dead".
+      const cols = this.db.prepare("PRAGMA table_info(runs)").all() as { name: string }[];
+      if (!cols.some((c) => c.name === "owner_pid")) this.db.exec(`ALTER TABLE runs ADD COLUMN owner_pid INTEGER`);
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_runs_owner ON runs(owner_pid) WHERE owner_pid IS NOT NULL`);
+      this.db.pragma("user_version = 1");
+    }
   }
 
   close(): void {
@@ -153,7 +177,7 @@ export class Engine {
         if (strategy === "reject") return { runId: "", action: "rejected" as const };
         if (strategy === "interrupt" || strategy === "rollback") {
           this.db
-            .prepare(`UPDATE runs SET status = 'interrupted', ended_at = ? WHERE thread_id = ? AND status = 'running'`)
+            .prepare(`UPDATE runs SET status = 'interrupted', ended_at = ?, owner_pid = NULL WHERE thread_id = ? AND status = 'running'`)
             .run(now, args.threadId);
           action = "interrupted_previous";
         } else {
@@ -163,10 +187,10 @@ export class Engine {
       const starting = action === "start" || action === "interrupted_previous";
       this.db
         .prepare(
-          `INSERT INTO runs (run_id, thread_id, agent, status, kind, input_json, created_at, started_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO runs (run_id, thread_id, agent, status, kind, input_json, created_at, started_at, owner_pid)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(runId, args.threadId, args.agent, starting ? "running" : "pending", args.kind, json(args.input), now, starting ? now : null);
+        .run(runId, args.threadId, args.agent, starting ? "running" : "pending", args.kind, json(args.input), now, starting ? now : null, starting ? process.pid : null);
       if (starting) {
         this.db.prepare(`UPDATE threads SET status = 'busy', updated_at = ? WHERE thread_id = ?`).run(now, args.threadId);
       }
@@ -196,6 +220,59 @@ export class Engine {
    * previous corpse from a live sibling, and a 30-minute approval wait is a
    * legitimately long-running run, so no timeout heuristic is safe either.
    */
+  /**
+   * Every run whose OWNING PROCESS IS GONE, swept to a terminal state, on a
+   * direct state check (RFA-0.8 sect. 3 item 4).
+   *
+   * The difference from `reconcileOrphans` is when it is safe to call, and that is
+   * the whole point. Orphan reconciliation is safe only at the instant the
+   * supervisor knows nothing owns a pack (as it starts a resident), so a pack
+   * whose resident is retired, disabled, or simply never restarted keeps its
+   * `running` rows and its `busy` threads for as long as the hub directory exists
+   * (measured before that fix: four threads busy, the oldest for two and a half
+   * days). This one asks the operating system whether the recorded owner exists,
+   * which is answerable at any moment, from any process, AT ZERO TRAFFIC.
+   *
+   * Zero traffic is the requirement, not an aside: this is a STATE, and a state
+   * needs a direct check. The repository has already paid for the inverse, an
+   * error-RATE alert that stayed silent through a total outage because a rate has
+   * no denominator on a quiet hub.
+   *
+   * Rows with a NULL `owner_pid` are LEFT ALONE: a pre-0.8 row carries no evidence
+   * about its owner, and inferring death from its age is the timeout heuristic
+   * this deliberately avoids (a 30-minute approval wait is a legitimately long
+   * run). `reconcileOrphans` still covers those at resident start.
+   *
+   * Pid reuse can spare a run one sweep, exactly as it can spare an account lease
+   * one, and it costs the same nothing: the next pass looks again.
+   */
+  reconcileDead(opts: { alive?: (pid: number) => boolean; agent?: string } = {}): { runs: string[]; threads: string[] } {
+    const alive = opts.alive ?? pidAlive;
+    return this.db.transaction(() => {
+      const rows = (
+        opts.agent
+          ? this.db
+              .prepare(`SELECT run_id, thread_id, owner_pid FROM runs WHERE status = 'running' AND owner_pid IS NOT NULL AND agent = ?`)
+              .all(opts.agent)
+          : this.db.prepare(`SELECT run_id, thread_id, owner_pid FROM runs WHERE status = 'running' AND owner_pid IS NOT NULL`).all()
+      ) as { run_id: string; thread_id: string; owner_pid: number }[];
+      const dead = rows.filter((r) => !alive(r.owner_pid));
+      if (dead.length === 0) return { runs: [], threads: [] };
+      const now = iso();
+      const markRun = this.db.prepare(
+        `UPDATE runs SET status = 'interrupted', ended_at = ?, owner_pid = NULL, error = COALESCE(error, ?) WHERE run_id = ?`,
+      );
+      // `idle`, not `interrupted`: idle is what lets a queued `pending` run be
+      // picked up, and making the conversation servable again is the point.
+      const freeThread = this.db.prepare(`UPDATE threads SET status = 'idle', updated_at = ? WHERE thread_id = ?`);
+      for (const r of dead) {
+        markRun.run(now, `orphaned: the process running this (pid ${r.owner_pid}) is gone`, r.run_id);
+        freeThread.run(now, r.thread_id);
+      }
+      return { runs: dead.map((r) => r.run_id), threads: [...new Set(dead.map((r) => r.thread_id))] };
+    })();
+  }
+
   reconcileOrphans(agent: string): { runs: string[]; threads: string[] } {
     return this.db.transaction(() => {
       const orphans = this.db
@@ -204,7 +281,7 @@ export class Engine {
       if (orphans.length === 0) return { runs: [], threads: [] };
       const now = iso();
       const markRun = this.db.prepare(
-        `UPDATE runs SET status = 'interrupted', ended_at = ?, error = COALESCE(error, ?) WHERE run_id = ?`,
+        `UPDATE runs SET status = 'interrupted', ended_at = ?, owner_pid = NULL, error = COALESCE(error, ?) WHERE run_id = ?`,
       );
       // The thread goes to `idle`, not `interrupted`: idle is what lets a queued
       // `pending` run be picked up, and the point of reconciling is to make the
@@ -229,9 +306,10 @@ export class Engine {
         .get(threadId) as RunRow | undefined;
       if (!row) return null;
       const now = iso();
-      this.db.prepare(`UPDATE runs SET status = 'running', started_at = ? WHERE run_id = ?`).run(now, row.run_id);
+      // Whoever drains the queue is the process that will run it, so it owns it.
+      this.db.prepare(`UPDATE runs SET status = 'running', started_at = ?, owner_pid = ? WHERE run_id = ?`).run(now, process.pid, row.run_id);
       this.db.prepare(`UPDATE threads SET status = 'busy', updated_at = ? WHERE thread_id = ?`).run(now, threadId);
-      return this.hydrate({ ...row, status: "running", started_at: now });
+      return this.hydrate({ ...row, status: "running", started_at: now, owner_pid: process.pid });
     })();
   }
 
@@ -247,12 +325,13 @@ export class Engine {
     this.db.transaction(() => {
       const now = iso();
       if (retry) {
+        // A re-queued run is owned by nobody until something picks it up again.
         this.db
-          .prepare(`UPDATE runs SET status = 'pending', attempt = attempt + 1, error = ?, started_at = NULL, checkpoint_json = COALESCE(?, checkpoint_json) WHERE run_id = ?`)
+          .prepare(`UPDATE runs SET status = 'pending', attempt = attempt + 1, error = ?, started_at = NULL, owner_pid = NULL, checkpoint_json = COALESCE(?, checkpoint_json) WHERE run_id = ?`)
           .run(error, opts.checkpoint ? json(opts.checkpoint) : null, runId);
       } else {
         this.db
-          .prepare(`UPDATE runs SET status = 'error', error = ?, ended_at = ?, checkpoint_json = COALESCE(?, checkpoint_json) WHERE run_id = ?`)
+          .prepare(`UPDATE runs SET status = 'error', error = ?, ended_at = ?, owner_pid = NULL, checkpoint_json = COALESCE(?, checkpoint_json) WHERE run_id = ?`)
           .run(error, now, opts.checkpoint ? json(opts.checkpoint) : null, runId);
       }
       this.db
@@ -308,7 +387,7 @@ export class Engine {
       this.db
         .prepare(
           `UPDATE runs SET status = ?, output_json = COALESCE(?, output_json), cost_usd = COALESCE(?, cost_usd),
-           num_turns = COALESCE(?, num_turns), checkpoint_json = COALESCE(?, checkpoint_json), ended_at = ? WHERE run_id = ?`,
+           num_turns = COALESCE(?, num_turns), checkpoint_json = COALESCE(?, checkpoint_json), ended_at = ?, owner_pid = NULL WHERE run_id = ?`,
         )
         .run(status, json(extra.output), extra.costUsd ?? null, extra.numTurns ?? null, extra.checkpoint ? json(extra.checkpoint) : null, now, runId);
       this.db
@@ -334,6 +413,7 @@ export class Engine {
       ended_at: row.ended_at,
       cost_usd: row.cost_usd,
       num_turns: row.num_turns,
+      owner_pid: row.owner_pid ?? null,
     };
   }
 
@@ -477,6 +557,7 @@ interface RunRow {
   ended_at: string | null;
   cost_usd: number | null;
   num_turns: number | null;
+  owner_pid: number | null;
 }
 
 interface ScheduleRow {
@@ -488,6 +569,16 @@ interface ScheduleRow {
   callback: string;
   payload_json: string | null;
   next_fire_at: string | null;
+}
+
+/** PID liveness: EPERM is a live process we do not own. The same check the account sweep uses. */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 const iso = () => new Date().toISOString();

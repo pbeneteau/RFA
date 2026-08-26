@@ -36,6 +36,7 @@ import { makeTurnLock } from "./turnlock.js";
 import { ObsStore } from "./obs.js";
 import { consolidate } from "./consolidate.js";
 import { EpisodeLog, FactStore, GatedMemory } from "./memoryfs.js";
+import { SessionBook } from "./sessions.js";
 import type { Part } from "./model.js";
 
 function arg(name: string): string | undefined {
@@ -149,11 +150,28 @@ const engine = new Engine(hubdir.paths.runsDb);
 // Layer 3 (spec 18.6): one account-wide cap on model turns in flight, shared
 // with every other resident and background pass through the same SQLite file.
 const account = new AccountLedger(hubdir.paths.runsDb);
-let currentLease: string | null = null;
+/**
+ * EVERY account lease this process currently holds, not the newest one
+ * (RFA-0.8 sect. 3 item 3).
+ *
+ * This was a single `currentLease` cell, and under two concurrent turns that cell
+ * is two bugs: the keepalive renews only the newest lease, so the older expires
+ * MID-TURN and is swept and its slot handed out again (effective concurrency
+ * silently rises past the cap), and the first `finally` releases the SECOND
+ * turn's lease. The turn lock of 2026-08-25 contains both by forbidding overlap
+ * inside one process; a set is what makes overlap legal instead of merely
+ * forbidden, so the lock can be narrowed at rung 3 without reopening either.
+ */
+const liveLeases = new Set<string>();
 const obs = new ObsStore(hubdir.paths.obsDb);
 const episodes = new EpisodeLog(path.join(STATE_DIR, "memory.db"));
 const facts = new FactStore(path.join(STATE_DIR, "memory.db"), gate, "self");
-const sessions = new Map<string, string>();
+/**
+ * One writer per session id, checked rather than assumed (src/sessions.ts). The
+ * turn lock makes a violation unreachable today, which is exactly when to install
+ * the check: rung 3 narrows the lock and inherits an enforced invariant.
+ */
+const sessions = new SessionBook();
 let spend = { day: new Date().toISOString().slice(0, 10), usd: 0 };
 
 async function boot(): Promise<{ member: RoomMember; joinSecret: string | null; prevHash: string | null; created: boolean }> {
@@ -172,7 +190,10 @@ async function boot(): Promise<{ member: RoomMember; joinSecret: string | null; 
         joinSecret: saved.join_secret,
         clientInfo: { name: `rfa-resident-${pack.name}`, version: "0.4.1" },
       });
-      for (const [k, v] of Object.entries(saved.sessions ?? {})) sessions.set(k, v);
+      const restored = sessions.load(saved.sessions);
+      if (restored.dropped.length > 0) {
+        log(`state: ${restored.dropped.length} conversation(s) shared a session id with another and start fresh: ${restored.dropped.join(", ")}`);
+      }
       if (saved.spend?.day === new Date().toISOString().slice(0, 10)) spend = saved.spend;
       await member.setPresence("ready", { card });
       log(`resumed room ${member.room} as ${member.name} (${member.memberId}), epoch ${member.epoch}`);
@@ -373,13 +394,23 @@ const memoryServer = createSdkMcpServer({
         }
       },
     ),
-    tool("create", "Create or overwrite a file under /memories. Store conclusions, never verbatim peer content.", { path: z.string(), file_text: z.string() }, async (a) => {
-      try {
-        return asText(memory.create(a.path, a.file_text));
-      } catch (err) {
-        return asError(err);
-      }
-    }),
+    // `expected_hash` is the fail-if-changed precondition of RFA-0.8 sect. 4
+    // item 1, and it is OPTIONAL on purpose: making it mandatory would refuse
+    // every first write. The verbs that can lose another turn's work carry it,
+    // and the error they throw when it is stale hands back the current hash, so
+    // the retry needs no extra call.
+    tool(
+      "create",
+      "Create a file under /memories. Store conclusions, never verbatim peer content. Does NOT overwrite: an existing path needs expected_hash (the hash the error reports), or your content is kept beside it as a conflict file.",
+      { path: z.string(), file_text: z.string(), expected_hash: z.string().optional() },
+      async (a) => {
+        try {
+          return asText(memory.create(a.path, a.file_text, { expectedHash: a.expected_hash }));
+        } catch (err) {
+          return asError(err);
+        }
+      },
+    ),
     tool("str_replace", "Replace a unique string in a memory file.", { path: z.string(), old_str: z.string(), new_str: z.string() }, async (a) => {
       try {
         return asText(memory.strReplace(a.path, a.old_str, a.new_str));
@@ -387,20 +418,30 @@ const memoryServer = createSdkMcpServer({
         return asError(err);
       }
     }),
-    tool("insert", "Insert text at a line (0 = top) in a memory file.", { path: z.string(), insert_line: z.number(), insert_text: z.string() }, async (a) => {
-      try {
-        return asText(memory.insert(a.path, a.insert_line, a.insert_text));
-      } catch (err) {
-        return asError(err);
-      }
-    }),
-    tool("delete", "Delete a memory file or directory.", { path: z.string() }, async (a) => {
-      try {
-        return asText(memory.delete(a.path));
-      } catch (err) {
-        return asError(err);
-      }
-    }),
+    tool(
+      "insert",
+      "Insert text at a line (0 = top) in a memory file. Pass expected_hash to fail if another turn changed the file since you read it.",
+      { path: z.string(), insert_line: z.number(), insert_text: z.string(), expected_hash: z.string().optional() },
+      async (a) => {
+        try {
+          return asText(memory.insert(a.path, a.insert_line, a.insert_text, { expectedHash: a.expected_hash }));
+        } catch (err) {
+          return asError(err);
+        }
+      },
+    ),
+    tool(
+      "delete",
+      "Delete a memory file or directory. Pass expected_hash to fail if another turn changed it since you read it.",
+      { path: z.string(), expected_hash: z.string().optional() },
+      async (a) => {
+        try {
+          return asText(memory.delete(a.path, { expectedHash: a.expected_hash }));
+        } catch (err) {
+          return asError(err);
+        }
+      },
+    ),
     tool("rename", "Rename or move a memory file.", { old_path: z.string(), new_path: z.string() }, async (a) => {
       try {
         return asText(memory.rename(a.old_path, a.new_path));
@@ -473,9 +514,45 @@ const MCP_TOOLS = [
 
 // ---------------------------------------------------------------- brain
 
+/**
+ * The directory the SDK gets as its cwd, and therefore the base every path the
+ * model reads is resolved against. Computed ONCE, because it is used twice and
+ * the two used to disagree (see `knowledgePath`).
+ *
+ * The pack's own folder, never the hub root: the SDK advertises its cwd as an MCP
+ * root, and a server that honours roots (the filesystem server does, and says
+ * roots REPLACE its own arguments) would otherwise be handed the hub directory,
+ * `.rfa/secrets.json` included. Found live on 2026-08-23.
+ */
+const BRAIN_CWD = pack.def.sandbox?.cwd ? path.resolve(HUB_ROOT, pack.def.sandbox.cwd) : pack.dir;
+
+/**
+ * How a knowledge file is NAMED to the model, and it must be a path the model can
+ * actually open.
+ *
+ * Found 2026-08-26 while running the parity gate, and dated precisely by the
+ * per-answer retrieval sets: this listed every file relative to the HUB ROOT
+ * while the model resolves what it reads against `BRAIN_CWD`, which became the
+ * PACK directory on 2026-08-23. Two different bases for one path. Every in-pack
+ * knowledge read then cost extra turns recovering by glob (`agents/pm-agent/
+ * knowledge/...` failed, `knowledge/...` worked), and knowledge OUTSIDE the pack
+ * became unreachable, because no glob under the cwd can find it: the last
+ * two-turn answer to the spec question was 2026-08-22, the day before the cwd
+ * moved, and afterwards the model burned seven turns guessing
+ * `/Users/paulbeneteau/rfa/Dev/agent-com/...` before refusing.
+ *
+ * Relative inside the cwd (short, and what the model sees when it lists the
+ * directory), ABSOLUTE outside it: a `../../` chain out of the tree is exactly
+ * what got resolved against the wrong base, and an absolute path cannot be.
+ */
+function knowledgePath(f: string): string {
+  const rel = path.relative(BRAIN_CWD, f);
+  return rel.startsWith("..") ? f : rel;
+}
+
 function systemPrompt(): string {
   const files = knowledgeFiles(pack)
-    .map((f) => `- ${path.relative(HUB_ROOT, f)} :: ${fileHint(f)}`)
+    .map((f) => `- ${knowledgePath(f)} :: ${fileHint(f)}`)
     .join("\n");
   const blocks = memory.compileBlocks();
   const index = memory.indexHead();
@@ -574,7 +651,20 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
   // for. A denied caller retries; the serve loop and the timers already do.
   const slot = await account.waitForSlot({ agent: pack.name, lane: run.lane ?? "serve", runId: run.runId }, { timeoutMs: 120_000 });
   if (!slot.ok) throw new AccountStop(slot.detail ?? "no account slot", slot.retry_after_s ?? null);
-  currentLease = slot.lease?.lease_id ?? null;
+  /** THIS turn's lease, held locally as well as in the set: nothing else may release it. */
+  const myLease = slot.lease?.lease_id ?? null;
+  // The try opens HERE, before the lease joins the set, and not after the query is
+  // constructed. Everything from the lease onward must be covered by the finally
+  // below, or a throw in between (a session already in flight, a systemPrompt that
+  // reads a file, the SDK refusing to start) leaks the lease for the life of the
+  // process, and the keepalive then renews it forever for a turn that never ran.
+  // With the old single current-lease cell that leak was masked by the next turn
+  // overwriting the cell; a set remembers, so the scope has to be right.
+  try {
+  if (myLease) liveLeases.add(myLease);
+  // One writer per session id, enforced (RFA-0.8 sect. 1.1). Entered AFTER the
+  // slot so a turn that never got one leaves nothing behind.
+  sessions.enter(convoKey);
   /** This turn's clock verdict (wire 12.4); local so an overlapping caller can never inherit it. */
   let clockRefusal: string | null = null;
   const posture = agentPosture(pack.def);
@@ -587,7 +677,7 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
       // hub directory, .rfa/secrets.json included. Found live on 2026-08-23:
       // a server started on agents/filer/scratch reported the hub root as its
       // only allowed directory and wrote there.
-      cwd: pack.def.sandbox?.cwd ? path.resolve(HUB_ROOT, pack.def.sandbox.cwd) : pack.dir,
+      cwd: BRAIN_CWD,
       model: pack.def.model,
       ...(pack.def.effort ? { effort: pack.def.effort } : {}),
       // In plan mode the SDK expects a plan file and ExitPlanMode, neither of
@@ -684,7 +774,7 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
       // per_task_usd is not a ceiling, which is why the per-day remainder is
       // the ceiling on its own when a pack declares no per-task budget.
       ...(Number.isFinite(taskCeiling) ? { maxBudgetUsd: taskCeiling } : {}),
-      ...(sessions.has(convoKey) ? { resume: sessions.get(convoKey) } : {}),
+      ...(sessions.resumeFor(convoKey) ? { resume: sessions.resumeFor(convoKey) } : {}),
     },
   });
   let text = "";
@@ -693,10 +783,9 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
   let costUsd = 0;
   let numTurns = 0;
   let tokens: { input: number | null; output: number | null } = { input: null, output: null };
-  try {
   for await (const msg of q) {
     if (msg.type === "system" && msg.subtype === "init") {
-      sessions.set(convoKey, msg.session_id);
+      sessions.adopt(convoKey, msg.session_id);
     } else if (msg.type === "assistant") {
       // The retrieval set (RFA-0.6 sect. 4.4, rung v0.6.4): WHICH knowledge the
       // model actually opened to produce this answer. Forensics only, and the spec
@@ -757,10 +846,14 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
   spend.usd += costUsd;
   return { text, costUsd, numTurns, tokens, retrieved: [...retrieved], refusal: clockRefusal };
   } finally {
-    // Always: a lease held by a dead run blocks every other resident until the
-    // supervisor's sweep reclaims it.
-    if (currentLease) account.release(currentLease);
-    currentLease = null;
+    // Always, and only THIS turn's lease: a lease held by a dead run blocks every
+    // other resident until the supervisor's sweep reclaims it, and a lease
+    // released by the wrong turn frees a slot that is still in use.
+    if (myLease) {
+      liveLeases.delete(myLease);
+      account.release(myLease);
+    }
+    sessions.leave(convoKey);
   }
 }
 
@@ -814,7 +907,7 @@ const save = () =>
     name: member.name,
     cursor: member.cursor,
     definition_hash: pack.definitionHash,
-    sessions: Object.fromEntries(sessions),
+    sessions: sessions.toJSON(),
     spend,
   });
 
@@ -857,7 +950,7 @@ const scheduleTimer = setInterval(async () => {
         return { chars: text.length };
       });
       episodes.recordOwn(member.room, member.memberId, member.name, text);
-      engine.completeRun(runId, { output: { chars: text.length }, costUsd, numTurns, checkpoint: { claude_session_id: sessions.get(`sched:${due.id}`), room_cursor: member.cursor } });
+      engine.completeRun(runId, { output: { chars: text.length }, costUsd, numTurns, checkpoint: { claude_session_id: sessions.resumeFor(`sched:${due.id}`), room_cursor: member.cursor } });
       obs.record({
         id: runId, name: `schedule:${pack.name}`, run_type: "agent_span", start_time: st0, end_time: Date.now(),
         group_id: member.room, inputs: { callback: due.callback.slice(0, 200) }, outputs: { chars: text.length },
@@ -875,13 +968,24 @@ scheduleTimer.unref?.();
 // ---------------------------------------------------------------- serve
 
 let answered = 0;
-let serving = false;
+/**
+ * How many turns are being served right now, not WHETHER one is
+ * (the same defect shape as the lease cell above, RFA-0.8 sect. 3 item 3).
+ *
+ * A boolean is wrong as soon as two serve-shaped things overlap, and they can:
+ * the turn lock serializes MODEL TURNS, not the handling around them, so a task
+ * wake and an ask can both be inside their handler at once and the first
+ * `finally` used to declare the resident idle while the other was still serving.
+ * That mislabels presence to the room and lets the consolidation timer start
+ * against a live turn. Balanced by `finally` at every site.
+ */
+let serving = 0;
 let sinceConsolidation = 0;
 let lastConsolidation = Date.now();
 
 // Background consolidation (spec 5.3): after 8 gated exchanges or 6h, when idle.
 const consolidationTimer = setInterval(() => {
-  if (serving) return;
+  if (serving > 0) return;
   if (sinceConsolidation < 8 && Date.now() - lastConsolidation < 6 * 3600_000) return;
   sinceConsolidation = 0;
   lastConsolidation = Date.now();
@@ -906,14 +1010,22 @@ consolidationTimer.unref?.();
 // supervisor's staleness check still catches real hangs.
 const keepaliveTimer = setInterval(() => {
   // The lease check stands on its own: a scheduled run holds a lease without
-  // ever setting `serving`, and skipping it here let the sweep reclaim a slot
-  // that a long cron turn was still using.
-  if (!serving && !currentLease) return;
-  // The lease TTL is shorter than a human approval wait, so renew it here for
-  // the same reason the heartbeat is renewed here.
-  if (currentLease) account.renew(currentLease);
+  // ever incrementing `serving`, and skipping it here let the sweep reclaim a
+  // slot that a long cron turn was still using.
+  if (serving === 0 && liveLeases.size === 0) return;
+  // EVERY live lease, not the newest (sect. 3 item 3). The TTL is shorter than a
+  // human approval wait, so renewal happens here for the same reason the
+  // heartbeat does; a lease the sweep already took is dropped from the set rather
+  // than renewed forever against a row that is gone.
+  if (liveLeases.size > 0) {
+    const { lost } = account.renewAll(liveLeases);
+    for (const id of lost) {
+      liveLeases.delete(id);
+      log(`account lease ${id} was swept while a turn still held it; the turn keeps running but its slot is gone`);
+    }
+  }
   fs.writeFileSync(HEARTBEAT, String(Date.now()));
-  if (serving) void member.setPresence("busy", { detail: "serving" }).catch(() => {});
+  if (serving > 0) void member.setPresence("busy", { detail: "serving" }).catch(() => {});
 }, 30_000);
 keepaliveTimer.unref?.();
 
@@ -922,7 +1034,8 @@ const shutdown = (sig: string) => {
   save();
   clearInterval(consolidationTimer);
   clearInterval(keepaliveTimer);
-  if (currentLease) account.release(currentLease);
+  for (const id of liveLeases) account.release(id);
+  liveLeases.clear();
   // The sidekick is a real membership: dying without leaving strands a zombie
   // observer in the roster (found live: five hitl corpses after a day of
   // restarts). Best-effort leave, capped so a dead hub cannot stall the drain.
@@ -957,7 +1070,7 @@ async function runAssignedTask(task: Record<string, unknown>, action: string): P
     input: { task: id, action, title: title.slice(0, 200) },
   });
   log(`task ${action === "verify_reject" ? "rework" : "assignment"} ${id} (run ${runId}): ${title.slice(0, 100)}`);
-  serving = true;
+  serving++;
   const t0 = Date.now();
   try {
     await member.task({ action: "update", id, state: "working", note: `picked up by ${member.name} (run ${runId})` });
@@ -1029,7 +1142,7 @@ async function runAssignedTask(task: Record<string, unknown>, action: string): P
       /* already released by the lease, cancelled, or the room ended */
     }
   } finally {
-    serving = false;
+    serving--;
   }
 }
 
@@ -1046,7 +1159,7 @@ await member.serve(
       input: { seq: ctx.envelope.seq, from: ctx.from.name, text: ctx.text.slice(0, 500) },
     });
     log(`Q from ${ctx.from.name} (seq ${ctx.envelope.seq}, run ${runId}): ${ctx.text.slice(0, 100)}`);
-    serving = true;
+    serving++;
     const t0 = Date.now();
     try {
       // L3 retrieval (spec 5.1): consolidated facts relevant to THIS question,
@@ -1062,7 +1175,7 @@ await member.serve(
         output: { chars: text.length },
         costUsd,
         numTurns,
-        checkpoint: { claude_session_id: sessions.get(convo), room_cursor: member.cursor },
+        checkpoint: { claude_session_id: sessions.resumeFor(convo), room_cursor: member.cursor },
       });
       obs.record({
         id: runId,
@@ -1088,7 +1201,6 @@ await member.serve(
           retrieved,
         },
       });
-      serving = false;
       sinceConsolidation++;
       log(`A sent (${text.length} chars, $${costUsd.toFixed(4)}, ${numTurns} turns): ${text.slice(0, 100)}`);
       const body: Part[] = [
@@ -1109,7 +1221,6 @@ await member.serve(
       // human said no: the asker gets the machine-readable reason (wire 12.4).
       return refusal ? new ServeRefusal("deadline_expired", refusal, body) : body;
     } catch (err) {
-      serving = false;
       const budgetStop = err instanceof BudgetStop ? err : null;
       const accountStop = err instanceof AccountStop ? err : null;
       engine.failRun(runId, (err as Error).message, { retryable: false });
@@ -1165,6 +1276,11 @@ await member.serve(
         log(`provider rate limit reported; account pickup paused`);
       }
       throw err;
+    } finally {
+      // Balanced here, not on each exit path: the success path and six refusal
+      // paths each used to clear the flag, and a counter decremented twice on one
+      // turn is worse than a boolean set twice.
+      serving--;
     }
   },
   {

@@ -4,6 +4,7 @@ import { test } from "node:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import Database from "better-sqlite3";
 import { Engine } from "../src/engine.js";
 
 function fresh(): { engine: Engine; dir: string } {
@@ -160,4 +161,67 @@ test("reconcileOrphans frees the threads a dead process left busy, and only that
   assert.deepEqual(engine.reconcileOrphans("pm-agent").runs, [picked!.run_id], "idempotent in shape: it reconciles whatever is running now");
   engine.close();
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+/**
+ * RFA-0.8 sect. 3 item 4: a run whose process died is swept to a terminal state
+ * by a DIRECT STATE CHECK, at any moment, from any process, AT ZERO TRAFFIC.
+ *
+ * `reconcileOrphans` above is safe only at the instant the supervisor knows
+ * nothing owns a pack (as it starts a resident), so a pack whose resident is
+ * retired, disabled or simply never restarted kept its `running` rows and its
+ * `busy` threads indefinitely. A rate could not have found this: on a quiet hub a
+ * rate has no denominator, which is the lesson the repository has already paid
+ * for once.
+ */
+test("reconcileDead sweeps runs whose owning process is gone, on a direct check, and leaves live ones alone", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-dead-"));
+  const engine = new Engine(path.join(dir, "runs.db"));
+  try {
+    const mine = engine.createRun({ agent: "pm-agent", threadId: "convo-live", kind: "serve" });
+    const theirs = engine.createRun({ agent: "pm-agent", threadId: "convo-dead", kind: "serve" });
+    const other = engine.createRun({ agent: "linear-scribe", threadId: "convo-scribe", kind: "serve" });
+    assert.equal(engine.get(mine.runId)!.owner_pid, process.pid, "a run that starts records who owns it");
+
+    // Only `theirs` belongs to a process that is gone. The check is injected, so
+    // the test drives it rather than killing something.
+    const deadPid = engine.get(theirs.runId)!.owner_pid!;
+    const swept = engine.reconcileDead({ alive: (pid) => pid === process.pid || pid !== deadPid });
+    assert.deepEqual(swept.runs, [], "nothing is swept while every owner is alive");
+
+    const real = engine.reconcileDead({ alive: () => false });
+    assert.equal(real.runs.length, 3, "every run whose owner is gone, across agents");
+    assert.deepEqual(real.threads.sort(), ["convo-dead", "convo-live", "convo-scribe"]);
+    for (const id of [mine.runId, theirs.runId, other.runId]) {
+      const run = engine.get(id)!;
+      assert.equal(run.status, "interrupted", "a terminal state, so the conversation is servable again");
+      assert.match(run.error!, /pid \d+\) is gone/, run.error!);
+      assert.equal(run.owner_pid, null, "ownership is cleared with the sweep");
+    }
+    assert.equal(engine.threadStatus("convo-dead"), "idle", "idle, not interrupted: idle is what lets a pending run be picked up");
+
+    // Idempotent, and it never invents death for a row that carries no owner: a
+    // pre-0.8 row has no evidence, and inferring death from age is the timeout
+    // heuristic this deliberately avoids (a 30-minute approval wait is a
+    // legitimately long run).
+    assert.deepEqual(engine.reconcileDead({ alive: () => false }).runs, [], "nothing left to sweep");
+    const raw = new Database(path.join(dir, "runs.db"));
+    raw
+      .prepare(`INSERT INTO runs (run_id, thread_id, agent, status, kind, created_at, started_at) VALUES ('run_legacy', 'convo-old', 'pm-agent', 'running', 'serve', ?, ?)`)
+      .run(new Date().toISOString(), new Date().toISOString());
+    raw.close();
+    assert.deepEqual(engine.reconcileDead({ alive: () => false }).runs, [], "a NULL owner_pid is left alone, never read as dead");
+    assert.equal(engine.get("run_legacy")!.status, "running");
+    // And `reconcileOrphans`, which is safe only at a resident start, still covers it.
+    assert.deepEqual(engine.reconcileOrphans("pm-agent").runs, ["run_legacy"]);
+
+    // A settled run carries no owner, so nothing can sweep it twice.
+    const fresh = engine.createRun({ agent: "pm-agent", threadId: "convo-done", kind: "serve" });
+    engine.completeRun(fresh.runId, { output: { ok: true }, costUsd: 0.01 });
+    assert.equal(engine.get(fresh.runId)!.owner_pid, null, "settling releases ownership");
+    assert.deepEqual(engine.reconcileDead({ alive: () => false }).runs, [], "a completed run is not a corpse");
+  } finally {
+    engine.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -457,6 +457,32 @@ const DEFAULT_MAX_REJECTIONS = 3;
  */
 const claimTokens = new Map<string, { token: string; memberId: string }>();
 
+/**
+ * A test-only seam between the claim path's CHECK and its COMMIT
+ * (RFA-0.8 sect. 14 item 1).
+ *
+ * Every repository gate is serial, and the one genuine concurrency probe in e2e
+ * (two concurrent claims) passes TRIVIALLY today, because the claim path has no
+ * await between reading `task.owner` and writing it: the interleaving it claims to
+ * test is unreachable. Rung 7's resource intersection check is what will break
+ * that property, so the seam is installed now, while the invariant still holds,
+ * and the test drives every ordering with barriers instead of hoping a race shows
+ * up.
+ *
+ * `if (hook) await hook()`, never `await hook?.()`: the latter yields a microtask
+ * even when the hook is undefined, which would OPEN in production exactly the
+ * window this exists to prove is closed. Undefined here means the claim path does
+ * not await at all.
+ */
+let claimSeam: (() => Promise<void>) | undefined;
+
+/** Install the seam (returns the previous value, so a test can restore it). */
+export function setClaimSeam(fn: (() => Promise<void>) | undefined): (() => Promise<void>) | undefined {
+  const prev = claimSeam;
+  claimSeam = fn;
+  return prev;
+}
+
 /** Lock liveness: stamped this often, considered abandoned after this long. */
 const LOCK_HEARTBEAT_MS = 10_000;
 const LOCK_STALE_MS = 60_000;
@@ -2476,9 +2502,21 @@ export class RoomHub {
         return { tasks: [...room.tasks.values()].map((t) => ({ ...t })) };
       case "claim": {
         const task = get(args.id);
-        if (task.state !== "submitted" || task.owner !== null) {
-          throw new RfaError("task_conflict", `task ${task.id} is not claimable (state=${task.state}, owner=${task.owner ?? "none"})`);
-        }
+        const requireClaimable = (): void => {
+          if (task.state !== "submitted" || task.owner !== null) {
+            throw new RfaError("task_conflict", `task ${task.id} is not claimable (state=${task.state}, owner=${task.owner ?? "none"})`);
+          }
+        };
+        requireClaimable();
+        // The check is done and the commit is below. A test may hold the claim
+        // here to drive a specific interleaving; in production this is not an
+        // await at all, so nothing yields and the window stays closed.
+        if (claimSeam) await claimSeam();
+        // Everything from here re-derives from `task`, and this re-check is what
+        // makes that safe: if another claim committed while the seam held us, the
+        // decision that admitted this one is stale and the loser gets
+        // `task_conflict` instead of stealing an owned task.
+        requireClaimable();
         const blockers = openBlockers(task);
         if (blockers.length > 0) {
           throw new RfaError("task_conflict", `task ${task.id} is blocked by ${blockers.join(", ")}`, null, { blocked_by: blockers });

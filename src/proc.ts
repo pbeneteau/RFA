@@ -119,7 +119,10 @@ export function entryFor(callerUrl: string, name: string): string {
  * tool's dependencies are.
  */
 export function nodeArgsFor(script: string): string[] {
-  if (!script.endsWith(".ts")) return [script];
+  // `.mts` too: a loose TypeScript file outside a `"type": "module"` package is
+  // treated as CJS unless it says otherwise, and top-level await then fails to
+  // transform, so callers writing throwaway drivers name them `.mts`.
+  if (!/\.m?ts$/.test(script)) return [script];
   return ["--import", fileURLToPath(import.meta.resolve("tsx")), script];
 }
 

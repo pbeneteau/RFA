@@ -13,6 +13,28 @@
  *
  * Episodes (L2) live beside it in state/memory.db: append-only, every gated
  * room exchange with its verdict and boundary-wrapped form.
+ *
+ * PER-VERB CONCURRENCY CONTRACT (RFA-0.8 sect. 4 item 1). Memory is SHARED
+ * across a pack's concurrent runs on purpose: partitioning it per run would
+ * create the diverging-replica case no shipped system merges. So each verb
+ * carries its own contract instead of one coarse lock:
+ *
+ * - appends stay concurrent;
+ * - `str_replace` keeps its accidental optimistic concurrency DELIBERATELY: a
+ *   unique `old_str` is a compare-and-swap, and a stale one fails loudly so the
+ *   model re-reads. Pinned by test/interleaving.test.ts, not incidental;
+ * - `create` is EXCLUSIVE. It used to clobber unconditionally, which is a
+ *   silently lost update the moment two turns pick the same path; now an
+ *   existing path with different content keeps the incumbent and the arriving
+ *   content survives beside it as a named conflict file (Syncthing's shape),
+ *   named in the error;
+ * - `create` over existing, `insert` and `delete` accept a fail-if-changed
+ *   content hash (`expected_hash`), and the stale error carries the CURRENT
+ *   hash so the retry needs no guessing.
+ *
+ * Deliberately NOT here: making the hash visible in `view`'s output. That is a
+ * prompt-surface change on every turn (a parity-gated behaviour change), and the
+ * write-path errors carry the hash, which is enough to use the precondition.
  */
 import Database from "better-sqlite3";
 import * as fs from "node:fs";
@@ -81,9 +103,60 @@ export class GatedMemory {
       .join("\n");
   }
 
-  create(p: string, content: string): string {
+  /**
+   * The content hash a write-path precondition compares against: the same value
+   * `expected_hash` takes, and the one the stale-precondition error reports.
+   */
+  contentHash(p: string): string {
     const abs = this.resolve(p);
+    if (!fs.existsSync(abs)) throw new Error(`no such memory file: ${p}`);
+    return hashContent(fs.readFileSync(abs, "utf8"));
+  }
+
+  /**
+   * Fail-if-changed (RFA-0.8 sect. 4 item 1). Enforced only when the caller
+   * supplies a hash: a verb whose caller passed none is exactly as concurrent as
+   * it was, and the error is what teaches the model the retry.
+   */
+  private requireUnchanged(abs: string, p: string, expected: string | undefined): void {
+    if (expected === undefined) return;
+    const current = fs.existsSync(abs) ? hashContent(fs.readFileSync(abs, "utf8")) : null;
+    if (current === expected) return;
+    throw new Error(
+      `${p} changed since you read it (you expected ${expected}, current is ${current ?? "(the file is gone)"}): ` +
+        `another turn wrote it. Re-read it with view and retry with the current expected_hash.`,
+    );
+  }
+
+  /**
+   * Create-exclusive. An existing path is NOT overwritten unless the caller
+   * proves it read the current content (`expectedHash`); otherwise the incumbent
+   * stays and the arriving content lands beside it as a conflict file, so a
+   * concurrent write is never silently discarded.
+   */
+  create(p: string, content: string, opts: { expectedHash?: string } = {}): string {
+    const abs = this.resolve(p);
+    // The gate first, always: gated content must not reach disk, conflict file
+    // included.
     this.guardWrite(abs, content);
+    if (fs.existsSync(abs)) {
+      const current = fs.readFileSync(abs, "utf8");
+      // Re-creating a path with the content it already holds is a no-op, not a
+      // conflict: the common benign retry must not litter the memory root.
+      if (current === content) return `${p} unchanged (identical content already there)`;
+      if (opts.expectedHash !== undefined) {
+        this.requireUnchanged(abs, p, opts.expectedHash);
+        fs.writeFileSync(abs, content);
+        return `overwrote ${p} (${content.length} chars, precondition held)`;
+      }
+      const conflict = conflictPath(abs);
+      fs.writeFileSync(conflict, content);
+      throw new Error(
+        `${p} already exists with different content and create does not overwrite. Your content was kept as ` +
+          `/memories/${path.relative(this.root, conflict)} so nothing is lost. Re-read ${p}, then either ` +
+          `str_replace the part you meant to change, or create again passing expected_hash=${hashContent(current)}.`,
+      );
+    }
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, content);
     return `created ${p} (${content.length} chars)`;
@@ -101,8 +174,9 @@ export class GatedMemory {
     return `replaced in ${p}`;
   }
 
-  insert(p: string, line: number, text: string): string {
+  insert(p: string, line: number, text: string, opts: { expectedHash?: string } = {}): string {
     const abs = this.resolve(p);
+    this.requireUnchanged(abs, p, opts.expectedHash);
     const lines = fs.readFileSync(abs, "utf8").split("\n");
     if (line < 0 || line > lines.length) throw new Error(`insert_line ${line} out of range (0..${lines.length})`);
     lines.splice(line, 0, text);
@@ -112,8 +186,9 @@ export class GatedMemory {
     return `inserted at line ${line} in ${p}`;
   }
 
-  delete(p: string): string {
+  delete(p: string, opts: { expectedHash?: string } = {}): string {
     const abs = this.resolve(p);
+    this.requireUnchanged(abs, p, opts.expectedHash);
     if (this.isBlock(abs)) {
       const meta = fs.existsSync(abs) ? parseBlock(fs.readFileSync(abs, "utf8")).meta : null;
       if (meta?.read_only) throw new Error(`block ${path.basename(abs)} is read_only`);
@@ -135,7 +210,9 @@ export class GatedMemory {
     const dir = path.join(this.root, "blocks");
     const blocks = fs
       .readdirSync(dir)
-      .filter((f) => f.endsWith(".md"))
+      // A conflict file is a preserved LOSER, not a block: compiling it would put
+      // two versions of one block in the system prompt.
+      .filter((f) => f.endsWith(".md") && !f.includes(CONFLICT_MARKER))
       .map((f) => parseBlock(fs.readFileSync(path.join(dir, f), "utf8"), f.replace(/\.md$/, "")));
     if (blocks.length === 0) return "";
     const body = blocks
@@ -176,6 +253,26 @@ export function parseBlock(content: string, fallbackLabel = "block"): { meta: Bl
   if (!m) return { meta: { label: fallbackLabel }, value: content.trim() };
   const meta = (YAML.parse(m[1]) ?? {}) as Partial<BlockMeta>;
   return { meta: { label: meta.label ?? fallbackLabel, description: meta.description, limit: meta.limit, read_only: meta.read_only }, value: m[2].trim() };
+}
+
+/** The infix that marks a preserved losing write; `view` shows them, `compileBlocks` skips them. */
+export const CONFLICT_MARKER = ".conflict-";
+
+/** 64 bits of the content's SHA-256: an optimistic-concurrency token, not a digest anyone verifies. */
+export function hashContent(content: string): string {
+  return sha256hex(content).slice(0, 16);
+}
+
+/**
+ * Where a losing `create` lands: Syncthing's shape, extension last so the file
+ * is still what it is. The instant is in the name because two losers on one path
+ * must not overwrite each other, and the hash because the same turn retrying
+ * twice in one millisecond must not either.
+ */
+function conflictPath(abs: string): string {
+  const ext = path.extname(abs);
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `${abs.slice(0, abs.length - ext.length)}${CONFLICT_MARKER}${stamp}${ext}`;
 }
 
 function listRec(dir: string, root: string, out: string[] = []): string[] {
@@ -243,6 +340,22 @@ export class FactStore {
         invalid_at TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_facts_hash ON facts(hash);
+      -- Gate skips (RFA-0.8 sect. 4 item 3). A gate-skipped fact used to vanish
+      -- into a bare "skipped", which blinds consolidation's contradiction
+      -- detector with its own front door: a measured near-duplicate gate rejected
+      -- 206 of 400 contradictory writes before the detector saw them. The skip is
+      -- now a durable row carrying hash, similarity and the episodes behind it.
+      CREATE TABLE IF NOT EXISTS fact_gate_skips (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        at TEXT NOT NULL,
+        hash TEXT NOT NULL,
+        text TEXT NOT NULL,
+        similarity REAL,
+        matched_from TEXT,
+        event TEXT NOT NULL,
+        episode_ids TEXT NOT NULL DEFAULT '[]'
+      );
+      CREATE INDEX IF NOT EXISTS idx_gate_skips_hash ON fact_gate_skips(hash);
       CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(text, content='facts', content_rowid='id');
       CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
         INSERT INTO facts_fts(rowid, text) VALUES (new.id, new.text);
@@ -279,6 +392,53 @@ export class FactStore {
         if (!have.has(name)) this.db.exec(`ALTER TABLE facts ADD COLUMN ${name} ${type}`);
       }
       this.db.pragma("user_version = 1");
+    }
+    if (current < 2) {
+      // RFA-0.8 sect. 3 item 1: the live-fact set enforces hash uniqueness in the
+      // STORE, not in the reader. `apply` was a SELECT-then-INSERT with no
+      // transaction over a non-unique index, and the resident's consolidation
+      // timer and `rfa agent reflect --apply` open this same file from two
+      // processes: a cross-process check-then-insert that produces silent
+      // duplicates.
+      //
+      // A store that already holds duplicate live hashes cannot take the index,
+      // so collapse first. The collapse is EXPIRY, never deletion: this store is
+      // bi-temporal and invalidation is expiry (spec sect. 4), so "who believed
+      // what when" stays answerable. The SURVIVOR is the lowest id, the earliest
+      // `created_at`, because belief in that text began then and has never
+      // stopped; the losers' `episode_ids` are merged FORWARD into the survivor,
+      // because episode ids are provenance and dropping them would lose which
+      // conversation produced the fact.
+      const now = new Date().toISOString();
+      const dupes = this.db
+        .prepare(`SELECT hash, COUNT(*) AS n FROM facts WHERE expired_at IS NULL GROUP BY hash HAVING n > 1`)
+        .all() as { hash: string; n: number }[];
+      let collapsed = 0;
+      for (const d of dupes) {
+        const rows = this.db
+          .prepare(`SELECT id, episode_ids FROM facts WHERE hash = ? AND expired_at IS NULL ORDER BY id`)
+          .all(d.hash) as { id: number; episode_ids: string }[];
+        const [survivor, ...losers] = rows;
+        const merged = new Set<number>(JSON.parse(survivor.episode_ids) as number[]);
+        for (const l of losers) for (const e of JSON.parse(l.episode_ids) as number[]) merged.add(e);
+        this.db
+          .prepare(`UPDATE facts SET episode_ids = ? WHERE id = ?`)
+          .run(JSON.stringify([...merged].sort((a, b) => a - b)), survivor.id);
+        for (const l of losers) {
+          // expired_at only, NOT invalid_at: these rows were never known false in
+          // the world, they are duplicate records of a fact still believed.
+          this.db.prepare(`UPDATE facts SET expired_at = ? WHERE id = ?`).run(now, l.id);
+          collapsed++;
+        }
+      }
+      if (collapsed > 0) {
+        console.error(
+          `[memory] collapsed ${collapsed} duplicate live-hash row(s) across ${dupes.length} hash(es) by expiry ` +
+            `(episode provenance merged into the surviving row) before taking the unique live-fact index`,
+        );
+      }
+      this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_live_hash ON facts(hash) WHERE expired_at IS NULL`);
+      this.db.pragma("user_version = 2");
     }
   }
 
@@ -340,36 +500,88 @@ export class FactStore {
     return rows.map(hydrateFact);
   }
 
-  /** Apply one Mem0 reconciliation item. Returns what happened (gate rejections skip). */
+  /**
+   * Apply one Mem0 reconciliation item. Returns what happened (gate rejections
+   * skip, and the skip is recorded).
+   *
+   * ONE TRANSACTION (RFA-0.8 sect. 3 item 1). The check-then-insert used to sit
+   * bare over a non-unique index while two processes held this file open, so two
+   * consolidations could both miss the duplicate and both insert. The IMMEDIATE
+   * transaction plus the unique partial index on `hash WHERE expired_at IS NULL`
+   * makes the store, not the reader, the authority: the loser of a genuine race
+   * gets the constraint and is reported as the skip it always should have been.
+   */
   apply(item: ReconciliationItem, episodeIds: number[], origin: Fact["source_origin"]): "added" | "updated" | "invalidated" | "skipped" {
-    const now = new Date().toISOString();
     if (item.event === "NONE") return "skipped";
-    if (item.event === "DELETE") {
-      if (item.id == null) return "skipped";
-      this.db.prepare(`UPDATE facts SET invalid_at = ?, expired_at = ? WHERE id = ? AND expired_at IS NULL`).run(now, now, item.id);
-      return "invalidated";
+    // The gate is CPU work over an in-memory window: keep it OUT of the write
+    // transaction, so a rejected write never opens one.
+    if (item.event === "ADD" || item.event === "UPDATE") {
+      if (this.gate) {
+        const v = this.gate.inspectText(item.text, this.selfId);
+        if (!v.ok) {
+          this.recordGateSkip(item, episodeIds, v.similarity, v.matchedFrom);
+          return "skipped";
+        }
+      }
     }
-    // ADD / UPDATE write new text: the gate holds at this door too (a fact that
-    // near-duplicates recent peer content is the worm asking to be remembered).
-    if (this.gate) {
-      const v = this.gate.inspectText(item.text, this.selfId);
-      if (!v.ok) return "skipped";
+    const tx = this.db.transaction((): "added" | "updated" | "invalidated" | "skipped" => {
+      const now = new Date().toISOString();
+      if (item.event === "DELETE") {
+        if (item.id == null) return "skipped";
+        this.db.prepare(`UPDATE facts SET invalid_at = ?, expired_at = ? WHERE id = ? AND expired_at IS NULL`).run(now, now, item.id);
+        return "invalidated";
+      }
+      const hash = factHash(item.text);
+      const dup = this.db.prepare(`SELECT id FROM facts WHERE hash = ? AND expired_at IS NULL`).get(hash);
+      if (dup) return "skipped";
+      let supersedes: number | null = null;
+      if (item.event === "UPDATE" && item.id != null) {
+        this.db.prepare(`UPDATE facts SET expired_at = ? WHERE id = ? AND expired_at IS NULL`).run(now, item.id);
+        supersedes = item.id;
+      }
+      this.db
+        .prepare(
+          `INSERT INTO facts (text, hash, importance, source_origin, episode_ids, supersedes, created_at, valid_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(item.text, hash, clamp01(item.importance ?? 0.5), origin, JSON.stringify(episodeIds), supersedes, now, now);
+      return item.event === "UPDATE" ? "updated" : "added";
+    });
+    try {
+      return tx.immediate();
+    } catch (err) {
+      // The other process committed the same live hash first. Same outcome the
+      // in-transaction check reports, reached from the other side of the race.
+      if (isLiveHashConflict(err)) return "skipped";
+      throw err;
     }
-    const hash = sha256hex(item.text.toLowerCase().replace(/\s+/g, " ").trim()).slice(0, 32);
-    const dup = this.db.prepare(`SELECT id FROM facts WHERE hash = ? AND expired_at IS NULL`).get(hash);
-    if (dup) return "skipped";
-    let supersedes: number | null = null;
-    if (item.event === "UPDATE" && item.id != null) {
-      this.db.prepare(`UPDATE facts SET expired_at = ? WHERE id = ? AND expired_at IS NULL`).run(now, item.id);
-      supersedes = item.id;
-    }
+  }
+
+  /**
+   * A gate-skipped fact, kept (RFA-0.8 sect. 4 item 3). It carries the hash, the
+   * similarity and the episodes behind it, so consolidation can see
+   * contradiction-shaped near-duplicates instead of being blinded by its own
+   * front door.
+   */
+  private recordGateSkip(item: ReconciliationItem, episodeIds: number[], similarity: number, matchedFrom: string): void {
     this.db
       .prepare(
-        `INSERT INTO facts (text, hash, importance, source_origin, episode_ids, supersedes, created_at, valid_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO fact_gate_skips (at, hash, text, similarity, matched_from, event, episode_ids)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(item.text, hash, clamp01(item.importance ?? 0.5), origin, JSON.stringify(episodeIds), supersedes, now, now);
-    return item.event === "UPDATE" ? "updated" : "added";
+      .run(new Date().toISOString(), factHash(item.text), item.text, similarity, matchedFrom, item.event, JSON.stringify(episodeIds));
+  }
+
+  /** What the gate refused, newest first: consolidation's input, and a forensic record. */
+  gateSkips(limit = 50): GateSkip[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM fact_gate_skips ORDER BY id DESC LIMIT ?`)
+      .all(limit) as (Omit<GateSkip, "episode_ids"> & { episode_ids: string })[];
+    return rows.map((r) => ({ ...r, episode_ids: JSON.parse(r.episode_ids) as number[] }));
+  }
+
+  countGateSkips(): number {
+    return (this.db.prepare(`SELECT COUNT(*) AS n FROM fact_gate_skips`).get() as { n: number }).n;
   }
 
   count(): { live: number; total: number } {
@@ -398,6 +610,29 @@ function hydrateFact(r: FactRow): Fact {
 }
 
 const clamp01 = (n: number) => Math.max(0, Math.min(1, n));
+
+/** The dedupe key: normalized text, so casing and whitespace are not two facts. */
+export function factHash(text: string): string {
+  return sha256hex(text.toLowerCase().replace(/\s+/g, " ").trim()).slice(0, 32);
+}
+
+/** The unique live-fact index firing, i.e. the other process won the race. */
+function isLiveHashConflict(err: unknown): boolean {
+  const code = (err as { code?: string }).code ?? "";
+  return code.startsWith("SQLITE_CONSTRAINT") && /idx_facts_live_hash|facts\.hash|UNIQUE/i.test((err as Error).message ?? "");
+}
+
+/** A write the gate refused, kept rather than dropped (RFA-0.8 sect. 4 item 3). */
+export interface GateSkip {
+  id: number;
+  at: string;
+  hash: string;
+  text: string;
+  similarity: number | null;
+  matched_from: string | null;
+  event: string;
+  episode_ids: number[];
+}
 
 // ---------------------------------------------------------------- episodes (L2)
 
@@ -479,6 +714,28 @@ export class EpisodeLog {
   setMeta(key: string, value: string): void {
     this.db.exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`);
     this.db.prepare(`INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(key, value);
+  }
+
+  /**
+   * Compare-and-set (RFA-0.8 sect. 3 item 2): write `value` only if the key still
+   * holds `expected`. False means somebody else moved it, and the caller's whole
+   * read-process-write was against a stale view.
+   *
+   * The named single-flight lock is what stops two passes STARTING; this is what
+   * stops a pass whose lock lapsed mid-flight from stomping the watermark its
+   * successor already advanced. Both, because a lock is a lease and a lease can
+   * be lost while its holder is still running.
+   */
+  casMeta(key: string, expected: string | null, value: string): boolean {
+    this.db.exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`);
+    const tx = this.db.transaction(() => {
+      const row = this.db.prepare(`SELECT value FROM meta WHERE key = ?`).get(key) as { value: string } | undefined;
+      const current = row?.value ?? null;
+      if (current !== expected) return false;
+      this.db.prepare(`INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(key, value);
+      return true;
+    });
+    return tx.immediate();
   }
 
   count(): number {

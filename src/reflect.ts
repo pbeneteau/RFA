@@ -224,6 +224,19 @@ export async function reflect(agentName: string, opts: { hubdir?: HubDir; model?
     ledger.close();
     return { ...empty, deferred: slot.detail ?? "no account slot" };
   }
+  // Single-flight across processes, for the same reason consolidation is
+  // (RFA-0.8 sect. 3 item 2): this is a read-process-write around a model call
+  // that ends in `apply`, and two of them applying one set of lessons is duplicate
+  // memory bought twice. A distinct name from consolidation's: they read different
+  // watermarks and one must not block the other.
+  const lockName = `reflect:${agentName}`;
+  const lock = ledger.takeSingleFlight(lockName, { holder: `reflect ${agentName}` });
+  if (!lock.ok || !lock.token) {
+    if (slot.lease) ledger.release(slot.lease.lease_id);
+    ledger.close();
+    return { ...empty, deferred: lock.detail ?? "another reflection pass holds this pack" };
+  }
+  const lockToken = lock.token;
   const meta = new EpisodeLog(dbPath);
   try {
     // A reviewed proposal: commit exactly what was reviewed, no extraction.
@@ -267,6 +280,7 @@ export async function reflect(agentName: string, opts: { hubdir?: HubDir; model?
     meta.setMeta(WATERMARK, String(watermark));
     return { scanned, incidents: incidents.length, lessons: lessons.length, proposal: file, applied: counts, cost_usd: ext.cost + cost, watermark };
   } finally {
+    ledger.releaseSingleFlight(lockName, lockToken);
     if (slot.lease) ledger.release(slot.lease.lease_id);
     ledger.close();
     meta.close();

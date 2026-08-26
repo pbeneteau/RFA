@@ -631,6 +631,20 @@ async function nightlyPass(): Promise<void> {
 function accountPass(): void {
   const swept = account.sweep();
   if (swept > 0) log(`account: swept ${swept} lease(s) whose owner is gone`);
+  // Run-state reconciliation at ZERO TRAFFIC (RFA-0.8 sect. 3 item 4). A direct
+  // state check, on this timer, not at a resident's start and not from any rate:
+  // a run whose process died holds its thread `busy` forever, every later run on
+  // that conversation is created `pending` behind it, and nothing about that is
+  // visible in an error rate, which on a quiet hub has no denominator at all.
+  // `reconcileOrphans` still covers pre-0.8 rows carrying no owner, at the one
+  // moment it can (a resident start, above).
+  const orphanedRuns = engine.reconcileDead();
+  if (orphanedRuns.runs.length > 0) {
+    log(
+      `engine: swept ${orphanedRuns.runs.length} run(s) whose owning process is gone, freeing ` +
+        `${orphanedRuns.threads.length} wedged thread(s): ${orphanedRuns.threads.join(", ")}`,
+    );
+  }
   const reports = account.pendingRateLimits();
   if (reports.length > 0) {
     const now = Date.now();
@@ -664,6 +678,12 @@ function accountPass(): void {
 log(`hub directory: ${hubdir.root} (${hubdir.mode === "hub" ? `hub on ${HUB}` : `remote hub ${HUB}`}); registry: ${AGENTS}; resident env: ${hubdir.manifest.agents.env}`);
 account.setCap(configuredCap());
 account.sweep();
+{
+  // At boot too: a supervisor restarting after a crash is the most likely moment
+  // for a dead owner's run to be sitting there.
+  const swept = engine.reconcileDead();
+  if (swept.runs.length > 0) log(`engine: swept ${swept.runs.length} run(s) whose owning process is gone at boot (${swept.threads.length} thread(s) freed)`);
+}
 log(`account layer: cap ${account.cap()} model turn(s) in flight (lane limits: serve ${account.laneLimit("serve")}, schedule ${account.laneLimit("schedule")}, background ${account.laneLimit("background")})`);
 if (account.pausedUntil() > 0) {
   announcedPauseUntil = account.pausedUntil();
