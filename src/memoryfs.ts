@@ -654,7 +654,30 @@ export interface Episode {
 export class EpisodeLog {
   private db: Database.Database;
 
-  constructor(dbPath: string) {
+  /**
+   * @param withhold A guard consulted before an OWN answer is recorded: return a
+   * reason and the write throws (RFA-0.8 sect. 11, rung 4).
+   *
+   * It exists for one rule: **a losing candidate's reasoning must never become
+   * remembered fact.** N candidates for one task, each recording an episode,
+   * means consolidation later distils the rejected candidates too, which is the
+   * fact store learning from work a human threw away. So a candidate turn writes
+   * NO episode; its answer lives in `candidate_runs` in the engine DB, and only
+   * the SELECTED winner's answer is recorded here, on the selection path, in
+   * normal id order ahead of the consolidation watermark.
+   *
+   * The alternative shape (tag every candidate's episode and filter them out of
+   * the consolidation input) was rejected for a concrete reason: consolidation
+   * advances its watermark to the last id of its batch, so a filtered-out
+   * episode would be stepped over and a candidate promoted afterwards would
+   * never be consolidated at all. That shape needs a watermark that can go
+   * backwards, which is what rung 1's compare-and-set exists to prevent.
+   *
+   * This guard is what makes the rule enforced at the write rather than
+   * remembered: the candidate path does not call `recordOwn`, so the throw is a
+   * tripwire for a future author, not a runtime path.
+   */
+  constructor(dbPath: string, private withhold?: () => string | null) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
@@ -687,6 +710,8 @@ export class EpisodeLog {
   }
 
   recordOwn(room: string, selfId: string, selfName: string, text: string): void {
+    const reason = this.withhold?.();
+    if (reason) throw new Error(`this answer must not be recorded as an episode: ${reason}`);
     this.db
       .prepare(
         `INSERT INTO episodes (ts, room, seq, from_id, from_name, origin, kind, gate_ok, text)

@@ -41,6 +41,15 @@ export interface TurnBinding {
   /** The scope an action taken in this turn serves (RFA-0.8 sect. 6.4 item 1). */
   conversationId: string | null;
   taskId: string | null;
+  /**
+   * The candidate set this turn is one of (RFA-0.8 sect. 11), else null.
+   *
+   * Read by the two memory write paths, which is the whole reason it travels
+   * with the turn: a candidate may lose, and a losing candidate's reasoning must
+   * never become remembered fact. `/memories` mutating verbs refuse while this
+   * is set, and the episode log's guard throws on an own-answer write.
+   */
+  candidateSet?: string | null;
 }
 
 export class TurnRegister {

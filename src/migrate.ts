@@ -241,10 +241,27 @@ function moveTree(from: string, to: string): void {
   }
 }
 
+/**
+ * The OPERATOR's ignore file, for a hub directory they version themselves. It is
+ * NOT RFA's own per-pack repository's ignore rules (RFA-0.8 sect. 8.2 item 5),
+ * which live in that repository's info/exclude and never inside a pack.
+ *
+ * `memory/` and `scratch/` are here because both are runtime surfaces the tool
+ * owns: the memory file store is per-pack live state, and `scratch/<runId>/` is
+ * a rung-5 run's write surface. Kept in step with `templates/gitignore`, which
+ * `rfa init` writes; this list is what `rfa migrate` writes and what it TOPS UP
+ * on an existing file, so a hub directory made before a line was added gets it
+ * on the next migration and not before.
+ */
 export const GITIGNORE_LINES = [
   "# rfa: runtime state, secrets and logs (owned by the tool)",
+  "# This is the OPERATOR's ignore file, for a hub directory they version themselves.",
+  "# RFA's own per-pack repository (RFA-0.8 sect. 8.2) has its own rules, in that",
+  "# repository's info/exclude, and never a .gitignore inside a pack.",
   ".rfa/",
   "agents/*/state/",
+  "agents/*/memory/",
+  "agents/*/scratch/",
   "agents/*/knowledge/*-clone/",
   "agents/*/knowledge/handbook-clone/",
 ];

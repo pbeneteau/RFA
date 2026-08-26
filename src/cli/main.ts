@@ -24,7 +24,7 @@ import { backupLs, backupNow, backupRestore, serviceInstall, serviceStatus, serv
 import { consoleCmd, down, hubRun, logs, restart, status, supervisorRun, up } from "./commands/procs.js";
 import { roomAdopt, roomAllow, roomCreate, roomDisallow, roomEnd, roomEvict, roomHold, roomInject, roomLs, roomPolicy, roomQuarantine, roomRelease, roomSecret, roomShow, roomTail } from "./commands/room.js";
 import { server } from "./commands/server.js";
-import { approvalsApprove, approvalsLs, approvalsReject, approvalsShow, ask, taskCancel, taskCreate, taskLs, taskShow, taskVerify } from "./commands/talk.js";
+import { approvalsApprove, approvalsLs, approvalsReject, approvalsShow, ask, taskCancel, taskCandidates, taskCreate, taskLs, taskSelect, taskShow, taskVerify } from "./commands/talk.js";
 
 process.title = "rfa";
 // `rfa status | head` closes our stdout early; that is the reader's business, not an error.
@@ -40,7 +40,7 @@ router.register(
   init, up, down, restart, status, doctor, logs, consoleCmd, hubRun, supervisorRun, migrate, demo, docs, version,
   agentNew, agentLs, agentShow, agentValidate, agentBind, agentStart, agentStop, agentRestart, agentEdit, agentMode, agentReflect, agentRetire,
   roomCreate, roomLs, roomShow, roomTail, roomAllow, roomDisallow, roomPolicy, roomSecret, roomEvict, roomHold, roomRelease, roomQuarantine, roomInject, roomEnd, roomAdopt,
-  ask, taskLs, taskShow, taskCreate, taskCancel, taskVerify, approvalsLs, approvalsShow, approvalsApprove, approvalsReject,
+  ask, taskLs, taskShow, taskCreate, taskCancel, taskVerify, taskCandidates, taskSelect, approvalsLs, approvalsShow, approvalsApprove, approvalsReject,
   humanAdd, humanLs, humanRotate, humanRemove, tokenMint, tokenLs, tokenRevoke, secretsSet, secretsLs, secretsUnset, configShow, configGet, configSet, keyNew, keySign,
   connectClaude, connectCursor, connectMcp, peerAdd, peerLs, peerShow, peerRevoke, hubExpose,
   knowledgeAdd, knowledgeSync, knowledgeStatusCmd, knowledgePin, evalsRun, evalsLs, evalsPromote, evalsLabel, evalsFlag, evalsParity, logVerify,

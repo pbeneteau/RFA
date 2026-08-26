@@ -943,6 +943,289 @@ other.close();
   return `overlapped (${res.trace.join(" ")}), cap held at ${res.maxLeases}, 1 writer per conversation, both memory appends kept, day $${res.daySpend.settled_usd.toFixed(2)}/0.30 then refused budget_exhausted`;
 });
 
+await scenario("rfa-0.8: one task answered THREE ways, a human keeps one, the losers cost money and leave no memory", async () => {
+  const dir = tmpDir("rfa-candidates");
+  const port = await freePort();
+  const { execFile } = await import("node:child_process");
+  const { nodeArgsFor } = await import("../src/proc.js");
+  const cli = path.join(ROOT, "src", "cli", "main.ts");
+  const rfa = (args: string[]): Promise<{ code: number; stdout: string; stderr: string }> =>
+    new Promise((resolve) =>
+      execFile(process.execPath, [...nodeArgsFor(cli), ...args], { cwd: dir, env: { ...process.env, RFA_DIR: "", NO_COLOR: "1" }, encoding: "utf8", timeout: 120_000 }, (err, stdout, stderr) =>
+        resolve({ code: err ? ((err as { code?: number }).code ?? 1) : 0, stdout, stderr }),
+      ),
+    );
+  const init = await rfa(["init", "--yes", "--no-start", "--name", "cand", "--port", String(port), "--human", "e2e", "--agent", "none", "--json"]);
+  assert(init.code === 0, `init failed: ${init.stderr.trim()}`);
+
+  // Same shape as the rung-3 scenario and for the same reason: the driver runs
+  // in its own process, so the modules are loaded the way a resident loads them
+  // and the rows are written by a pid this harness does not own.
+  const driver = path.join(dir, "candidates.mts");
+  fs.writeFileSync(
+    driver,
+    `import { AccountLedger } from ${JSON.stringify(path.join(ROOT, "src", "account.js"))};
+import { Engine } from ${JSON.stringify(path.join(ROOT, "src", "engine.js"))};
+import { makeKeyedTurnLock } from ${JSON.stringify(path.join(ROOT, "src", "turnlock.js"))};
+import { SessionBook } from ${JSON.stringify(path.join(ROOT, "src", "sessions.js"))};
+import { planCandidates, runCandidateSet } from ${JSON.stringify(path.join(ROOT, "src", "candidates.js"))};
+import { EpisodeLog, FactStore } from ${JSON.stringify(path.join(ROOT, "src", "memoryfs.js"))};
+import { TurnRegister } from ${JSON.stringify(path.join(ROOT, "src", "turnbinding.js"))};
+import { loadHubDir } from ${JSON.stringify(path.join(ROOT, "src", "hubdir.js"))};
+import * as fs from "node:fs";
+import * as path from "node:path";
+
+const h = loadHubDir(process.argv[2]);
+const engine = new Engine(h.paths.runsDb);
+const account = new AccountLedger(h.paths.runsDb);
+const other = new AccountLedger(h.paths.runsDb);
+account.setCap(4);
+const oneTurn = makeKeyedTurnLock();
+const sessions = new SessionBook();
+const turns = new TurnRegister();
+const packDir = path.join(h.paths.agents, 'pm-agent');
+const scratchRoot = path.join(packDir, 'scratch');
+fs.mkdirSync(path.join(packDir, 'state'), { recursive: true });
+const memDb = path.join(packDir, 'state', 'memory.db');
+// The guard the resident wires up: an episode written from inside a candidate
+// turn THROWS. The candidate path never calls it, so this is a tripwire.
+const episodes = new EpisodeLog(memDb, () => (turns.current()?.candidateSet ? 'candidate work' : null));
+
+const DAY = '2026-08-26';
+// Sized so THREE candidates fit at the start and only ONE fits afterwards: the
+// first fan-out settles 0.33 of 0.53, and 0.20 left buys exactly one more at the
+// 0.20 per-task ceiling. That second plan is the honest-degrade case.
+const BUDGET = { perDayUsd: 0.53, perTaskUsd: 0.20, day: DAY };
+
+const trace: string[] = [];
+let maxOverlap = 0;
+let live = 0;
+const gates: (() => void)[] = [];
+
+/** One candidate turn, in the shape the resident runs it. */
+function startCandidate(setId: string, index: number, taskId: string, opts: { cost: number; hold?: Promise<void>; interruptible?: boolean }) {
+  const convo = 'task:' + taskId + '#c' + index;
+  const { runId } = engine.createRun({ agent: 'pm-agent', threadId: convo, kind: 'candidate', candidateSet: setId, candidateIndex: index });
+  const scratchDir = path.join(scratchRoot, runId);
+  fs.mkdirSync(scratchDir, { recursive: true });
+  engine.startCandidate(setId, index, runId, scratchDir);
+  let interrupt: ((reason: string) => void) | null = null;
+  const done = oneTurn(convo, async () => {
+    const binding = { runId, leaseId: null as string | null, agent: 'pm-agent', lane: 'serve' as const, chain: null, replyBy: null, conversationId: null, taskId, candidateSet: setId };
+    const slot = await account.waitForSlot({ agent: 'pm-agent', lane: 'serve', runId, budget: opts.budget ?? BUDGET }, { timeoutMs: 30_000 });
+    if (!slot.ok) { engine.failRun(runId, slot.detail ?? 'refused', { retryable: false, costUsd: 0 }); throw Object.assign(new Error(slot.detail ?? 'refused'), { costUsd: 0 }); }
+    binding.leaseId = slot.lease.lease_id;
+    return await turns.run(binding, async () => {
+      const unbind = turns.bind(binding);
+      sessions.enter(convo);
+      live++; maxOverlap = Math.max(maxOverlap, live);
+      trace.push(index + ':start');
+      // What a candidate is NOT allowed to do, exercised rather than assumed.
+      let episodeRefused = false;
+      try { episodes.recordOwn('r_cand', 'm_pm', 'pm-agent', 'candidate ' + index + ' thinks something'); } catch { episodeRefused = true; }
+      if (!episodeRefused) throw new Error('a candidate turn was allowed to record an episode');
+      let cost = opts.cost;
+      try {
+        if (opts.interruptible) {
+          await new Promise<void>((resolve, reject) => { interrupt = (r) => { cost = 0.02; reject(Object.assign(new Error('interrupted: ' + r), { costUsd: 0.02 })); }; gates.push(resolve); });
+        } else if (opts.hold) {
+          await opts.hold;
+        }
+        sessions.adopt(convo, 'sess_' + runId);
+        engine.completeRun(runId, { output: { index }, costUsd: cost, numTurns: 2 });
+        trace.push(index + ':end');
+        return { text: 'ANSWER-' + index + ' the fee is 1.5 percent', costUsd: cost, numTurns: 2 };
+      } catch (err) {
+        const spent = (err as { costUsd?: number }).costUsd ?? 0;
+        engine.failRun(runId, (err as Error).message, { retryable: false, costUsd: spent });
+        trace.push(index + ':cut');
+        throw Object.assign(err as Error, { costUsd: spent });
+      } finally {
+        live--;
+        unbind();
+        sessions.leave(convo);
+        if (binding.leaseId) account.release(binding.leaseId, cost);
+      }
+    });
+  });
+  return { runId, done, cancel: (reason: string) => interrupt?.(reason), scratchDir };
+}
+
+// ---- run 1: three candidates, human selection.
+const wide = await (async () => {
+  const p = planCandidates({ requested: 3, selector: 'human', concurrency: 4, affordable: account.affordableCandidates({ agent: 'pm-agent', want: 3, budget: BUDGET }) });
+  const setId = engine.openCandidateSet({ agent: 'pm-agent', room: 'r_cand', taskId: 't_1', title: 'the fee table', requested: p.requested, running: p.running, selector: 'human', degraded: p.degraded });
+  const dirs = new Map<number, string>();
+  let releaseAll!: () => void;
+  const hold = new Promise<void>((r) => (releaseAll = r));
+  let startedCount = 0;
+  const result = await runCandidateSet({
+    plan: p,
+    start: (i) => {
+      const st = startCandidate(setId, i, 't_1', { cost: 0.1 + i / 100, hold });
+      dirs.set(i, st.scratchDir);
+      if (++startedCount === p.running) setTimeout(() => releaseAll(), 5);
+      return st;
+    },
+    onSettled: (o) => engine.settleCandidate(setId, o.index, { state: o.state, text: o.text, costUsd: o.costUsd, numTurns: o.numTurns, error: o.error }),
+    onDiscard: (o) => fs.rmSync(dirs.get(o.index) ?? '/nonexistent', { recursive: true, force: true }),
+  });
+  engine.closeCandidateSet(setId, 'awaiting_selection');
+  return { setId, result, dirs };
+})();
+
+// A human keeps candidate 1. Only THAT lets an answer into memory.
+// Under human selection nobody is a loser until a person picks, so all three
+// surfaces are still there at this point: that is the state being pinned.
+const scratchAtSelection: Record<string, boolean> = {};
+for (const [i, d] of wide.dirs) scratchAtSelection[String(i)] = fs.existsSync(d);
+const chosen = engine.selectCandidate(wide.setId, 1, 'human:e2e');
+if (!chosen.ok) throw new Error('selection refused: ' + chosen.detail);
+// What the resident's fileCandidateWinner does, in order: the winner's answer
+// becomes an episode, the evidence is filed, and every surface goes.
+episodes.recordOwn('r_cand', 'm_pm', 'pm-agent', chosen.run.text);
+engine.markCandidateSetFiled(wide.setId);
+for (const [, d] of wide.dirs) fs.rmSync(d, { recursive: true, force: true });
+const scratchAfter: Record<string, boolean> = {};
+for (const [i, d] of wide.dirs) scratchAfter[String(i)] = fs.existsSync(d);
+
+const episodeTexts = episodes.recent(20).map((e) => e.text);
+episodes.close();
+
+// ---- run 2: the same task on a pack with a dollar left runs ONE, and says why.
+const spentNow = other.daySpend('pm-agent', DAY).settled_usd;
+const narrow = planCandidates({
+  requested: 3,
+  selector: 'human',
+  concurrency: 4,
+  affordable: account.affordableCandidates({ agent: 'pm-agent', want: 3, budget: BUDGET }),
+});
+
+// ---- run 3: early stop, on a fresh day so the budget is not the variable.
+const DAY2 = '2026-08-27';
+const B2 = { perDayUsd: 1.20, perTaskUsd: 0.20, day: DAY2 };
+const early = await (async () => {
+  const p = planCandidates({ requested: 3, selector: 'first-verified', concurrency: 4, affordable: account.affordableCandidates({ agent: 'pm-agent', want: 3, budget: B2 }) });
+  const setId = engine.openCandidateSet({ agent: 'pm-agent', room: 'r_cand', taskId: 't_2', title: 'the fee table again', requested: p.requested, running: p.running, selector: 'first-verified' });
+  const dirs = new Map<number, string>();
+  let startedCount = 0;
+  const result = await runCandidateSet({
+    plan: p,
+    start: (i) => {
+      const st = startCandidate(setId, i, 't_2', { cost: 0.1, interruptible: true, budget: B2 });
+      dirs.set(i, st.scratchDir);
+      // Let candidate 0 through once all three are in flight; the other two are
+      // interrupted by the orchestration and must still settle their cost.
+      if (++startedCount === p.running) setTimeout(() => gates[0]?.(), 5);
+      return st;
+    },
+    onSettled: (o) => engine.settleCandidate(setId, o.index, { state: o.state, text: o.text, costUsd: o.costUsd, numTurns: o.numTurns, error: o.error }),
+    onDiscard: (o) => fs.rmSync(dirs.get(o.index) ?? '/nonexistent', { recursive: true, force: true }),
+  });
+  // Early stop needs no selector: the winner is recorded and filed straight
+  // away, exactly as the resident does it, and the last surface goes with it.
+  const existsAfter = [...dirs.values()].map((d) => fs.existsSync(d));
+  if (result.winner !== null) {
+    // The set leaves 'running' first in every branch: selectCandidate refuses a
+    // set with candidates still in flight, and early stop is a selection too.
+    engine.closeCandidateSet(setId, 'awaiting_selection');
+    const w = engine.selectCandidate(setId, result.winner, 'first-verified');
+    if (!w.ok) throw new Error('early-stop winner not recorded: ' + w.detail);
+    engine.markCandidateSetFiled(setId);
+    for (const d of dirs.values()) fs.rmSync(d, { recursive: true, force: true });
+  }
+  return { setId, result, dirs, existsAfter };
+})();
+
+const wideSet = engine.candidateSet(wide.setId);
+const earlySet = engine.candidateSet(early.setId);
+console.log(JSON.stringify({
+  trace,
+  maxOverlap,
+  wide: { states: wideSet.candidates.map((c) => c.state), cost: wideSet.cost_usd, selected: wideSet.selected_index, by: wideSet.selected_by, state: wideSet.state, texts: wideSet.candidates.map((c) => c.text) },
+  scratchAtSelection,
+  scratchAfter,
+  episodeTexts,
+  narrow: { running: narrow.running, degraded: narrow.degraded, spentNow },
+  early: { winner: early.result.winner, states: earlySet.candidates.map((c) => c.state), costs: earlySet.candidates.map((c) => c.cost_usd), setCost: earlySet.cost_usd, existsAfter: early.existsAfter },
+  runsBySet: engine.candidateSets({ agent: 'pm-agent' }).map((s) => ({ set: s.set_id, task: s.task_id, n: s.candidates.length, cost: Number(s.cost_usd.toFixed(4)) })),
+  candidateRuns: engine.runs({ agent: 'pm-agent', limit: 50 }).filter((r) => r.kind === 'candidate').length,
+  leasesLeft: other.leases().length,
+  daySpend: other.daySpend('pm-agent', DAY),
+  scratchLeft: fs.existsSync(scratchRoot) ? fs.readdirSync(scratchRoot) : [],
+}));
+engine.close();
+account.close();
+other.close();
+`,
+  );
+  const out = await new Promise<{ code: number; stdout: string; stderr: string }>((resolve) =>
+    execFile(process.execPath, [...nodeArgsFor(driver), dir], { cwd: ROOT, encoding: "utf8", timeout: 120_000 }, (err, stdout, stderr) =>
+      resolve({ code: err ? ((err as { code?: number }).code ?? 1) : 0, stdout, stderr }),
+    ),
+  );
+  assert(out.code === 0, `driver failed: ${out.stderr.trim().slice(0, 600)}`);
+  const res = JSON.parse(out.stdout.trim().split("\n").pop()!) as {
+    trace: string[];
+    maxOverlap: number;
+    wide: { states: string[]; cost: number; selected: number | null; by: string | null; state: string; texts: (string | null)[] };
+    scratchAtSelection: Record<string, boolean>;
+    scratchAfter: Record<string, boolean>;
+    episodeTexts: string[];
+    narrow: { running: number; degraded: string | null; spentNow: number };
+    early: { winner: number | null; states: string[]; costs: (number | null)[]; setCost: number; existsAfter: boolean[] };
+    runsBySet: { set: string; task: string | null; n: number; cost: number }[];
+    candidateRuns: number;
+    leasesLeft: number;
+    daySpend: { settled_usd: number; reserved_usd: number };
+    scratchLeft: string[];
+  };
+
+  // 1. THREE WAYS, GENUINELY OVERLAPPING. Proved by shape, not by clock: no
+  // candidate may finish until every candidate has started.
+  assert(res.maxOverlap === 3, `three candidates in flight together, saw ${res.maxOverlap} (trace ${res.trace.join(" ")})`);
+  assert(res.trace.slice(0, 3).every((t) => t.endsWith(":start")), `all three started before any ended: ${res.trace.join(" ")}`);
+  assert(res.wide.states.filter((s) => s === "won").length === 1 && res.wide.states.filter((s) => s === "lost").length === 2, `one winner, two discarded: ${res.wide.states.join(", ")}`);
+  assert(res.wide.selected === 1 && res.wide.by === "human:e2e", `a HUMAN picked, and the record says who: ${res.wide.selected} / ${res.wide.by}`);
+
+  // 2. THE LOSERS' SCRATCH IS GONE, AND THEIR COST IS STILL ON THE BOOKS.
+  // Under human selection nobody is a loser until a person picks, so all three
+  // surfaces live until then and every one of them goes when the winner is filed.
+  assert(Object.values(res.scratchAtSelection).every(Boolean), `all three surfaces lived until the human chose: ${JSON.stringify(res.scratchAtSelection)}`);
+  assert(res.scratchAfter["0"] === false && res.scratchAfter["2"] === false, `the two losers' scratch surfaces were deleted: ${JSON.stringify(res.scratchAfter)}`);
+  assert(res.scratchAfter["1"] === false, "and the winner's too, once its evidence was filed: nothing reads it after that");
+  assert(res.scratchLeft.length === 0, `nothing is left under scratch/ afterwards: ${res.scratchLeft.join(", ")}`);
+  assert(res.wide.texts.every((t) => (t ?? "").length > 0), "every candidate kept its answer as a record, winner and losers alike");
+  assert(Math.abs(res.wide.cost - 0.33) < 1e-6, `the set cost is the sum of all three (0.10+0.11+0.12), got ${res.wide.cost}`);
+
+  // 3. NO TRACE OF THE REJECTED TWO IN MEMORY. A candidate turn cannot record an
+  // episode at all (the driver asserts the throw), so consolidation's only input
+  // is the one answer a human kept.
+  assert(res.episodeTexts.length === 1, `exactly one episode, the winner's: ${JSON.stringify(res.episodeTexts)}`);
+  assert(/ANSWER-1/.test(res.episodeTexts[0]), `and it is the SELECTED one: ${res.episodeTexts[0]}`);
+  assert(!res.episodeTexts.some((t) => /ANSWER-0|ANSWER-2/.test(t)), "a discarded candidate reached the episode log");
+
+  // 4. THE SAME TASK ON A PACK WITH A DOLLAR LEFT RUNS ONE, AND SAYS WHY.
+  assert(res.narrow.running === 1, `the second fan-out was cut to one candidate, got ${res.narrow.running}`);
+  assert(/day budget/.test(res.narrow.degraded ?? ""), `and it says why, in a sentence an operator reads: ${res.narrow.degraded}`);
+
+  // 5. EARLY STOP CANCELS AND STILL SETTLES. This is where trap 2's settle path
+  // is tested: a candidate whose spend disappeared is the unattributable meter.
+  assert(res.early.winner === 0, `the first finisher won: ${res.early.winner}`);
+  assert(res.early.states.filter((s) => s === "cancelled").length === 2, `the other two were interrupted: ${res.early.states.join(", ")}`);
+  assert(res.early.costs.every((c) => (c ?? 0) > 0), `and every one of them settled a real cost: ${JSON.stringify(res.early.costs)}`);
+  assert(res.early.existsAfter.filter(Boolean).length === 1, `the interrupted candidates' scratch is gone: ${JSON.stringify(res.early.existsAfter)}`);
+
+  // 6. COST PER TASK IS ANSWERABLE, not just cost per run.
+  assert(res.candidateRuns === 6, `six candidate runs across two tasks, got ${res.candidateRuns}`);
+  assert(res.runsBySet.length === 2 && res.runsBySet.every((s) => s.n === 3 && s.cost > 0), `each set totals its own task's cost: ${JSON.stringify(res.runsBySet)}`);
+
+  // NOTHING LEFT BEHIND.
+  assert(res.leasesLeft === 0, `every candidate released its lease, ${res.leasesLeft} left`);
+  assert(res.daySpend.reserved_usd === 0, `nothing left reserved, got ${res.daySpend.reserved_usd}`);
+  return `3 candidates overlapped (${res.trace.slice(0, 3).join(" ")}), human kept #1, 2 scratch gone, $${res.wide.cost.toFixed(2)} still billed, 1 episode; a dollar left ran ${res.narrow.running}; early stop settled ${res.early.costs.join("/")}`;
+});
+
 // ---------------------------------------------------------------- report
 
 const pass = results.filter((r) => r.ok).length;

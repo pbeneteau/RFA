@@ -7,6 +7,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { RoomMember } from "../../client.js";
+import { Engine, type CandidateSet } from "../../engine.js";
 import type { HubDir, RoomRecord } from "../../hubdir.js";
 import { roomsStore } from "../../hubdir.js";
 import { TERMINAL_TASK_STATES, type RfaTask } from "../../model.js";
@@ -390,6 +391,46 @@ export async function taskAction(ctx: CliContext, h: HubDir, rec: RoomRecord, ar
   } finally {
     await b.close();
   }
+}
+
+/**
+ * The candidate set for a task (RFA-0.8 sect. 11), read from the engine DB.
+ *
+ * Local on purpose and worth saying at every surface: candidates never reach
+ * the wire, so this is a hub-directory read and not a `room_task` call. The room
+ * saw one task and will see one completion.
+ */
+export function readCandidateSet(h: HubDir, taskId: string): CandidateSet | null {
+  const engine = new Engine(h.paths.runsDb);
+  try {
+    return engine.candidateSetForTask(taskId);
+  } catch {
+    return null;
+  } finally {
+    engine.close();
+  }
+}
+
+/**
+ * Pick the candidate to keep, and nudge the owner to file it. Exactly what
+ * `rfa task select` does, through the same two calls, so the dashboard cannot
+ * drift from the command.
+ */
+export async function selectCandidate(ctx: CliContext, h: HubDir, rec: RoomRecord, setId: string, idx: number, by: string): Promise<string> {
+  const engine = new Engine(h.paths.runsDb);
+  let set: CandidateSet | null;
+  try {
+    const chosen = engine.selectCandidate(setId, idx, by);
+    if (!chosen.ok) throw new Error(chosen.detail ?? `candidate ${idx} cannot be selected`);
+    set = engine.candidateSet(setId);
+  } finally {
+    engine.close();
+  }
+  if (set?.task_id) {
+    await taskAction(ctx, h, rec, { action: "update", id: set.task_id, note: `candidate ${idx} selected; file it as the evidence` });
+  }
+  const discarded = (set?.candidates ?? []).filter((c) => c.state === "lost").length;
+  return `candidate ${idx} selected: ${discarded} discarded, $${(set?.cost_usd ?? 0).toFixed(4)} for the set`;
 }
 
 // ---------------------------------------------------------------- asking

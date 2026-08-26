@@ -1,5 +1,10 @@
 # rfa: runtime state, secrets and logs (owned by the tool)
+# This is the OPERATOR's ignore file, for a hub directory they version themselves.
+# RFA's own per-pack repository (RFA-0.8 sect. 8.2) has its own rules, in that
+# repository's info/exclude, and never a .gitignore inside a pack.
 .rfa/
 agents/*/state/
+agents/*/memory/
+agents/*/scratch/
 agents/*/knowledge/*-clone/
 agents/*/knowledge/handbook-clone/

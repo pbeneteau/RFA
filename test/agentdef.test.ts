@@ -166,3 +166,30 @@ test("concurrency: defaults to 1, and above 1 needs all three gates of RFA-0.8 s
   );
   assert.throws(() => parseAgentMd(CONC("concurrency: 0\nbudgets:\n  per_day_usd: 5\n")), /concurrency/);
 });
+
+test("sandbox.isolation accepts only what is implemented: a dead safety setting is refused by name", () => {
+  // Found 2026-08-26 at rung 6's trigger check: the field accepted three values
+  // and no production module read any of them, so `container` bought nothing and
+  // said nothing. RFA-0.8 sect. 8.1.
+  const withIsolation = (v: string) => VALID.replace("effort: low\n", `effort: low\nsandbox:\n  isolation: ${v}\n`);
+
+  assert.equal(parseAgentMd(withIsolation("none")).def.sandbox?.isolation, "none");
+  // Absent stays legal and defaults, so no existing pack is broken by the refusal.
+  assert.equal(parseAgentMd(VALID).def.sandbox, undefined);
+
+  for (const dead of ["worktree", "container"]) {
+    assert.throws(
+      () => parseAgentMd(withIsolation(dead)),
+      /only .none. is implemented/,
+      `${dead} must be refused by name, not silently honoured as none`,
+    );
+  }
+  // The refusal names what each value would require, so the operator learns the
+  // state of the world rather than just being told no.
+  assert.throws(() => parseAgentMd(withIsolation("worktree")), /rejected on the merits/);
+  assert.throws(() => parseAgentMd(withIsolation("container")), /parked/);
+  assert.throws(() => parseAgentMd(withIsolation("clone")), /becomes legal with RFA-0\.8 rung 6a/);
+  // A value that is not even in the enum must not be told that three refused
+  // values are legal, which is zod's default enum error (RFA-0.8 sect. 8.1).
+  assert.throws(() => parseAgentMd(withIsolation("vm")), /only .none. is implemented/);
+});

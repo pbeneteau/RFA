@@ -24,6 +24,18 @@ import { HubDirError, requireHubDir, roomsStore, type HubDir } from "./hubdir.js
 import { entryFor, nodeArgsFor } from "./proc.js";
 import { fileHint } from "./knowledge.js";
 import { agentPosture } from "./posture.js";
+import {
+  claimFence,
+  hasWriteSurface,
+  isGuardedBuiltin,
+  parseShadowWarning,
+  pathGuard,
+  sandboxAvailable,
+  sandboxPolicy,
+  shadowingFailures,
+  type ClaimHeld,
+} from "./writefence.js";
+import { guardedToProbe, probeGuardedBuiltin, probeIsFatal } from "./fenceprobe.js";
 
 const PLAN_MODE_NOTE = `
 
@@ -35,6 +47,7 @@ import { Engine, type ActionClaim } from "./engine.js";
 import { AccountLedger, isAuthError, isRateLimitError, pidAlive, spendDay, type Lane } from "./account.js";
 import { makeKeyedTurnLock } from "./turnlock.js";
 import { Dispatcher } from "./dispatch.js";
+import { isCandidateSelector, planCandidates, runCandidateSet, type CandidatePlan, type CandidateSelector } from "./candidates.js";
 import { ObsStore } from "./obs.js";
 import { consolidate } from "./consolidate.js";
 import { EpisodeLog, FactStore, GatedMemory } from "./memoryfs.js";
@@ -170,7 +183,6 @@ const account = new AccountLedger(hubdir.paths.runsDb);
  */
 const liveLeases = new Set<string>();
 const obs = new ObsStore(hubdir.paths.obsDb);
-const episodes = new EpisodeLog(path.join(STATE_DIR, "memory.db"));
 const facts = new FactStore(path.join(STATE_DIR, "memory.db"), gate, "self");
 /**
  * One writer per session id, checked rather than assumed (src/sessions.ts). The
@@ -184,6 +196,19 @@ const sessions = new SessionBook();
  * need its account lease (src/turnbinding.ts has the shape and the reasoning).
  */
 const turns = new TurnRegister();
+/**
+ * Constructed AFTER the turn register, because its guard reads it (RFA-0.8
+ * sect. 11): a turn belonging to a candidate set must not record an episode,
+ * since a losing candidate's reasoning would otherwise be distilled into fact by
+ * the next consolidation pass, which is the fact store learning from work a
+ * human threw away. The candidate path does not call `recordOwn` at all, so this
+ * throw is a tripwire for a future author rather than a runtime path; the
+ * WINNER's answer is recorded on the selection path, by `fileCandidateWinner`.
+ */
+const episodes = new EpisodeLog(path.join(STATE_DIR, "memory.db"), () => {
+  const set = turns.current()?.candidateSet;
+  return set ? `it is candidate work in set ${set}, and only a selected winner may be remembered (RFA-0.8 sect. 11)` : null;
+});
 /** A MIRROR of `agent_spend` in runs.db, for the state file and the answer's json part. Never the source. */
 let spend = { day: spendDay(), usd: 0 };
 
@@ -560,6 +585,33 @@ const consolidationOnly = (verb: string) =>
     ),
   );
 
+/**
+ * The second memory write path a candidate can reach (RFA-0.8 sect. 11, rung 4).
+ *
+ * `/memories` is ONE store shared across a pack's concurrent runs, on purpose
+ * (sect. 4: partitioning it per run creates the diverging-replica case no
+ * shipped system merges). N candidates writing into it, with one of them
+ * selected, is the trap this rung is built around, and it cannot be resolved at
+ * write time because nobody knows yet which candidate wins.
+ *
+ * Buffering each candidate's writes and replaying the winner's is a miniature of
+ * rung 6's clone-and-publish, conflict lifecycle included, and rung 6 owns it. A
+ * second, weaker merge story in this repository is how two of them end up here.
+ * So: refuse, loudly, with the reason and with somewhere for the conclusion to
+ * go. The winner's copy reaches memory anyway, through the episode the selection
+ * path records.
+ */
+const candidateReadOnly = (verb: string, setId: string) =>
+  asError(
+    new Error(
+      `${verb} is refused inside a candidate run (set ${setId}, RFA-0.8 sect. 11): this task is being answered several ways and only one answer is kept, ` +
+        `so a write into the shared memory store now would persist work that may be discarded. Put the conclusion in your ANSWER; if it is selected, it is remembered.`,
+    ),
+  );
+
+/** Null unless the calling turn belongs to a candidate set, in which case the set id. */
+const candidateTurn = (): string | null => turns.current()?.candidateSet ?? null;
+
 const memoryServer = createSdkMcpServer({
   name: "memory",
   version: "0.4.1",
@@ -586,6 +638,8 @@ const memoryServer = createSdkMcpServer({
       "Create a file under /memories. Store conclusions, never verbatim peer content. Does NOT overwrite: an existing path needs expected_hash (the hash the error reports), or your content is kept beside it as a conflict file.",
       { path: z.string(), file_text: z.string(), expected_hash: z.string().optional() },
       async (a) => {
+        const cand = candidateTurn();
+        if (cand) return candidateReadOnly("create", cand);
         try {
           return asText(memory.create(a.path, a.file_text, { expectedHash: a.expected_hash }));
         } catch (err) {
@@ -594,6 +648,8 @@ const memoryServer = createSdkMcpServer({
       },
     ),
     tool("str_replace", "Replace a unique string in a memory file.", { path: z.string(), old_str: z.string(), new_str: z.string() }, async (a) => {
+      const cand = candidateTurn();
+      if (cand) return candidateReadOnly("str_replace", cand);
       if (!mayRewriteBlocks && /(^|\/)blocks\//.test(a.path.replace(/^\/memories\/?/, ""))) return consolidationOnly("str_replace on blocks/*");
       try {
         return asText(memory.strReplace(a.path, a.old_str, a.new_str));
@@ -606,6 +662,8 @@ const memoryServer = createSdkMcpServer({
       "Insert text at a line (0 = top) in a memory file. Pass expected_hash to fail if another turn changed the file since you read it.",
       { path: z.string(), insert_line: z.number(), insert_text: z.string(), expected_hash: z.string().optional() },
       async (a) => {
+        const cand = candidateTurn();
+        if (cand) return candidateReadOnly("insert", cand);
         try {
           return asText(memory.insert(a.path, a.insert_line, a.insert_text, { expectedHash: a.expected_hash }));
         } catch (err) {
@@ -618,6 +676,8 @@ const memoryServer = createSdkMcpServer({
       "Delete a memory file or directory. Pass expected_hash to fail if another turn changed it since you read it.",
       { path: z.string(), expected_hash: z.string().optional() },
       async (a) => {
+        const cand = candidateTurn();
+        if (cand) return candidateReadOnly("delete", cand);
         if (!mayDelete) return consolidationOnly("delete");
         try {
           return asText(memory.delete(a.path, { expectedHash: a.expected_hash }));
@@ -627,6 +687,8 @@ const memoryServer = createSdkMcpServer({
       },
     ),
     tool("rename", "Rename or move a memory file.", { old_path: z.string(), new_path: z.string() }, async (a) => {
+      const cand = candidateTurn();
+      if (cand) return candidateReadOnly("rename", cand);
       if (!mayRename) return consolidationOnly("rename");
       try {
         return asText(memory.rename(a.old_path, a.new_path));
@@ -719,6 +781,146 @@ const MCP_TOOLS = [
 const BRAIN_CWD = pack.def.sandbox?.cwd ? path.resolve(HUB_ROOT, pack.def.sandbox.cwd) : pack.dir;
 
 /**
+ * The working directory for ONE run, and for a fenced run it is not the pack's
+ * (RFA-0.8 sect. 9, rung 5).
+ *
+ * Door two is expressible per run because of one measured fact: the CLI grants
+ * WRITES TO ITS OWN WORKING DIRECTORY and refuses everything else under
+ * `sandbox: { enabled: true }` (probe I). `filesystem.allowWrite` does not open
+ * a path on its own (probe G), and naming the pack tree in `denyWrite` would
+ * deny the scratch inside it, since deny beats allow within srt's allow-only
+ * model (probe H case G). So the cwd IS the fence's allow root, and a fenced
+ * run's cwd is its scratch surface.
+ *
+ * Narrowing the advertised MCP root from the pack directory to one run's scratch
+ * is strictly better than what it replaces (the 2026-08-23 change was about a
+ * server being handed the hub root). The one thing it moves is the base
+ * knowledge paths are rendered against, which is why `knowledgePath` takes its
+ * base as an argument now: two readers of one base disagreeing is exactly the
+ * regression that cost three days on 2026-08-26.
+ */
+function runCwd(run: { scratchDir?: string | null }): string {
+  return WRITING_PACK && run.scratchDir ? run.scratchDir : BRAIN_CWD;
+}
+
+/**
+ * The per-run scratch surface: `scratch/<runId>/` under the pack (RFA-0.8 sect.
+ * 8.1's subtree map), created before a run starts.
+ *
+ * Rung 4 built it for candidates, where it was a directory a read-only pack
+ * could not actually write to. Rung 5 is where it becomes the thing it was named
+ * for: a WRITING pack's runs get one each, it is the ONLY place they may write,
+ * and both doors of sect. 9 are pointed at it - door one's path guard refuses a
+ * Write or Edit outside it, and door two's OS sandbox refuses everything else
+ * including whatever a Bash command would have done.
+ *
+ * Lifecycle at this rung: a losing candidate's surface is deleted (rung 4). An
+ * ordinary run's is KEPT if it holds anything, because it is that run's artifact
+ * and rung 6 is what publishes it, and removed if the run wrote nothing, so a
+ * writing pack answering ordinary questions leaves no litter.
+ */
+const SCRATCH_ROOT = path.join(pack.dir, "scratch");
+
+/** Does this pack declare a write surface (a guarded built-in)? Fixed at load. */
+const WRITING_PACK = hasWriteSurface(pack.def);
+
+function makeScratch(runId: string): string {
+  const dir = path.join(SCRATCH_ROOT, runId);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+/** Remove a losing candidate's surface. Never throws: a failed cleanup must not fail a task. */
+function dropScratch(dir: string | null | undefined): void {
+  if (!dir) return;
+  // Refuse to remove anything that is not under this pack's scratch root, even
+  // though every caller passes one this module minted: a recursive delete taking
+  // a path from a table is worth one guard.
+  const abs = path.resolve(dir);
+  if (abs !== SCRATCH_ROOT && !abs.startsWith(SCRATCH_ROOT + path.sep)) return;
+  try {
+    fs.rmSync(abs, { recursive: true, force: true });
+  } catch (err) {
+    log(`scratch ${abs} not removed: ${(err as Error).message}`);
+  }
+}
+
+/**
+ * Remove a run's surface only if the run left nothing in it. A writing pack that
+ * actually produced something keeps it (rung 6 publishes it); a turn that merely
+ * answered a question leaves no empty directory behind.
+ */
+function dropScratchIfEmpty(dir: string | null | undefined): void {
+  if (!dir) return;
+  try {
+    if (fs.readdirSync(dir).length === 0) dropScratch(dir);
+  } catch {
+    /* already gone */
+  }
+}
+
+/**
+ * What this run holds on the board, read once as the run STARTS. The pair
+ * (attempt, owner) is what the fence compares against; a task with no owner is
+ * not a claim and yields null, so an unassigned run is never fenced on one.
+ */
+function claimHeldFor(task: Record<string, unknown>, id: string): ClaimHeld | null {
+  const owner = task.owner;
+  if (typeof owner !== "string" || !owner) return null;
+  return { taskId: id, attempt: Number(task.attempt ?? 0), owner };
+}
+
+/**
+ * Door one's claim-fence check (RFA-0.8 sect. 9 item 1), asked once per guarded
+ * write.
+ *
+ * The board is READ rather than the local record trusted, because the whole
+ * point is to notice that something moved while this run was thinking. It is
+ * asked at the write and not at turn start for the same reason.
+ *
+ * An unreadable board fails CLOSED. A hub blip therefore costs a refused write,
+ * which is the trade this rung makes deliberately: the other branch lands a
+ * mutation under a claim nobody has confirmed is still ours.
+ */
+async function claimStillOurs(run: RunContext): Promise<string | null> {
+  const held = run.claim;
+  if (!held) return null;
+  let now: { attempt?: number; owner?: string | null; state?: string };
+  try {
+    now = (await member.task({ action: "get", id: held.taskId })) as typeof now;
+  } catch (err) {
+    return (
+      `write refused: this run's claim on task ${held.taskId} could not be re-checked against the board ` +
+      `(${(err as Error).message}), and a write is not made on an unconfirmed claim. Stop and report this.`
+    );
+  }
+  const verdict = claimFence(held, {
+    current_attempt: Number(now.attempt ?? 0),
+    current_owner: (now.owner ?? null) as string | null,
+    task_state: String(now.state ?? "unknown"),
+  });
+  return verdict.ok ? null : verdict.message;
+}
+
+/** What the model is told about its own surface, appended to the system prompt for the runs that have one. */
+function scratchNote(run: { scratchDir?: string | null; candidateSet?: string | null }): string {
+  if (!run.scratchDir) return "";
+  return (
+    `\n\nYour private working directory for this run is ${run.scratchDir}.` +
+    (run.candidateSet ? ` Nothing else reads it and it is deleted when this run is not the one kept.` : "") +
+    // Told plainly, because a model that learns the boundary from a refusal
+    // spends a turn on it. The fence refuses either way; this is what makes the
+    // refusal unnecessary rather than what makes it work.
+    (WRITING_PACK
+      ? ` It is the ONLY place you may write: every other path, including this pack's own files, its knowledge and the hub directory, is refused by the file tools AND by the shell, so do not try a shell command as a way around a refused write. Say in your answer where you put anything you created.`
+      : "") +
+    (run.candidateSet
+      ? ` This task is being answered independently several times and ONE answer will be kept, so work the problem yourself: do not coordinate, and put everything a reader needs into your final message.`
+      : "")
+  );
+}
+
+/**
  * How a knowledge file is NAMED to the model, and it must be a path the model can
  * actually open.
  *
@@ -737,8 +939,8 @@ const BRAIN_CWD = pack.def.sandbox?.cwd ? path.resolve(HUB_ROOT, pack.def.sandbo
  * directory), ABSOLUTE outside it: a `../../` chain out of the tree is exactly
  * what got resolved against the wrong base, and an absolute path cannot be.
  */
-function knowledgePath(f: string): string {
-  const rel = path.relative(BRAIN_CWD, f);
+function knowledgePath(f: string, base: string): string {
+  const rel = path.relative(base, f);
   return rel.startsWith("..") ? f : rel;
 }
 
@@ -780,9 +982,9 @@ function corpusExtra(atStart: Record<string, string>): Record<string, unknown> {
   };
 }
 
-function systemPrompt(): string {
+function systemPrompt(base: string): string {
   const files = knowledgeFiles(pack)
-    .map((f) => `- ${knowledgePath(f)} :: ${fileHint(f)}`)
+    .map((f) => `- ${knowledgePath(f, base)} :: ${fileHint(f)}`)
     .join("\n");
   const blocks = memory.compileBlocks();
   const index = memory.indexHead();
@@ -887,6 +1089,30 @@ type RunContext = {
    * where parallel-overshoot forensics would have looked.
    */
   costUsd?: number;
+  /**
+   * The candidate set this run belongs to (RFA-0.8 sect. 11), else absent. It
+   * reaches the turn binding, and from there the two memory write paths, which
+   * both refuse while it is set: a losing candidate's reasoning must never
+   * become remembered fact.
+   */
+  candidateSet?: string | null;
+  /** This run's private working directory (`scratch/<runId>/`), named in its system prompt. */
+  scratchDir?: string | null;
+  /**
+   * The board claim this run is working under, if any (RFA-0.8 sect. 9): the
+   * task, the attempt and the owner AS THEY WERE when the run started. Door
+   * one's claim fence compares it against the live task before every guarded
+   * write, so a run whose claim moved to attempt N+1 cannot mutate anything.
+   */
+  claim?: ClaimHeld | null;
+  /**
+   * Set BY `brainTurn`, for the fan-out to call: interrupt this turn's query.
+   * An interrupt and not an abort, deliberately - the CLI emits its `result`
+   * message on an interrupt and `total_cost_usd` lives on that message, so the
+   * cancelled candidate still settles what it really spent. Aborting the
+   * controller throws the iteration away with the cost inside it.
+   */
+  interrupt?: (reason: string) => void;
 };
 
 type BrainResult = {
@@ -955,6 +1181,14 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
    */
   let costUsd = 0;
   /**
+   * A scratch surface THIS turn minted (RFA-0.8 sect. 9). Declared out here for
+   * the same reason `costUsd` is: the `finally` cleans it up, and a variable
+   * scoped inside the try is invisible on exactly the paths where the cleanup
+   * matters. Null for a read-only pack, and null for a candidate run, whose
+   * surface rung 4 minted and owns.
+   */
+  let mintedScratch: string | null = null;
+  /**
    * THIS turn's binding: the lease, the lane, the chain and the scope, in one
    * mutable record that the blocked-wait park may swap the lease id inside
    * (sect. 6.3, the swept-lease path). The `finally` below releases whatever it
@@ -970,6 +1204,10 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
     replyBy: run.replyBy ?? null,
     conversationId: run.conversationId ?? null,
     taskId: run.taskId ?? null,
+    // Travels with the turn so the two memory write paths can see it from
+    // module scope (RFA-0.8 sect. 11): a candidate may lose, and a losing
+    // candidate must leave no trace in the fact store.
+    candidateSet: run.candidateSet ?? null,
   };
   const myLease = binding.leaseId;
   /**
@@ -1010,6 +1248,24 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
   /** This turn's clock verdict (wire 12.4); local so an overlapping caller can never inherit it. */
   let clockRefusal: string | null = null;
   const posture = agentPosture(pack.def);
+  /**
+   * This run's writable surface, and door two's allow root (RFA-0.8 sect. 9).
+   * Null for a pack with no declared write surface: nothing is fenced because
+   * nothing can write, and paying for an OS sandbox to fence a pack that holds
+   * Read and Grep would be a cost with no property behind it.
+   *
+   * Minted HERE rather than at each of the four call sites, so a fifth kind of
+   * run cannot arrive unfenced by forgetting a line. A candidate run already
+   * carries one (rung 4 mints it before the fan-out starts and owns its
+   * deletion), which is why the mint is conditional and the cleanup below only
+   * touches what this turn made.
+   */
+  if (WRITING_PACK && !run.scratchDir) {
+    mintedScratch = makeScratch(run.runId);
+    run.scratchDir = mintedScratch;
+  }
+  const fencedScratch = WRITING_PACK ? (run.scratchDir ?? null) : null;
+  const cwd = runCwd(run);
   const q = query({
     prompt,
     options: {
@@ -1018,14 +1274,16 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
       // and says roots REPLACE its own arguments) would otherwise be handed the
       // hub directory, .rfa/secrets.json included. Found live on 2026-08-23:
       // a server started on agents/filer/scratch reported the hub root as its
-      // only allowed directory and wrote there.
-      cwd: BRAIN_CWD,
+      // only allowed directory and wrote there. For a FENCED run it narrows
+      // further, to that run's scratch surface, which is what makes door two's
+      // policy a per-run one (`runCwd`).
+      cwd,
       model: pack.def.model,
       ...(pack.def.effort ? { effort: pack.def.effort } : {}),
       // In plan mode the SDK expects a plan file and ExitPlanMode, neither of
       // which exists in a room: the answer is the plan (found live: the first
       // plan-mode answer apologised for a tool it could not call).
-      systemPrompt: systemPrompt() + (posture.mode === "plan" ? PLAN_MODE_NOTE : ""),
+      systemPrompt: systemPrompt(cwd) + (posture.mode === "plan" ? PLAN_MODE_NOTE : "") + scratchNote(run),
       settingSources: [],
       // A resident authenticates with the OPERATOR's login, and the operator's
       // claude.ai account carries MCP connectors (Linear, Notion, Figma …).
@@ -1047,15 +1305,117 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
       // callback. Listing the declared built-ins makes every other one ABSENT,
       // and makes a built-in the SDK adds tomorrow absent too.
       tools: posture.builtins,
+      /**
+       * Door two, per RUN (RFA-0.8 sect. 9 item 2).
+       *
+       * It is the ONLY door for Bash: a Bash command's write set cannot be
+       * traced from its arguments, so door one cannot see it at all. Three
+       * things in this policy are measured rather than chosen, and each of them
+       * is a silent no-op if it is dropped:
+       *   - `allowUnsandboxedCommands: false`, because the default is TRUE and
+       *     leaves the Bash tool's `dangerouslyDisableSandbox` parameter live.
+       *     Probe J watched a model hit "operation not permitted", set it, and
+       *     write into the pack tree on the retry.
+       *   - `failIfUnavailable: true`, so a host that loses its sandbox
+       *     primitives under a running resident fails the query loudly instead
+       *     of running it unfenced. The startup check is the other half.
+       *   - the deny list is filtered of anything that CONTAINS the allow root,
+       *     because deny beats allow (`sandboxPolicy`).
+       */
+      ...(fencedScratch
+        ? {
+            sandbox: sandboxPolicy({
+              scratchDir: fencedScratch,
+              // Sect. 8.1's never-reachable surfaces. The pack tree itself is
+              // deliberately NOT here: it is denied by construction (allow-only),
+              // and naming it would carve the run out of its own workspace.
+              denyWrite: [path.join(pack.dir, "state"), path.join(pack.dir, "knowledge"), path.join(HUB_ROOT, ".rfa")],
+            }),
+          }
+        : {}),
       mcpServers: { rfa: rfaServer, memory: memoryServer, ...packServers },
       // interrupt_on tools are EXCLUDED from the allowlist so they fall through
       // to canUseTool, where the human decision happens (spec 7.3).
       allowedTools: [...posture.allowedTools, ...MCP_TOOLS],
       disallowedTools: pack.def.tools?.deny,
       canUseTool: async (toolName, input) => {
+        /**
+         * Door one, reached by FALL-THROUGH (RFA-0.8 sect. 9 item 1).
+         *
+         * A guarded built-in gets here because it sits in the SDK's base `tools`
+         * set and is deliberately absent from `allowedTools`: the bare entry is
+         * what auto-approves a call before this callback is consulted, measured
+         * for Write (probe A) and for Edit (probe C). Startup has already
+         * asserted the absence, watched for the SDK's shadowing warning, and
+         * re-proven the fall-through against the installed SDK with a live deny
+         * probe, all of them fatal, so reaching this branch means door one is
+         * known-good on THIS boot rather than assumed from a changelog.
+         *
+         * It runs BEFORE the mode and the card, because a guarded built-in
+         * usually has no `interrupt_on` rule and would otherwise die on the
+         * "not allowed for this pack" line with a message that tells the model
+         * nothing it can act on. It does NOT replace the card when the pack
+         * declared one: see the fall-through at the end of the branch.
+         */
         const rule = interruptMatch(pack.def.interrupt_on, toolName);
-        if (!rule) return { behavior: "deny" as const, message: `tool ${toolName} is not allowed for this pack` };
-        // The mode decides what an acting tool meets here (src/posture.ts).
+        if (isGuardedBuiltin(toolName)) {
+          if (posture.onActing === "refuse-plan") {
+            // Plan mode is "propose, never act", and a file write is an act even
+            // when it lands in a private directory. A pack the operator put in
+            // plan mode does not get a quiet exception for its own scratch.
+            log(`plan mode: ${toolName} not called`);
+            return {
+              behavior: "deny" as const,
+              message: `plan mode: ${toolName} is not called, not even inside this run's own working directory. Put the file's full path and its complete content in your answer as the plan; a human writes it, or switches this agent to ask mode.`,
+            };
+          }
+          if (!fencedScratch) {
+            // Unreachable while startup fails closed on a writing pack it cannot
+            // fence; kept because "the fence is off" must never read as "allow".
+            return {
+              behavior: "deny" as const,
+              message: `write refused: ${toolName} reached a run with no writable surface. Report this; nothing on disk can be changed from here.`,
+            };
+          }
+          const verdict = pathGuard({ toolName, input, scratchDir: fencedScratch });
+          if (!verdict.allow) {
+            // The target and the surface, not a truncated prefix of the prose:
+            // an operator reading this line needs to see WHICH path was refused
+            // against WHICH surface, and the sentence written for the model is
+            // long enough that a slice can cut the reason off.
+            const target = (input as Record<string, unknown> | null)?.file_path ?? (input as Record<string, unknown> | null)?.notebook_path ?? "(no target)";
+            log(`door one refused ${toolName}: ${String(target)} is outside ${fencedScratch}`);
+            return { behavior: "deny" as const, message: verdict.message };
+          }
+          // The claim fence (sect. 9 item 1): a write whose task claim has moved
+          // to attempt N+1 is refused, and the refusal tells re-claim from
+          // abandon, which is what sect. 2.4's {current_attempt, current_owner,
+          // task_state} exists to decide. Scope, because rung 7 threads this
+          // same door later: the fence here is on the TASK claim's attempt;
+          // resource-keyed claims are rung 7 and are not built.
+          const fence = await claimStillOurs(run);
+          if (fence) {
+            log(`door one refused ${toolName}: ${fence.slice(0, 160)}`);
+            return { behavior: "deny" as const, message: fence };
+          }
+          // Rung 6's notify-and-repair channel (sect. 8.2) attaches HERE, where
+          // a conflict on publish would come back as tool-result feedback while
+          // this context is still live. Nothing to notify yet: at this rung a
+          // run's writes never leave its own surface.
+          //
+          // Past the fence, the pack's OWN declaration still governs. A pack that
+          // names a guarded built-in in `interrupt_on` has asked for a human card
+          // on every one of its writes, and door one must not quietly grant what
+          // the operator said to ask about: the fence narrows where a write may
+          // land, it never widens who may authorize it. So only an UNGATED
+          // guarded built-in is decided here; a gated one falls through to the
+          // card path below with the fence already satisfied.
+          if (!rule) return { behavior: "allow" as const, updatedInput: input as Record<string, unknown> };
+        } else if (!rule) {
+          return { behavior: "deny" as const, message: `tool ${toolName} is not allowed for this pack` };
+        }
+        // The mode decides what a GATED tool meets here (src/posture.ts). An
+        // ungated guarded built-in has already returned above.
         if (posture.onActing === "refuse-plan") {
           log(`plan mode: ${toolName} not called`);
           return { behavior: "deny" as const, message: `plan mode: ${toolName} is not called. Put the complete call you would make (the tool and every argument) in your answer as the plan; a human runs it, or switches this agent to ask mode.` };
@@ -1184,6 +1544,21 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
       ...(sessions.resumeFor(convoKey) ? { resume: sessions.resumeFor(convoKey) } : {}),
     },
   });
+  /**
+   * The cancellation handle a candidate fan-out reaches for (RFA-0.8 sect. 11).
+   *
+   * `q.interrupt()` and NOT `abortController.abort()`, and the difference is the
+   * money: an interrupt lets the CLI emit its `result` message, and
+   * `total_cost_usd` lives on that message, so the loop below records the cost
+   * and this turn's `finally` settles it against the reservation. An abort
+   * throws the iteration away with the cost inside it, and a candidate whose
+   * spend disappears is exactly the unattributable meter the honest-meters
+   * doctrine forbids.
+   */
+  run.interrupt = (reason: string) => {
+    log(`interrupting run ${run.runId}: ${reason}`);
+    void q.interrupt().catch((err: Error) => log(`interrupt of ${run.runId} did not land: ${err.message}`));
+  };
   let text = "";
   /** Insertion-ordered and deduped: the same file read twice is one retrieval, and the ORDER is the diagnostic (which file it opened first). */
   const retrieved = new Set<string>();
@@ -1288,6 +1663,15 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
   return { text, costUsd, numTurns, tokens, retrieved: [...retrieved], refusal: clockRefusal };
   } finally {
     unbind();
+    // A surface this turn minted and the run never wrote to leaves nothing
+    // behind; one it wrote to is the run's artifact and stays (rung 6 publishes
+    // it). A candidate's surface is not touched here: rung 4 owns that
+    // lifecycle and deletes the losers'.
+    if (mintedScratch) dropScratchIfEmpty(mintedScratch);
+    // The handle dies with the turn: an interrupt arriving after the query has
+    // finished would reach a closed transport, and a fan-out holding a stale
+    // one would think it had cancelled something.
+    run.interrupt = undefined;
     // The run's real cost, wherever the turn left: every error path carries it
     // now (RFA-0.8 sect. 5 item 6), so the caller's observability row and
     // `failRun` stop recording NULL where parallel-overshoot forensics look.
@@ -1386,28 +1770,160 @@ if (!pack.def.budgets?.per_task_usd && !pack.def.budgets?.per_day_usd) {
   log("WARNING: this pack declares neither per_task_usd nor per_day_usd, so its runs have no cost ceiling");
 }
 /**
+ * ESTABLISHING THE TWO-DOOR WRITE FENCE (RFA-0.8 sect. 9, rung 5).
+ *
+ * Everything here fails CLOSED, and the order is deliberate: the cheap
+ * definition checks first, then the host, then the live probe that costs money.
+ * A writing pack that cannot establish its fence REFUSES TO SERVE. It never
+ * serves unfenced, which is the whole of sect. 9 item 3 and the failure mode
+ * Bazel's silently-degrading sandbox is the cautionary tale for.
+ *
+ * A read-only pack pays for none of this: it has no guarded built-in, so there
+ * is no door one to prove and nothing for door two to fence.
+ */
+const startupPosture = agentPosture(pack.def);
+
+/**
+ * The SDK's own shadowing warning, READ rather than ignored (RFA-0.8 sect. 9
+ * item 1, and recommendation 2 of the live-probe note).
+ *
+ * `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED` fires on EVERY query this resident makes
+ * already, naming the MCP tools this platform pre-approves on purpose, so "any
+ * warning is fatal" would be a boot loop rather than a check. What is fatal is
+ * an intersection with the GUARDED set, and that is exactly the case the assert
+ * below cannot see: the warning's own last sentence says allow rules from
+ * settings files shadow the callback invisibly, and the probe machine's settings
+ * were never audited (RFA-0.8 Appendix B item 2). So this listener is the only
+ * thing standing between a settings file somebody else wrote and a silently
+ * disabled door one.
+ */
+process.on("warning", (w: Error & { code?: string }) => {
+  if (w.code !== "CLAUDE_SDK_CAN_USE_TOOL_SHADOWED") return;
+  const named = parseShadowWarning(w.message);
+  const hit = named.filter((t) => startupPosture.guarded.includes(t));
+  if (hit.length === 0) return;
+  log(
+    `FATAL: the SDK reports that canUseTool will not be invoked for ${hit.join(", ")}, which is this pack's write surface. ` +
+      `Nothing in this resident lists them in allowedTools, so the shadow is a settings-file allow rule on this host. ` +
+      `Door one is off and the fence is one door; refusing to continue (RFA-0.8 sect. 9 item 1).`,
+  );
+  process.exit(1);
+});
+
+if (startupPosture.guarded.length > 0) {
+  const guarded = startupPosture.guarded;
+  log(`write fence: establishing for ${guarded.join(", ")} (RFA-0.8 sect. 9)`);
+
+  // 1. The shadowing assert. True by construction after rung 5 (`preApproved`
+  //    strips the guarded built-ins), so this is here for the edit that breaks
+  //    it, and for the permission mode, which a pack CAN still set to
+  //    `acceptEdits` and thereby auto-accept the very two tools door one exists
+  //    to intercept.
+  const shadowed = shadowingFailures({
+    guarded,
+    allowedTools: [...startupPosture.allowedTools, ...MCP_TOOLS],
+    permissionMode: startupPosture.permissionMode,
+  });
+  if (shadowed.length > 0) {
+    for (const f of shadowed) log(`FATAL: ${f}`);
+    process.exit(1);
+  }
+
+  /**
+   * A REFUSAL-ONLY test hook, and the direction matters: `RFA_FENCE_FORCE_FAIL`
+   * can only make this resident refuse to boot, never make it boot when it
+   * should not. It exists because the two refusals below are the ones an
+   * operator most needs to have SEEN work (a host with no sandbox primitives, an
+   * SDK that stopped routing a guarded built-in through the callback) and
+   * neither can be produced on demand on a healthy macOS host. `scripts/
+   * fence-proof.ts` uses it; nothing else may, and no value of it widens
+   * anything.
+   */
+  const forceFail = process.env.RFA_FENCE_FORCE_FAIL ?? "";
+
+  // 2. The OS sandbox, on THIS host. Asked before the model probe because it is
+  //    free and because a host with no sandbox primitives cannot run this pack
+  //    however door one behaves.
+  const sandbox =
+    forceFail === "sandbox"
+      ? { ok: false, platform: process.platform, detail: "RFA_FENCE_FORCE_FAIL=sandbox (refusal-only test hook)" }
+      : await sandboxAvailable();
+  if (!sandbox.ok) {
+    log(
+      `FATAL: this pack declares the write surface ${guarded.join(", ")} and the OS sandbox cannot establish itself here ` +
+        `(${sandbox.platform}: ${sandbox.detail}). Door two is the ONLY door for Bash, so running with door one alone would be a fence ` +
+        `with a hole the size of the shell. Refusing to serve rather than serving unfenced (RFA-0.8 sect. 9 item 3).`,
+    );
+    process.exit(1);
+  }
+
+  // 3. The per-built-in deny probe, on the INSTALLED SDK. This is the check that
+  //    survives an SDK bump: the callback's built-in behaviour has already
+  //    changed once across setups, so door one is re-proven every boot rather
+  //    than trusted from a changelog.
+  let probeCost = 0;
+  for (const tool of guardedToProbe(guarded)) {
+    const r =
+      forceFail === "probe"
+        ? { tool, verdict: "bypassed" as const, detail: "RFA_FENCE_FORCE_FAIL=probe (refusal-only test hook): this SDK no longer routes it through the callback", attempts: 1, costUsd: 0 }
+        : await probeGuardedBuiltin(tool, {
+            query: query as never,
+            permissionMode: startupPosture.permissionMode,
+            log,
+          });
+    probeCost += r.costUsd;
+    if (probeIsFatal(r)) {
+      log(
+        `FATAL: the door-one startup probe for ${tool} came back \`${r.verdict}\` after ${r.attempts} attempt(s): ${r.detail}. ` +
+          `A write surface this platform cannot prove it intercepts is not one it may serve (RFA-0.8 sect. 9 item 1).`,
+      );
+      process.exit(1);
+    }
+    log(`write fence: ${tool} still falls through to canUseTool on this SDK (${r.detail}, $${r.costUsd.toFixed(4)})`);
+  }
+
+  // Said in the log because an operator reading "fence" must be able to tell
+  // WHICH fence they got. This deployment wraps each RUN's own CLI child through
+  // the SDK's per-query sandbox option, so it is per-run isolation and not the
+  // per-pack degrade sect. 9 item 2 also permits. Implying isolation you do not
+  // have is the failure that paragraph is guarding against.
+  log(
+    `write fence ESTABLISHED, per RUN: door one (canUseTool path guard + claim fence) over ${guarded.join(", ")}, ` +
+      `door two (${sandbox.platform} OS sandbox, allowWrite = this run's scratch/<runId>, unsandboxed commands refused) over everything else including Bash. ` +
+      `Startup probe cost $${probeCost.toFixed(4)}.`,
+  );
+}
+
+/**
  * The runtime half of sect. 10 gate 1, failing closed.
  *
  * The schema checks posture, the memory-verb surface and the declared budget,
  * because those are definition facts. The FENCE is not: whether the two-door
  * write fence of sect. 9 is available and established for this pack's write set
- * is a property of this host and this SDK, and rungs 5 and 6 have not built it.
- * So a pack that reaches concurrency > 1 with any write surface is refused HERE,
- * loudly, rather than started and hoped about. A definition can be edited between
- * validation and start; this is the check that cannot be gone around.
+ * is a property of this host and this SDK. A pack with a declared write surface
+ * reaches this line only after the block above established that fence or exited;
+ * a pack with ACTING tools is a different question, and still refused, because
+ * an acting tool reaches the world through a third-party MCP server whose write
+ * set no sandbox here can fence. No rung of RFA-0.8 changes that: 6a clones the
+ * pack's own tree and 6b publishes it, and neither reaches a write that lands in
+ * someone else's SaaS workspace. So an acting pack stays serial rather than
+ * waiting for a rung.
+ *
+ * A definition can be edited between validation and start; this is the check
+ * that cannot be gone around.
  */
 if (pack.def.concurrency > 1) {
-  const posture = agentPosture(pack.def);
-  if (posture.mode !== "read-only" || posture.acting.length > 0) {
+  if (startupPosture.mode !== "read-only" || startupPosture.acting.length > 0) {
     log(
-      `FATAL: concurrency ${pack.def.concurrency} needs a read-only posture until the two-door write fence ships (RFA-0.8 sects. 9 and 10, rungs 5 and 6); ` +
-        `this pack is \`${posture.mode}\` with ${posture.acting.length} acting tool(s): ${posture.acting.join(", ") || "none declared"}`,
+      `FATAL: concurrency ${pack.def.concurrency} needs a pack with no acting tools: an acting tool's writes land through a third-party MCP server that no door of the fence can trace, and no rung of RFA-0.8 fences those, so such a pack stays serial (RFA-0.8 sects. 9 and 10 gate 1); ` +
+        `this pack is \`${startupPosture.mode}\` with ${startupPosture.acting.length} acting tool(s): ${startupPosture.acting.join(", ") || "none declared"}`,
     );
     process.exit(1);
   }
   log(
     `concurrency ${pack.def.concurrency}: up to ${pack.def.concurrency} turns at once, each a full claude CLI child process ` +
-      `(day ceiling $${pack.def.budgets?.per_day_usd}, account cap ${account.cap()})`,
+      `(day ceiling $${pack.def.budgets?.per_day_usd}, account cap ${account.cap()})` +
+      (startupPosture.guarded.length > 0 ? `, each writing only its own scratch/<runId>` : ""),
   );
 }
 
@@ -1560,7 +2076,16 @@ const keepaliveTimer = setInterval(() => {
   fs.writeFileSync(HEARTBEAT, String(Date.now()));
   if (dispatcher.inFlightCount() > 0)
     void member
-      .setPresence("busy", { detail: `serving ${dispatcher.inFlightCount()}/${dispatcher.concurrency}${dispatcher.queuedCount() ? ` (+${dispatcher.queuedCount()} queued)` : ""}` })
+      .setPresence("busy", {
+        // TURNS, not dispatcher jobs. One candidate fan-out is one job running N
+        // model turns, and reporting "1 in flight" while three children burn the
+        // operator's money is the meter telling the same kind of lie the parked
+        // lease used to tell.
+        detail:
+          `serving ${dispatcher.inFlightCount()}/${dispatcher.concurrency}` +
+          (turns.liveCount() > dispatcher.inFlightCount() ? ` (${turns.liveCount()} turns)` : "") +
+          (dispatcher.queuedCount() ? ` (+${dispatcher.queuedCount()} queued)` : ""),
+      })
       .catch(() => {});
 }, 30_000);
 keepaliveTimer.unref?.();
@@ -1597,9 +2122,68 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
  * task cannot even be claimed (claim requires a null owner), so acting on the
  * delivered event is the only path there is.
  */
+/**
+ * The prompt one task turn gets, candidate or not. Extracted so the fan-out
+ * hands EVERY candidate the identical prompt: identical packs produce useful
+ * candidate spread on their own, and prompt diversity was a measured null result
+ * (W5 sect. 9), so there is deliberately no diversity mechanism here.
+ */
+function taskPrompt(task: Record<string, unknown>, action: string, id: string): string {
+  // Task text is peer-authored data and goes through the same boundary a
+  // message does (wire 14.11); only hub-stamped facts stay outside it.
+  const fields = [
+    task.title ? `title: ${String(task.title)}` : null,
+    task.description ? `description: ${String(task.description)}` : null,
+    task.note ? `note: ${String(task.note)}` : null,
+    (task.verification as { note?: string } | null)?.note
+      ? `verifier's rejection note: ${String((task.verification as { note: string }).note)}`
+      : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return (
+    `You have been assigned task ${id} on this room's board` +
+    (action === "verify_reject" ? ", and its evidence was REJECTED: rework it, addressing the verifier's note" : "") +
+    `. Do the work now. Your final message becomes the completion evidence a verifier reads: ` +
+    `state what you did and point at something checkable.\n\n` +
+    wrapTaskText({ taskId: id, author: String(task.created_by ?? "?"), text: fields })
+  );
+}
+
 async function runAssignedTask(task: Record<string, unknown>, action: string): Promise<void> {
   const id = String(task.id);
   const title = String(task.title ?? "");
+  /**
+   * How many ways to answer this task (RFA-0.8 sect. 11, rung 4). The per-task
+   * ask is local, in `runs.db`, because there is no wire field to carry it and
+   * this rung adds none; absent one, the pack's own default applies.
+   */
+  const ask = engine.takeCandidateRequest({ taskId: id, room: member.room, title });
+  const requested = Math.max(1, ask?.count ?? pack.def.candidates ?? 1);
+  const selector: CandidateSelector = isCandidateSelector(ask?.selector) ? ask.selector : "human";
+  let degraded: string | null = null;
+  if (requested > 1) {
+    const plan = planCandidates({
+      requested,
+      selector,
+      concurrency: pack.def.concurrency,
+      // The whole set runs inside ONE dispatcher job, so the dispatcher counts
+      // one where N turns will run. Subtracting what this process is already
+      // running is what keeps `concurrency: N` a true statement about the host.
+      busy: Math.max(0, turns.liveCount()),
+      // Ask the ledger BEFORE fanning out, never after (sect. 11 / sect. 5):
+      // admitting four so three can die at the viability floor is the operator
+      // paying for one answer and collecting three refusals.
+      affordable: account.affordableCandidates({
+        agent: pack.name,
+        want: requested,
+        budget: { perDayUsd: pack.def.budgets?.per_day_usd ?? null, perTaskUsd: pack.def.budgets?.per_task_usd ?? null, day: spendDay() },
+      }),
+    });
+    if (plan.running > 1) return await runCandidateTask(task, action, plan);
+    degraded = plan.degraded;
+    log(`task ${id}: ${requested} candidates asked for, running 1 (${degraded ?? "no reason recorded"})`);
+  }
   const { runId } = engine.createRun({
     agent: pack.name,
     threadId: `task:${id}`,
@@ -1608,28 +2192,18 @@ async function runAssignedTask(task: Record<string, unknown>, action: string): P
   });
   log(`task ${action === "verify_reject" ? "rework" : "assignment"} ${id} (run ${runId}): ${title.slice(0, 100)}`);
   const t0 = Date.now();
-  const taskRun: RunContext = { runId, taskId: id };
+  const taskRun: RunContext = { runId, taskId: id, claim: claimHeldFor(task, id) };
   const corpusAtStart = corpusHeads();
   try {
-    await member.task({ action: "update", id, state: "working", note: `picked up by ${member.name} (run ${runId})` });
-    // Task text is peer-authored data and goes through the same boundary a
-    // message does (wire 14.11); only hub-stamped facts stay outside it.
-    const fields = [
-      task.title ? `title: ${String(task.title)}` : null,
-      task.description ? `description: ${String(task.description)}` : null,
-      task.note ? `note: ${String(task.note)}` : null,
-      (task.verification as { note?: string } | null)?.note
-        ? `verifier's rejection note: ${String((task.verification as { note: string }).note)}`
-        : null,
-    ]
-      .filter(Boolean)
-      .join("\n");
-    const prompt =
-      `You have been assigned task ${id} on this room's board` +
-      (action === "verify_reject" ? ", and its evidence was REJECTED: rework it, addressing the verifier's note" : "") +
-      `. Do the work now. Your final message becomes the completion evidence a verifier reads: ` +
-      `state what you did and point at something checkable.\n\n` +
-      wrapTaskText({ taskId: id, author: String(task.created_by ?? "?"), text: fields });
+    await member.task({
+      action: "update",
+      id,
+      state: "working",
+      // The degrade is said where the room can read it, not only in a log: a
+      // three-becomes-one is a first-class outcome with a reason attached.
+      note: `picked up by ${member.name} (run ${runId})` + (degraded ? `; ${requested} candidates asked for, running 1 because ${degraded}` : ""),
+    });
+    const prompt = taskPrompt(task, action, id);
     const { text, costUsd, numTurns, tokens } = await brain(prompt, `task:${id}`, taskRun);
     engine.completeRun(runId, { output: { chars: text.length }, costUsd, numTurns });
     obs.record({
@@ -1683,6 +2257,273 @@ async function runAssignedTask(task: Record<string, unknown>, action: string): P
     }
   }
 }
+
+// ------------------------------------------- candidate parallelism (RFA-0.8 sect. 11)
+
+/**
+ * Answer ONE task N ways, keep one (RFA-0.8 sect. 11, rung 4). The design note
+ * is `docs/design/rung4-candidates.md`; `src/candidates.ts` is the orchestration
+ * and this is what it is wired to.
+ *
+ * The fan-out is LOCAL. The room sees one task, one owner, one completion, and
+ * the N runs exist only here and in `runs.db`. That is the rung's central
+ * decision (design note sect. 1): the wire task object holds one owner and one
+ * evidence, so wire-visible candidates need N evidences or N child tasks, both
+ * of them protocol surface RFA-0.8 never staged. Wire 10.4 still governs the
+ * verification of the completion the winner produces, by a member that is not
+ * the owner, unchanged.
+ *
+ * Room-log hygiene falls out of that (sect. 11 item 5): a candidate posts
+ * NOTHING. The whole set produces at most three room events for one task, one
+ * more than an ordinary task, so N candidates never become a wall of noise for
+ * every member.
+ */
+async function runCandidateTask(task: Record<string, unknown>, action: string, plan: CandidatePlan): Promise<void> {
+  const id = String(task.id);
+  const title = String(task.title ?? "");
+  const setId = engine.openCandidateSet({
+    agent: pack.name,
+    room: member.room,
+    taskId: id,
+    title: title.slice(0, 200),
+    requested: plan.requested,
+    running: plan.running,
+    selector: plan.selector,
+    degraded: plan.degraded,
+  });
+  log(
+    `task ${id}: candidate set ${setId}, ${plan.running} of ${plan.requested} requested, selector ${plan.selector}` +
+      (plan.degraded ? ` (${plan.degraded})` : ""),
+  );
+  const prompt = taskPrompt(task, action, id);
+  /** Every candidate's context, so a discard can find its scratch surface. */
+  const contexts = new Map<number, RunContext>();
+  try {
+    await member.task({
+      action: "update",
+      id,
+      state: "working",
+      note:
+        `picked up by ${member.name}: answering ${plan.running} way${plan.running === 1 ? "" : "s"} (set ${setId}, ${plan.selector})` +
+        (plan.degraded ? `; ${plan.requested} asked for, cut to ${plan.running} because ${plan.degraded}` : ""),
+    });
+    const result = await runCandidateSet({
+      plan,
+      log,
+      start: (index) => {
+        // A distinct conversation key per candidate, which is the same string as
+        // the engine thread id, deliberately: the keyed turn lock and the session
+        // book both key on it, so identical keys would serialize the fan-out and
+        // `SessionBook.enter` would throw. Distinct keys also mean N INDEPENDENT
+        // SDK sessions with no `resume`, which is the definition of the rung.
+        const convo = `task:${id}#c${index}`;
+        const { runId } = engine.createRun({
+          agent: pack.name,
+          threadId: convo,
+          kind: "candidate",
+          input: { task: id, action, title: title.slice(0, 200), candidate: index },
+          candidateSet: setId,
+          candidateIndex: index,
+        });
+        const scratchDir = makeScratch(runId);
+        const ctx: RunContext = { runId, taskId: id, candidateSet: setId, scratchDir, claim: claimHeldFor(task, id) };
+        contexts.set(index, ctx);
+        engine.startCandidate(setId, index, runId, scratchDir);
+        const t0 = Date.now();
+        const corpusAtStart = corpusHeads();
+        const done = brain(prompt, convo, ctx).then(
+          (r) => {
+            engine.completeRun(runId, { output: { chars: r.text.length }, costUsd: r.costUsd, numTurns: r.numTurns });
+            obs.record({
+              id: runId,
+              name: `candidate:${pack.name}`,
+              run_type: "agent_span",
+              start_time: t0,
+              end_time: Date.now(),
+              group_id: member.room,
+              inputs: { task: id, action, candidate: index },
+              outputs: { text: r.text.slice(0, 300), chars: r.text.length },
+              input_tokens: r.tokens.input,
+              output_tokens: r.tokens.output,
+              cost_usd: r.costUsd,
+              // The set id on every row is what makes cost per TASK a query
+              // rather than an inference (sect. 11 item 6): without it three
+              // candidates for one task look exactly like three tasks.
+              extra: { "gen_ai.request.model": pack.def.model ?? "inherit", num_turns: r.numTurns, definition: pack.definitionHash.slice(0, 15), candidate_set: setId, candidate_index: index, ...corpusExtra(corpusAtStart) },
+            });
+            return { text: r.text, costUsd: r.costUsd, numTurns: r.numTurns };
+          },
+          (err: Error) => {
+            const spent = ctx.costUsd ?? 0;
+            engine.failRun(runId, err.message, { retryable: false, costUsd: spent });
+            obs.record({
+              id: runId,
+              name: `candidate:${pack.name}`,
+              run_type: "agent_span",
+              status: "error",
+              error: err.message.slice(0, 300),
+              start_time: t0,
+              end_time: Date.now(),
+              group_id: member.room,
+              inputs: { task: id, action, candidate: index },
+              cost_usd: spent,
+              extra: { "gen_ai.request.model": pack.def.model ?? "inherit", candidate_set: setId, candidate_index: index, ...corpusExtra(corpusAtStart) },
+            });
+            // What an interrupted candidate SPENT rides on the error, so the
+            // orchestration can settle it. A cancelled candidate's cost never
+            // vanishes; that is the whole test of the early-stop variant.
+            throw Object.assign(err, { costUsd: spent });
+          },
+        );
+        return { runId, done, cancel: (reason: string) => ctx.interrupt?.(reason) };
+      },
+      onSettled: (o) =>
+        engine.settleCandidate(setId, o.index, { state: o.state, text: o.text, costUsd: o.costUsd, numTurns: o.numTurns, error: o.error }),
+      onDiscard: (o) => dropScratch(contexts.get(o.index)?.scratchDir),
+    });
+    const ready = result.outcomes.filter((o) => o.state === "ready");
+    const money = `$${result.costUsd.toFixed(4)} across ${result.outcomes.length} candidate${result.outcomes.length === 1 ? "" : "s"}`;
+    log(`candidate set ${setId}: ${ready.length} ready, ${money}`);
+
+    if (ready.length === 0) {
+      engine.closeCandidateSet(setId, "abandoned");
+      for (const o of result.outcomes) dropScratch(contexts.get(o.index)?.scratchDir);
+      const why = result.outcomes.map((o) => `#${o.index}: ${o.error ?? o.state}`).join("; ");
+      throw new Error(`every candidate failed (${money}): ${why}`);
+    }
+    // The set leaves `running` FIRST, in every branch. `selectCandidate` refuses
+    // a set with candidates still in flight, deliberately (a winner picked while
+    // the fan-out is still spending is a winner picked from an incomplete
+    // field), and the early-stop path below is a selection like any other.
+    engine.closeCandidateSet(setId, "awaiting_selection");
+
+    if (result.winner !== null) {
+      // The early-stop variant: no selector at all, first verified completion
+      // wins, the rest were interrupted and have already settled what they spent.
+      const chosen = engine.selectCandidate(setId, result.winner, "first-verified");
+      if (!chosen.ok) throw new Error(`candidate set ${setId} could not record its winner: ${chosen.detail}`);
+      await fileCandidateWinner(setId);
+      return;
+    }
+    // Human selection. The resident holds NOTHING while a person thinks: no
+    // turn, no lease, no slot. `input_required` is already the wire's word for
+    // "a human or the creator owes this task an answer" (10.4 chose it for the
+    // same reason), and answering it flips the task back to `working`, whose
+    // event is what wakes this resident to file the winner.
+    await member.task({
+      action: "update",
+      id,
+      state: "input_required",
+      note:
+        `${ready.length} candidate answer${ready.length === 1 ? "" : "s"} ready for selection (set ${setId}, ${money}). ` +
+        `A human picks one: rfa task candidates ${id}, then rfa task select ${id} --candidate <n>. Nothing is filed as evidence until then.`,
+    });
+    log(`candidate set ${setId} awaits selection (${ready.length} ready)`);
+  } catch (err) {
+    const reason =
+      err instanceof BudgetStop
+        ? `out of budget: ${err.message}`
+        : err instanceof AccountStop
+          ? `no account slot: ${err.message}`
+          : isAuthError(err)
+            ? "this host cannot authenticate to its model provider; the operator must act"
+            : (err as Error).message.slice(0, 300);
+    log(`candidate set ${setId} failed: ${reason}`);
+    engine.closeCandidateSet(setId, "abandoned");
+    for (const [, ctx] of contexts) dropScratch(ctx.scratchDir);
+    try {
+      await member.task({ action: "update", id, note: `${member.name} could not complete this: ${reason}` });
+      await member.task({ action: "release", id });
+    } catch {
+      /* already released by the lease, cancelled, or the room ended */
+    }
+  }
+}
+
+/**
+ * File the selected candidate as the task's completion evidence, and let the
+ * winner's answer into memory.
+ *
+ * This is the ONE place a candidate's output becomes remembered (design note
+ * sect. 2.1). A candidate turn records no episode at all, because consolidation
+ * distils episodes into facts and a losing candidate's reasoning must never
+ * become fact. The losers' text stays in `candidate_runs` for the audit and
+ * never enters the episode log: it does not vanish, it just never becomes fact.
+ *
+ * No model turn: the answer already exists. So this is safe to run from a task
+ * event, and safe to run at boot for a set a human selected while the resident
+ * was down.
+ */
+async function fileCandidateWinner(setId: string): Promise<void> {
+  const set = engine.candidateSet(setId);
+  if (!set || set.state !== "selected" || set.selected_index === null || !set.task_id) return;
+  const winner = set.candidates.find((c) => c.idx === set.selected_index);
+  if (!winner?.text) {
+    log(`candidate set ${setId} is selected but candidate ${set.selected_index} has no text; leaving it for a human`);
+    return;
+  }
+  // The winner's answer is an episode exactly as a serve answer is: same call,
+  // same store, in normal id order ahead of the consolidation watermark. The
+  // guard on `episodes` throws if this is ever called from inside a candidate
+  // turn, which is what makes the rule enforced rather than remembered.
+  episodes.recordOwn(member.room, member.memberId, member.name, winner.text);
+  sinceConsolidation++;
+  await member.task({ action: "complete", id: set.task_id, evidence: { summary: winner.text.slice(0, 2000) } });
+  engine.markCandidateSetFiled(setId);
+  // Every surface goes now, the winner's included: nothing reads it once the
+  // evidence is filed.
+  for (const c of set.candidates) dropScratch(c.scratch_dir);
+  log(
+    `task ${set.task_id}: candidate ${set.selected_index} filed as evidence by ${set.selected_by ?? "?"} ` +
+      `($${set.cost_usd.toFixed(4)} for the set of ${set.candidates.length})`,
+  );
+}
+
+/**
+ * A task event arrived for a task this resident owns and it was not a wake.
+ * If a human selected a candidate for it, file the winner; otherwise do nothing
+ * (one indexed lookup, no model turn, so this is cheap on every task update).
+ */
+async function maybeFileSelection(taskId: string): Promise<void> {
+  const set = engine.candidateSetForTask(taskId);
+  if (!set || set.state !== "selected") return;
+  await fileCandidateWinner(set.set_id);
+}
+
+/**
+ * At boot: sets this pack left behind. Two shapes, and neither may sit forever.
+ *
+ *  - `selected` means a human picked while this resident was down; file it.
+ *  - `running` means the process that started the fan-out is gone. Its
+ *    candidates cannot be resumed (their SDK sessions died with it), so the
+ *    unsettled ones are recorded as failed rather than left `running` forever,
+ *    and the set moves on: to selection if anything usable survived, to
+ *    abandoned if nothing did. Same reasoning as the engine's run sweep (sect. 3
+ *    item 4): a stuck state needs a direct check, not a timeout heuristic.
+ */
+async function reconcileCandidateSets(): Promise<void> {
+  for (const set of engine.candidateSets({ agent: pack.name, state: "selected", limit: 20 })) {
+    try {
+      await fileCandidateWinner(set.set_id);
+    } catch (err) {
+      log(`candidate set ${set.set_id} could not be filed at boot: ${(err as Error).message}`);
+    }
+  }
+  for (const set of engine.candidateSets({ agent: pack.name, state: "running", limit: 20 })) {
+    let ready = 0;
+    for (const c of set.candidates) {
+      if (c.state === "ready") ready++;
+      else if (c.state === "running") {
+        engine.settleCandidate(set.set_id, c.idx, { state: "failed", error: "the resident that started this candidate is gone" });
+        dropScratch(c.scratch_dir);
+      }
+    }
+    engine.closeCandidateSet(set.set_id, ready > 0 ? "awaiting_selection" : "abandoned");
+    log(`candidate set ${set.set_id} reconciled at boot: ${ready} usable, ${ready > 0 ? "awaiting selection" : "abandoned"}`);
+  }
+}
+
+await reconcileCandidateSets();
 
 await member.serve(
   async (ctx: ServeContext) => {
@@ -1853,6 +2694,11 @@ await member.serve(
       // else is doing, or an echo of this resident's own actions.
       if (t.action === "create" && task.state === "submitted") await runAssignedTask(task, t.action);
       else if (t.action === "verify_reject") await runAssignedTask(task, t.action);
+      // A human answering an `input_required` task flips it back to `working`,
+      // and that event is how a candidate selection reaches this resident
+      // (RFA-0.8 sect. 11). One indexed lookup and no model turn, so it costs
+      // nothing on every other task update.
+      else if (t.action === "update") await maybeFileSelection(String(task.id));
     },
   },
 );

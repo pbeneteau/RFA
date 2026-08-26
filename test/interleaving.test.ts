@@ -25,6 +25,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { MemoryGate } from "../src/client.js";
 import { GatedMemory } from "../src/memoryfs.js";
+import type { LlmFn } from "../src/consolidate.js";
 
 function fresh() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-inter-"));
@@ -131,6 +132,129 @@ test("seam 2: every interleaving of two create-shaped turns on one path preserve
     assert.deepEqual(bodies, ["A", "B"], `ordering ${first}->${second} kept both writes`);
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ------------------------------ seam 2, extended: candidate memory (rung 4)
+
+/**
+ * RFA-0.8 sect. 11's first trap, end to end, and it is the one that corrupts
+ * most quietly: **a losing candidate's reasoning must never become remembered
+ * fact.**
+ *
+ * The whole chain is exercised rather than the mechanism alone, because the
+ * failure is a chain: a candidate answers, consolidation reads episodes, and
+ * facts come out. Three candidates answer one task, a human keeps one, and the
+ * fact store must hold no trace of the two thrown away. It must also hold the
+ * one that was kept: a rule that quarantined everything would pass a
+ * nothing-leaked assertion while making the feature pointless.
+ */
+test("seam 2: a discarded candidate leaves NOTHING in the fact store, and the selected one is remembered", async () => {
+  const { EpisodeLog, FactStore } = await import("../src/memoryfs.js");
+  const { Engine } = await import("../src/engine.js");
+  const { consolidate } = await import("../src/consolidate.js");
+  const { loadHubDir } = await import("../src/hubdir.js");
+  const { execFileSync } = await import("node:child_process");
+  const { nodeArgsFor } = await import("../src/proc.js");
+
+  const { freePort } = await import("./hubproc.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-cand-mem-"));
+  const CLI = path.join(import.meta.dirname, "..", "src", "cli", "main.ts");
+  const env = { ...process.env, RFA_DIR: "", NO_COLOR: "1" };
+  execFileSync(process.execPath, [...nodeArgsFor(CLI), "init", "--yes", "--no-start", "--agent", "none", "--name", "candmem", "--port", String(await freePort())], { cwd: root, encoding: "utf8", env });
+  const h = loadHubDir(root)!;
+  const packDir = path.join(h.paths.agents, "pm");
+  fs.mkdirSync(path.join(packDir, "state"), { recursive: true });
+  fs.writeFileSync(
+    path.join(packDir, "agent.md"),
+    `---
+rfa_agent: 1
+name: pm
+description: A pack that answers.
+concurrency: 3
+candidates: 3
+budgets:
+  per_day_usd: 5
+  per_task_usd: 1
+---
+You answer questions.
+`,
+  );
+  const dbPath = path.join(packDir, "state", "memory.db");
+
+  // Three candidates for one task, in the engine DB exactly as the resident
+  // writes them. Each answer carries a marker a fact could only contain if that
+  // candidate's text reached consolidation.
+  const engine = new Engine(h.paths.runsDb);
+  const setId = engine.openCandidateSet({ agent: "pm", room: "r_cand", taskId: "t_1", title: "the fee table", requested: 3, running: 3, selector: "human" });
+  const answers = [
+    "The premium envelope management fee is 1.5 percent per year. Marker LOSER-ALPHA applies.",
+    "The premium envelope management fee is 1.5 percent per year. Marker WINNER-BETA applies.",
+    "The premium envelope management fee is 1.5 percent per year. Marker LOSER-GAMMA applies.",
+  ];
+  for (let i = 0; i < 3; i++) {
+    engine.startCandidate(setId, i, `run_c${i}`, null);
+    engine.settleCandidate(setId, i, { state: "ready", text: answers[i], costUsd: 0.2, numTurns: 2 });
+  }
+  engine.closeCandidateSet(setId, "awaiting_selection");
+
+  // The candidate runs themselves recorded NO episode: that is the rule, and it
+  // is enforced at the write by the guard the resident wires up.
+  const guarded = new EpisodeLog(dbPath, () => "it is candidate work");
+  for (const a of answers) assert.throws(() => guarded.recordOwn("r_cand", "m_pm", "pm", a));
+  assert.equal(guarded.count(), 0);
+  guarded.close();
+
+  // A human keeps candidate 1. That, and only that, is what lets an answer into
+  // the episode log, which is consolidation's only input.
+  const chosen = engine.selectCandidate(setId, 1, "human:test");
+  assert.equal(chosen.ok, true);
+  const log = new EpisodeLog(dbPath);
+  log.recordOwn("r_cand", "m_pm", "pm", chosen.run!.text!);
+  assert.equal(log.count(), 1);
+  log.close();
+
+  // Consolidation with an injected model that echoes what it is SHOWN, so the
+  // assertion is about what reached it and nothing else.
+  let material = "";
+  const markersIn = (text: string) => ["LOSER-ALPHA", "WINNER-BETA", "LOSER-GAMMA"].filter((m) => text.includes(m));
+  const llm: LlmFn = async (_cwd, system, prompt) => {
+    if (system.includes("reconcile")) {
+      // Echo back one fact per marker the extraction step was SHOWN, so the
+      // assertion below is about what reached consolidation and nothing else.
+      return {
+        text: JSON.stringify({ memory: markersIn(prompt).map((m) => ({ text: `The premium envelope fee is 1.5 percent per year, per ${m}`, event: "ADD", importance: 0.9 })) }),
+        cost: 0,
+      };
+    }
+    material = prompt;
+    return { text: JSON.stringify({ facts: markersIn(prompt).map((m) => `The premium envelope fee is 1.5 percent per year, per ${m}`) }), cost: 0 };
+  };
+  const out = await consolidate("pm", { hubdir: h, llm });
+  assert.equal(out.episodes, 1, "consolidation saw exactly one episode: the winner's");
+
+  // The two markers the human threw away are nowhere: not in what consolidation
+  // read, and not in the facts it produced.
+  assert.ok(material.includes("WINNER-BETA"), "the selected answer never reached consolidation");
+  for (const marker of ["LOSER-ALPHA", "LOSER-GAMMA"]) {
+    assert.ok(!material.includes(marker), `${marker} reached consolidation's input`);
+  }
+  const facts = new FactStore(dbPath);
+  const live = facts.live(200);
+  for (const marker of ["LOSER-ALPHA", "LOSER-GAMMA"]) {
+    assert.ok(!live.some((f) => f.text.includes(marker)), `${marker} became a remembered fact`);
+  }
+  assert.ok(live.some((f) => f.text.includes("WINNER-BETA")), "the selected answer was not remembered either, which makes the feature pointless");
+  facts.close();
+
+  // And the discarded candidates are not GONE, they are just not fact: their
+  // text and their cost stay on the books, because a candidate whose spend
+  // disappeared is the unattributable meter the honest-meters doctrine forbids.
+  const set = engine.candidateSet(setId)!;
+  assert.deepEqual(set.candidates.map((c) => c.state), ["lost", "won", "lost"]);
+  assert.ok(set.candidates.every((c) => (c.text ?? "").length > 0 && c.cost_usd === 0.2));
+  assert.ok(Math.abs(set.cost_usd - 0.6) < 1e-9);
+  engine.close();
+  fs.rmSync(root, { recursive: true, force: true });
 });
 
 // ---------------------------------------------------------------- seam 1: the store's claim path

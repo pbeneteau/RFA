@@ -2,7 +2,11 @@
  * Talking to the room as a human principal (RFA-0.7 sect. 3.4): `ask`, the task
  * board, and the approval cards.
  */
+import * as path from "node:path";
 import { RoomMember } from "../../client.js";
+import { CANDIDATE_SELECTORS, SELECTOR_NOTES, isCandidateSelector, type CandidateSelector } from "../../candidates.js";
+import { Engine, type CandidateSet } from "../../engine.js";
+import { loadPack } from "../../agentdef.js";
 import { JsonStore, principalsStore, roomsStore, type HubDir, type RoomRecord } from "../../hubdir.js";
 import { TERMINAL_TASK_STATES, type TaskState } from "../../model.js";
 import { packageVersion } from "../../pkg.js";
@@ -253,10 +257,12 @@ export const taskShow: CommandDef = {
 export const taskCreate: CommandDef = {
   path: ["task", "create"],
   summary: "Put a task on the board: assigned by name, found by capability, or unowned for a claimer",
-  usage: '"<title>" [--room] [--description <text>] [--owner <member> | --capability <skill id>] [--reply-by <ISO|+minutes>] [--evidence-required] [--blocked-by <id,id>] [--max-attempts <n>]',
-  options: { room: { type: "string" }, description: { type: "string" }, owner: { type: "string" }, capability: { type: "string" }, "reply-by": { type: "string" }, "evidence-required": { type: "boolean", default: false }, "blocked-by": { type: "string" }, "max-attempts": { type: "string" } },
-  why: "An assigned resident wakes and does the task; an unowned one waits on the board for a claimer. --capability assigns without naming: the present participant offering that skill (ready first), resolved at create time by the same rule `rfa ask` uses, because discovery is by capability and the board must not be the one place that couples work to a name.",
-  examples: ['rfa task create "draft the release note" --owner linear-agent --evidence-required', 'rfa task create "draft the release note" --capability draft-linear-document', 'rfa task create "collect the fee table" --reply-by +60'],
+  usage: '"<title>" [--room] [--description <text>] [--owner <member> | --capability <skill id>] [--reply-by <ISO|+minutes>] [--evidence-required] [--blocked-by <id,id>] [--max-attempts <n>] [--candidates <n>] [--select human|first-verified]',
+  options: { room: { type: "string" }, description: { type: "string" }, owner: { type: "string" }, capability: { type: "string" }, "reply-by": { type: "string" }, "evidence-required": { type: "boolean", default: false }, "blocked-by": { type: "string" }, "max-attempts": { type: "string" }, candidates: { type: "string" }, select: { type: "string" } },
+  why:
+    "An assigned resident wakes and does the task; an unowned one waits on the board for a claimer. --capability assigns without naming: the present participant offering that skill (ready first), resolved at create time by the same rule `rfa ask` uses, because discovery is by capability and the board must not be the one place that couples work to a name.\n\n" +
+    "--candidates N answers the task N INDEPENDENT ways and keeps one (RFA-0.8 sect. 11). It costs what it says: N model runs, N reservations against the same day budget, and N CLI child processes on the host, for ONE answer. This command prints the arithmetic against the pack's real ceilings before it creates anything. The room still sees one task and one completion; the candidates are local to the agent's own hub directory. --select human (the default) runs all N and waits for a person to pick, which is where 10-15 points of task coverage are typically lost to selection when no executable check exists; --select first-verified keeps the first candidate to finish and interrupts the rest, buying 1.6-2.2x latency for 1.7-2.6x cost with no selector at all. Only a read-only pack may fan out; a writing pack's candidates need the write fence of RFA-0.8 rungs 5 and 6, which is not built.",
+  examples: ['rfa task create "draft the release note" --owner linear-agent --evidence-required', 'rfa task create "draft the release note" --capability draft-linear-document', 'rfa task create "collect the fee table" --reply-by +60', 'rfa task create "reconcile the fee table" --owner pm-agent --candidates 3'],
   run: async (ctx, a) => {
     const h = ctx.hubdir();
     const title = a.positionals.join(" ").trim();
@@ -264,11 +270,18 @@ export const taskCreate: CommandDef = {
     const capability = a.values.capability as string | undefined;
     if (capability && a.values.owner) throw new CliError(2, "--owner names the agent; --capability finds it by what it offers: pass one or the other");
     const maxAttempts = numberFlag(a.values["max-attempts"], "max-attempts", { int: true, min: 1, max: 20 });
+    const candidates = numberFlag(a.values.candidates, "candidates", { int: true, min: 1, max: 8 });
+    const selectRaw = a.values.select as string | undefined;
+    if (selectRaw && !isCandidateSelector(selectRaw)) throw new CliError(2, `--select takes ${CANDIDATE_SELECTORS.join(" or ")}, not ${JSON.stringify(selectRaw)}`);
+    const selector: CandidateSelector = (selectRaw as CandidateSelector | undefined) ?? "human";
+    if (selectRaw && (candidates ?? 1) <= 1) throw new CliError(2, "--select chooses between candidates; pass --candidates <n> above 1 as well");
     const replyRaw = a.values["reply-by"] as string | undefined;
     const replyBy = replyRaw ? (/^\+\d+$/.test(replyRaw) ? new Date(Date.now() + Number(replyRaw.slice(1)) * 60_000).toISOString() : replyRaw) : undefined;
     const b = await board(ctx, h, a.values.room as string | undefined);
     try {
       let owner = a.values.owner ? String(a.values.owner) : undefined;
+      /** The pack NAME behind the owner, for the candidate cost line: a resolved capability hands back a member id. */
+      let ownerName = owner;
       if (capability) {
         const roster = ((await b.roster()) as { roster: RosterEntry[] }).roster;
         const target = memberFor(roster, b.rec.operator?.member_id ?? null, capability);
@@ -278,25 +291,83 @@ export const taskCreate: CommandDef = {
           throw new CliError(3, `nobody in ${b.rec.alias} offers ${capability} right now`, offered.length ? `offered: ${describeOffers(candidates, offered)}` : "rfa status shows whether the agents are up");
         }
         owner = target.id;
+        ownerName = target.name;
         ctx.ui.step(`${capability} -> ${target.name} (${target.state})`, "resolved at create time, ready first: the same rule rfa ask uses");
       }
-      const t = await b.call({
-        action: "create",
-        title,
-        ...(a.values.description ? { description: String(a.values.description) } : {}),
-        ...(owner ? { owner } : {}),
-        ...(replyBy ? { reply_by: replyBy } : {}),
-        ...(a.values["evidence-required"] ? { evidence_required: true } : {}),
-        ...(a.values["blocked-by"] ? { blocked_by: String(a.values["blocked-by"]).split(",").map((s) => s.trim()).filter(Boolean) } : {}),
-        ...(maxAttempts !== undefined ? { max_attempts: maxAttempts } : {}),
-      });
-      ctx.ui.done(`task ${t.id} created in ${b.rec.alias}`, `${t.state}${t.owner ? `, assigned to ${t.owner}` : ""}`);
-      if (ctx.flags.json) ctx.ui.json(t);
+      /**
+       * The candidate ask is LOCAL (RFA-0.8 sect. 11): there is no wire field to
+       * carry it and this rung adds none, so it goes in `runs.db` for the
+       * resident to read at pickup.
+       *
+       * Written BEFORE the wire create, with a null task id, and bound to the id
+       * immediately after. Writing it afterwards races the hub's own event: the
+       * resident could be woken and look before the row lands. The resident's
+       * read matches the bound id first and falls back to an unconsumed row for
+       * the same room and title, so neither ordering can lose the request.
+       */
+      let engine: Engine | null = null;
+      let requestId: string | null = null;
+      try {
+        if (candidates !== undefined && candidates > 1) {
+          engine = new Engine(h.paths.runsDb);
+          statCandidateCost(ctx, h, ownerName, candidates, selector);
+          requestId = engine.requestCandidates({ room: b.rec.handle, title, count: candidates, selector });
+        }
+        const t = await b.call({
+          action: "create",
+          title,
+          ...(a.values.description ? { description: String(a.values.description) } : {}),
+          ...(owner ? { owner } : {}),
+          ...(replyBy ? { reply_by: replyBy } : {}),
+          ...(a.values["evidence-required"] ? { evidence_required: true } : {}),
+          ...(a.values["blocked-by"] ? { blocked_by: String(a.values["blocked-by"]).split(",").map((s) => s.trim()).filter(Boolean) } : {}),
+          ...(maxAttempts !== undefined ? { max_attempts: maxAttempts } : {}),
+        });
+        if (engine && requestId) engine.bindCandidateRequest(requestId, String(t.id));
+        ctx.ui.done(
+          `task ${t.id} created in ${b.rec.alias}`,
+          `${t.state}${t.owner ? `, assigned to ${t.owner}` : ""}${candidates && candidates > 1 ? `, up to ${candidates} candidates (${selector})` : ""}`,
+        );
+        if (ctx.flags.json) ctx.ui.json(t);
+      } finally {
+        engine?.close();
+      }
     } finally {
       await b.close();
     }
   },
 };
+
+/**
+ * Say what N candidates will cost, BEFORE the task exists, against this pack's
+ * real ceilings (RFA-0.8 sect. 11 item 7: N candidates is N times the money for
+ * one answer and the operator is the one who pays).
+ *
+ * Best effort by design: an owner that is not a local pack, or a pack this
+ * directory cannot read, means the numbers are unknown, and saying so beats
+ * inventing them or saying nothing.
+ */
+function statCandidateCost(ctx: CliContext, h: HubDir, owner: string | undefined, n: number, selector: CandidateSelector): void {
+  ctx.ui.step(`${n} candidates: ${n} model runs of this one task, and you pay for all ${n}`, SELECTOR_NOTES[selector]);
+  if (!owner) return;
+  let perTask: number | undefined;
+  let perDay: number | undefined;
+  let concurrency = 1;
+  try {
+    const pack = loadPack(path.join(h.paths.agents, owner));
+    perTask = pack.def.budgets?.per_task_usd;
+    perDay = pack.def.budgets?.per_day_usd;
+    concurrency = pack.def.concurrency;
+  } catch {
+    return; // not a local pack, or unreadable: the resident reports the real plan on pickup
+  }
+  const lines: string[] = [];
+  if (perTask && perDay) lines.push(`${owner} caps a task at $${perTask.toFixed(2)} and a day at $${perDay.toFixed(2)}, so ${n} candidates is up to $${(perTask * n).toFixed(2)} of today's budget`);
+  else if (perDay) lines.push(`${owner} declares no per_task_usd, so the first candidate reserves the whole remainder of its $${perDay.toFixed(2)} day and only ONE will run; declare budgets.per_task_usd to fan out`);
+  else lines.push(`${owner} declares no budgets.per_day_usd, which candidate parallelism requires (RFA-0.8 sect. 5 item 7)`);
+  if (concurrency < n) lines.push(`${owner} declares concurrency: ${concurrency}, so at most ${concurrency} candidate${concurrency === 1 ? "" : "s"} will actually run`);
+  for (const l of lines) ctx.ui.note(l);
+}
 
 export const taskCancel: CommandDef = {
   path: ["task", "cancel"],
@@ -336,6 +407,138 @@ export const taskVerify: CommandDef = {
     }
   },
 };
+
+// ------------------------------------------- candidates (RFA-0.8 sect. 11)
+
+/** The set to act on: the newest for this task id, or a set id passed directly. */
+function candidateSetFor(engine: Engine, ref: string): CandidateSet {
+  const set = ref.startsWith("cs_") ? engine.candidateSet(ref) : engine.candidateSetForTask(ref);
+  if (!set) {
+    throw new CliError(
+      3,
+      `no candidate set for ${ref}`,
+      "candidates are asked for at create time: rfa task create \"<title>\" --owner <agent> --candidates <n>",
+    );
+  }
+  return set;
+}
+
+const STATE_WORD: Record<string, string> = {
+  running: "running",
+  ready: "ready",
+  won: "SELECTED",
+  lost: "discarded",
+  cancelled: "interrupted",
+  failed: "failed",
+};
+
+export const taskCandidates: CommandDef = {
+  path: ["task", "candidates"],
+  summary: "The candidate answers for a task: what each cost, and which is selected",
+  usage: "<task id | set id> [--full]",
+  options: { full: { type: "boolean", default: false } },
+  why:
+    "A task answered N ways (RFA-0.8 sect. 11) keeps its candidates HERE, in this hub directory, not on the wire: the room saw one task and will see one completion. This is where the answers, the states and the money live, and the set total is the number `what did this task cost` actually means once one task is three runs. --full prints each answer in full rather than its first lines.\n\n" +
+    "A discarded candidate keeps its record and its cost forever and loses only its scratch surface: a candidate whose spend disappeared would be exactly the unattributable meter the honest-meters doctrine forbids. Nothing it wrote reaches the fact store, ever; only a selected winner's answer becomes an episode consolidation can distil.",
+  examples: ["rfa task candidates t_19", "rfa task candidates t_19 --full"],
+  run: async (ctx, a) => {
+    const h = ctx.hubdir();
+    const ref = a.positionals[0];
+    if (!ref) throw new CliError(2, "rfa task candidates <task id | set id>");
+    const engine = new Engine(h.paths.runsDb);
+    try {
+      const set = candidateSetFor(engine, ref);
+      if (ctx.flags.json) return void ctx.ui.json(set);
+      ctx.ui.line(
+        `${set.set_id}  ${set.state}  ${set.running} of ${set.requested} requested  ${set.selector}  ` +
+          ctx.ui.dim(`$${set.cost_usd.toFixed(4)} for the set`),
+      );
+      if (set.title) ctx.ui.line(ctx.ui.dim(`  ${set.task_id ?? "-"}: ${set.title}`));
+      if (set.degraded) ctx.ui.note(`fewer than asked for: ${set.degraded}`);
+      ctx.ui.table(
+        set.candidates.map((c) => [
+          String(c.idx),
+          STATE_WORD[c.state] ?? c.state,
+          c.cost_usd === null ? ctx.ui.dim("-") : `$${c.cost_usd.toFixed(4)}`,
+          c.run_id,
+          (c.error ?? c.text ?? "").replace(/\s+/g, " ").slice(0, a.values.full ? 4000 : 90),
+        ]),
+      );
+      if (a.values.full) {
+        for (const c of set.candidates) {
+          if (!c.text) continue;
+          ctx.ui.line("");
+          ctx.ui.line(`--- candidate ${c.idx} (${STATE_WORD[c.state] ?? c.state}) ---`);
+          process.stdout.write(c.text + "\n");
+        }
+      }
+      if (set.state === "awaiting_selection") {
+        ctx.ui.note(`nothing is filed as evidence until a human picks: rfa task select ${set.task_id ?? set.set_id} --candidate <n>`);
+      } else if (set.selected_index !== null) {
+        ctx.ui.note(`candidate ${set.selected_index} selected by ${set.selected_by ?? "?"}${set.state === "filed" ? " and filed as the task's evidence" : ", waiting for the agent to file it"}`);
+      }
+    } finally {
+      engine.close();
+    }
+  },
+};
+
+export const taskSelect: CommandDef = {
+  path: ["task", "select"],
+  summary: "Pick the candidate answer to keep; the rest are discarded",
+  usage: "<task id | set id> --candidate <n> [--room <alias|handle>]",
+  options: { candidate: { type: "string" }, room: { type: "string" } },
+  why:
+    "Selection among candidates is a LOCAL act, and this is it. It is not the wire's `verify`: the room saw one task and one owner, so wire 10.4 still governs the VERIFICATION of the completion the winner produces, by a member that is not the owner, exactly as for any other evidence-bearing task (rfa task verify).\n\n" +
+    "Choosing is what lets the winner's answer be remembered. A candidate turn records no episode at all, because consolidation distils episodes into facts and a rejected candidate's reasoning must never become one; the selected answer is written to the episode log here, and the discarded ones stay in this directory as a record and never enter it. The agent files the winner as the task's evidence with no further model turn, so this costs nothing.",
+  examples: ["rfa task select t_19 --candidate 2"],
+  run: async (ctx, a) => {
+    const h = ctx.hubdir();
+    const ref = a.positionals[0];
+    const idx = numberFlag(a.values.candidate, "candidate", { int: true, min: 0, max: 7 });
+    if (!ref || idx === undefined) throw new CliError(2, "rfa task select <task id | set id> --candidate <n>", "rfa task candidates <task id> lists them");
+    const engine = new Engine(h.paths.runsDb);
+    try {
+      const set = candidateSetFor(engine, ref);
+      const chosen = engine.selectCandidate(set.set_id, idx, principalName(h));
+      if (!chosen.ok) throw new CliError(3, chosen.detail ?? `candidate ${idx} cannot be selected`, `rfa task candidates ${ref}`);
+      const discarded = set.candidates.filter((c) => c.idx !== idx && c.state === "ready").length;
+      ctx.ui.done(
+        `candidate ${idx} selected for ${set.task_id ?? set.set_id}`,
+        `${discarded} discarded, $${set.cost_usd.toFixed(4)} for the set; the winner is the only one that reaches memory`,
+      );
+      // Nudge the task so the owner wakes and files it. Answering an
+      // `input_required` task flips it back to `working` (wire 10.2), and that
+      // event is exactly how the selection reaches the resident; a resident that
+      // is down picks the set up at its next boot instead.
+      if (set.task_id) {
+        try {
+          const b = await board(ctx, h, a.values.room as string | undefined);
+          try {
+            await b.call({ action: "update", id: set.task_id, note: `candidate ${idx} selected; file it as the evidence` });
+          } finally {
+            await b.close();
+          }
+        } catch (err) {
+          ctx.ui.note(`the selection is recorded, but the agent could not be nudged (${(err as Error).message}); it files the winner at its next start`);
+        }
+      }
+      if (ctx.flags.json) ctx.ui.json(engine.candidateSet(set.set_id));
+    } finally {
+      engine.close();
+    }
+  },
+};
+
+/** Who selected, for the record. The CLI acts as the hub's first human principal (RFA-0.7 sect. 3.4). */
+function principalName(h: HubDir): string {
+  try {
+    const first = principalsStore(h).read().principals?.[0];
+    return first?.label ? `human:${first.label}` : "human:cli";
+  } catch {
+    return "human:cli";
+  }
+}
 
 // ---------------------------------------------------------------- approvals
 

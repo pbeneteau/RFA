@@ -194,6 +194,63 @@ export class Engine {
       `);
       this.db.pragma("user_version = 2");
     }
+    if (current < 3) {
+      // RFA-0.8 sect. 11 (rung 4): candidate parallelism. Three tables and two
+      // columns, and the columns are the ones that make cost per TASK a query
+      // rather than an inference: without `candidate_set` on the run itself,
+      // three candidates for one task are indistinguishable from three tasks,
+      // and the meters technically add up while answering nothing.
+      const cols = this.db.prepare("PRAGMA table_info(runs)").all() as { name: string }[];
+      if (!cols.some((c) => c.name === "candidate_set")) this.db.exec(`ALTER TABLE runs ADD COLUMN candidate_set TEXT`);
+      if (!cols.some((c) => c.name === "candidate_index")) this.db.exec(`ALTER TABLE runs ADD COLUMN candidate_index INTEGER`);
+      this.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_runs_candidate ON runs(candidate_set) WHERE candidate_set IS NOT NULL;
+        CREATE TABLE IF NOT EXISTS candidate_sets (
+          set_id TEXT PRIMARY KEY,
+          agent TEXT NOT NULL,
+          room TEXT,
+          task_id TEXT,
+          title TEXT,
+          requested INTEGER NOT NULL,
+          running INTEGER NOT NULL,
+          selector TEXT NOT NULL,
+          degraded TEXT,
+          state TEXT NOT NULL CHECK (state IN ('running','awaiting_selection','selected','filed','abandoned')),
+          selected_index INTEGER,
+          selected_by TEXT,
+          created_at TEXT NOT NULL,
+          settled_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_candidate_sets_task ON candidate_sets(task_id);
+        CREATE INDEX IF NOT EXISTS idx_candidate_sets_state ON candidate_sets(agent, state);
+        CREATE TABLE IF NOT EXISTS candidate_runs (
+          set_id TEXT NOT NULL,
+          idx INTEGER NOT NULL,
+          run_id TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('running','ready','won','lost','cancelled','failed')),
+          text TEXT,
+          cost_usd REAL,
+          num_turns INTEGER,
+          error TEXT,
+          scratch_dir TEXT,
+          started_at TEXT NOT NULL,
+          ended_at TEXT,
+          PRIMARY KEY (set_id, idx)
+        );
+        CREATE TABLE IF NOT EXISTS candidate_requests (
+          request_id TEXT PRIMARY KEY,
+          room TEXT NOT NULL,
+          title TEXT NOT NULL,
+          task_id TEXT,
+          count INTEGER NOT NULL,
+          selector TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          consumed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_candidate_requests_open ON candidate_requests(room, title) WHERE consumed_at IS NULL;
+      `);
+      this.db.pragma("user_version = 3");
+    }
   }
 
   close(): void {
@@ -214,6 +271,9 @@ export class Engine {
     kind: string;
     input?: unknown;
     multitask?: MultitaskStrategy;
+    /** The candidate set this run belongs to (RFA-0.8 sect. 11), or nothing for an ordinary run. */
+    candidateSet?: string | null;
+    candidateIndex?: number | null;
   }): { runId: string; action: "start" | "enqueued" | "rejected" | "interrupted_previous" } {
     const strategy = args.multitask ?? "enqueue";
     const now = iso();
@@ -243,10 +303,22 @@ export class Engine {
       const starting = action === "start" || action === "interrupted_previous";
       this.db
         .prepare(
-          `INSERT INTO runs (run_id, thread_id, agent, status, kind, input_json, created_at, started_at, owner_pid)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO runs (run_id, thread_id, agent, status, kind, input_json, created_at, started_at, owner_pid, candidate_set, candidate_index)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(runId, args.threadId, args.agent, starting ? "running" : "pending", args.kind, json(args.input), now, starting ? now : null, starting ? process.pid : null);
+        .run(
+          runId,
+          args.threadId,
+          args.agent,
+          starting ? "running" : "pending",
+          args.kind,
+          json(args.input),
+          now,
+          starting ? now : null,
+          starting ? process.pid : null,
+          args.candidateSet ?? null,
+          args.candidateIndex ?? null,
+        );
       if (starting) {
         this.db.prepare(`UPDATE threads SET status = 'busy', updated_at = ? WHERE thread_id = ?`).run(now, args.threadId);
       }
@@ -481,6 +553,197 @@ export class Engine {
       num_turns: row.num_turns,
       owner_pid: row.owner_pid ?? null,
     };
+  }
+
+  // ------------------------------------------------- candidate sets (RFA-0.8 sect. 11)
+
+  /**
+   * Open a candidate set: N runs of ONE task, one output selected, the rest
+   * discarded (RFA-0.8 sect. 11, rung 4).
+   *
+   * The set is durable here, in the hub directory's engine DB, and NOWHERE on
+   * the wire. That is the rung's central decision and the design note
+   * (`docs/design/rung4-candidates.md` sect. 1) carries the argument: the wire
+   * task object holds one owner and one evidence, so wire-visible candidates
+   * would need N evidences or N child tasks, both of them new protocol surface
+   * RFA-0.8 never staged. The room sees one task, one owner, one completion,
+   * and wire 10.4 governs the verification of THAT completion unchanged.
+   *
+   * `requested` and `running` are both recorded, and they differ whenever the
+   * budget or the pack's host sizing cut the fan-out down. `degraded` carries
+   * the sentence explaining it: a three-becomes-one is a first-class outcome
+   * with a reason attached, never a silent one.
+   */
+  openCandidateSet(args: {
+    agent: string;
+    room?: string | null;
+    taskId?: string | null;
+    title?: string | null;
+    requested: number;
+    running: number;
+    selector: string;
+    degraded?: string | null;
+  }): string {
+    const setId = `cs_${randomBytes(6).toString("hex")}`;
+    this.db
+      .prepare(
+        `INSERT INTO candidate_sets (set_id, agent, room, task_id, title, requested, running, selector, degraded, state, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)`,
+      )
+      .run(setId, args.agent, args.room ?? null, args.taskId ?? null, args.title ?? null, args.requested, args.running, args.selector, args.degraded ?? null, iso());
+    return setId;
+  }
+
+  /** Record a candidate as started. Its run row carries the same set id, which is what makes cost per TASK a query. */
+  startCandidate(setId: string, idx: number, runId: string, scratchDir: string | null): void {
+    this.db
+      .prepare(
+        `INSERT INTO candidate_runs (set_id, idx, run_id, state, scratch_dir, started_at) VALUES (?, ?, ?, 'running', ?, ?)
+         ON CONFLICT(set_id, idx) DO UPDATE SET run_id = excluded.run_id, state = 'running', scratch_dir = excluded.scratch_dir, started_at = excluded.started_at`,
+      )
+      .run(setId, idx, runId, scratchDir, iso());
+  }
+
+  /**
+   * Settle one candidate with what it actually produced and what it actually
+   * cost. Every terminal state passes through here, `cancelled` included: a
+   * candidate whose spend disappears is exactly the unattributable meter the
+   * honest-meters doctrine forbids, so the cost is recorded on the discard path
+   * as firmly as on the winning one.
+   */
+  settleCandidate(
+    setId: string,
+    idx: number,
+    result: { state: "ready" | "cancelled" | "failed"; text?: string | null; costUsd?: number | null; numTurns?: number | null; error?: string | null },
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE candidate_runs SET state = ?, text = COALESCE(?, text), cost_usd = COALESCE(?, cost_usd),
+         num_turns = COALESCE(?, num_turns), error = COALESCE(?, error), ended_at = ? WHERE set_id = ? AND idx = ?`,
+      )
+      .run(result.state, result.text ?? null, result.costUsd ?? null, result.numTurns ?? null, result.error ?? null, iso(), setId, idx);
+  }
+
+  /** Move the set out of `running` once every candidate has settled. */
+  closeCandidateSet(setId: string, state: "awaiting_selection" | "selected" | "abandoned", opts: { degraded?: string | null } = {}): void {
+    this.db
+      .prepare(`UPDATE candidate_sets SET state = ?, degraded = COALESCE(?, degraded), settled_at = COALESCE(settled_at, ?) WHERE set_id = ?`)
+      .run(state, opts.degraded ?? null, state === "awaiting_selection" ? null : iso(), setId);
+  }
+
+  /**
+   * Record the selection. One transaction, so a set can never hold two winners:
+   * the chosen index becomes `won`, every other settled candidate becomes
+   * `lost`, and the set moves to `selected`.
+   *
+   * This is the ONLY thing that makes a candidate's output eligible for memory
+   * (design note sect. 2.1). The losers' text stays in this table forever, for
+   * the audit, and never enters the episode log at all: it does not vanish, it
+   * just never becomes fact.
+   */
+  selectCandidate(setId: string, idx: number, by: string): { ok: boolean; detail?: string; run?: CandidateRun } {
+    return this.db.transaction((): { ok: boolean; detail?: string; run?: CandidateRun } => {
+      const set = this.candidateSet(setId);
+      if (!set) return { ok: false, detail: `no candidate set ${setId}` };
+      if (set.state === "selected" || set.state === "filed") {
+        return { ok: false, detail: `${setId} already selected candidate ${set.selected_index} (${set.state})` };
+      }
+      if (set.state === "running") return { ok: false, detail: `${setId} still has candidates in flight` };
+      const chosen = set.candidates.find((c) => c.idx === idx);
+      if (!chosen) return { ok: false, detail: `${setId} has no candidate ${idx}` };
+      if (chosen.state !== "ready") {
+        return { ok: false, detail: `candidate ${idx} is ${chosen.state}, not ready${chosen.error ? ` (${chosen.error})` : ""}` };
+      }
+      const now = iso();
+      this.db.prepare(`UPDATE candidate_runs SET state = 'lost' WHERE set_id = ? AND state = 'ready'`).run(setId);
+      this.db.prepare(`UPDATE candidate_runs SET state = 'won' WHERE set_id = ? AND idx = ?`).run(setId, idx);
+      this.db
+        .prepare(`UPDATE candidate_sets SET state = 'selected', selected_index = ?, selected_by = ?, settled_at = COALESCE(settled_at, ?) WHERE set_id = ?`)
+        .run(idx, by, now, setId);
+      return { ok: true, run: { ...chosen, state: "won" } };
+    })();
+  }
+
+  /** The winner has been filed as the task's evidence: the set is done and nothing will pick it up again. */
+  markCandidateSetFiled(setId: string): void {
+    this.db.prepare(`UPDATE candidate_sets SET state = 'filed' WHERE set_id = ?`).run(setId);
+  }
+
+  candidateSet(setId: string): CandidateSet | null {
+    const row = this.db.prepare(`SELECT * FROM candidate_sets WHERE set_id = ?`).get(setId) as CandidateSetRow | undefined;
+    return row ? this.hydrateSet(row) : null;
+  }
+
+  /** The newest set for a task: what the resident consults on a task wake and what `rfa task candidates` prints. */
+  candidateSetForTask(taskId: string): CandidateSet | null {
+    const row = this.db.prepare(`SELECT * FROM candidate_sets WHERE task_id = ? ORDER BY created_at DESC LIMIT 1`).get(taskId) as CandidateSetRow | undefined;
+    return row ? this.hydrateSet(row) : null;
+  }
+
+  candidateSets(filter: { agent?: string; state?: string; limit?: number } = {}): CandidateSet[] {
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (filter.agent) (where.push("agent = ?"), params.push(filter.agent));
+    if (filter.state) (where.push("state = ?"), params.push(filter.state));
+    const rows = this.db
+      .prepare(`SELECT * FROM candidate_sets ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY created_at DESC LIMIT ?`)
+      .all(...params, filter.limit ?? 50) as CandidateSetRow[];
+    return rows.map((r) => this.hydrateSet(r));
+  }
+
+  private hydrateSet(row: CandidateSetRow): CandidateSet {
+    const candidates = this.db.prepare(`SELECT * FROM candidate_runs WHERE set_id = ? ORDER BY idx`).all(row.set_id) as CandidateRun[];
+    return { ...row, candidates, cost_usd: candidates.reduce((n, c) => n + (c.cost_usd ?? 0), 0) };
+  }
+
+  // -------- the local per-task candidate request (design note sect. 4.5)
+
+  /**
+   * Ask that the next task with this `(room, title)` be answered by N
+   * candidates. Local by necessity: there is no wire field to carry it and this
+   * rung adds none, so the operator's CLI writes it here and the resident reads
+   * it at pickup.
+   *
+   * Written BEFORE the task is created on the wire, with a null task id, and
+   * bound to the id immediately after. Writing it after the create would race
+   * the hub's own event: the resident could in principle be woken and look
+   * before the row lands. `takeCandidateRequest` matches the bound id first and
+   * falls back to an unconsumed row for the same room and title, so neither
+   * ordering can lose the request.
+   */
+  requestCandidates(args: { room: string; title: string; count: number; selector: string; taskId?: string | null }): string {
+    const id = `cq_${randomBytes(6).toString("hex")}`;
+    this.db
+      .prepare(`INSERT INTO candidate_requests (request_id, room, title, task_id, count, selector, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(id, args.room, args.title, args.taskId ?? null, args.count, args.selector, iso());
+    return id;
+  }
+
+  bindCandidateRequest(requestId: string, taskId: string): void {
+    this.db.prepare(`UPDATE candidate_requests SET task_id = ? WHERE request_id = ? AND consumed_at IS NULL`).run(taskId, requestId);
+  }
+
+  /**
+   * Consume the request for this task, if there is one. Atomic: two wakes for
+   * one task (a redelivery, a restart) must not fan out twice.
+   */
+  takeCandidateRequest(args: { taskId: string; room?: string | null; title?: string | null }): { count: number; selector: string } | null {
+    return this.db.transaction((): { count: number; selector: string } | null => {
+      let row = this.db
+        .prepare(`SELECT request_id, count, selector FROM candidate_requests WHERE task_id = ? AND consumed_at IS NULL LIMIT 1`)
+        .get(args.taskId) as { request_id: string; count: number; selector: string } | undefined;
+      if (!row && args.room && args.title) {
+        row = this.db
+          .prepare(
+            `SELECT request_id, count, selector FROM candidate_requests
+             WHERE room = ? AND title = ? AND task_id IS NULL AND consumed_at IS NULL ORDER BY created_at LIMIT 1`,
+          )
+          .get(args.room, args.title) as { request_id: string; count: number; selector: string } | undefined;
+      }
+      if (!row) return null;
+      this.db.prepare(`UPDATE candidate_requests SET task_id = ?, consumed_at = ? WHERE request_id = ?`).run(args.taskId, iso(), row.request_id);
+      return { count: row.count, selector: row.selector };
+    })();
   }
 
   // ---------------------------------------------------------------- steps (memoized side effects)
@@ -731,6 +994,44 @@ export class Engine {
       return due;
     })();
   }
+}
+
+/** One candidate of a set: its run, what it produced, and what it cost, terminal state included. */
+export interface CandidateRun {
+  set_id: string;
+  idx: number;
+  run_id: string;
+  state: "running" | "ready" | "won" | "lost" | "cancelled" | "failed";
+  text: string | null;
+  cost_usd: number | null;
+  num_turns: number | null;
+  error: string | null;
+  scratch_dir: string | null;
+  started_at: string;
+  ended_at: string | null;
+}
+
+interface CandidateSetRow {
+  set_id: string;
+  agent: string;
+  room: string | null;
+  task_id: string | null;
+  title: string | null;
+  requested: number;
+  running: number;
+  selector: string;
+  degraded: string | null;
+  state: "running" | "awaiting_selection" | "selected" | "filed" | "abandoned";
+  selected_index: number | null;
+  selected_by: string | null;
+  created_at: string;
+  settled_at: string | null;
+}
+
+export interface CandidateSet extends CandidateSetRow {
+  candidates: CandidateRun[];
+  /** What the whole set cost: the number `cost per task` means once a task is answered N ways. */
+  cost_usd: number;
 }
 
 interface RunRow {

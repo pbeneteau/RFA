@@ -203,7 +203,9 @@ memory:
   gate: memory-gate   # peer content cannot become memory unexamined
 ${kind === "tool" ? `mode: ${o.mode ?? "ask"}   # ask: cards for every acting tool · plan: proposes, never acts · bypass: acts without asking
 ` : ""}sandbox:
-  isolation: none     # worktree or container once it runs code
+  isolation: none     # the only implemented value. Per-RUN write fencing (RFA-0.8 sect. 9)
+                      # engages only for a pack that declares a guarded built-in
+                      # (Write/Edit/NotebookEdit), which no scaffolded kind does.
   permission_mode: default
   network: none
 # Names only, never values. The supervisor injects these from .rfa/secrets.json.

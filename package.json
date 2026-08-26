@@ -30,7 +30,8 @@
     "demo:push": "tsx scripts/demo-push.ts",
     "coldstart": "tsx scripts/coldstart.ts",
     "parity": "tsx src/cli/main.ts evals parity",
-    "tui:smoke": "python3 scripts/tui-drive.py --smoke"
+    "tui:smoke": "python3 scripts/tui-drive.py --smoke",
+    "fence-proof": "tsx scripts/fence-proof.ts"
   },
   "engines": {
     "node": ">=22"

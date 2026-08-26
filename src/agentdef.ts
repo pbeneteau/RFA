@@ -15,6 +15,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import YAML from "yaml";
 import { effectiveMode } from "./posture.js";
+import { guardedBuiltinsOf, shadowingFailures } from "./writefence.js";
 import * as z from "zod";
 import { sha256hex } from "./jcs.js";
 import type { AgentCard } from "./model.js";
@@ -129,7 +130,34 @@ export const agentDefSchema = z.object({
     .optional(),
   sandbox: z
     .object({
-      isolation: z.enum(["none", "worktree", "container"]).default("none"),
+      /**
+       * Workspace isolation, and only `none` is accepted because only `none` is
+       * implemented (RFA-0.8 sect. 8.1). Found 2026-08-26 at rung 6's trigger
+       * check: this field was INERT, accepting `worktree` and `container` while
+       * no production module read it, so a pack asking for container isolation
+       * got none of it and nothing said so. A safety setting that silently does
+       * nothing is the lie RFA-0.8 sect. 9 item 3 forbids everywhere else, so the
+       * enum keeps the dead values only to refuse them by name rather than with
+       * zod's generic enum error. `clone` is listed for the same reason before it
+       * works: an operator who reads sect. 8.1 and sets the value the spec names
+       * deserves "not until rung 6a" and not "invalid option".
+       *
+       * The enum therefore carries its OWN error too, for a value that is not
+       * even in the list: zod's default would print "expected one of
+       * none|worktree|container|clone" and advertise three values as legal,
+       * which is the generic-enum outcome this field exists to avoid. It names
+       * `none` and points at the refusal below. The refusal itself carries no
+       * "sandbox.isolation:" prefix: `parseAgentMd` already prints the path.
+       */
+      isolation: z
+        .enum(["none", "worktree", "container", "clone"], {
+          error: "only `none` is implemented; any other value is refused by name, with what that value would require",
+        })
+        .default("none")
+        .refine((v) => v === "none", {
+          message:
+            "only `none` is implemented. `worktree` is rejected on the merits (RFA-0.8 Appendix A: a worktree materializes tracked files only, and a pack's mutable bulk is gitignored by design), `container` is parked with its own trigger, and `clone` becomes legal with RFA-0.8 rung 6a. Per-run write isolation today is the two-door fence of RFA-0.8 sect. 9, which needs no isolation setting.",
+        }),
       permission_mode: z.enum(["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk", "auto"]).default("default"),
       network: z.enum(["none", "allowlist", "open"]).default("none"),
       allowed_domains: z.array(z.string()).optional(),
@@ -153,6 +181,24 @@ export const agentDefSchema = z.object({
    * property and is checked at resident startup, failing closed.
    */
   concurrency: z.number().int().min(1).max(16).default(1),
+  /**
+   * How many CANDIDATES this pack runs for one task by default (RFA-0.8
+   * sect. 11, rung 4): N independent runs of the same task, one output
+   * selected, the rest discarded. 1, the default, is no fan-out at all.
+   *
+   * What the number costs, in the field's own documentation, because N
+   * candidates is N times the money for ONE answer and the operator pays it:
+   * three candidates is three model runs, three account reservations against
+   * the same day budget, and three CLI child processes on this host. The
+   * per-task ask (`rfa task create --candidates N`) overrides this, and both
+   * are cut down to what the day budget can actually reserve, with the reason
+   * reported rather than swallowed.
+   *
+   * Above 1 it requires `concurrency >= candidates` (and therefore the three
+   * gates of sect. 10), because running N candidates IS running N turns at
+   * once and the pack has to have said so.
+   */
+  candidates: z.number().int().min(1).max(8).default(1),
   budgets: z
     .object({
       max_turns: z.number().int().min(1).max(200).optional(),
@@ -234,23 +280,50 @@ export const agentDefSchema = z.object({
  */
 export function concurrencyGateFailures(def: {
   concurrency?: number;
+  candidates?: number;
   tools?: { allow?: string[] };
   mode?: string;
   interrupt_on?: AgentDef["interrupt_on"];
   budgets?: { per_day_usd?: number };
 }): string[] {
-  if ((def.concurrency ?? 1) <= 1) return [];
+  const concurrency = def.concurrency ?? 1;
+  const candidates = def.candidates ?? 1;
+  // Candidates ride these gates rather than getting their own: N candidates IS
+  // N turns at once, so a pack declaring `candidates: 3` has declared the same
+  // exposure as one declaring `concurrency: 3` and answers for it here.
+  if (concurrency <= 1 && candidates <= 1) return [];
   const fails: string[] = [];
 
-  // Gate 1, posture. A writing pack needs the two-door fence of sect. 9, which
-  // is rungs 5 and 6 and does not exist: two turns writing one pack tree with no
-  // fence is the lost-update case, not a performance question.
+  if (candidates > concurrency) {
+    fails.push(
+      `it declares candidates: ${candidates} but concurrency: ${concurrency}: ${candidates} candidates for one task is ${candidates} turns at once, ` +
+        `each a full CLI child process, so the pack has to declare concurrency: ${candidates} or more (RFA-0.8 sect. 11)`,
+    );
+  }
+
+  // Gate 1, posture, in the two halves sect. 10 gives it.
+  //
+  // The half the schema CAN see: a pack with gated acting tools. Those reach the
+  // world through third-party MCP tools whose write set this platform cannot
+  // fence at all, and NO rung of RFA-0.8 changes that: rung 6a is a CoW clone of
+  // the pack's own tree and 6b is a git publish of it, so neither touches a write
+  // that lands in a remote SaaS workspace. An acting pack therefore stays serial
+  // rather than waiting for a rung; the fence of sect. 9 (rung 5, built) covers
+  // guarded BUILT-INS, which is a different surface.
   const mode = effectiveMode(def as AgentDef);
   if (mode !== "read-only") {
     fails.push(
-      `its effective posture is \`${mode}\`, not read-only: a pack with acting tools needs the two-door write fence (RFA-0.8 sect. 9, rungs 5 and 6), which is not built yet`,
+      `its effective posture is \`${mode}\`, not read-only: an acting tool reaches the world through a third-party MCP server whose write set neither door of the write fence can trace (RFA-0.8 sect. 9), and no rung of RFA-0.8 fences those side effects, so an acting pack stays serial`,
     );
   }
+  // The half it CANNOT: a pack with a declared write surface (a guarded built-in
+  // in `tools.allow`) is allowed through here on purpose, which is a change of
+  // 2026-08-26 and the point of rung 5. Whether the two-door fence is available
+  // and ESTABLISHED for that surface is a property of this host and this SDK,
+  // not of the definition, so it is checked at resident startup and fails closed
+  // there (sect. 10's own split, and sect. 9 item 3). What the definition CAN
+  // say about the fence is checked by `writeSurfaceDefFailures`, for every pack
+  // and not only a concurrent one.
 
   // Gate 2, memory topology (sect. 4 item 2).
   const declared = (def.tools?.allow ?? []).filter((t) => (MEMORY_DESTRUCTIVE_TOOLS as readonly string[]).includes(t));
@@ -264,10 +337,35 @@ export function concurrencyGateFailures(def: {
   // unbounded times N is not something a warning can hold.
   if (!def.budgets?.per_day_usd) {
     fails.push(
-      `it declares no budgets.per_day_usd: a pack with no daily ceiling goes from unbounded-serially to unbounded-times-${def.concurrency} (RFA-0.8 sect. 5 item 7)`,
+      `it declares no budgets.per_day_usd: a pack with no daily ceiling goes from unbounded-serially to unbounded-times-${Math.max(concurrency, candidates)} (RFA-0.8 sect. 5 item 7)`,
     );
   }
   return fails;
+}
+
+/**
+ * What a DEFINITION can say about the two-door write fence (RFA-0.8 sect. 9),
+ * checked for every pack with a declared write surface regardless of
+ * `concurrency`: one turn writing outside its scratch surface is the same defect
+ * as two, it is just cheaper to find.
+ *
+ * The rest of the fence is a runtime property (is the OS sandbox available on
+ * this host, does this SDK still route the guarded built-ins through the
+ * callback) and lives at resident startup, failing closed.
+ */
+export function writeSurfaceDefFailures(def: {
+  tools?: { allow?: string[] };
+  sandbox?: { permission_mode?: string };
+}): string[] {
+  const guarded = guardedBuiltinsOf(def as AgentDef);
+  if (guarded.length === 0) return [];
+  return shadowingFailures({
+    guarded,
+    // The definition cannot name `allowedTools` (the resident computes it), so
+    // only the permission mode is visible here.
+    allowedTools: [],
+    permissionMode: def.sandbox?.permission_mode,
+  }).map((f) => `it declares the write surface ${guarded.join(", ")} and ${f}`);
 }
 
 export type AgentDef = z.infer<typeof agentDefSchema>;
@@ -317,8 +415,14 @@ export function parseAgentMd(content: string): { def: AgentDef; prompt: string; 
   const gates = concurrencyGateFailures(def);
   if (gates.length > 0) {
     throw new Error(
-      `agent.md declares concurrency: ${def.concurrency} but ${gates.length === 1 ? "does not pass a gate" : `does not pass ${gates.length} gates`} (RFA-0.8 sect. 10):\n` +
+      `agent.md declares concurrency: ${def.concurrency}${def.candidates > 1 ? ` and candidates: ${def.candidates}` : ""} but ${gates.length === 1 ? "does not pass a gate" : `does not pass ${gates.length} gates`} (RFA-0.8 sect. 10):\n` +
         gates.map((g) => `  - ${g}`).join("\n"),
+    );
+  }
+  const fence = writeSurfaceDefFailures(def);
+  if (fence.length > 0) {
+    throw new Error(
+      `agent.md cannot be fenced as written (RFA-0.8 sect. 9):\n` + fence.map((f) => `  - ${f}`).join("\n"),
     );
   }
   const serves = (def.rooms ?? []).some((r) => r.serve && r.role === "participant");

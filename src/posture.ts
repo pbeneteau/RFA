@@ -22,6 +22,7 @@
  */
 import type { AgentDef } from "./agentdef.js";
 import { interruptMatch } from "./bridge.js";
+import { guardedBuiltinsOf } from "./writefence.js";
 
 export const MODES = ["ask", "plan", "bypass"] as const;
 export type AgentMode = (typeof MODES)[number];
@@ -60,6 +61,14 @@ export interface Posture {
   builtins: string[];
   /** The acting tools: what `interrupt_on` names, among what the pack may call. */
   acting: string[];
+  /**
+   * The guarded built-ins this pack declares (RFA-0.8 sect. 9, rung 5): its
+   * declared WRITE SURFACE. They sit in `builtins` (the SDK's base tool set) and
+   * are deliberately absent from `allowedTools`, because the bare entry is what
+   * auto-approves the call before `canUseTool` is consulted and so switches door
+   * one off. Measured, twice: probe A for Write, probe C for Edit.
+   */
+  guarded: string[];
   /** What `canUseTool` does when an acting tool reaches it. */
   onActing: "card" | "refuse-plan" | "allow";
 }
@@ -74,9 +83,22 @@ export function actingTools(def: AgentDef): string[] {
   return (def.tools?.allow ?? []).filter((t) => interruptMatch(def.interrupt_on, t) !== null);
 }
 
+/**
+ * What the SDK may auto-approve: everything the pack declared, minus the acting
+ * tools (they route to the card) and minus the guarded built-ins (they route to
+ * door one's path guard). Both exclusions exist for the same reason and it is
+ * worth saying once: a bare `allowedTools` entry auto-approves the whole tool
+ * BEFORE `canUseTool` is consulted, so pre-approving a tool is the same act as
+ * removing every check this platform puts behind it.
+ */
+function preApproved(allow: string[], acting: string[], guarded: string[]): string[] {
+  return allow.filter((t) => !acting.includes(t) && !guarded.includes(t));
+}
+
 export function agentPosture(def: AgentDef): Posture {
   const allow = def.tools?.allow ?? [];
   const acting = actingTools(def);
+  const guarded: string[] = guardedBuiltinsOf(def);
   const mode = effectiveMode(def);
   const base = def.sandbox?.permission_mode ?? "default";
   switch (mode) {
@@ -86,7 +108,7 @@ export function agentPosture(def: AgentDef): Posture {
       // spent its answer apologising for them (two live runs). Our plan mode is
       // the default posture with the acting tools refused and the answer named
       // as the plan.
-      return { mode, permissionMode: base, allowedTools: allow.filter((t) => !acting.includes(t)), builtins: declaredBuiltins(def), acting, onActing: "refuse-plan" };
+      return { mode, permissionMode: base, allowedTools: preApproved(allow, acting, guarded), builtins: declaredBuiltins(def), acting, guarded, onActing: "refuse-plan" };
     case "bypass":
       // NOT the SDK's bypassPermissions. That auto-approves EVERY reachable
       // tool BEFORE canUseTool is consulted - and a resident logged in through
@@ -100,11 +122,11 @@ export function agentPosture(def: AgentDef): Posture {
       // become silent approvals: the acting tools stay out of allowedTools so
       // they route through canUseTool, where onActing "allow" answers without
       // a card.
-      return { mode, permissionMode: base, allowedTools: allow.filter((t) => !acting.includes(t)), builtins: declaredBuiltins(def), acting, onActing: "allow" };
+      return { mode, permissionMode: base, allowedTools: preApproved(allow, acting, guarded), builtins: declaredBuiltins(def), acting, guarded, onActing: "allow" };
     case "ask":
     case "read-only":
     default:
-      return { mode, permissionMode: base, allowedTools: allow.filter((t) => !acting.includes(t)), builtins: declaredBuiltins(def), acting, onActing: "card" };
+      return { mode, permissionMode: base, allowedTools: preApproved(allow, acting, guarded), builtins: declaredBuiltins(def), acting, guarded, onActing: "card" };
   }
 }
 

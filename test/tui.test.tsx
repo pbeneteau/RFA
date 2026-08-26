@@ -10,7 +10,7 @@ import { render } from "ink-testing-library";
 import { Router, type CommandDef } from "../src/cli/router.js";
 import { complete } from "../src/cli/commands/completion.js";
 import { suggestCommands } from "../src/cli/suggest.js";
-import { AskBox, describeVerdict, EvalsTab, evidenceWord, fmtDeadline, sittingSummary, TaskBox, TasksTab, verdictMark, type Verdict } from "../src/cli/tui/dashboard.js";
+import { AskBox, CandidateBox, describeVerdict, EvalsTab, evidenceWord, fmtDeadline, sittingSummary, TaskBox, TasksTab, verdictMark, type Verdict } from "../src/cli/tui/dashboard.js";
 import type { RfaTask } from "../src/model.js";
 import type { GateView } from "../src/cli/tui/data.js";
 import type { Trace } from "../src/evals/label.js";
@@ -189,6 +189,63 @@ test("the Tasks tab lists the board with owners by name and the evidence each ta
   assert.equal(evidenceWord(taskOf({ verification: { pending: false, verifier: "m_paul", verdict: "reject", note: null, rejections: 2 } })), "sent back ×2");
   assert.equal(fmtDeadline(null), "-");
   assert.match(fmtDeadline(new Date(Date.now() - 120_000).toISOString()), /^2m \d+s late$/);
+});
+
+test("the candidate picker shows what each answer cost, keeps only what is ready pickable, and says what choosing does", async () => {
+  // RFA-0.8 sect. 11's operator half. The costs are the point: three answers to
+  // one task is three times the money, and a picker that hid that would be the
+  // meter lying by omission.
+  const candidate = (idx: number, state: string, cost: number | null, text: string | null, error: string | null = null) => ({
+    set_id: "cs_1",
+    idx,
+    run_id: `run_${idx}`,
+    state: state as never,
+    text,
+    cost_usd: cost,
+    num_turns: 2,
+    error,
+    scratch_dir: null,
+    started_at: "2026-08-26T14:49:08Z",
+    ended_at: "2026-08-26T14:49:38Z",
+  });
+  const set = {
+    set_id: "cs_1",
+    agent: "pm-agent",
+    room: "r_room",
+    task_id: "t_9",
+    title: "reconcile the fee table",
+    requested: 3,
+    running: 2,
+    selector: "human",
+    degraded: "$0.40 left of pm-agent's $8.00 day budget reserves 2 candidates at $0.20 each, not 3",
+    state: "awaiting_selection" as const,
+    selected_index: null,
+    selected_by: null,
+    created_at: "2026-08-26T14:49:08Z",
+    settled_at: null,
+    candidates: [candidate(0, "ready", 0.0649, "the first answer"), candidate(1, "failed", 0.0021, null, "budget"), candidate(2, "ready", 0.0683, "the third answer")],
+    cost_usd: 0.1353,
+  };
+  const picked: number[] = [];
+  const { stdin, lastFrame } = render(<CandidateBox set={set as never} height={20} onClose={() => {}} onPick={(i) => picked.push(i)} />);
+  await tick();
+  const frame = strip(lastFrame());
+  assert.ok(frame.includes("$0.1353 for the set"), "the set total, which is what cost-per-TASK means");
+  assert.ok(frame.includes("$0.0649") && frame.includes("$0.0683"), "and what each answer cost on its own");
+  assert.ok(frame.includes("2 of 3 ran") && frame.includes("day budget"), "a fan-out cut short says so, with the reason");
+  assert.ok(frame.includes("the first answer") && frame.includes("the third answer"), "each answer is previewed, not just named");
+  assert.ok(/still verifies|wire 10\.4/.test(frame), "choosing is not verifying: the completion is still verified by another member");
+  // Down moves within the READY candidates only: a failed one cannot be chosen,
+  // and offering it would be a dead key.
+  stdin.write("j");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  assert.deepEqual(picked, [2], "the second pickable candidate is index 2, skipping the failed one");
+
+  const done = strip(render(<CandidateBox set={{ ...set, state: "filed", selected_index: 2, selected_by: "human:paul" } as never} height={20} onClose={() => {}} onPick={() => assert.fail("a filed set cannot be re-picked")} />).lastFrame());
+  assert.ok(done.includes("selected by human:paul"), "and once chosen it says who chose");
+  assert.ok(done.includes("none of them reaches the fact store"), "with the memory rule stated where the operator makes the decision");
 });
 
 test("the task box offers capabilities beside names, and an unassigned task stays a choice", async () => {

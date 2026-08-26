@@ -90,6 +90,156 @@ outside cwd: "intercepted": true,  "contentsLeaked": false
 
 The RFA consequence is concrete, because a resident's cwd IS its pack directory: a pack that declares Read can read anything under `agents/<name>/`, its own `state/member.json` (which holds the membership token) and `state/memory.db` included, and `canUseTool` cannot fence it. The hub's `.rfa/secrets.json` is NOT reachable this way, because it sits in the hub root outside the pack directory, which is what the 2026-08-23 cwd change bought. This also strengthens the case for RFA-0.8 sect. 9 item 1's per-built-in startup deny probe: the doctrine is per-tool AND per-path, and the only safe way to know a given built-in is fenced on a given SDK is to probe it and fail closed.
 
+## Probes F-J: the per-run OS sandbox, and an escape hatch that was open (added 2026-08-26)
+
+Run at rung 5's build to settle its second precondition: **can a policy be attached per
+`query()` when the SDK spawns the CLI child itself?** Same SDK 0.3.233 and srt 0.0.73,
+same machine (macOS, Seatbelt), model `claude-haiku-4-5`, scratch trees under
+`os.tmpdir()`, `tools: ['Bash']` with `allowedTools: ['Bash']` so door one is out of the
+way and door two is measured alone.
+
+**The answer is yes, natively: `Options.sandbox` is an ordinary per-`query()` option.**
+`Options.spawnClaudeCodeProcess` plus `SandboxManager.wrapWithSandboxArgv(...,
+customConfig)` is a second per-run route and was rejected, because it sandboxes the CLI
+process itself rather than the commands it runs. The degraded per-pack path RFA-0.8
+sect. 9 documents is therefore not needed on this SDK.
+
+**Probe F, the control and the shape of the policy.** No `sandbox` option: both Bash
+writes land, the one into the pack tree included. `sandbox: { enabled: true }` with no
+filesystem block: the write into the session cwd lands and the write outside it is
+refused, so **the CLI grants its own working directory**.
+
+**Probe H, srt directly, no model.** `getFsWriteConfig()` reports
+`allowOnly = [...getDefaultWritePaths(), ...allowWrite]` and
+`denyWithinAllow = denyWrite`, and six wrapped commands confirm the semantics:
+
+```
+A pack file, base policy                          -> denied
+C run_1 scratch, allowWrite=[run_1], no denyWrite -> ALLOWED
+D run_2 scratch, allowWrite=[run_1]               -> denied   (per-invocation policy)
+E run_2 scratch, allowWrite=[run_2]               -> ALLOWED  (same manager, other policy)
+F pack file,  allowWrite=[run_1]                  -> denied
+G run_1 scratch, allowWrite=[run_1] + denyWrite=[packTree] -> DENIED
+H run_1/../../notes4.txt (traversal out)          -> denied
+```
+
+Cases D and E are the per-run answer at the srt layer: one initialized manager, two
+different `customConfig` policies, each honoured. **Case G is the trap**: the write model
+is ALLOW-ONLY and `denyWrite` is a carve-out *within* the allow set that beats it, so
+naming the pack tree in `denyWrite` denies the scratch inside it. RFA-0.8 sect. 9's
+"denyWrite = the pack tree, the knowledge clones and `.rfa/`" must not be implemented
+literally; the pack tree is denied by construction and an ancestor in `denyWrite` is a
+self-inflicted outage.
+
+**Probe I, the decisive one for the design.** `cwd` = the run's `scratch/<runId>`,
+`sandbox: { enabled: true }`, three Bash writes:
+
+```
+pack tree  -> refused ("operation not permitted")
+scratch    -> landed
+elsewhere  -> refused
+```
+
+Unchanged with a `git init` at the pack root, so the grant follows the cwd and not a
+walk-up to a repository root. **A fenced run's working directory IS its scratch
+surface** is what makes door two expressible per run without fighting case G.
+
+**Probe J, and this one was open in the default configuration.** `SandboxSettings
+.allowUnsandboxedCommands` defaults to TRUE, which keeps the Bash tool's
+`dangerouslyDisableSandbox` parameter live. Told that the parameter exists, the model
+hit "operation not permitted" on the pack tree, set it, re-ran the same command and
+**the write landed**:
+
+```
+default (true)                    -> packWriteHeld: false   (escaped)
+allowUnsandboxedCommands: false   -> packWriteHeld: true    (both attempts refused)
+```
+
+A door with a documented handle on the inside is not a door: every fenced query passes
+`allowUnsandboxedCommands: false`.
+
+**Probe G, the negative result worth keeping.** `sandbox.filesystem.allowWrite` describes
+itself as "Additional paths to allow writing within the sandbox. Merged with paths from
+`Edit(...)` allow permission rules", but passing the scratch through it, through
+`settings.sandbox`, as an `Edit(...)` allow rule, and as `additionalDirectories` all left
+the scratch write refused while the cwd grant alone allowed it. Nothing in rung 5 relies
+on `allowWrite` to OPEN a surface; it is passed for defence in depth and the cwd grant is
+what opens the scratch.
+
+## Probes K and L: a dependency check is not an establishment check (added 2026-08-26)
+
+Run at rung 5's build, to answer the two questions the rung's own brief poses about loud
+refusal: what does bubblewrap do inside an unprivileged Docker container, and what does
+Seatbelt do inside an already-sandboxed macOS context. Both were measured; one of them
+changed the code.
+
+**Probe K, nested Seatbelt on macOS.** A probe process was wrapped by srt and, from
+inside that sandbox, asked srt the same questions the fence's startup check asks:
+
+```
+INNER {"platform":"darwin","isSupportedPlatform":true,"deps":{"errors":[],"warnings":[]},
+       "canWrapAgain":"threw: listen EPERM: operation not permitted /tmp/claude/srt-mux-9977-0.sock"}
+```
+
+**`isSupportedPlatform()` returns TRUE and `checkDependenciesAsync()` returns ZERO
+errors inside a context where nothing can be sandboxed.** The failure appears only when
+a command is actually wrapped and run, and on a second attempt with a different config it
+appears as the nested `sandbox-exec` itself being refused. A fence whose startup check
+asked only about dependencies would therefore have reported "available", booted, and
+failed at the first turn: exactly the silent degrade sect. 9 item 3 forbids, arrived at
+from the opposite direction (an over-optimistic check rather than an over-optimistic
+fallback). The check now ESTABLISHES: it wraps and runs a trivial write inside a temp
+allow root, then wraps and runs one outside it, and requires the first to land and the
+second to be refused.
+
+**Probe L, the shape of that establishment check.** `initialize()` throws without a
+`network` key at all (`Cannot read properties of undefined (reading 'parentProxy')`), and
+an empty `network: {}` leaves the proxy and its mux socket unstarted, which matters
+because the check runs inside a long-lived resident. Measured on a healthy macOS host:
+
+```
+OUTER {"initialized":true,"ran":"done","wrote":true,"deniedOutside":true,"canary":false}
+```
+
+Nothing lingered in `/tmp/claude` afterwards and no srt process survived. The negative
+half is in the check on purpose: a sandbox that establishes and then permits everything
+would pass the positive half alone.
+
+**The Linux half, in an unprivileged container.** `node:24-slim` (linux/arm64, Docker,
+no added capabilities), srt 0.0.73, no bubblewrap:
+
+```
+RESULT {"platform":"linux","isSupportedPlatform":true,
+        "deps":{"errors":["ripgrep (rg) not found","bubblewrap (bwrap) not installed","socat not installed"]},
+        "establishThrew":"Sandbox dependencies not available: ripgrep (rg) not found, bubblewrap (bwrap) not installed, socat not installed"}
+```
+
+Loud at both layers, and the dependency list is explicit enough to act on, so the Linux
+"missing primitives" case is the easy one. Note that `isSupportedPlatform()` is true
+there too: it answers "is this OS supported", never "can this host do it".
+
+**And the Linux case that is NOT easy, which is probe K's exact twin.** With bubblewrap
+INSTALLED in the same unprivileged container (`alpine:3`, `apk add bubblewrap`, no added
+capabilities), the binary is present for any dependency check to find, and using it
+fails:
+
+```
+bwrap: /usr/bin/bwrap
+bwrap: Creating new namespace failed: Operation not permitted
+```
+
+So both platforms have a state where "the primitives are present" and "this host can
+sandbox a command" disagree: nested Seatbelt on macOS, and an unprivileged container's
+denied user namespace on Linux. A dependency-only check reports the fence established in
+both, which is why rung 5's startup check wraps and RUNS a command instead of asking.
+
+**A note on what did not complete**: the same container with srt installed on top of
+bubblewrap was attempted and never returned (an emulated linux/arm64 `apt-get` on this
+Mac), so srt's OWN error text in that state is unmeasured. What is measured is the
+primitive underneath it, refusing.
+
 ## What these probes do not establish
 
 These are single-shot probes on one machine against SDK 0.3.233 with a Haiku model; they establish existence, not guarantees. Not established: that `canUseTool` fires for every built-in (Write, Edit and Read are now probed, the last of them path-dependent; Bash and the harness-internal tools named in CLAUDE.md are not, and Read's path-dependence is a warning against generalizing from any of them), that the interception behavior is stable across SDK versions (the CLAUDE.md rule recorded the opposite behavior for an earlier setup, so this has already changed once), what settings-file allow rules exist on a given deployment (the warning says they shadow invisibly, and the probe machine's user settings were not audited), whether two turns resuming the SAME session id concurrently are safe (deliberately not probed, see recommendation 5), how concurrency behaves at higher fan-out than 2 or under the account-wide lease cap, and whether resource contention (cwd file locks, /memories writes) stays clean when the concurrent runs actually use tools, since round 1 and 2 ran with `tools: []`. The APPLE non-answer in round 1 is also a reminder that a 1-turn Haiku run does not reliably follow "reply with exactly" instructions; the probe conclusions rest on session ids and interference, not on answer quality.
+
+Probes F-J add their own limits: they are macOS/Seatbelt only, single-shot, and one model. bubblewrap on Linux and an unprivileged container were NOT exercised; what rung 5 builds for those hosts is the refusal path, on srt's own `checkDependenciesAsync()`, and a Linux deployment should re-run F-J before trusting the fence. `getDefaultWritePaths()` is also not empty (`/dev/*`, `/tmp/claude`, `/private/tmp/claude`, `~/.npm/_logs`, `~/.claude/debug`), so "only the scratch is writable" is a sentence about the hub directory, not about the filesystem.

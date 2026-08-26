@@ -166,6 +166,13 @@ export interface PackChanges {
    * gate failed instead of getting a bare rejection.
    */
   concurrency?: number;
+  /**
+   * How many CANDIDATES this pack runs for one task by default (RFA-0.8
+   * sect. 11): N independent runs, one kept. Gated with `concurrency` by the
+   * same schema, and additionally requiring `concurrency >= candidates`,
+   * because N candidates IS N turns at once.
+   */
+  candidates?: number;
 }
 
 export interface EditResult {
@@ -176,7 +183,7 @@ export interface EditResult {
 }
 
 /** The settings as `rfa agent edit` reads them, for the walkthrough's list and the no-op check. */
-export function currentSettings(def: AgentDef): Required<Pick<PackChanges, "description" | "model">> & { offer: { id: string; description: string } | null; budgets: { per_task_usd: number | null; per_day_usd: number | null; max_turns: number | null }; mode: AgentMode | "read-only"; room: string | null; knowledge: string[]; concurrency: number } {
+export function currentSettings(def: AgentDef): Required<Pick<PackChanges, "description" | "model">> & { offer: { id: string; description: string } | null; budgets: { per_task_usd: number | null; per_day_usd: number | null; max_turns: number | null }; mode: AgentMode | "read-only"; room: string | null; knowledge: string[]; concurrency: number; candidates: number } {
   return {
     description: def.description,
     model: def.model ?? "inherit",
@@ -186,6 +193,7 @@ export function currentSettings(def: AgentDef): Required<Pick<PackChanges, "desc
     room: def.rooms?.[0]?.room ?? null,
     knowledge: def.knowledge ?? [],
     concurrency: def.concurrency,
+    candidates: def.candidates,
   };
 }
 
@@ -247,6 +255,10 @@ export function editPack(file: string, c: PackChanges): EditResult {
   if (c.concurrency !== undefined && c.concurrency !== now.concurrency) {
     text = setTopScalar(text, "concurrency", `concurrency: ${c.concurrency}   # turns at once; each one is a full claude CLI child process`, { after: "model" });
     changed.push("concurrency");
+  }
+  if (c.candidates !== undefined && c.candidates !== now.candidates) {
+    text = setTopScalar(text, "candidates", `candidates: ${c.candidates}   # ways to answer ONE task; you pay for all of them, one is kept`, { after: "concurrency" });
+    changed.push("candidates");
   }
   // Validated as a whole before anything touches the disk: a refused edit leaves the file as it was.
   const after = parseAgentMd(text).definitionHash;

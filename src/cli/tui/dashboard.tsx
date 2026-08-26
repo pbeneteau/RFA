@@ -21,12 +21,13 @@ import { TextInput } from "@inkjs/ui";
 import { applySitting, flagForReview, reviewQueue, type ApplyResult, type Trace } from "../../evals/label.js";
 import type { HubDir, RoomRecord } from "../../hubdir.js";
 import type { RfaTask } from "../../model.js";
+import type { CandidateSet } from "../../engine.js";
 import type { CliContext } from "../context.js";
 import { supervisorCommand } from "../commands/agent.js";
 import { memberFor } from "../commands/talk.js";
 import { downAll, upAll } from "../commands/procs.js";
 import type { CommandDef } from "../router.js";
-import { askInRoom, followFile, gateView, isOpenTask, offersIn, readBoard, recordedRooms, roomLogFile, snapshot, tailLines, taskAction, type AgentView, type AskOutcome, type Board, type CardView, type FeedLine, type GateView, type Member, type Offer, type RoomView, type Snapshot } from "./data.js";
+import { askInRoom, followFile, gateView, isOpenTask, offersIn, readBoard, readCandidateSet, recordedRooms, roomLogFile, selectCandidate, snapshot, tailLines, taskAction, type AgentView, type AskOutcome, type Board, type CardView, type FeedLine, type GateView, type Member, type Offer, type RoomView, type Snapshot } from "./data.js";
 import { Mark } from "./logo.js";
 import { Palette, paletteItems } from "./palette.js";
 import { ACCENT, BAD, fmtMs, fmtUsd, GOOD, MUTED, sparkline, WARN } from "./theme.js";
@@ -45,6 +46,7 @@ type Overlay =
   | { kind: "answer"; trace: Trace }
   | { kind: "applied"; result: ApplyResult }
   | { kind: "task"; room: RoomRecord; members: Member[] }
+  | { kind: "candidates"; room: RoomRecord; set: CandidateSet }
   | null;
 
 interface Flash {
@@ -258,6 +260,14 @@ export function Dashboard(props: { ctx: CliContext; hub: HubDir; commands: Comma
   const shownTasks = (boardState.board?.tasks ?? []).filter((t) => allTasks || isOpenTask(t));
   const taskIndex = Math.min(sel.task, Math.max(0, shownTasks.length - 1));
   const task = shownTasks[taskIndex];
+  /**
+   * The selected task's candidate set (RFA-0.8 sect. 11), if it has one. A
+   * hub-directory read rather than a board call, because candidates are local:
+   * the room saw one task and will see one completion. Memoised on the id and
+   * the board's own refresh, so it re-reads when the board does and not on every
+   * keystroke.
+   */
+  const taskSet = useMemo(() => (tab === "Tasks" && task ? readCandidateSet(h, task.id) : null), [tab, task?.id, boardState.at, h]);
   const hubUp = Boolean(snap?.status?.hub.healthy);
   useEffect(() => {
     if (tab !== "Tasks" || !taskRec) return;
@@ -383,6 +393,13 @@ export function Dashboard(props: { ctx: CliContext; hub: HubDir; commands: Comma
         if (input === "n") return setOverlay({ kind: "task", room: taskRec, members: boardState.board?.members ?? [] });
         if (!task) return;
         const ref = taskRec.alias ?? taskRec.handle;
+        // The candidate picker (RFA-0.8 sect. 11). Read from the hub directory,
+        // not the board: candidates are local and the room saw one task.
+        if (input === "c") {
+          const set = readCandidateSet(h, task.id);
+          if (!set) return say(`${task.id} was not answered with candidates (rfa task create ... --candidates <n>)`, "info");
+          return setOverlay({ kind: "candidates", room: taskRec, set });
+        }
         if (input === "v") return void run(["task", "show", task.id, "--room", ref]);
         if (input === "x") {
           if (!isOpenTask(task)) return say(`${task.id} is already ${task.state}`, "info");
@@ -545,6 +562,20 @@ export function Dashboard(props: { ctx: CliContext; hub: HubDir; commands: Comma
             say(`task ${t.id} created in ${overlay.room.alias}${t.owner ? ", assigned" : ""}`, "good");
             void loadBoard(overlay.room);
           }} />
+        ) : overlay?.kind === "candidates" ? (
+          <CandidateBox
+            set={overlay.set}
+            height={bodyHeight}
+            onClose={() => setOverlay(null)}
+            onPick={(idx) => {
+              setOverlay(null);
+              void act(`select candidate ${idx}`, async () => {
+                const out = await selectCandidate(ctx, h, overlay.room, overlay.set.set_id, idx, "human:dashboard");
+                void loadBoard(overlay.room);
+                return out;
+              });
+            }}
+          />
         ) : tab === "Overview" ? (
           <Overview snap={snap} hub={h} aliasOf={aliasOf} columns={columns} />
         ) : tab === "Agents" ? (
@@ -556,7 +587,7 @@ export function Dashboard(props: { ctx: CliContext; hub: HubDir; commands: Comma
         ) : tab === "Feed" ? (
           <FeedTab hub={h} handle={feedRoom ?? roomViews.find((r) => r.alias !== "ops")?.handle ?? roomViews[0]?.handle ?? null} aliasOf={aliasOf} height={bodyHeight - 3} />
         ) : tab === "Tasks" ? (
-          <TasksTab state={boardState} tasks={shownTasks} selected={taskIndex} room={taskRec} allStates={allTasks} hubUp={hubUp} columns={columns} />
+          <TasksTab state={boardState} tasks={shownTasks} selected={taskIndex} room={taskRec} allStates={allTasks} hubUp={hubUp} columns={columns} candidates={taskSet} />
         ) : (
           <EvalsTab queue={queue} verdicts={verdicts} selected={traceIndex} gate={gate} aliasOf={aliasOf} columns={columns} height={bodyHeight} />
         )}
@@ -579,7 +610,7 @@ function Footer(props: { tab: Tab; overlay: Overlay }): React.JSX.Element {
     Approvals: [["y", "approve"], ["n", "reject"]],
     Feed: [["[ ]", "room"]],
     Evals: [["p", "pass"], ["f", "fail"], ["g", "gold"], ["c", "cut a case"], ["x", "clear"], ["v", "answer"], ["enter", "apply"], ["r", "run the gate"]],
-    Tasks: [["n", "new"], ["y", "accept"], ["r", "reject"], ["x", "cancel"], ["v", "show"], ["f", "all states"], ["[ ]", "room"]],
+    Tasks: [["n", "new"], ["y", "accept"], ["r", "reject"], ["c", "candidates"], ["x", "cancel"], ["v", "show"], ["f", "all states"], ["[ ]", "room"]],
   };
   return <Keys items={[...per[props.tab], ...common]} />;
 }
@@ -602,6 +633,7 @@ function Help(props: { onClose: () => void }): React.JSX.Element {
     ["p f g c x", "the sitting: pass / fail (and its failure mode) / gold source / cut a case / clear the verdict"],
     ["v enter r", "the whole answer / apply the sitting (confirmed) / run the gate (confirmed: it costs)"],
     ["n y r x f", "the board: a new task / accept its evidence / reject it with a note / cancel / every state, not only the open ones"],
+    ["c", "the candidate answers of a task answered several ways, and which one to keep (the rest are discarded, their cost stays on the books)"],
     ["R", "refresh now (it refreshes every 2s anyway; the review queue only on R)"],
     ["q, ctrl-c", "leave the dashboard; nothing running is touched"],
   ];
@@ -1041,7 +1073,7 @@ export function evidenceWord(t: RfaTask): string {
  * the selected task in full beside it. Every verb is the `room_task` call the
  * task commands make, from the same operator membership.
  */
-export function TasksTab(props: { state: BoardState; tasks: RfaTask[]; selected: number; room: RoomRecord | null; allStates: boolean; hubUp: boolean; columns: number }): React.JSX.Element {
+export function TasksTab(props: { state: BoardState; tasks: RfaTask[]; selected: number; room: RoomRecord | null; allStates: boolean; hubUp: boolean; columns: number; candidates?: CandidateSet | null }): React.JSX.Element {
   const stacked = props.columns < 100;
   const t = props.tasks[props.selected];
   const members = props.state.board?.members ?? [];
@@ -1138,8 +1170,19 @@ export function TasksTab(props: { state: BoardState; tasks: RfaTask[]; selected:
                 created {t.created_at.slice(0, 16).replace("T", " ")} · updated {t.updated_at.slice(0, 16).replace("T", " ")}
               </Text>
             </Box>
+            {props.candidates ? (
+              <Text wrap="wrap" color={props.candidates.state === "awaiting_selection" ? WARN : undefined}>
+                <Text dimColor>candidates </Text>
+                {props.candidates.running} of {props.candidates.requested} ran, ${props.candidates.cost_usd.toFixed(4)} for the set
+                {props.candidates.state === "awaiting_selection"
+                  ? " · waiting for you to pick: c"
+                  : props.candidates.selected_index !== null
+                    ? ` · ${props.candidates.selected_index} selected by ${props.candidates.selected_by ?? "?"}`
+                    : ` · ${props.candidates.state}`}
+              </Text>
+            ) : null}
             <Box marginTop={1}>
-              <Text dimColor>{isOpenTask(t) ? "x cancel · v show as JSON" : "v show as JSON"}</Text>
+              <Text dimColor>{isOpenTask(t) ? "x cancel · v show as JSON" : "v show as JSON"}{props.candidates ? " · c candidates" : ""}</Text>
             </Box>
           </>
         ) : (
@@ -1147,6 +1190,68 @@ export function TasksTab(props: { state: BoardState; tasks: RfaTask[]; selected:
         )}
       </Panel>
     </Box>
+  );
+}
+
+const CANDIDATE_WORD: Record<string, string> = { running: "running", ready: "ready", won: "SELECTED", lost: "discarded", cancelled: "interrupted", failed: "failed" };
+
+/**
+ * Pick the candidate answer to keep (RFA-0.8 sect. 11), which is the whole
+ * operator half of candidate parallelism: N runs of one task, one kept.
+ *
+ * It is NOT `verify`. The room saw one task and one owner, so wire 10.4 still
+ * governs the verification of the completion the winner produces, by a member
+ * that is not the owner. This chooses which answer becomes that completion, and
+ * it is the moment the winner's answer is allowed into memory: a candidate turn
+ * records no episode, so a discarded answer never becomes fact, and only the one
+ * picked here does.
+ */
+export function CandidateBox(props: { set: CandidateSet; height: number; onClose: () => void; onPick: (idx: number) => void }): React.JSX.Element {
+  const pickable = props.set.candidates.filter((c) => c.state === "ready");
+  const [at, setAt] = useState(0);
+  const done = props.set.state === "selected" || props.set.state === "filed";
+  useInput((input, key) => {
+    if (key.escape) return props.onClose();
+    if (key.downArrow || input === "j") return setAt((n) => Math.min(pickable.length - 1, n + 1));
+    if (key.upArrow || input === "k") return setAt((n) => Math.max(0, n - 1));
+    if (key.return && !done && pickable[at]) return props.onPick(pickable[at].idx);
+  });
+  return (
+    <Panel
+      title={`candidates · ${props.set.task_id ?? props.set.set_id}`}
+      hint={`${props.set.running} of ${props.set.requested} ran · $${props.set.cost_usd.toFixed(4)} for the set · ${props.set.selector}`}
+      active
+      width="100%"
+    >
+      {props.set.title ? <Text bold wrap="wrap">{props.set.title}</Text> : null}
+      {props.set.degraded ? <Text color={WARN} wrap="wrap">fewer than asked for: {props.set.degraded}</Text> : null}
+      <Box marginTop={1} flexDirection="column">
+        {props.set.candidates.map((c) => {
+          const selected = pickable[at]?.idx === c.idx && !done;
+          const body = (c.error ?? c.text ?? "").replace(/\s+/g, " ");
+          return (
+            <Box key={c.idx} flexDirection="column" marginBottom={1}>
+              <Text color={c.state === "won" ? GOOD : c.state === "ready" ? undefined : MUTED} wrap="truncate-end">
+                {selected ? "> " : "  "}
+                {c.idx}  {CANDIDATE_WORD[c.state] ?? c.state}  {c.cost_usd === null ? "-" : `$${c.cost_usd.toFixed(4)}`}
+                {c.num_turns ? `  ${c.num_turns} turns` : ""}
+              </Text>
+              <Text dimColor wrap="wrap">
+                {"    "}
+                {body.slice(0, Math.max(160, props.height * 6))}
+              </Text>
+            </Box>
+          );
+        })}
+      </Box>
+      <Text dimColor wrap="wrap">
+        {done
+          ? `candidate ${props.set.selected_index} was selected by ${props.set.selected_by ?? "?"}. The rest keep their record and their cost and lost only their scratch; none of them reaches the fact store.`
+          : pickable.length === 0
+            ? "nothing here is ready to pick"
+            : "enter keeps the marked answer and discards the rest; the agent then files it as the task's evidence, which a different member still verifies (wire 10.4)"}
+      </Text>
+    </Panel>
   );
 }
 

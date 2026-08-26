@@ -553,6 +553,67 @@ export class AccountLedger {
     return last;
   }
 
+  /**
+   * How many candidate runs this pack can actually AFFORD right now (RFA-0.8
+   * sect. 11, rung 4), and the sentence explaining any shortfall.
+   *
+   * N candidates are N reservations against ONE day budget, and admission
+   * reserves `min(per_task_usd, remaining)` each. Admitting four so three can
+   * die at the viability floor is the dishonest shape: the operator pays for one
+   * candidate and gets three refusals, with nothing useful said about why. So
+   * the fan-out asks first, over the same `settled + live reservations` the
+   * admission transaction reads.
+   *
+   * The `per_task_usd`-absent line is not a degenerate case, it is the honest
+   * answer: with no per-task ceiling the FIRST reservation is the whole
+   * remainder, so exactly one candidate is affordable. That is a real reason to
+   * declare a per-task ceiling before using candidates, and the CLI says so.
+   *
+   * A SNAPSHOT, deliberately: between this and the Nth `acquire` a sibling
+   * resident may take the remainder, and the Nth candidate is then refused
+   * `budget_exhausted` by admission exactly as any other turn would be. Planning
+   * narrows that window, it cannot close it, and no plan-then-act shape can.
+   */
+  affordableCandidates(req: { agent: string; want: number; budget?: BudgetRequest }): { count: number; detail: string | null } {
+    const want = Math.max(0, Math.floor(req.want));
+    if (want <= 1) return { count: want, detail: null };
+    const perDay = req.budget?.perDayUsd ?? null;
+    // No declared ceiling means nothing to reserve against, so nothing to plan.
+    // `concurrency > 1` is gated on a declared `per_day_usd` (sect. 5 item 7),
+    // and candidates ride that gate, so this branch is unreachable for a pack
+    // that passed validation; it answers honestly rather than assuming so.
+    if (perDay == null || !(perDay > 0)) return { count: want, detail: null };
+    const day = req.budget?.day ?? spendDay();
+    const viable = req.budget?.viableUsd ?? VIABLE_BUDGET_USD;
+    const perTask = req.budget?.perTaskUsd ?? null;
+    const committed = this.settledUsd(req.agent, day) + this.reservedUsdFor(req.agent, day);
+    const remaining = perDay - committed;
+    const money = (n: number) => `$${n.toFixed(2)}`;
+    if (remaining < viable) {
+      return {
+        count: 0,
+        detail: `${req.agent} has ${money(Math.max(0, remaining))} left of its ${money(perDay)} day budget, under the ${money(viable)} viability floor`,
+      };
+    }
+    if (perTask == null || !(perTask > 0)) {
+      return {
+        count: 1,
+        detail:
+          `${req.agent} declares no budgets.per_task_usd, so the first candidate reserves the whole ${money(remaining)} remainder ` +
+          `and only one is affordable; declare a per-task ceiling to fan out`,
+      };
+    }
+    const fit = Math.max(0, Math.floor((remaining - viable) / perTask) + 1);
+    const count = Math.min(want, fit);
+    return {
+      count,
+      detail:
+        count >= want
+          ? null
+          : `${money(remaining)} left of ${req.agent}'s ${money(perDay)} day budget reserves ${count} candidate${count === 1 ? "" : "s"} at ${money(perTask)} each, not ${want}`,
+    };
+  }
+
   /** Extend a lease held by a long turn. Returns false when the sweep already took it. */
   renew(leaseId: string): boolean {
     return (
