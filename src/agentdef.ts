@@ -14,6 +14,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import YAML from "yaml";
+import { effectiveMode } from "./posture.js";
 import * as z from "zod";
 import { sha256hex } from "./jcs.js";
 import type { AgentCard } from "./model.js";
@@ -48,6 +49,26 @@ const toolsSchema = z
       });
     }
   });
+
+/**
+ * The memory verbs an answer-path turn carries for free, and the ones a pack has
+ * to declare (RFA-0.8 sect. 4 item 2, the ownership split; the enforcement
+ * mechanism is the one v0.4 sect. 3.12 already owns, which is that tools ARE the
+ * declaration).
+ *
+ * Destructive verbs belong to the consolidation lane. Two turns appending to one
+ * file compose; two turns where one deletes what the other is rewriting do not,
+ * and no shipped system merges the result. So `delete` and `rename` are granted
+ * only to a pack that names them, and a pack that names one cannot run at
+ * `concurrency > 1` (sect. 10 gate 2).
+ *
+ * `str_replace` is the awkward one and is split by PATH rather than by name: on
+ * `notes/*` it is the loud-stale compare-and-swap sect. 4 item 1 pins
+ * deliberately, on `blocks/*` it is a whole-block rewrite, which is the
+ * documented lost-update shape. So the verb is granted always and its
+ * destructive half is opt-in, through the same declaration.
+ */
+export const MEMORY_DESTRUCTIVE_TOOLS = ["mcp__memory__delete", "mcp__memory__rename", "mcp__memory__str_replace"] as const;
 
 export const agentDefSchema = z.object({
   rfa_agent: z.literal(1),
@@ -116,6 +137,22 @@ export const agentDefSchema = z.object({
     })
     .optional(),
   secrets: z.array(z.string()).optional(),
+  /**
+   * Turns this pack may run at once (RFA-0.8 sect. 10, amending v0.4 sect. 3.2).
+   *
+   * Sizing, and this is not a detail: each concurrent turn is a full `claude`
+   * CLI CHILD PROCESS, not a thread (live probe B, 2026-08-25 - two children
+   * were observed during one overlap run). `concurrency: 4` is a statement about
+   * four processes' worth of memory and file descriptors on this host, and the
+   * account cap (`agents.max_inflight`) bounds the total across every resident.
+   *
+   * Above 1 it is refused unless all three gates of sect. 10 pass: a read-only
+   * posture, no destructive memory verb in the answer-path surface, and a
+   * declared per-day budget. The gates are checked below, where the schema can
+   * see them; the fence-availability half of the posture gate is a runtime
+   * property and is checked at resident startup, failing closed.
+   */
+  concurrency: z.number().int().min(1).max(16).default(1),
   budgets: z
     .object({
       max_turns: z.number().int().min(1).max(200).optional(),
@@ -185,6 +222,54 @@ export const agentDefSchema = z.object({
     .optional(),
 });
 
+/**
+ * The three gates on `concurrency > 1` (RFA-0.8 sect. 10). Separated from the
+ * object literal so the reasons can be read, and so the CLI can explain a
+ * refusal without re-deriving it.
+ *
+ * Every one of these is a thing that is merely inefficient serially and becomes
+ * a correctness or a money problem at N > 1, which is why they are gates and not
+ * warnings. A warning is not a control at N > 1: it scales the exposure by N and
+ * changes nothing.
+ */
+export function concurrencyGateFailures(def: {
+  concurrency?: number;
+  tools?: { allow?: string[] };
+  mode?: string;
+  interrupt_on?: AgentDef["interrupt_on"];
+  budgets?: { per_day_usd?: number };
+}): string[] {
+  if ((def.concurrency ?? 1) <= 1) return [];
+  const fails: string[] = [];
+
+  // Gate 1, posture. A writing pack needs the two-door fence of sect. 9, which
+  // is rungs 5 and 6 and does not exist: two turns writing one pack tree with no
+  // fence is the lost-update case, not a performance question.
+  const mode = effectiveMode(def as AgentDef);
+  if (mode !== "read-only") {
+    fails.push(
+      `its effective posture is \`${mode}\`, not read-only: a pack with acting tools needs the two-door write fence (RFA-0.8 sect. 9, rungs 5 and 6), which is not built yet`,
+    );
+  }
+
+  // Gate 2, memory topology (sect. 4 item 2).
+  const declared = (def.tools?.allow ?? []).filter((t) => (MEMORY_DESTRUCTIVE_TOOLS as readonly string[]).includes(t));
+  if (declared.length > 0) {
+    fails.push(
+      `its answer-path tool surface declares ${declared.join(", ")}, which are destructive memory verbs belonging to the consolidation lane (RFA-0.8 sect. 4 item 2)`,
+    );
+  }
+
+  // Gate 3, a ceiling (sect. 5 item 7). Unbounded serially is a warning;
+  // unbounded times N is not something a warning can hold.
+  if (!def.budgets?.per_day_usd) {
+    fails.push(
+      `it declares no budgets.per_day_usd: a pack with no daily ceiling goes from unbounded-serially to unbounded-times-${def.concurrency} (RFA-0.8 sect. 5 item 7)`,
+    );
+  }
+  return fails;
+}
+
 export type AgentDef = z.infer<typeof agentDefSchema>;
 
 /** Every secret NAME a pack needs injected: its own `secrets` plus what its MCP servers declare. */
@@ -225,6 +310,17 @@ export function parseAgentMd(content: string): { def: AgentDef; prompt: string; 
     throw new Error(`agent.md definition invalid at ${issue.path.join(".") || "(root)"}: ${issue.message}`);
   }
   const def = parsed.data;
+  // The concurrency gates (RFA-0.8 sect. 10). Here rather than inside the object
+  // literal so `agentDefSchema` stays the plain shared schema every caller
+  // reaches for, and beside the `offers` rule below, which is the same kind of
+  // check: a cross-field truth the field-level schema cannot see.
+  const gates = concurrencyGateFailures(def);
+  if (gates.length > 0) {
+    throw new Error(
+      `agent.md declares concurrency: ${def.concurrency} but ${gates.length === 1 ? "does not pass a gate" : `does not pass ${gates.length} gates`} (RFA-0.8 sect. 10):\n` +
+        gates.map((g) => `  - ${g}`).join("\n"),
+    );
+  }
   const serves = (def.rooms ?? []).some((r) => r.serve && r.role === "participant");
   if (serves && !(def.offers ?? []).length) {
     throw new Error("a pack that serves a room as participant must declare at least one entry in `offers` (its card skills)");

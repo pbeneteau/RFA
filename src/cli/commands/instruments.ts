@@ -20,6 +20,7 @@ import { countDocs, fileProvenance, isGitRemote, knowledgeStatus, packClones, pi
 import { describeReport, expandLogTargets, verifyLogFile, type LogReport } from "../../logverify.js";
 import { addKnowledge } from "../agentmd.js";
 import { attachKnowledge, AttachError, type Attachment } from "../attach.js";
+import { AccountLedger } from "../../account.js";
 import { CliError, numberFlag } from "../context.js";
 import { askLine, pickOne } from "../prompts.js";
 import type { CommandDef } from "../router.js";
@@ -82,26 +83,72 @@ export const knowledgeAdd: CommandDef = {
 export const knowledgeSync: CommandDef = {
   path: ["knowledge", "sync"],
   summary: "Fast-forward every attached clone (or one agent's) and say what moved",
-  usage: "[<agent>] [--pin]",
-  options: { pin: { type: "boolean", default: false } },
-  why: "Nothing is copied: the pack reads the clone through its globs, so a sync is a pull. --pin records the synced head as the eval corpus_version afterwards, which is what keeps an upstream edit from reading as a regression.",
+  usage: "[<agent>] [--pin] [--wait <s>] [--force]",
+  options: { pin: { type: "boolean", default: false }, wait: { type: "string" }, force: { type: "boolean", default: false } },
+  why: "Nothing is copied: the pack reads the clone through its globs, so a sync is a pull. It holds the pack's new turns and waits for the running ones to finish first, because a pull under a live turn can produce one answer citing two corpus versions. --pin records the synced head as the eval corpus_version afterwards, which is what keeps an upstream edit from reading as a regression.",
   run: async (ctx, a) => {
     const h = ctx.hubdir();
     const packs = a.positionals[0] ? [requirePack(h, a.positionals[0])] : listPacks(h.paths.agents);
+    const waitMs = Math.max(0, (numberFlag(a.values.wait, "--wait") ?? 30) * 1000);
     const rows: { agent: string; clone: string; head: string; fresh: boolean; documents: number; error?: string }[] = [];
-    for (const pack of packs) {
-      for (const c of packClones(pack)) {
-        if (!c.remote) {
-          rows.push({ agent: pack.name, clone: c.name, head: "?", fresh: false, documents: c.documents, error: "not a git clone (no origin)" });
+    /**
+     * The pack-scoped drain barrier (RFA-0.8 sect. 7 item 1).
+     *
+     * `git pull --ff-only` in a clone that live turns are reading mid-turn needs
+     * no crash to hurt: one answer citing two corpus versions, a torn file, or a
+     * listed file momentarily absent, which is the phantom-missing-fact shape
+     * that already cost a day here. The account-lease table is the one
+     * cross-process authority on "a turn is in flight", so the marker goes there:
+     * new admissions for this pack queue behind it, the running ones are waited
+     * out, and the marker's own short TTL means a sync killed mid-flight cannot
+     * wedge the pack.
+     */
+    const ledger = new AccountLedger(h.paths.runsDb);
+    try {
+      for (const pack of packs) {
+        const clones = packClones(pack);
+        if (clones.length === 0) continue;
+        const held = ledger.beginMaintenance(pack.name, "knowledge sync", { ttlMs: waitMs + 120_000 });
+        if (!held.ok || !held.token) {
+          rows.push({ agent: pack.name, clone: "-", head: "?", fresh: false, documents: 0, error: held.detail ?? "another maintenance holds this pack" });
           continue;
         }
         try {
-          const r = syncClone(c.dir, c.remote);
-          rows.push({ agent: pack.name, clone: c.name, head: r.head, fresh: r.fresh, documents: countDocs(c.dir) });
-        } catch (err) {
-          rows.push({ agent: pack.name, clone: c.name, head: c.head ?? "?", fresh: false, documents: c.documents, error: (err as Error).message.split("\n")[0] });
+          const { drained, remaining } = await ledger.drain(pack.name, { timeoutMs: waitMs });
+          if (!drained && !a.values.force) {
+            // Skipped, not forced. The whole job of this command is to not tear a
+            // corpus, so proceeding over a live turn would be the command doing
+            // the thing it exists to prevent. `--force` is there for an operator
+            // who knows the lease is a corpse the sweep has not reached yet.
+            rows.push({
+              agent: pack.name,
+              clone: "-",
+              head: "?",
+              fresh: false,
+              documents: 0,
+              error: `${remaining.length} turn(s) still running after ${Math.round(waitMs / 1000)}s; skipped (retry, or --wait <s>, or --force)`,
+            });
+            continue;
+          }
+          if (!drained) ctx.ui.line(ctx.ui.dim(`${pack.name}: forcing the pull with ${remaining.length} turn(s) in flight; their answers may be marked mixed-corpus`));
+          for (const c of clones) {
+            if (!c.remote) {
+              rows.push({ agent: pack.name, clone: c.name, head: "?", fresh: false, documents: c.documents, error: "not a git clone (no origin)" });
+              continue;
+            }
+            try {
+              const r = syncClone(c.dir, c.remote);
+              rows.push({ agent: pack.name, clone: c.name, head: r.head, fresh: r.fresh, documents: countDocs(c.dir) });
+            } catch (err) {
+              rows.push({ agent: pack.name, clone: c.name, head: c.head ?? "?", fresh: false, documents: c.documents, error: (err as Error).message.split("\n")[0] });
+            }
+          }
+        } finally {
+          ledger.endMaintenance(pack.name, held.token);
         }
       }
+    } finally {
+      ledger.close();
     }
     let pinned: string | null = null;
     if (a.values.pin) {

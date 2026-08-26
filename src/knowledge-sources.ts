@@ -95,6 +95,58 @@ export function syncClone(dir: string, remote: string, opts: { depth?: number; s
   return { head: after, fresh: before !== after, created: false };
 }
 
+/**
+ * A clone's HEAD, read from the files rather than through git (RFA-0.8 sect. 7
+ * item 2).
+ *
+ * This runs at the START and the END of every model turn, so it must cost
+ * nothing and must never throw: two small reads beat spawning `git rev-parse`
+ * twice a turn, and a clone with no `.git` (a plain attached directory) simply
+ * has no head, which is not an error. `packed-refs` is the case a fresh
+ * `git clone` actually produces, so it is handled rather than assumed away; git
+ * itself is the last resort.
+ */
+export function cloneHead(dir: string): string | null {
+  const gitDir = path.join(dir, ".git");
+  try {
+    if (!fs.existsSync(gitDir)) return null;
+    const head = fs.readFileSync(path.join(gitDir, "HEAD"), "utf8").trim();
+    if (!head.startsWith("ref:")) return /^[0-9a-f]{40}$/.test(head) ? head : null;
+    const ref = head.slice(4).trim();
+    const loose = path.join(gitDir, ref);
+    if (fs.existsSync(loose)) return fs.readFileSync(loose, "utf8").trim() || null;
+    const packed = path.join(gitDir, "packed-refs");
+    if (fs.existsSync(packed)) {
+      for (const line of fs.readFileSync(packed, "utf8").split("\n")) {
+        const [sha, name] = line.trim().split(/\s+/);
+        if (name === ref && /^[0-9a-f]{40}$/.test(sha ?? "")) return sha;
+      }
+    }
+    return git(["rev-parse", "HEAD"], dir) || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Every knowledge clone under a pack, and where each one's HEAD is right now.
+ * The stamp a turn compares against itself: a mismatch between start and end
+ * means the corpus moved under the answer, whatever caused it - the drain
+ * barrier being bypassed, or an operator's own hand-run `git pull`, which is
+ * exactly the case a barrier alone can never catch.
+ */
+export function cloneHeads(packDir: string): Record<string, string> {
+  const kdir = path.join(packDir, "knowledge");
+  const out: Record<string, string> = {};
+  if (!fs.existsSync(kdir)) return out;
+  for (const entry of fs.readdirSync(kdir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !entry.name.endsWith(CLONE_SUFFIX)) continue;
+    const head = cloneHead(path.join(kdir, entry.name));
+    if (head) out[entry.name] = head;
+  }
+  return out;
+}
+
 /** Per-file provenance from the clone's own history: free, and exactly what a hosted connector cannot give. */
 export function fileProvenance(clone: string, relative: string): { author: string; committed_at: string; sha: string } | null {
   try {

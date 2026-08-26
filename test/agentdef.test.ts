@@ -113,3 +113,56 @@ test("knowledgeFiles: resolves globs and plain paths to existing .md files only"
   assert.deepEqual(files, ["one.md", "plain.md", "two.md"]);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// ---------------------------------------------------------------- concurrency (RFA-0.8 sect. 10)
+
+const CONC = (extra: string) => `---
+rfa_agent: 1
+name: conc-agent
+description: A concurrent answerer.
+tools:
+  allow: [Read, Grep]
+offers:
+  - id: answer-things
+    description: Answers things.
+${extra}---
+Body.
+`;
+
+test("concurrency: defaults to 1, and above 1 needs all three gates of RFA-0.8 sect. 10", () => {
+  assert.equal(parseAgentMd(CONC("")).def.concurrency, 1, "a pack that says nothing runs one turn at a time");
+  assert.equal(parseAgentMd(CONC("concurrency: 1\n")).def.concurrency, 1);
+
+  // Gate 3, the ceiling. A warning is not a control at N > 1: it scales the
+  // exposure by N and changes nothing.
+  assert.throws(() => parseAgentMd(CONC("concurrency: 2\n")), /per_day_usd/);
+
+  // All three passing.
+  const ok = parseAgentMd(CONC("concurrency: 3\nbudgets:\n  per_day_usd: 5\n")).def;
+  assert.equal(ok.concurrency, 3);
+
+  // Gate 1, posture: a pack with acting tools waits for the fence of sect. 9.
+  assert.throws(
+    () =>
+      parseAgentMd(
+        CONC("concurrency: 2\nbudgets:\n  per_day_usd: 5\ninterrupt_on:\n  \"mcp__linear__*\": true\n").replace("allow: [Read, Grep]", "allow: [Read, mcp__linear__save_document]"),
+      ),
+    /read-only/,
+  );
+
+  // Gate 2, memory topology: a destructive memory verb belongs to the
+  // consolidation lane (sect. 4 item 2).
+  assert.throws(
+    () => parseAgentMd(CONC("concurrency: 2\nbudgets:\n  per_day_usd: 5\n").replace("allow: [Read, Grep]", "allow: [Read, mcp__memory__delete]")),
+    /destructive memory verbs/,
+  );
+  // ... and it is fine at concurrency 1, which is what makes it a gate and not a ban.
+  assert.equal(parseAgentMd(CONC("").replace("allow: [Read, Grep]", "allow: [Read, mcp__memory__delete]")).def.concurrency, 1);
+
+  // Every failing gate is named at once, so an operator fixes the pack in one pass.
+  assert.throws(
+    () => parseAgentMd(CONC("concurrency: 2\n").replace("allow: [Read, Grep]", "allow: [Read, mcp__memory__rename]")),
+    /does not pass 2 gates/,
+  );
+  assert.throws(() => parseAgentMd(CONC("concurrency: 0\nbudgets:\n  per_day_usd: 5\n")), /concurrency/);
+});

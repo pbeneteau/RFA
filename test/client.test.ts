@@ -2,7 +2,7 @@
 import { strict as assert } from "node:assert";
 import { after, before, test } from "node:test";
 import * as http from "node:http";
-import { RoomMember, RfaClientError } from "../src/client.js";
+import { RoomMember, RfaClientError, conversationKey } from "../src/client.js";
 import type { Envelope } from "../src/model.js";
 import { startHub, stopAllHubs, type TestHub } from "./hubproc.js";
 
@@ -259,4 +259,16 @@ test("client: serve onTask wakes on a task event instead of discarding it", asyn
 
   abort.abort();
   await Promise.race([serving, sleep(30_000)]);
+});
+
+test("conversationKey: the queue key and the session key are one string (RFA-0.8 sect. 6.2)", () => {
+  const env = (over: Partial<Envelope>) =>
+    ({ conversation_id: null, from: { id: "m_peer", name: "peer" }, ...over }) as unknown as Envelope;
+  assert.equal(conversationKey(env({ conversation_id: "c_42" })), "c_42", "a conversation id is finer than a counterparty, and wins");
+  // The fallback used to be the literal string "adhoc", so EVERY counterparty
+  // with no conversation id shared one SDK session: serially that leaked one
+  // asker's context into another's answer, and at concurrency > 1 it would be a
+  // same-session concurrent resume, which is documented corruption.
+  assert.equal(conversationKey(env({})), "peer:m_peer");
+  assert.notEqual(conversationKey(env({})), conversationKey(env({ from: { id: "m_other", name: "other" } })));
 });

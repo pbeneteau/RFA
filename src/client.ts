@@ -12,6 +12,7 @@
  */
 import { BlockedChains, CHAIN_EXT, readChain, wouldDeadlockDetail, type ChainRef } from "./chainid.js";
 import type { AgentCard, Envelope, Part, PresenceRecord, RefusalReason, RfaEvent, SendResult } from "./model.js";
+import { Dispatcher } from "./dispatch.js";
 import { neutralize, renderWrapped } from "./wrap.js";
 
 /** Every reason in the wire Appendix B registry is member-sendable; this alias remains for callers. */
@@ -47,7 +48,34 @@ export interface ServeContext {
   /** The message pre-wrapped as untrusted data, ready to paste into a model prompt. */
   wrapped: string;
   conversationId: string | null;
+  /**
+   * The FIFO group and the session fence, from `conversationKey()`. Handed to the
+   * handler rather than recomputed by it, because the dispatcher's queue key and
+   * the resident's session key MUST be the same string (RFA-0.8 sect. 6.2
+   * requirements 1 and 2 are one mechanism) and two computations of one key is
+   * how they stop being.
+   */
+  conversationKey: string;
   from: { id: string; name: string };
+}
+
+/**
+ * The conversation key: the per-conversation FIFO group of RFA-0.8 sect. 6.2
+ * requirement 1, AND the key that owns an SDK session id (`src/sessions.ts`),
+ * which is what makes requirement 2 the same mechanism rather than a second one.
+ *
+ * A member serves one room, so the room half of `(room, counterparty
+ * membership)` is the member itself; the counterparty is `from.id`. A
+ * conversation id, when the asker sent one, is FINER than the counterparty and
+ * is used in preference.
+ *
+ * The fallback used to be the literal string `"adhoc"`, which put every
+ * counterparty with no conversation id on ONE session: serially that leaked one
+ * asker's context into another's answer, and at `concurrency > 1` it would be a
+ * same-session concurrent resume, which is documented corruption.
+ */
+export function conversationKey(env: Envelope): string {
+  return env.conversation_id ?? `peer:${env.from.id}`;
 }
 
 /**
@@ -435,6 +463,17 @@ export class RoomMember {
     }
   }
 
+  /**
+   * Did this client already answer that request from an ask wait? The
+   * dispatcher's `shouldSkip` reads it, at submit AND at dequeue: rung 2's
+   * hazard (the asker gets the refusal now and a full answer later) grew a
+   * second window when the queue arrived, because a queued request can be
+   * refused inline while it waits.
+   */
+  wasRefusedInline(messageId: string): boolean {
+    return this.refusedInline.has(messageId);
+  }
+
   /** Bounded FIFO: 500 ids is far more than either cursor can be behind. */
   private noteInlineRefusal(messageId: string): void {
     this.refusedInline.add(messageId);
@@ -446,6 +485,19 @@ export class RoomMember {
    * The handler returns the reply (string or parts); throwing sends a
    * machine-readable "overloaded" refusal. Runs until the signal aborts or
    * the room ends.
+   *
+   * The loop READS and the dispatcher RUNS (RFA-0.8 sect. 6.2). Until rung 3
+   * this loop awaited the handler inline, which made it serial twice over, and
+   * the second one was the expensive one: while a turn ran, `listenOnce` was not
+   * called, so incoming requests were not queued behind the turn, they were
+   * UNREAD, and a peer asking a busy resident got dead air until its `reply_by`.
+   * Now every request is submitted to the dispatcher, which answers
+   * synchronously with queued, refused or skipped, and this loop goes straight
+   * back to reading.
+   *
+   * With the default `concurrency: 1` the resident still runs one turn at a
+   * time. What changes even there is that the queue exists, so a second asker
+   * gets an ordinary refusal or a real answer instead of silence.
    */
   async serve(
     handler: (ctx: ServeContext) => Promise<string | Part[] | ServeRefusal>,
@@ -464,12 +516,53 @@ export class RoomMember {
        * reported through onError and never kills the loop.
        */
       onTask?: (event: { task: Record<string, unknown>; action: string; actor: string | null }) => Promise<void>;
+      /**
+       * The scheduler. Pass one to run turns concurrently (`concurrency: N`);
+       * omit it and a private one at concurrency 1 is used, which is the
+       * pre-rung-3 shape plus a queue.
+       */
+      dispatcher?: Dispatcher;
     } = {},
   ): Promise<void> {
+    const dispatcher =
+      opts.dispatcher ??
+      new Dispatcher({
+        // Rung 2's inline-refusal memory, inherited (RFA-0.8 sect. 6.2). See the
+        // `shouldSkip` note where the shared dispatcher is built in the resident:
+        // the check has to happen at DEQUEUE as well as at submit, because the
+        // queue makes the window wide enough for the ask-wait loop to refuse a
+        // request while it sits there.
+        shouldSkip: (job) => (this.refusedInline.has(job.id) ? "already refused inline from an ask wait" : null),
+        onError: (err) => opts.onError?.(err),
+      });
+    /** One refusal, on the wire, in this member's own voice. Best-effort: the room may have ended. */
+    const refuse = async (env: Envelope, reason: SendableRefusalReason, detail: string, retryAfterS?: number, body?: string) => {
+      try {
+        await this.send({
+          kind: "refuse",
+          inReplyTo: env.message_id,
+          conversationId: env.conversation_id ?? undefined,
+          to: [env.from.id],
+          refusal: { reason, detail: detail.slice(0, 200), ...(retryAfterS ? { retry_after_s: retryAfterS } : {}) },
+          body: body ?? detail,
+        });
+      } catch {
+        /* the room may have ended under us */
+      }
+    };
+
+    try {
     while (!opts.signal?.aborted) {
         let events: RfaEvent[];
         try {
-          events = await this.listenOnce({ timeoutMs: 25_000, waitFor: "mentions", presence: opts.presence ?? "ready" });
+          events = await this.listenOnce({
+            timeoutMs: 25_000,
+            waitFor: "mentions",
+            // Honest presence: a resident with turns in flight is busy, and now
+            // that the loop keeps reading through a turn it is the only thing
+            // that still knows.
+            presence: dispatcher.inFlightCount() > 0 ? "busy" : (opts.presence ?? "ready"),
+          });
         } catch (err) {
           if ((err as RfaClientError).code === "room_ended") return;
           opts.onError?.(err as Error);
@@ -482,11 +575,25 @@ export class RoomMember {
           if (event.type === "system" && event.event === "room_ended") return;
           if (event.type === "task" && opts.onTask) {
             const t = event as unknown as { task: Record<string, unknown>; action: string; actor: string | null };
-            try {
-              await opts.onTask(t);
-            } catch (err) {
-              opts.onError?.(err as Error);
-            }
+            const onTask = opts.onTask;
+            // Through the dispatcher too, so a task wake counts against the same
+            // concurrency and cannot overlap a turn on its own conversation. A
+            // task has no asker waiting on a `reply_by` and nothing to refuse to,
+            // so a shed is reported and dropped.
+            const id = String((t.task as { id?: unknown }).id ?? "?");
+            const verdict = dispatcher.submit({
+              key: `task:${id}`,
+              id: `task:${id}:${t.action}`,
+              replyBy: null,
+              run: async () => {
+                try {
+                  await onTask(t);
+                } catch (err) {
+                  opts.onError?.(err as Error);
+                }
+              },
+            });
+            if (verdict.verdict === "refused") opts.onError?.(new Error(`task ${id} (${t.action}) not picked up: ${verdict.detail}`));
             continue;
           }
           if (event.type !== "message") continue;
@@ -496,43 +603,60 @@ export class RoomMember {
           // Already refused inline from an ask wait (wire 8's would_deadlock).
           // Both loops read the same log on separate cursors, so without this
           // the asker would get the refusal now and a full answer later, from a
-          // turn nobody is waiting on any more.
+          // turn nobody is waiting on any more. Checked here AND inside the
+          // dispatcher, which re-checks at dequeue: the queue makes the window
+          // between the two wide enough to matter.
           if (this.refusedInline.has(env.message_id)) continue;
           const text = textOf(env.body);
           if (!text.trim()) continue;
-          try {
-            const answer = await handler({
-              text,
-              envelope: env,
-              wrapped: RoomMember.wrapForModel(env),
-              conversationId: env.conversation_id,
-              from: { id: env.from.id, name: env.from.name },
-            });
-            await this.send({
-              kind: answer instanceof ServeRefusal ? "refuse" : env.kind === "request" ? "response" : "chat",
-              inReplyTo: env.message_id,
-              conversationId: env.conversation_id ?? undefined,
-              to: [env.from.id],
-              body: answer instanceof ServeRefusal ? answer.body : answer,
-              refusal: answer instanceof ServeRefusal ? { reason: answer.reason, detail: answer.detail.slice(0, 200) } : undefined,
-              presence: opts.presence ?? "ready",
-            });
-          } catch (err) {
-            opts.onError?.(err as Error);
-            try {
-              await this.send({
-                kind: "refuse",
-                inReplyTo: env.message_id,
-                conversationId: env.conversation_id ?? undefined,
-                refusal: { reason: "overloaded", detail: "answer generation failed, retry shortly", retry_after_s: 60 },
-                body: "Answer generation failed; please retry shortly.",
-              });
-            } catch {
-              /* room may have ended */
-            }
+
+          const verdict = dispatcher.submit({
+            key: conversationKey(env),
+            id: env.message_id,
+            replyBy: env.reply_by ?? null,
+            onShed: (reason, detail) => void refuse(env, reason, detail, undefined, `I could not start this in time: ${detail}`),
+            run: async () => {
+              try {
+                const answer = await handler({
+                  text,
+                  envelope: env,
+                  wrapped: RoomMember.wrapForModel(env),
+                  conversationId: env.conversation_id,
+                  conversationKey: conversationKey(env),
+                  from: { id: env.from.id, name: env.from.name },
+                });
+                await this.send({
+                  kind: answer instanceof ServeRefusal ? "refuse" : env.kind === "request" ? "response" : "chat",
+                  inReplyTo: env.message_id,
+                  conversationId: env.conversation_id ?? undefined,
+                  to: [env.from.id],
+                  body: answer instanceof ServeRefusal ? answer.body : answer,
+                  refusal: answer instanceof ServeRefusal ? { reason: answer.reason, detail: answer.detail.slice(0, 200) } : undefined,
+                  presence: dispatcher.inFlightCount() > 1 ? "busy" : (opts.presence ?? "ready"),
+                });
+              } catch (err) {
+                opts.onError?.(err as Error);
+                await refuse(env, "overloaded", "answer generation failed, retry shortly", 60, "Answer generation failed; please retry shortly.");
+              }
+            },
+          });
+          // Backpressure and the deadline are refusals on the wire, never silent
+          // drops (requirements 3 and 4). A skip is silent on purpose: something
+          // else already answered this id.
+          if (verdict.verdict === "refused") {
+            await refuse(env, verdict.reason, verdict.detail, verdict.retryAfterS);
           }
         }
       }
+    } finally {
+      // In a `finally`, because the loop returns from four places (aborted,
+      // `room_ended` on a listen or in an event) and turns are no longer awaited
+      // inline: without this, exiting would abandon whatever was mid-turn and
+      // the caller would then close the databases under it. Bounded for the same
+      // reason the sidekick's leave is bounded: a wedged turn must not be able to
+      // stall a drain forever.
+      await Promise.race([dispatcher.idle(), sleep(30_000)]);
+    }
   }
 
   /**

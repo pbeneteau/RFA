@@ -19,6 +19,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as z from "zod";
 import { deriveCard, knowledgeFiles, loadPack, type AgentPack } from "./agentdef.js";
+import { cloneHeads } from "./knowledge-sources.js";
 import { HubDirError, requireHubDir, roomsStore, type HubDir } from "./hubdir.js";
 import { entryFor, nodeArgsFor } from "./proc.js";
 import { fileHint } from "./knowledge.js";
@@ -31,8 +32,9 @@ import { renderWrapped, wrapTaskText } from "./wrap.js";
 import { approvalWindowMs, interruptMatch, joinSidekick, refusalForOutcome, requestApproval } from "./bridge.js";
 import { MemoryGate, RoomMember, ServeRefusal, type ServeContext } from "./client.js";
 import { Engine, type ActionClaim } from "./engine.js";
-import { AccountLedger, isAuthError, isRateLimitError, pidAlive, type Lane } from "./account.js";
-import { makeTurnLock } from "./turnlock.js";
+import { AccountLedger, isAuthError, isRateLimitError, pidAlive, spendDay, type Lane } from "./account.js";
+import { makeKeyedTurnLock } from "./turnlock.js";
+import { Dispatcher } from "./dispatch.js";
 import { ObsStore } from "./obs.js";
 import { consolidate } from "./consolidate.js";
 import { EpisodeLog, FactStore, GatedMemory } from "./memoryfs.js";
@@ -114,7 +116,8 @@ class AccountStop extends Error {
 }
 
 /** Below this, a run buys one truncated request instead of an answer (spec 18.1). */
-const VIABLE_BUDGET_USD = 0.05;
+// The viability floor moved to src/account.ts with admission (RFA-0.8 sect. 5
+// item 1), so there is one number and one place that applies it.
 
 const log = (...a: unknown[]) => console.log(new Date().toISOString().slice(11, 19), `[${pack.name}]`, ...a);
 
@@ -181,7 +184,8 @@ const sessions = new SessionBook();
  * need its account lease (src/turnbinding.ts has the shape and the reasoning).
  */
 const turns = new TurnRegister();
-let spend = { day: new Date().toISOString().slice(0, 10), usd: 0 };
+/** A MIRROR of `agent_spend` in runs.db, for the state file and the answer's json part. Never the source. */
+let spend = { day: spendDay(), usd: 0 };
 
 /**
  * Run a BLOCKED WAIT with this turn's account slot lent out (RFA-0.8 sect. 6.3).
@@ -204,14 +208,62 @@ let spend = { day: new Date().toISOString().slice(0, 10), usd: 0 };
  * turns there is no lease that is right for both, so the old behaviour (hold
  * the slot) is the safe answer and the log says so.
  */
+/**
+ * At most ONE parked turn per process, and this is the re-derivation rung 2
+ * asked rung 3 for (RFA-0.8 sect. 6.3; the ledger entry states the old bound).
+ *
+ * Rung 2 bounded the unpark overshoot at "one park per resident process,
+ * because the turn lock holds one turn per process". Rung 3 is the change that
+ * breaks that premise: at `concurrency: N`, N turns can block at once, each
+ * parks, and each `unpark` takes its slot back after a short grace whether or
+ * not capacity exists - so the account could sit at `cap + sum(N_i)` across
+ * residents. That is a ceiling the operator set becoming a suggestion, and the
+ * ceiling is money.
+ *
+ * The other two ways out do not bound anything. Serializing the over-cap returns
+ * only delays them, because the second returning turn eventually takes its slot
+ * too: the alternative is killing a turn that has already spent money, which is
+ * the "bill with no answer" rung 2 rejected, and that reason does not weaken at
+ * N > 1.
+ *
+ * So the parks are bounded instead. A turn that would park while another turn of
+ * this process is already parked simply keeps its slot through the blocked wait,
+ * which is the pre-rung-2 behaviour for that turn alone. The overshoot bound is
+ * therefore unchanged from rung 2 and INDEPENDENT of N, and the anti-freeze
+ * property survives: a process with any blocked turn still frees at least one
+ * slot, so a depth-2 chain cannot own the whole account.
+ *
+ * The price, stated rather than hidden: with k > 1 turns blocked at once here,
+ * k-1 of them hold a slot they are not spending. That is latency for other work,
+ * and it is the smaller of the two failures.
+ */
+const parkedHere = {
+  owner: null as TurnBinding | null,
+  claim(turn: TurnBinding): boolean {
+    if (this.owner && this.owner !== turn) return false;
+    this.owner = turn;
+    return true;
+  },
+  forget(turn: TurnBinding): void {
+    if (this.owner === turn) this.owner = null;
+  },
+};
+
 async function withSlotParked<T>(reason: "ask" | "approval", fn: () => Promise<T>): Promise<T> {
   const turn = turns.current();
   if (!turn?.leaseId) {
     if (turns.liveCount() > 1) log(`slot park skipped: ${turns.liveCount()} turns live, so no single lease owns this wait`);
     return fn();
   }
+  if (!parkedHere.claim(turn)) {
+    log(`slot park skipped: another turn in this process is already parked, and the overshoot bound is one per process (RFA-0.8 sect. 6.3)`);
+    return fn();
+  }
   const lease = turn.leaseId;
-  if (!account.park(lease, reason)) return fn();
+  if (!account.park(lease, reason)) {
+    parkedHere.forget(turn);
+    return fn();
+  }
   try {
     return await fn();
   } finally {
@@ -234,6 +286,9 @@ async function withSlotParked<T>(reason: "ask" | "approval", fn: () => Promise<T
     } else if (back.overshoot) {
       log(`account slot taken back over the cap after the ${reason} wait: ${back.detail}`);
     }
+    // The bound is on turns parked AT ONCE, not on parks per turn: a turn that
+    // finished one blocked wait may park again for the next one.
+    parkedHere.forget(turn);
   }
 }
 
@@ -257,7 +312,22 @@ async function boot(): Promise<{ member: RoomMember; joinSecret: string | null; 
       if (restored.dropped.length > 0) {
         log(`state: ${restored.dropped.length} conversation(s) shared a session id with another and start fresh: ${restored.dropped.join(", ")}`);
       }
-      if (saved.spend?.day === new Date().toISOString().slice(0, 10)) spend = saved.spend;
+      // The day ledger is `agent_spend` in runs.db now (RFA-0.8 sect. 5 item 1),
+      // so the state file's copy is a stale mirror, not a source. Reading it back
+      // as the source is what made a restart forget the day's spend, and it is
+      // also how two residents on one membership disagreed about the budget for
+      // eight hours in 2026-08-19.
+      //
+      // ONE-TIME carry-over: on the first boot after this change the durable
+      // ledger is empty while the state file holds today's real spend, so a pack
+      // that had spent its day would silently get a fresh one. Seeded once, only
+      // when the ledger has nothing for today, and only from TODAY's mirror.
+      const already = account.daySpend(pack.name);
+      if (already.settled_usd === 0 && saved.spend?.day === spendDay() && saved.spend.usd > 0) {
+        account.recordSpend(pack.name, saved.spend.usd);
+        log(`carried $${saved.spend.usd.toFixed(4)} of today's spend from the state file into the durable ledger (one-time)`);
+      }
+      spend = { day: spendDay(), usd: account.daySpend(pack.name).settled_usd };
       await member.setPresence("ready", { card });
       log(`resumed room ${member.room} as ${member.name} (${member.memberId}), epoch ${member.epoch}`);
       return { member, joinSecret: saved.join_secret, prevHash: saved.definition_hash ?? null, created: false };
@@ -460,6 +530,36 @@ const rfaServer = createSdkMcpServer({
   ],
 });
 
+/**
+ * Ownership by tool declaration (RFA-0.8 sect. 4 item 2), enforced by the
+ * mechanism v0.4 sect. 3.12 already owns: tools ARE the declaration.
+ *
+ * `delete` and `rename` are destructive: two turns where one deletes what the
+ * other is rewriting do not compose, and nothing merges the result. They belong
+ * to the consolidation lane, so an answer-path turn gets them only if the pack
+ * NAMED them - and a pack that names one cannot run at `concurrency > 1`
+ * (the sect. 10 gate 2, refused in `src/agentdef.ts`). Until this, all six verbs
+ * were granted unconditionally, so gate 2 could never have been passed by any
+ * pack: the gate and the grant have to agree or the gate is decoration.
+ *
+ * `str_replace` splits by PATH rather than by name, because the verb is two
+ * different things: on `notes/*` it is the loud-stale compare-and-swap sect. 4
+ * item 1 pins deliberately, and on `blocks/*` it is a whole-block rewrite, which
+ * is the documented lost-update shape. So the verb is always granted and its
+ * destructive half needs the same declaration.
+ */
+const destructiveMemoryAllowed = (pack.def.tools?.allow ?? []).filter((t) => t.startsWith("mcp__memory__"));
+const mayDelete = destructiveMemoryAllowed.includes("mcp__memory__delete");
+const mayRename = destructiveMemoryAllowed.includes("mcp__memory__rename");
+const mayRewriteBlocks = destructiveMemoryAllowed.includes("mcp__memory__str_replace");
+const consolidationOnly = (verb: string) =>
+  asError(
+    new Error(
+      `${verb} is a destructive memory verb and belongs to the consolidation lane (RFA-0.8 sect. 4 item 2); this pack did not declare it. ` +
+        `Append the correction as a note instead, and consolidation will reconcile it.`,
+    ),
+  );
+
 const memoryServer = createSdkMcpServer({
   name: "memory",
   version: "0.4.1",
@@ -494,6 +594,7 @@ const memoryServer = createSdkMcpServer({
       },
     ),
     tool("str_replace", "Replace a unique string in a memory file.", { path: z.string(), old_str: z.string(), new_str: z.string() }, async (a) => {
+      if (!mayRewriteBlocks && /(^|\/)blocks\//.test(a.path.replace(/^\/memories\/?/, ""))) return consolidationOnly("str_replace on blocks/*");
       try {
         return asText(memory.strReplace(a.path, a.old_str, a.new_str));
       } catch (err) {
@@ -517,6 +618,7 @@ const memoryServer = createSdkMcpServer({
       "Delete a memory file or directory. Pass expected_hash to fail if another turn changed it since you read it.",
       { path: z.string(), expected_hash: z.string().optional() },
       async (a) => {
+        if (!mayDelete) return consolidationOnly("delete");
         try {
           return asText(memory.delete(a.path, { expectedHash: a.expected_hash }));
         } catch (err) {
@@ -525,6 +627,7 @@ const memoryServer = createSdkMcpServer({
       },
     ),
     tool("rename", "Rename or move a memory file.", { old_path: z.string(), new_path: z.string() }, async (a) => {
+      if (!mayRename) return consolidationOnly("rename");
       try {
         return asText(memory.rename(a.old_path, a.new_path));
       } catch (err) {
@@ -583,6 +686,13 @@ async function ensureSidekick(): Promise<RoomMember> {
   return sidekick;
 }
 
+/**
+ * Pre-allowed at the SDK, on top of the pack's own declaration. The answer-path
+ * memory verbs are here for every pack; the destructive two are here only for a
+ * pack that declared them (RFA-0.8 sect. 4 item 2, and see the memory server
+ * above, which refuses them at the handler as well). Two layers on purpose: the
+ * allowlist is what the model SEES, and the handler is what actually holds.
+ */
 const MCP_TOOLS = [
   "mcp__rfa__roster",
   "mcp__rfa__task_read",
@@ -590,8 +700,8 @@ const MCP_TOOLS = [
   "mcp__memory__create",
   "mcp__memory__str_replace",
   "mcp__memory__insert",
-  "mcp__memory__delete",
-  "mcp__memory__rename",
+  ...(mayDelete ? ["mcp__memory__delete"] : []),
+  ...(mayRename ? ["mcp__memory__rename"] : []),
 ];
 
 // ---------------------------------------------------------------- brain
@@ -630,6 +740,44 @@ const BRAIN_CWD = pack.def.sandbox?.cwd ? path.resolve(HUB_ROOT, pack.def.sandbo
 function knowledgePath(f: string): string {
   const rel = path.relative(BRAIN_CWD, f);
   return rel.startsWith("..") ? f : rel;
+}
+
+/**
+ * The knowledge-corpus taint detector (RFA-0.8 sect. 7 item 2).
+ *
+ * The drain barrier in `rfa knowledge sync` stops the race it knows about. This
+ * catches the race it cannot: an operator running `git pull` in the clone by
+ * hand, a second tool, anything at all. Each clone's HEAD is stamped at turn
+ * start and compared at turn end, and a mismatch marks the answer MIXED-CORPUS
+ * rather than trusting that the barrier was used.
+ *
+ * The failure it names needs no crash to hurt: one answer citing two corpus
+ * versions, a torn file, or a listed file momentarily absent, which is the
+ * phantom-missing-fact shape that already cost a day here.
+ */
+function corpusHeads(): Record<string, string> {
+  try {
+    return cloneHeads(pack.dir);
+  } catch {
+    return {};
+  }
+}
+
+function corpusExtra(atStart: Record<string, string>): Record<string, unknown> {
+  const names = Object.keys(atStart);
+  if (names.length === 0) return {};
+  const atEnd = corpusHeads();
+  const moved = names.filter((n) => atEnd[n] !== atStart[n]);
+  if (moved.length > 0) {
+    log(
+      `MIXED CORPUS: ${moved.map((n) => `${n} ${atStart[n]?.slice(0, 8)} -> ${atEnd[n]?.slice(0, 8) ?? "gone"}`).join(", ")} ` +
+        `moved while this turn was reading it; the answer may cite two corpus versions (RFA-0.8 sect. 7 item 2)`,
+    );
+  }
+  return {
+    corpus: atStart,
+    ...(moved.length > 0 ? { corpus_mixed: true, corpus_moved: moved, corpus_at_end: atEnd } : {}),
+  };
 }
 
 function systemPrompt(): string {
@@ -732,6 +880,13 @@ type RunContext = {
   /** The scope any gated action in this turn serves (RFA-0.8 sect. 6.4 item 1). */
   conversationId?: string | null;
   taskId?: string | null;
+  /**
+   * What the turn actually cost, written back by `brainTurn` on EVERY exit
+   * including a throw (RFA-0.8 sect. 5 item 6). A failed run still spent money,
+   * and until this existed the error paths recorded NULL, which is precisely
+   * where parallel-overshoot forensics would have looked.
+   */
+  costUsd?: number;
 };
 
 type BrainResult = {
@@ -745,39 +900,60 @@ type BrainResult = {
   refusal: string | null;
 };
 
-// One turn at a time in this process (src/turnlock.ts has the found story).
-// The account cap (spec 18.6) bounds turns across processes; this bounds the
-// ones inside it, which is what keeps `currentLease` meaning THE lease and the
-// keepalive renewing the right one. Every caller goes through here: the serve
-// loop, the task wake, and the schedule timer, which fires on its own clock
-// and used to overlap a serve turn.
-const oneTurn = makeTurnLock();
+/**
+ * One turn per SESSION in this process (RFA-0.8 sect. 6.1), narrowed from one
+ * turn per process. The dispatcher already runs at most one job per conversation
+ * key, so for room traffic this never blocks; it is here for the callers that do
+ * NOT go through the dispatcher and never will, above all the schedule timer,
+ * which fires on its own clock and is the reason the process-wide lock was built
+ * on 2026-08-25. Narrowing the scope without keeping a lock over every caller
+ * would have quietly un-fixed that.
+ */
+const oneTurn = makeKeyedTurnLock();
 async function brain(prompt: string, convoKey: string, run: RunContext): Promise<BrainResult> {
-  return oneTurn(() => brainTurn(prompt, convoKey, run));
+  return oneTurn(convoKey, () => brainTurn(prompt, convoKey, run));
 }
 
 async function brainTurn(prompt: string, convoKey: string, run: RunContext): Promise<BrainResult> {
   const budgets = pack.def.budgets ?? {};
-  const today = new Date().toISOString().slice(0, 10);
-  if (spend.day !== today) spend = { day: today, usd: 0 };
-  // A viability floor, not `> 0` (spec 18.1): the SDK enforces the cap BETWEEN
-  // model requests, so a two-cent remainder buys one real request and returns a
-  // truncated answer. Refusing at pickup is cheaper and more honest.
-  const remaining = budgets.per_day_usd ? budgets.per_day_usd - spend.usd : Infinity;
-  if (remaining < VIABLE_BUDGET_USD) {
-    throw new BudgetStop(
-      `daily budget exhausted (spend=${spend.usd.toFixed(2)} budget=${budgets.per_day_usd})`,
-      spend.usd,
-      budgets.per_day_usd ?? 0,
-    );
+  const today = spendDay();
+  /**
+   * Admission decides the slot AND the money, in one transaction (RFA-0.8 sect.
+   * 5 item 1). There is deliberately no local pre-check and no local ceiling
+   * arithmetic left here: this used to read an in-memory day ledger, compute
+   * `min(per_task_usd, per_day_usd - spend)` and hand it to the SDK, which meant
+   * the race window was the width of a whole model call. Under N concurrent
+   * turns all N read the same stale spend, and a pack with no `per_task_usd`
+   * made each run's ceiling the whole day remainder.
+   */
+  const slot = await account.waitForSlot(
+    {
+      agent: pack.name,
+      lane: run.lane ?? "serve",
+      runId: run.runId,
+      budget: { perDayUsd: budgets.per_day_usd ?? null, perTaskUsd: budgets.per_task_usd ?? null, day: today },
+    },
+    { timeoutMs: 120_000 },
+  );
+  if (!slot.ok) {
+    // `budget_exhausted` is an internal admission result, never a wire refusal
+    // reason (sect. 5 item 4): it becomes the spec 18.3 `overloaded` refusal
+    // carrying the numbers, which is what BudgetStop already renders.
+    if (slot.reason === "budget_exhausted") {
+      const seen = account.daySpend(pack.name, today);
+      throw new BudgetStop(slot.detail ?? "daily budget exhausted", seen.settled_usd, budgets.per_day_usd ?? 0);
+    }
+    throw new AccountStop(slot.detail ?? "no account slot", slot.retry_after_s ?? null);
   }
-  const taskCeiling = Math.min(budgets.per_task_usd ?? Infinity, remaining);
-  // Admission before the model call (spec 18.6). Reservation-based, so a
-  // human-facing serve can fill the cap while background work must leave room:
-  // the point is that consolidation never starves an answer someone is waiting
-  // for. A denied caller retries; the serve loop and the timers already do.
-  const slot = await account.waitForSlot({ agent: pack.name, lane: run.lane ?? "serve", runId: run.runId }, { timeoutMs: 120_000 });
-  if (!slot.ok) throw new AccountStop(slot.detail ?? "no account slot", slot.retry_after_s ?? null);
+  /** What admission granted this turn, and the only ceiling it gets. */
+  const taskCeiling = slot.granted_usd ?? Infinity;
+  /**
+   * What the turn has cost so far. Declared OUT here, above the try, because the
+   * `finally` settles it: a turn that throws after the model spent money must
+   * still settle that money, and a cost scoped inside the try would be invisible
+   * exactly on the paths where the accounting matters most.
+   */
+  let costUsd = 0;
   /**
    * THIS turn's binding: the lease, the lane, the chain and the scope, in one
    * mutable record that the blocked-wait park may swap the lease id inside
@@ -809,13 +985,23 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
   // Module-scope tools (the nested ask) reach this turn through the register;
   // released in the `finally`, so a throwing turn does not leave a phantom owner.
   const unbind = turns.bind(binding);
-  // The try opens HERE, before the lease joins the set, and not after the query is
-  // constructed. Everything from the lease onward must be covered by the finally
-  // below, or a throw in between (a session already in flight, a systemPrompt that
-  // reads a file, the SDK refusing to start) leaks the lease for the life of the
-  // process, and the keepalive then renews it forever for a turn that never ran.
-  // With the old single current-lease cell that leak was masked by the next turn
-  // overwriting the cell; a set remembers, so the scope has to be right.
+  /**
+   * The whole turn runs INSIDE its binding's async context (RFA-0.8 rung 3).
+   * With `concurrency: N` two turns are live at once, so the register's
+   * population no longer identifies "this turn" and `turns.current()` would
+   * return null to every module-scope reader (`src/turnbinding.ts` said so in
+   * advance). The store is what makes the nested-ask tool still find ITS turn's
+   * chain and lease rather than nobody's.
+   *
+   * The try opens HERE, before the lease joins the set, and not after the query is
+   * constructed. Everything from the lease onward must be covered by the finally
+   * below, or a throw in between (a session already in flight, a systemPrompt that
+   * reads a file, the SDK refusing to start) leaks the lease for the life of the
+   * process, and the keepalive then renews it forever for a turn that never ran.
+   * With the old single current-lease cell that leak was masked by the next turn
+   * overwriting the cell; a set remembers, so the scope has to be right.
+   */
+  return await turns.run(binding, async () => {
   try {
   if (myLease) liveLeases.add(myLease);
   // One writer per session id, enforced (RFA-0.8 sect. 1.1). Entered AFTER the
@@ -1001,7 +1187,6 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
   let text = "";
   /** Insertion-ordered and deduped: the same file read twice is one retrieval, and the ORDER is the diagnostic (which file it opened first). */
   const retrieved = new Set<string>();
-  let costUsd = 0;
   let numTurns = 0;
   let tokens: { input: number | null; output: number | null } = { input: null, output: null };
   for await (const msg of q) {
@@ -1058,7 +1243,13 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
       // so every failed run was free as far as the day's total knew.
       costUsd = msg.total_cost_usd ?? 0;
       if (msg.subtype !== "success" || msg.is_error) {
-        spend.usd += costUsd;
+        // No ledger write here any more. `costUsd` is settled once, by this
+        // turn's `finally`, whatever exit it takes (RFA-0.8 sect. 5 item 1);
+        // adding it here as well would double-count every failed run. The
+        // spec 18.2 rule this line used to carry ("a run that ends in error
+        // still spent money") is now structural rather than remembered: the
+        // settle is in the finally, so no exit path can skip it.
+        const dayNow = spend.usd + costUsd;
         // The SDK's own budget and turn stops (spec 18.3) carry the numbers so
         // the asker learns a ceiling was hit rather than "something broke".
         if (msg.subtype === "error_max_budget_usd" || msg.subtype === "error_max_turns") {
@@ -1073,8 +1264,8 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
               ? `the ${budgets.max_turns ?? 10}-turn ceiling`
               : `its $${Number.isFinite(taskCeiling) ? taskCeiling.toFixed(2) : "unbounded"} task ceiling`;
           throw new BudgetStop(
-            `${msg.subtype}: this task hit ${ceiling} after $${costUsd.toFixed(4)} (day now $${spend.usd.toFixed(2)})`,
-            spend.usd,
+            `${msg.subtype}: this task hit ${ceiling} after $${costUsd.toFixed(4)} (day now $${dayNow.toFixed(2)})`,
+            dayNow,
             Number.isFinite(taskCeiling) ? taskCeiling : 0,
             costUsd,
           );
@@ -1094,25 +1285,42 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
     }
   }
   if (!text) throw new Error("brain returned an empty result");
-  spend.usd += costUsd;
   return { text, costUsd, numTurns, tokens, retrieved: [...retrieved], refusal: clockRefusal };
   } finally {
     unbind();
+    // The run's real cost, wherever the turn left: every error path carries it
+    // now (RFA-0.8 sect. 5 item 6), so the caller's observability row and
+    // `failRun` stop recording NULL where parallel-overshoot forensics look.
+    run.costUsd = costUsd;
     // Always, and only THIS turn's lease: a lease held by a dead run blocks every
     // other resident until the supervisor's sweep reclaims it, and a lease
     // released by the wrong turn frees a slot that is still in use. Read from the
     // binding rather than from `myLease`, because a blocked wait may have swapped
     // in a re-acquired lease while this turn was parked (sect. 6.3).
+    //
+    // The release SETTLES: the reservation admission took is replaced by what the
+    // turn actually cost, in one transaction, and the remainder goes back to the
+    // day. This is the only place the day ledger moves for an answer-path turn.
     if (binding.leaseId) {
       liveLeases.delete(binding.leaseId);
-      account.release(binding.leaseId);
+      account.release(binding.leaseId, costUsd);
+    } else if (costUsd > 0) {
+      // A turn that lost its lease (swept while parked, sect. 6.3 outcome 3)
+      // still spent the operator's money, and the day has to know.
+      account.recordSpend(pack.name, costUsd, today);
     }
+    // The display ledger is a MIRROR of the durable one, never a second opinion:
+    // it is what the state file and the answer's json part report, and it is read
+    // back rather than incremented so the two cannot drift.
+    spend = { day: today, usd: account.daySpend(pack.name, today).settled_usd };
     // Claims this turn took and never learned the outcome of stay UNSETTLED, but
     // stop reading as in-flight (RFA-0.8 sect. 6.4): an irreversible action gates
     // until a human settles it, anything else may be retried on the same key.
     for (const identity of unsettled) engine.disownAction(identity);
     sessions.leave(convoKey);
+    parkedHere.forget(binding);
   }
+  });
 }
 
 /** Trace continuity (spec 7.1): join the asker's trace when the envelope carries SEP-414 context. */
@@ -1177,6 +1385,31 @@ log(`definition ${pack.definitionHash.slice(0, 15)} (model ${pack.def.model ?? "
 if (!pack.def.budgets?.per_task_usd && !pack.def.budgets?.per_day_usd) {
   log("WARNING: this pack declares neither per_task_usd nor per_day_usd, so its runs have no cost ceiling");
 }
+/**
+ * The runtime half of sect. 10 gate 1, failing closed.
+ *
+ * The schema checks posture, the memory-verb surface and the declared budget,
+ * because those are definition facts. The FENCE is not: whether the two-door
+ * write fence of sect. 9 is available and established for this pack's write set
+ * is a property of this host and this SDK, and rungs 5 and 6 have not built it.
+ * So a pack that reaches concurrency > 1 with any write surface is refused HERE,
+ * loudly, rather than started and hoped about. A definition can be edited between
+ * validation and start; this is the check that cannot be gone around.
+ */
+if (pack.def.concurrency > 1) {
+  const posture = agentPosture(pack.def);
+  if (posture.mode !== "read-only" || posture.acting.length > 0) {
+    log(
+      `FATAL: concurrency ${pack.def.concurrency} needs a read-only posture until the two-door write fence ships (RFA-0.8 sects. 9 and 10, rungs 5 and 6); ` +
+        `this pack is \`${posture.mode}\` with ${posture.acting.length} acting tool(s): ${posture.acting.join(", ") || "none declared"}`,
+    );
+    process.exit(1);
+  }
+  log(
+    `concurrency ${pack.def.concurrency}: up to ${pack.def.concurrency} turns at once, each a full claude CLI child process ` +
+      `(day ceiling $${pack.def.budgets?.per_day_usd}, account cap ${account.cap()})`,
+  );
+}
 
 if (prevHash && prevHash !== pack.definitionHash) {
   await member.send({
@@ -1201,8 +1434,10 @@ const scheduleTimer = setInterval(async () => {
     const { runId } = engine.createRun({ agent: pack.name, threadId: `sched:${due.id}`, kind: "schedule", input: { callback: due.callback } });
     log(`schedule fired (${due.kind}): ${due.callback.slice(0, 60)}`);
     const st0 = Date.now();
+    undispatchedTurns++;
+    const schedRun: RunContext = { runId, lane: "schedule" };
     try {
-      const { text, costUsd, numTurns, tokens } = await brain(due.callback, `sched:${due.id}`, { runId, lane: "schedule" });
+      const { text, costUsd, numTurns, tokens } = await brain(due.callback, `sched:${due.id}`, schedRun);
       await engine.step(runId, "post-to-room", async () => {
         await member.send({ body: text, kind: "status" });
         return { chars: text.length };
@@ -1216,8 +1451,12 @@ const scheduleTimer = setInterval(async () => {
         extra: { "gen_ai.request.model": pack.def.model ?? "inherit", num_turns: numTurns, schedule: due.id },
       });
     } catch (err) {
-      engine.failRun(runId, (err as Error).message, { retryable: false });
+      // With the run's real cost (RFA-0.8 sect. 5 item 6): a failed cron turn
+      // still spent money, and a NULL here is a hole in the reconciliation.
+      engine.failRun(runId, (err as Error).message, { retryable: false, costUsd: schedRun.costUsd });
       log(`schedule run failed: ${(err as Error).message}`);
+    } finally {
+      undispatchedTurns--;
     }
   }
 }, 60_000);
@@ -1227,31 +1466,61 @@ scheduleTimer.unref?.();
 
 let answered = 0;
 /**
- * How many turns are being served right now, not WHETHER one is
- * (the same defect shape as the lease cell above, RFA-0.8 sect. 3 item 3).
+ * The scheduler (RFA-0.8 sect. 6.2; the design is `docs/design/rung3-dispatcher.md`).
  *
- * A boolean is wrong as soon as two serve-shaped things overlap, and they can:
- * the turn lock serializes MODEL TURNS, not the handling around them, so a task
- * wake and an ask can both be inside their handler at once and the first
- * `finally` used to declare the resident idle while the other was still serving.
- * That mislabels presence to the room and lets the consolidation timer start
- * against a live turn. Balanced by `finally` at every site.
+ * It owns four things the serve loop used to have no answer for: per-conversation
+ * FIFO queues, one running job per conversation key (which IS one writer per
+ * session id, because a conversation key owns a session), bounded queues whose
+ * overflow is an ordinary refusal, and deadline-aware admission.
+ *
+ * `concurrency` comes from the pack and defaults to 1, so a pack that says
+ * nothing keeps running one turn at a time. What it gains even at 1 is the
+ * queue: a second asker now gets a real answer or an honest refusal instead of
+ * the silence that came from not READING during a turn.
+ *
+ * It also replaces the `serving` counter that used to live here. That counter
+ * was a boolean until rung 1 and a tally until now; the number the consolidation
+ * timer and the presence meter read is better taken from the thing that enforces
+ * it than kept in parallel beside it.
  */
-let serving = 0;
+const dispatcher = new Dispatcher({
+  concurrency: pack.def.concurrency,
+  onError: (err, job) => log(`dispatched job ${job.id} failed: ${err.message}`),
+  // Rung 2's inline-refusal memory, inherited by the thing that replaced the
+  // loop that held it. Without this a `would_deadlock` refusal issued from an
+  // ask wait would be followed minutes later by a full answer to the same
+  // request, off the serve cursor, from a turn nobody is waiting on.
+  shouldSkip: (job) => (member.wasRefusedInline(job.id) ? "already refused inline from an ask wait" : null),
+});
+/**
+ * Turns the dispatcher does not schedule: the cron timer, which fires on its own
+ * clock and is deliberately outside the queues (it has no conversation and no
+ * asker). Counted here so "no turn in flight" means all of them.
+ */
+let undispatchedTurns = 0;
+const turnsInFlight = () => dispatcher.inFlightCount() + undispatchedTurns;
 let sinceConsolidation = 0;
 let lastConsolidation = Date.now();
 
 // Background consolidation (spec 5.3): after 8 gated exchanges or 6h, when idle.
 const consolidationTimer = setInterval(() => {
-  if (serving > 0) return;
+  // "No turn in flight" is the precondition, and it now includes the SCHEDULED
+  // turns the old `serving` counter never saw: a cron turn holds a lease without
+  // ever passing through a serve handler, and consolidation used to start
+  // against one.
+  if (turnsInFlight() > 0) return;
   if (sinceConsolidation < 8 && Date.now() - lastConsolidation < 6 * 3600_000) return;
   sinceConsolidation = 0;
   lastConsolidation = Date.now();
   void consolidate(pack.name, { hubdir })
     .then((r) => {
       // The same daily ledger as answer-path work (spec 18.4). It was hiding
-      // roughly 3% of the resident's spend in a separate maxBudgetUsd.
-      spend.usd += r.cost_usd;
+      // roughly 3% of the resident's spend in a separate maxBudgetUsd. It goes
+      // to the DURABLE ledger, which is the one admission reads: a consolidation
+      // pass that only moved an in-memory mirror would be spend the next
+      // admission could not see.
+      account.recordSpend(pack.name, r.cost_usd);
+      spend = { day: spendDay(), usd: account.daySpend(pack.name).settled_usd };
       save();
       if (r.deferred) log(`consolidation deferred: ${r.deferred}`);
       if (r.episodes > 0) log(`consolidated ${r.episodes} episodes: +${r.added} facts, ~${r.updated}, -${r.invalidated} ($${r.cost_usd.toFixed(4)}, day now $${spend.usd.toFixed(4)})`);
@@ -1270,7 +1539,7 @@ const keepaliveTimer = setInterval(() => {
   // The lease check stands on its own: a scheduled run holds a lease without
   // ever incrementing `serving`, and skipping it here let the sweep reclaim a
   // slot that a long cron turn was still using.
-  if (serving === 0 && liveLeases.size === 0) return;
+  if (dispatcher.inFlightCount() === 0 && liveLeases.size === 0) return;
   // EVERY live lease, not the newest (sect. 3 item 3). The TTL is shorter than a
   // human approval wait, so renewal happens here for the same reason the
   // heartbeat does; a lease the sweep already took is dropped from the set rather
@@ -1289,7 +1558,10 @@ const keepaliveTimer = setInterval(() => {
     }
   }
   fs.writeFileSync(HEARTBEAT, String(Date.now()));
-  if (serving > 0) void member.setPresence("busy", { detail: "serving" }).catch(() => {});
+  if (dispatcher.inFlightCount() > 0)
+    void member
+      .setPresence("busy", { detail: `serving ${dispatcher.inFlightCount()}/${dispatcher.concurrency}${dispatcher.queuedCount() ? ` (+${dispatcher.queuedCount()} queued)` : ""}` })
+      .catch(() => {});
 }, 30_000);
 keepaliveTimer.unref?.();
 
@@ -1298,6 +1570,7 @@ const shutdown = (sig: string) => {
   save();
   clearInterval(consolidationTimer);
   clearInterval(keepaliveTimer);
+  if (dispatcher.queuedCount() > 0) log(`draining: ${dispatcher.queuedCount()} queued request(s) will not be answered`);
   for (const id of liveLeases) account.release(id);
   liveLeases.clear();
   // The sidekick is a real membership: dying without leaving strands a zombie
@@ -1334,8 +1607,9 @@ async function runAssignedTask(task: Record<string, unknown>, action: string): P
     input: { task: id, action, title: title.slice(0, 200) },
   });
   log(`task ${action === "verify_reject" ? "rework" : "assignment"} ${id} (run ${runId}): ${title.slice(0, 100)}`);
-  serving++;
   const t0 = Date.now();
+  const taskRun: RunContext = { runId, taskId: id };
+  const corpusAtStart = corpusHeads();
   try {
     await member.task({ action: "update", id, state: "working", note: `picked up by ${member.name} (run ${runId})` });
     // Task text is peer-authored data and goes through the same boundary a
@@ -1356,7 +1630,7 @@ async function runAssignedTask(task: Record<string, unknown>, action: string): P
       `. Do the work now. Your final message becomes the completion evidence a verifier reads: ` +
       `state what you did and point at something checkable.\n\n` +
       wrapTaskText({ taskId: id, author: String(task.created_by ?? "?"), text: fields });
-    const { text, costUsd, numTurns, tokens } = await brain(prompt, `task:${id}`, { runId, taskId: id });
+    const { text, costUsd, numTurns, tokens } = await brain(prompt, `task:${id}`, taskRun);
     engine.completeRun(runId, { output: { chars: text.length }, costUsd, numTurns });
     obs.record({
       id: runId,
@@ -1375,7 +1649,7 @@ async function runAssignedTask(task: Record<string, unknown>, action: string): P
     await member.task({ action: "complete", id, evidence: { summary: text.slice(0, 2000) } });
     log(`task ${id} completed (${text.length} chars, $${costUsd.toFixed(4)}, ${numTurns} turns)`);
   } catch (err) {
-    engine.failRun(runId, (err as Error).message, { retryable: false });
+    engine.failRun(runId, (err as Error).message, { retryable: false, costUsd: taskRun.costUsd });
     obs.record({
       id: runId,
       name: `task:${pack.name}`,
@@ -1386,6 +1660,8 @@ async function runAssignedTask(task: Record<string, unknown>, action: string): P
       end_time: Date.now(),
       group_id: member.room,
       inputs: { task: id, action },
+      cost_usd: taskRun.costUsd,
+      extra: corpusExtra(corpusAtStart),
     });
     const reason =
       err instanceof BudgetStop
@@ -1405,8 +1681,6 @@ async function runAssignedTask(task: Record<string, unknown>, action: string): P
     } catch {
       /* already released by the lease, cancelled, or the room ended */
     }
-  } finally {
-    serving--;
   }
 }
 
@@ -1415,7 +1689,10 @@ await member.serve(
     const verdict = gate.inspect(ctx.envelope);
     episodes.recordInbound(ctx.envelope, verdict.ok ? { ok: true } : { ok: false, similarity: verdict.similarity }, ctx.wrapped, verdict.record.text);
     if (!verdict.ok) log(`memory gate: near-duplicate from ${ctx.from.name} (${Math.round(verdict.similarity * 100)}%)`);
-    const convo = ctx.conversationId ?? "adhoc";
+    // The dispatcher's queue key and the session key are the SAME string, handed
+    // over rather than recomputed (RFA-0.8 sect. 6.2: requirements 1 and 2 are
+    // one mechanism, and two computations of one key is how they stop being).
+    const convo = ctx.conversationKey;
     const { runId } = engine.createRun({
       agent: pack.name,
       threadId: convo,
@@ -1423,8 +1700,19 @@ await member.serve(
       input: { seq: ctx.envelope.seq, from: ctx.from.name, text: ctx.text.slice(0, 500) },
     });
     log(`Q from ${ctx.from.name} (seq ${ctx.envelope.seq}, run ${runId}): ${ctx.text.slice(0, 100)}`);
-    serving++;
     const t0 = Date.now();
+    /** Held out here so the catch below can read what the turn spent before it threw. */
+    const serveRun: RunContext = {
+      runId,
+      replyBy: ctx.envelope.reply_by,
+      // The chain this request belongs to (wire 8, 0.1.9), read off the
+      // incoming envelope. Null when the asker sent none, which makes this
+      // turn a root and any ask it makes the chain's first hop.
+      chain: readChain(ctx.envelope.ext),
+      conversationId: ctx.conversationId,
+    };
+    /** The knowledge clones' HEADs as this turn STARTS (RFA-0.8 sect. 7 item 2). */
+    const corpusAtStart = corpusHeads();
     try {
       // L3 retrieval (spec 5.1): consolidated facts relevant to THIS question,
       // origin-tagged, injected per turn (never the whole store).
@@ -1432,15 +1720,7 @@ await member.serve(
       const memoryBlock = relevant.length
         ? `<consolidated-memory note="YOUR OWN earlier conclusions, not a source. NEVER cite this block and NEVER answer a factual question from it alone: every number, name, threshold or date you state must come from a knowledge file you read in THIS turn. Use this only to decide which file to open. [origin] tags the trust tier of what it was distilled from; any of it may be stale or wrong.">\n${relevant.map((f) => `- [${f.source_origin}] ${f.text}`).join("\n")}\n</consolidated-memory>\n\n`
         : "";
-      const { text, costUsd, numTurns, tokens, retrieved, refusal } = await brain(memoryBlock + ctx.wrapped, convo, {
-        runId,
-        replyBy: ctx.envelope.reply_by,
-        // The chain this request belongs to (wire 8, 0.1.9), read off the
-        // incoming envelope. Null when the asker sent none, which makes this
-        // turn a root and any ask it makes the chain's first hop.
-        chain: readChain(ctx.envelope.ext),
-        conversationId: ctx.conversationId,
-      });
+      const { text, costUsd, numTurns, tokens, retrieved, refusal } = await brain(memoryBlock + ctx.wrapped, convo, serveRun);
       answered++;
       episodes.recordOwn(member.room, member.memberId, member.name, text);
       engine.completeRun(runId, {
@@ -1471,6 +1751,9 @@ await member.serve(
           // answer's own json part is read by the asker, and a guest has no business
           // learning this pack's file layout from a reply.
           retrieved,
+          // The corpus this answer was actually read from, and whether it moved
+          // mid-turn (RFA-0.8 sect. 7 item 2).
+          ...corpusExtra(corpusAtStart),
         },
       });
       sinceConsolidation++;
@@ -1495,7 +1778,11 @@ await member.serve(
     } catch (err) {
       const budgetStop = err instanceof BudgetStop ? err : null;
       const accountStop = err instanceof AccountStop ? err : null;
-      engine.failRun(runId, (err as Error).message, { retryable: false });
+      // Every error path carries the run's real cost now (RFA-0.8 sect. 5 item
+      // 6). It used to be carried only by a BudgetStop, so a generic brain error
+      // wrote a NULL-cost row: a failed turn that spent two dollars looked free.
+      const spent = serveRun.costUsd ?? budgetStop?.runCostUsd;
+      engine.failRun(runId, (err as Error).message, { retryable: false, costUsd: spent });
       obs.record({
         id: runId,
         ...traceFrom(ctx.envelope._meta),
@@ -1510,8 +1797,8 @@ await member.serve(
         // A failed run still spent money (spec 18.2), but what it spent is the
         // RUN's cost and never the day ledger: writing the ledger here inflated
         // this table by an order of magnitude and poisoned the p90 cost queue.
-        cost_usd: budgetStop ? budgetStop.runCostUsd : undefined,
-        extra: { "gen_ai.request.model": pack.def.model ?? "inherit", conversation: convo },
+        cost_usd: spent,
+        extra: { "gen_ai.request.model": pack.def.model ?? "inherit", conversation: convo, ...corpusExtra(corpusAtStart) },
       });
       // A ceiling is not a crash: the asker gets the spec 18.3 refusal with the
       // numbers, so it can tell "you are out of budget" from "you are broken".
@@ -1548,14 +1835,10 @@ await member.serve(
         log(`provider rate limit reported; account pickup paused`);
       }
       throw err;
-    } finally {
-      // Balanced here, not on each exit path: the success path and six refusal
-      // paths each used to clear the flag, and a counter decremented twice on one
-      // turn is worse than a boolean set twice.
-      serving--;
     }
   },
   {
+    dispatcher,
     onCycle: () => {
       save();
       fs.writeFileSync(HEARTBEAT, String(Date.now()));

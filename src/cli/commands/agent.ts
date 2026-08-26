@@ -358,7 +358,7 @@ export async function editInEditor(ctx: CliContext, name: string, file: string):
   return 0;
 }
 
-const EDIT_FLAGS = ["model", "description", "offer", "offer-description", "per-task", "per-day", "max-turns", "mode", "room", "knowledge"] as const;
+const EDIT_FLAGS = ["model", "description", "offer", "offer-description", "per-task", "per-day", "max-turns", "mode", "room", "knowledge", "concurrency"] as const;
 
 /** The flags of `rfa agent edit` as the changes `editPack` takes; null when no flag was given. */
 export function changesFromFlags(h: HubDir, current: ReturnType<typeof currentSettings>, v: Record<string, string | boolean | undefined>): PackChanges | null {
@@ -396,16 +396,21 @@ export function changesFromFlags(h: HubDir, current: ReturnType<typeof currentSe
     if (!rec) throw new CliError(2, "--room takes an alias or a handle");
     c.room = rec.handle;
   }
+  if (v.concurrency !== undefined) {
+    const n = Number(v.concurrency);
+    if (!Number.isInteger(n) || n < 1 || n > 16) throw new CliError(2, "--concurrency takes a whole number from 1 to 16");
+    c.concurrency = n;
+  }
   return c;
 }
 
 export const agentEdit: CommandDef = {
   path: ["agent", "edit"],
   summary: "Change a pack's settings: alone on a terminal the walkthrough, with flags headless, --editor opens agent.md",
-  usage: '<name> [--model haiku|sonnet|opus] [--description "<text>"] [--offer <id>] [--offer-description "<text>"] [--per-task <usd>] [--per-day <usd>] [--max-turns <n>] [--mode ask|plan|bypass] [--room <alias|handle>] [--knowledge <dir|git remote> [--docs <subdir>]] [--editor]',
-  options: { model: { type: "string" }, description: { type: "string" }, offer: { type: "string" }, "offer-description": { type: "string" }, "per-task": { type: "string" }, "per-day": { type: "string" }, "max-turns": { type: "string" }, mode: { type: "string" }, room: { type: "string" }, knowledge: { type: "string" }, docs: { type: "string" }, editor: { type: "boolean", default: false } },
+  usage: '<name> [--model haiku|sonnet|opus] [--description "<text>"] [--offer <id>] [--offer-description "<text>"] [--per-task <usd>] [--per-day <usd>] [--max-turns <n>] [--mode ask|plan|bypass] [--room <alias|handle>] [--knowledge <dir|git remote> [--docs <subdir>]] [--concurrency <n>] [--editor]',
+  options: { model: { type: "string" }, description: { type: "string" }, offer: { type: "string" }, "offer-description": { type: "string" }, "per-task": { type: "string" }, "per-day": { type: "string" }, "max-turns": { type: "string" }, mode: { type: "string" }, room: { type: "string" }, knowledge: { type: "string" }, docs: { type: "string" }, concurrency: { type: "string" }, editor: { type: "boolean", default: false } },
   why: "Every setting rfa agent new asks for can be changed afterwards on the same screen, pre-filled with what the pack has; the flags are the headless form of every answer, and --editor is agent.md itself for the prompt and everything else. Each change rewrites only its line or block (the rest of the file byte for byte) and the whole is validated through the supervisor's own schema before a single write, so an edit can never produce a pack the platform refuses. A change rotates the definition: a running supervisor drains the resident and respawns it, and the room sees the digest change.",
-  examples: ["rfa agent edit pm-agent", "rfa agent edit pm-agent --model sonnet --per-day 10", 'rfa agent edit pm-agent --offer answer-fee-question --offer-description "Answers fee questions from the handbook, citing the page."', "rfa agent edit pm-agent --knowledge ./handbook", "rfa agent edit pm-agent --editor"],
+  examples: ["rfa agent edit pm-agent", "rfa agent edit pm-agent --model sonnet --per-day 10", 'rfa agent edit pm-agent --offer answer-fee-question --offer-description "Answers fee questions from the handbook, citing the page."', "rfa agent edit pm-agent --knowledge ./handbook", "rfa agent edit pm-agent --editor", "rfa agent edit pm-agent --concurrency 2"],
   run: async (ctx, a) => {
     const h = ctx.hubdir();
     const name = await packArg(ctx, h, a.positionals[0], "rfa agent edit <name> [--model …]");

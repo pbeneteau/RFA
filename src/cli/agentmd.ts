@@ -159,6 +159,13 @@ export interface PackChanges {
   room?: string;
   /** Knowledge globs to add (deduplicated); removal is an edit by hand. */
   knowledge?: string[];
+  /**
+   * Turns this pack may run at once (RFA-0.8 sect. 10). Refused above 1 unless
+   * the pack passes all three gates, by the same schema every other caller uses:
+   * the validation below is what reports the reason, so an operator learns which
+   * gate failed instead of getting a bare rejection.
+   */
+  concurrency?: number;
 }
 
 export interface EditResult {
@@ -169,7 +176,7 @@ export interface EditResult {
 }
 
 /** The settings as `rfa agent edit` reads them, for the walkthrough's list and the no-op check. */
-export function currentSettings(def: AgentDef): Required<Pick<PackChanges, "description" | "model">> & { offer: { id: string; description: string } | null; budgets: { per_task_usd: number | null; per_day_usd: number | null; max_turns: number | null }; mode: AgentMode | "read-only"; room: string | null; knowledge: string[] } {
+export function currentSettings(def: AgentDef): Required<Pick<PackChanges, "description" | "model">> & { offer: { id: string; description: string } | null; budgets: { per_task_usd: number | null; per_day_usd: number | null; max_turns: number | null }; mode: AgentMode | "read-only"; room: string | null; knowledge: string[]; concurrency: number } {
   return {
     description: def.description,
     model: def.model ?? "inherit",
@@ -178,6 +185,7 @@ export function currentSettings(def: AgentDef): Required<Pick<PackChanges, "desc
     mode: effectiveMode(def),
     room: def.rooms?.[0]?.room ?? null,
     knowledge: def.knowledge ?? [],
+    concurrency: def.concurrency,
   };
 }
 
@@ -235,6 +243,10 @@ export function editPack(file: string, c: PackChanges): EditResult {
       text = setTopBlock(text, "knowledge", knowledgeBlock(merged));
       changed.push("knowledge");
     }
+  }
+  if (c.concurrency !== undefined && c.concurrency !== now.concurrency) {
+    text = setTopScalar(text, "concurrency", `concurrency: ${c.concurrency}   # turns at once; each one is a full claude CLI child process`, { after: "model" });
+    changed.push("concurrency");
   }
   // Validated as a whole before anything touches the disk: a refused edit leaves the file as it was.
   const after = parseAgentMd(text).definitionHash;

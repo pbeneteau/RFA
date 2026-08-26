@@ -373,22 +373,32 @@ export class Engine {
     this.settle(runId, "success", { output: result.output, costUsd: result.costUsd, numTurns: result.numTurns, checkpoint: result.checkpoint });
   }
 
-  /** Fail a run; below MAX_ATTEMPTS it re-queues as pending attempt+1 (idempotent steps make the retry cheap). */
-  failRun(runId: string, error: string, opts: { checkpoint?: Checkpoint; retryable?: boolean } = {}): { retried: boolean } {
+  /**
+   * Fail a run; below MAX_ATTEMPTS it re-queues as pending attempt+1 (idempotent
+   * steps make the retry cheap).
+   *
+   * `costUsd` is what the failed attempt actually SPENT (RFA-0.8 sect. 5 item 6).
+   * A failed run is not a free run, and until this parameter existed every error
+   * path recorded nothing, so the cost column was NULL exactly where
+   * parallel-overshoot forensics would look. Accumulated rather than replaced,
+   * because a retried run's earlier attempts were paid for too.
+   */
+  failRun(runId: string, error: string, opts: { checkpoint?: Checkpoint; retryable?: boolean; costUsd?: number } = {}): { retried: boolean } {
     const row = this.get(runId);
     if (!row) throw new Error(`no run ${runId}`);
     const retry = (opts.retryable ?? true) && row.attempt < MAX_ATTEMPTS;
+    const cost = Number.isFinite(opts.costUsd) && (opts.costUsd as number) > 0 ? (opts.costUsd as number) : null;
     this.db.transaction(() => {
       const now = iso();
       if (retry) {
         // A re-queued run is owned by nobody until something picks it up again.
         this.db
-          .prepare(`UPDATE runs SET status = 'pending', attempt = attempt + 1, error = ?, started_at = NULL, owner_pid = NULL, checkpoint_json = COALESCE(?, checkpoint_json) WHERE run_id = ?`)
-          .run(error, opts.checkpoint ? json(opts.checkpoint) : null, runId);
+          .prepare(`UPDATE runs SET status = 'pending', attempt = attempt + 1, error = ?, started_at = NULL, owner_pid = NULL, cost_usd = COALESCE(cost_usd, 0) + COALESCE(?, 0), checkpoint_json = COALESCE(?, checkpoint_json) WHERE run_id = ?`)
+          .run(error, cost, opts.checkpoint ? json(opts.checkpoint) : null, runId);
       } else {
         this.db
-          .prepare(`UPDATE runs SET status = 'error', error = ?, ended_at = ?, owner_pid = NULL, checkpoint_json = COALESCE(?, checkpoint_json) WHERE run_id = ?`)
-          .run(error, now, opts.checkpoint ? json(opts.checkpoint) : null, runId);
+          .prepare(`UPDATE runs SET status = 'error', error = ?, ended_at = ?, owner_pid = NULL, cost_usd = COALESCE(cost_usd, 0) + COALESCE(?, 0), checkpoint_json = COALESCE(?, checkpoint_json) WHERE run_id = ?`)
+          .run(error, now, cost, opts.checkpoint ? json(opts.checkpoint) : null, runId);
       }
       this.db
         .prepare(`UPDATE threads SET status = ?, updated_at = ? WHERE thread_id = ?`)

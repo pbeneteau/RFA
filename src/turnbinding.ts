@@ -11,15 +11,20 @@
  * freed a slot that was still in use. The lesson is not "never module state",
  * it is "never state a second writer can silently overwrite".
  *
- * So: a LIST, and `current()` returns a binding only when exactly one turn is
- * live. Zero or two is not a crash and not a guess, it is `null`, and every
- * caller degrades to the pre-rung-2 behaviour (no chain propagated, no slot
- * parked) with a log line naming why. Today the per-process turn lock
- * (`src/turnlock.ts`) makes the two-turn case unreachable; rung 3 narrows that
- * lock to one turn per SESSION, at which point the dispatcher must thread a
- * binding per run and `current()` starts returning null instead of the wrong
- * answer. Failing visibly at that boundary is the point of this file.
+ * So: a LIST plus an async-context store. `current()` answers with the binding
+ * IN SCOPE, and falls back to the single live turn when nothing put one there.
+ * Zero live turns, or two with no scope, is not a crash and not a guess, it is
+ * `null`, and every caller degrades to the pre-rung-2 behaviour (no chain
+ * propagated, no slot parked) with a log line naming why.
+ *
+ * Rung 2 shipped the list alone, and said what rung 3 would owe: the per-process
+ * turn lock made two live turns unreachable, so the population WAS the answer,
+ * and narrowing that lock to one turn per SESSION (rung 3) would start returning
+ * null where it used to return the right binding. The store is that debt paid:
+ * the binding now travels with its turn rather than being inferred. Failing
+ * visibly at the boundary is still the point of this file.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { Lane } from "./account.js";
 import type { ChainRef } from "./chainid.js";
 
@@ -40,6 +45,20 @@ export interface TurnBinding {
 
 export class TurnRegister {
   private live: TurnBinding[] = [];
+  /**
+   * The rung-3 answer to the paragraph above. `current()` used to be able to
+   * answer only because the turn lock made two live turns impossible; under
+   * `concurrency: N` two live turns are the point, so the binding travels WITH
+   * the turn instead of being inferred from the register's population.
+   *
+   * ALS propagates through promise chains, so anything the turn awaits - the
+   * query iteration, and the MCP tool handlers the SDK invokes from inside it -
+   * sees the store. What this repository cannot prove is that the SDK never
+   * invokes a handler from a context rooted outside that iteration; if it ever
+   * does, the fallback below still covers N = 1, and at N > 1 the caller
+   * degrades exactly as it does today, with a log line naming why.
+   */
+  private readonly als = new AsyncLocalStorage<TurnBinding>();
 
   /** Bind a turn for its lifetime; the returned function unbinds it, once. */
   bind(binding: TurnBinding): () => void {
@@ -53,13 +72,23 @@ export class TurnRegister {
     };
   }
 
+  /** Run a turn's whole body with its binding in scope, for the readers that cannot be handed one. */
+  run<T>(binding: TurnBinding, fn: () => Promise<T>): Promise<T> {
+    return this.als.run(binding, fn);
+  }
+
   /**
-   * The one live turn, or null when there is no turn or more than one. Never a
-   * guess: with two live turns there is no answer that is right for both, and
-   * returning either would attach one turn's chain to the other's ask.
+   * THIS turn's binding: the one in scope, else the one live turn, else null.
+   *
+   * Never a guess. The ALS store is the turn that is actually asking. The
+   * single-live-turn fallback covers a caller the store did not reach while the
+   * process holds exactly one turn, which is the pre-rung-3 world and still the
+   * default (`concurrency: 1`). With two live turns and no store there is no
+   * answer that is right for both, and returning either would attach one turn's
+   * chain to the other's ask, so the answer is null and the caller degrades.
    */
   current(): TurnBinding | null {
-    return this.live.length === 1 ? this.live[0] : null;
+    return this.als.getStore() ?? (this.live.length === 1 ? this.live[0] : null);
   }
 
   /** How many turns are live: what a caller logs when `current()` gave it nothing. */

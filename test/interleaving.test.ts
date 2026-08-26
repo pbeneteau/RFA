@@ -622,3 +622,389 @@ test("seam 4: a throwing turn releases its conversation and its lease, and the n
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------- seam 4, extended: the dispatcher (rung 3)
+//
+// The never-two-turns-one-session property becomes the DISPATCHER's acceptance
+// test (RFA-0.8 sect. 6.2). Until rung 3 the property held because the turn lock
+// held one turn per PROCESS, which made it true a fortiori; the whole point of
+// rung 3 is that several turns run at once, so the property now has to be
+// carried by the thing that schedules them. Same barriers, same enumeration, no
+// sleeps: the assertion is that the maximum concurrency PER KEY is 1 while the
+// maximum across keys reaches the configured N.
+
+test("seam 4: the dispatcher runs N turns at once and never two on one conversation, in any interleaving", async () => {
+  const { Dispatcher } = await import("../src/dispatch.js");
+  const { SessionBook } = await import("../src/sessions.js");
+
+  for (const concurrency of [1, 2, 3]) {
+    const book = new SessionBook();
+    const d = new Dispatcher({ concurrency });
+    const release = new Map<string, () => void>();
+    let liveNow = 0;
+    let maxLive = 0;
+    const order: string[] = [];
+
+    // Several conversations, several jobs each, submitted in an interleaved
+    // order so per-key FIFO is a real claim and not an artefact of submission.
+    const jobs = ["a1", "b1", "a2", "c1", "b2", "a3", "c2"];
+    for (const id of jobs) {
+      const key = id[0];
+      const verdict = d.submit({
+        key,
+        id,
+        replyBy: null,
+        run: async () => {
+          // The session book is the ASSERTION layer: if the dispatcher ever ran
+          // two jobs on one key, `enter` throws and the job rejects.
+          book.enter(key);
+          order.push(id);
+          liveNow++;
+          maxLive = Math.max(maxLive, liveNow);
+          try {
+            await new Promise<void>((r) => release.set(id, r));
+            book.adopt(key, `sess_${key}`);
+          } finally {
+            liveNow--;
+            book.leave(key);
+          }
+        },
+      });
+      assert.equal(verdict.verdict, "queued", `${id} queued`);
+    }
+
+    // Drive it: release whatever is running, one wave at a time, until dry.
+    for (let wave = 0; wave < jobs.length + 2 && (d.inFlightCount() > 0 || d.queuedCount() > 0); wave++) {
+      assert.ok(d.inFlightCount() <= concurrency, `never more than ${concurrency} in flight, saw ${d.inFlightCount()}`);
+      for (const [id, r] of [...release]) {
+        release.delete(id);
+        r();
+      }
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+    }
+    await d.idle();
+
+    assert.equal(maxLive <= concurrency, true, `at most ${concurrency} turns at once, saw ${maxLive}`);
+    if (concurrency > 1) assert.ok(maxLive > 1, `concurrency ${concurrency} actually overlapped, saw ${maxLive}`);
+    assert.equal(book.liveCount(), 0, "every conversation released");
+    assert.deepEqual(order.filter((i) => i[0] === "a"), ["a1", "a2", "a3"], "per-conversation FIFO, whatever ran in between");
+    assert.deepEqual(order.filter((i) => i[0] === "b"), ["b1", "b2"]);
+    assert.deepEqual(order.filter((i) => i[0] === "c"), ["c1", "c2"]);
+    assert.equal(order.length, jobs.length, "nothing dropped");
+  }
+});
+
+test("seam 4: the keyed turn lock is one turn per SESSION, not one per process (RFA-0.8 sect. 6.1)", async () => {
+  const { makeKeyedTurnLock } = await import("../src/turnlock.js");
+  const lock = makeKeyedTurnLock();
+  const live = new Map<string, number>();
+  let maxPerKey = 0;
+  let maxTotal = 0;
+  let total = 0;
+  const gate = new Map<string, () => void>();
+  const runs = ["x:1", "y:1", "x:2", "z:1", "y:2"].map((tag) => {
+    const key = tag.split(":")[0];
+    return lock(key, async () => {
+      live.set(key, (live.get(key) ?? 0) + 1);
+      total++;
+      maxPerKey = Math.max(maxPerKey, live.get(key)!);
+      maxTotal = Math.max(maxTotal, total);
+      await new Promise<void>((r) => gate.set(tag, r));
+      live.set(key, live.get(key)! - 1);
+      total--;
+      return tag;
+    });
+  });
+  for (let i = 0; i < 6; i++) {
+    for (const [, r] of [...gate]) r();
+    gate.clear();
+    await new Promise((r) => setImmediate(r));
+  }
+  assert.deepEqual(await Promise.all(runs), ["x:1", "y:1", "x:2", "z:1", "y:2"]);
+  assert.equal(maxPerKey, 1, "one turn per key, which is one writer per session id");
+  assert.ok(maxTotal > 1, "different keys DO overlap: that is the narrowing rung 3 is");
+});
+
+test("seam 4: the turn binding travels with its turn, so two live turns each find their own", async () => {
+  const { TurnRegister } = await import("../src/turnbinding.js");
+  const reg = new TurnRegister();
+  const mk = (runId: string) => ({ runId, leaseId: `lse_${runId}`, agent: "a", lane: "serve" as const, chain: null, replyBy: null, conversationId: null, taskId: null });
+  const seen: (string | null)[] = [];
+  // The pre-rung-3 fallback still answers with one live turn and no store.
+  const un = reg.bind(mk("solo"));
+  assert.equal(reg.current()?.runId, "solo", "one live turn: the population is still an answer");
+  un();
+
+  const a = mk("A");
+  const b = mk("B");
+  const ua = reg.bind(a);
+  const ub = reg.bind(b);
+  // Two live turns: the population is no longer an answer, and null is the
+  // honest one rather than either binding.
+  assert.equal(reg.current(), null, "two live turns and no store: null, never a guess");
+  await Promise.all([
+    reg.run(a, async () => {
+      await new Promise((r) => setImmediate(r));
+      seen.push(reg.current()?.runId ?? null);
+      // Nested async work still sees its own turn.
+      await Promise.resolve().then(() => seen.push(reg.current()?.runId ?? null));
+    }),
+    reg.run(b, async () => {
+      seen.push(reg.current()?.runId ?? null);
+      await new Promise((r) => setImmediate(r));
+      seen.push(reg.current()?.runId ?? null);
+    }),
+  ]);
+  ua();
+  ub();
+  assert.deepEqual(seen.filter((s) => s === "A").length, 2, "turn A saw itself twice");
+  assert.deepEqual(seen.filter((s) => s === "B").length, 2, "turn B saw itself twice");
+  assert.equal(seen.includes(null), false, `no turn lost its binding: ${seen.join(",")}`);
+});
+
+test("seam 4: a queued request refused inline meanwhile is skipped at DEQUEUE, not answered twice", async () => {
+  const { Dispatcher } = await import("../src/dispatch.js");
+  // Rung 2's hazard, widened by the queue: the ask-wait loop refuses a request
+  // with `would_deadlock` while it is SITTING IN THE QUEUE, and answering it
+  // afterwards would be a full answer to a request already refused.
+  const refusedInline = new Set<string>();
+  const ran: string[] = [];
+  const d = new Dispatcher({ concurrency: 1, shouldSkip: (job) => (refusedInline.has(job.id) ? "already refused inline" : null) });
+  let releaseFirst!: () => void;
+  d.submit({ key: "k", id: "first", replyBy: null, run: async () => { ran.push("first"); await new Promise<void>((r) => (releaseFirst = r)); } });
+  assert.equal(d.submit({ key: "k", id: "second", replyBy: null, run: async () => void ran.push("second") }).verdict, "queued");
+  await new Promise((r) => setImmediate(r));
+  // ... and now the ask wait refuses it, while it waits.
+  refusedInline.add("second");
+  releaseFirst();
+  await d.idle();
+  assert.deepEqual(ran, ["first"], "the refused request was dropped at dequeue, not answered off the other cursor");
+
+  // Submitted AFTER the refusal it is skipped at the door, with nothing to send.
+  assert.equal(d.submit({ key: "k", id: "second", replyBy: null, run: async () => void ran.push("again") }).verdict, "skipped");
+});
+
+test("seam 4: deadline-aware admission refuses at the door and sheds at the gate, never into a dead reply_by", async () => {
+  const { Dispatcher, MIN_VIABLE_TURN_MS } = await import("../src/dispatch.js");
+  let clock = 1_000_000;
+  const now = () => clock;
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const d = new Dispatcher({ concurrency: 1, now });
+  const ran: string[] = [];
+  const shed: string[] = [];
+
+  // 1. Already past, or too close to be worth starting: refused AT ADMISSION.
+  const past = d.submit({ key: "k", id: "past", replyBy: iso(clock - 1), run: async () => void ran.push("past") });
+  assert.equal(past.verdict, "refused");
+  assert.equal(past.verdict === "refused" && past.reason, "deadline_expired");
+  const tight = d.submit({ key: "k", id: "tight", replyBy: iso(clock + MIN_VIABLE_TURN_MS - 1), run: async () => void ran.push("tight") });
+  assert.equal(tight.verdict, "refused", "a deadline under one viable turn buys a truncated answer nobody can use");
+
+  // 2. Admitted with room, then the queue eats its deadline: SHED at dequeue
+  // with a refusal, never started into a reply_by that has passed.
+  let release!: () => void;
+  assert.equal(d.submit({ key: "k", id: "slow", replyBy: iso(clock + 600_000), run: async () => { ran.push("slow"); await new Promise<void>((r) => (release = r)); } }).verdict, "queued");
+  await new Promise((r) => setImmediate(r));
+  assert.equal(
+    d.submit({ key: "k", id: "waiting", replyBy: iso(clock + 60_000), onShed: (_r, detail) => shed.push(detail), run: async () => void ran.push("waiting") }).verdict,
+    "queued",
+    "at submit it still had a minute, so it was admitted honestly",
+  );
+  clock += 120_000; // the slow turn outlived the second asker's deadline
+  release();
+  await d.idle();
+  assert.deepEqual(ran, ["slow"], "the expired request was shed, not executed");
+  assert.equal(shed.length, 1, "and the asker was told, on the wire, rather than dropped silently");
+  assert.match(shed[0], /reply_by/);
+});
+
+test("seam 4: backpressure refuses the ARRIVAL, never a request already waiting", async () => {
+  const { Dispatcher } = await import("../src/dispatch.js");
+  const d = new Dispatcher({ concurrency: 1, queueLimit: 2, maxQueued: 3 });
+  const ran: string[] = [];
+  const releases: (() => void)[] = [];
+  const job = (key: string, id: string) => d.submit({ key, id, replyBy: null, run: async () => { ran.push(id); await new Promise<void>((r) => releases.push(r)); } });
+
+  assert.equal(job("a", "a1").verdict, "queued"); // starts
+  assert.equal(job("a", "a2").verdict, "queued"); // queued 1
+  assert.equal(job("a", "a3").verdict, "queued"); // queued 2
+  const overKey = job("a", "a4");
+  assert.equal(overKey.verdict, "refused", "the per-conversation limit is a refusal to the newcomer");
+  assert.equal(overKey.verdict === "refused" && overKey.reason, "overloaded");
+  assert.ok(overKey.verdict === "refused" && (overKey.retryAfterS ?? 0) > 0, "and it carries a retry hint, because it IS transient");
+
+  assert.equal(job("b", "b1").verdict, "queued"); // queued 3, hits maxQueued
+  const overAll = job("c", "c1");
+  assert.equal(overAll.verdict, "refused", "the global limit refuses too");
+  assert.match(overAll.verdict === "refused" ? overAll.detail : "", /queued across/);
+
+  for (let i = 0; i < 8 && (d.inFlightCount() > 0 || d.queuedCount() > 0); i++) {
+    for (const r of releases.splice(0)) r();
+    await new Promise((r) => setImmediate(r));
+  }
+  await d.idle();
+  assert.deepEqual(ran, ["a1", "a2", "a3", "b1"], "everything that was ADMITTED ran; nothing waiting was dropped to make room");
+});
+
+// ---------------------------------------------------------------- seam 3, extended: the budget reservation (rung 3)
+//
+// The two-connection lease race becomes the RESERVATION test (RFA-0.8 sect. 5).
+// The sharpest thing to assert is the interaction with rung 2: a PARKED lease has
+// freed its SLOT but not its MONEY, so the slot count and the money count must
+// DISAGREE about that row, and one query for both would get one of them wrong.
+
+test("seam 3: admission reserves inside the same transaction, so N concurrent turns cannot admit against one stale spend", async () => {
+  const { AccountLedger } = await import("../src/account.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-resv-"));
+  const db = path.join(dir, "runs.db");
+  const one = new AccountLedger(db);
+  const two = new AccountLedger(db);
+  try {
+    one.setCap(4);
+    const day = "2026-08-26";
+    const budget = { perDayUsd: 5, perTaskUsd: 2, day };
+    // Four turns, across two connections, with NOTHING settled yet: before
+    // reservations all four would have read spend=0 and each been granted a
+    // whole 2 dollar ceiling, admitting a 8 dollar day against a 5 dollar cap.
+    const grants: (number | null | undefined)[] = [];
+    const leases: string[] = [];
+    for (const ledger of [one, two, one, two]) {
+      const res = ledger.acquire({ agent: "pm", lane: "serve", budget });
+      grants.push(res.granted_usd);
+      if (res.lease) leases.push(res.lease.lease_id);
+    }
+    assert.deepEqual(grants.slice(0, 2), [2, 2], "the first two get a full per-task ceiling");
+    assert.equal(grants[2], 1, "the third gets what is LEFT, not another full ceiling");
+    assert.equal(grants[3], null, "the fourth is refused: the remainder is under the viability floor, so nothing is granted");
+    assert.equal(one.leases().length, 3, "and the refused one holds nothing");
+
+    const refused = two.acquire({ agent: "pm", lane: "serve", budget });
+    assert.equal(refused.reason, "budget_exhausted");
+    assert.match(refused.detail ?? "", /committed=\$5\.0000 of \$5\.00/);
+    assert.ok((refused.retry_after_s ?? 0) > 0, "budget exhaustion IS transient: it clears at midnight, and the hint says so");
+
+    // Settling the truth frees what was reserved and never spent.
+    one.release(leases[0], 0.11);
+    assert.equal(one.daySpend("pm", day).settled_usd, 0.11);
+    const after = two.acquire({ agent: "pm", lane: "serve", budget });
+    assert.ok(after.ok, "the 1.89 the first turn did not spend is available again");
+    assert.equal(Number(after.granted_usd?.toFixed(4)), 1.89);
+
+    // Attribution: lane, granted ceiling and spend day survive the deleted lease.
+    const settled = one.settlements("pm", day);
+    assert.equal(settled.length, 1);
+    assert.deepEqual(
+      { lane: settled[0].lane, ceiling: settled[0].ceiling_usd, actual: settled[0].actual_usd, day: settled[0].spend_day },
+      { lane: "serve", ceiling: 2, actual: 0.11, day },
+    );
+  } finally {
+    one.close();
+    two.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("seam 3: a parked lease frees its SLOT and not its MONEY, and the two counts disagree correctly", async () => {
+  const { AccountLedger } = await import("../src/account.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-park-money-"));
+  const db = path.join(dir, "runs.db");
+  const led = new AccountLedger(db);
+  try {
+    led.setCap(2);
+    const day = "2026-08-26";
+    const budget = { perDayUsd: 4, perTaskUsd: 2, day };
+    const first = led.acquire({ agent: "pm", lane: "serve", budget });
+    assert.ok(first.ok && first.lease);
+    assert.equal(first.granted_usd, 2);
+
+    // The turn blocks on a nested ask and lends its slot (sect. 6.3).
+    assert.equal(led.park(first.lease.lease_id, "ask"), true);
+    const snap = led.snapshot();
+    assert.equal(snap.in_flight, 0, "the SLOT is free: a blocked turn is spending nothing");
+    assert.equal(snap.parked, 1, "and the row is still there, which is what the sweep and the meter read");
+
+    // THE point of this test. The money is NOT free: the turn will resume and
+    // spend the ceiling it was granted. One query for both counts would have to
+    // pick a side, and either side is wrong for the other.
+    assert.equal(led.daySpend("pm", day).reserved_usd, 2, "the reservation rides the PARKED lease");
+    const second = led.acquire({ agent: "pm", lane: "serve", budget });
+    assert.ok(second.ok, "the freed slot is genuinely usable");
+    assert.equal(second.granted_usd, 2, "and it is granted the remaining 2, not another 2 on top of a forgotten reservation");
+    const third = led.acquire({ agent: "pm", lane: "serve", budget });
+    assert.equal(third.reason, "budget_exhausted", "the parked turn's money was counted, so the third is refused on MONEY");
+    assert.notEqual(third.reason, "cap_reached", "and not on slots: the parked row does not hold one");
+
+    // Settle both and the day is what was really spent, not what was reserved.
+    led.release(first.lease.lease_id, 0.5);
+    led.release(second.lease!.lease_id, 0.25);
+    assert.equal(led.daySpend("pm", day).settled_usd, 0.75);
+    assert.equal(led.daySpend("pm", day).reserved_usd, 0, "nothing reserved once every lease settled");
+  } finally {
+    led.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("seam 3: the knowledge-sync drain barrier holds new admissions, waits for the running ones, and cannot wedge the pack", async () => {
+  const { AccountLedger } = await import("../src/account.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-drain-"));
+  const db = path.join(dir, "runs.db");
+  const sync = new AccountLedger(db);
+  const resident = new AccountLedger(db);
+  try {
+    resident.setCap(3);
+    const running = resident.acquire({ agent: "pm", lane: "serve" });
+    assert.ok(running.ok && running.lease);
+
+    const held = sync.beginMaintenance("pm", "knowledge sync", { ttlMs: 60_000 });
+    assert.ok(held.ok && held.token);
+    // New admissions for THIS pack queue behind the barrier; another pack is
+    // untouched, because the barrier is pack-scoped.
+    const blocked = resident.acquire({ agent: "pm", lane: "serve" });
+    assert.equal(blocked.reason, "maintenance");
+    const elsewhere = resident.acquire({ agent: "other", lane: "serve" });
+    assert.ok(elsewhere.ok, "a barrier on one pack is not an outage for the rest");
+    resident.release(elsewhere.lease!.lease_id);
+    assert.equal(sync.beginMaintenance("pm", "second sync").ok, false, "one barrier at a time");
+
+    // The drain waits for the turn already running, and says what is left when
+    // it cannot have it. Bounded: a resident renewing a long turn must not hold
+    // an operator command open forever.
+    const timedOut = await sync.drain("pm", { timeoutMs: 60, pollMs: 10 });
+    assert.equal(timedOut.drained, false);
+    assert.equal(timedOut.remaining.length, 1);
+    resident.release(running.lease.lease_id, 0.02);
+    assert.deepEqual(await sync.drain("pm", { timeoutMs: 200, pollMs: 10 }), { drained: true, remaining: [] });
+
+    // A maintenance marker is not a turn, and is not a slot.
+    assert.equal(sync.snapshot().in_flight, 0);
+    assert.equal(sync.leases().length, 0, "leases() means TURNS; the marker shares the table and is not one");
+    assert.deepEqual(sync.snapshot().maintenance.map((m) => [m.agent, m.reason]), [["pm", "knowledge sync"]]);
+
+    sync.endMaintenance("pm", held.token);
+    assert.ok(resident.acquire({ agent: "pm", lane: "serve" }).ok, "and the pack serves again");
+  } finally {
+    sync.close();
+    resident.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("seam 3: a sync killed mid-barrier cannot wedge the pack: the marker's own TTL lapses it", async () => {
+  const { AccountLedger } = await import("../src/account.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-wedge-"));
+  const db = path.join(dir, "runs.db");
+  const led = new AccountLedger(db);
+  try {
+    const held = led.beginMaintenance("pm", "knowledge sync", { ttlMs: 40 });
+    assert.ok(held.ok);
+    assert.equal(led.acquire({ agent: "pm", lane: "serve" }).reason, "maintenance");
+    // The process dies HERE: no endMaintenance is ever called.
+    await new Promise((r) => setTimeout(r, 60));
+    assert.ok(led.acquire({ agent: "pm", lane: "serve" }).ok, "the next admission expires the abandoned marker rather than waiting for a human");
+  } finally {
+    led.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
