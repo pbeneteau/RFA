@@ -19,6 +19,23 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as z from "zod";
 
+/**
+ * The effective account concurrency default (RFA-0.8 sect. 5 item 8), owned
+ * HERE because the supervisor writes the ledger's cap from this manifest field
+ * and that is what makes it effective. `src/account.ts` imports it; its own
+ * `UNSUPERVISED_CAP` is a different fact about a different setup (no supervisor,
+ * therefore no sweep either), not a second opinion about this one.
+ */
+export const EFFECTIVE_DEFAULT_CAP = 2;
+
+/**
+ * The hub's chosen `cross_home_reply_by_default_s` (wire section 8, 0.1.9).
+ * Declared here so the manifest schema does not import the store (and with it
+ * the whole hub) into every CLI path; `src/store.ts` carries the reasoning for
+ * the number beside the value it defaults to.
+ */
+export const CROSS_HOME_REPLY_BY_DEFAULT_S = 600;
+
 export const MANIFEST_FILE = "rfa.json";
 export const MANIFEST_VERSION = 1;
 
@@ -42,6 +59,14 @@ const localHubSchema = z
     trusted_keys: z.string().nullable().default(null),
     /** Notification-only push (v0.5 sect. 17.3). The URL is not a secret: it carries a title and a link, never a credential. */
     push_url: z.url().nullable().default(null),
+    /**
+     * The bounded default `reply_by` the hub stamps on a `request` crossing a
+     * `home` boundary when the sender omits one (wire section 8 and Appendix B,
+     * 0.1.9: `cross_home_reply_by_default_s`, a knob the wire spec names and
+     * deliberately leaves unnumbered). 0 disables it. The reasoning behind 600
+     * is in `DEFAULT_CONFIG` in `src/store.ts`, beside the value.
+     */
+    cross_home_reply_by_default_s: z.number().int().min(0).max(86_400).default(CROSS_HOME_REPLY_BY_DEFAULT_S),
   })
   .strict();
 
@@ -61,8 +86,13 @@ export const manifestSchema = z
     agents: z
       .object({
         dir: z.string().default("agents"),
-        /** The account layer's cap on model turns in flight (spec 18.6). */
-        max_inflight: z.number().int().min(1).default(2),
+        /**
+         * The account layer's cap on model turns in flight (spec 18.6). The
+         * default is `EFFECTIVE_DEFAULT_CAP` from `src/account.ts` rather than a
+         * literal, so the effective default standardized by RFA-0.8 sect. 5
+         * item 8 is written down exactly once.
+         */
+        max_inflight: z.number().int().min(1).default(EFFECTIVE_DEFAULT_CAP),
         /**
          * What a resident inherits from the supervisor's environment. `minimal`
          * is v0.4 sect. 6.3 as written (declared secrets plus what the model

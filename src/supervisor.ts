@@ -28,7 +28,7 @@
 import type { ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { AccountLedger, DEFAULT_CAP, RATE_LIMIT_PAUSE_FLOOR_MS } from "./account.js";
+import { AccountLedger, RATE_LIMIT_PAUSE_FLOOR_MS, UNSUPERVISED_CAP } from "./account.js";
 import { declaredSecretNames, listPacks, loadPack, type AgentPack } from "./agentdef.js";
 import { RoomMember } from "./client.js";
 import { Engine } from "./engine.js";
@@ -105,10 +105,17 @@ const ACCOUNT = {
   escalationWindowMs: 10 * 60_000,
 };
 
+/**
+ * The cap the supervisor writes into the ledger, which is what makes it the
+ * EFFECTIVE cap for every resident (RFA-0.8 sect. 5 item 8). The manifest's
+ * `agents.max_inflight` defaults to `EFFECTIVE_DEFAULT_CAP` in `src/hubdir.ts`;
+ * `UNSUPERVISED_CAP` is unreachable from here (zod has already applied the
+ * default and enforces min 1) and is kept only so this line reads as total.
+ */
 function configuredCap(): number {
   const raw = Number(process.env.RFA_ACCOUNT_MAX_INFLIGHT);
   if (Number.isInteger(raw) && raw >= 1) return raw;
-  return hubdir.manifest.agents.max_inflight || DEFAULT_CAP;
+  return hubdir.manifest.agents.max_inflight || UNSUPERVISED_CAP;
 }
 
 const account = new AccountLedger(hubdir.paths.runsDb);

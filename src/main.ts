@@ -118,6 +118,11 @@ try {
     principals,
     // Policy-gate checks (spec 12.2): a JSON array of GateCheck objects.
     gateChecks: gatePath ? JSON.parse(fs.readFileSync(gatePath, "utf8")) : [],
+    // The hub-defaulted cross-home `reply_by` (wire section 8, 0.1.9). Read
+    // from the manifest so an operator can lengthen or disable it without a
+    // build; the compiled default applies when this hub runs outside a
+    // directory (a test, `--stdio`).
+    ...(local ? { crossHomeReplyByDefaultS: local.cross_home_reply_by_default_s } : {}),
   });
 } catch (err) {
   console.error(`rfa-hub: ${(err as Error).message}`);

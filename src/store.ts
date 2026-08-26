@@ -10,6 +10,8 @@ import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { COUNTER_ASK_EXT } from "./chainid.js";
+import { CROSS_HOME_REPLY_BY_DEFAULT_S } from "./hubdir.js";
 import { RfaError } from "./errors.js";
 import { canonicalize, digestCard, sha256hex } from "./jcs.js";
 import { verifyCard, type Jwk, type VerificationDetail } from "./signing.js";
@@ -99,6 +101,13 @@ export interface HubConfig {
    * "it died while I was away" through the other door.
    */
   holdTtlS: number;
+  /**
+   * The bounded default `reply_by`, in seconds, that the hub stamps on a
+   * `request` crossing a `home` boundary when the sender omits one (wire
+   * section 8, added in 0.1.9; the knob is named `cross_home_reply_by_default_s`
+   * in wire Appendix B, which deliberately picks no number). 0 disables it.
+   */
+  crossHomeReplyByDefaultS: number;
   now: () => number;
 }
 
@@ -198,6 +207,25 @@ export const DEFAULT_CONFIG: HubConfig = {
   // 1800s, matching the `npm run ask` default deadline (platform spec 16.3,
   // which deliberately raises the 300s this shipped with).
   holdTtlS: 1800,
+  // 600s. The wire spec names the knob and picks no number, so this hub picks
+  // one, and the reasoning is the whole justification:
+  //
+  //  - It is a BACKSTOP, not a service level. Chain-id cycle refusal fails open
+  //    at every hop crossing a framework that does not propagate the ext, and
+  //    this clock is the only recovery left when it does. So it must be short
+  //    enough that a frozen cross-org cycle unwedges inside one operator's
+  //    attention span.
+  //  - It must never truncate a conforming caller that simply omitted the
+  //    field. The reference client's own ask default is 120s, and measured
+  //    round trips here are ~12s; 600s is five times the former.
+  //  - It must leave room for the answering side to raise an approval card,
+  //    whose window is derived from this very deadline (`approvalWindowMs`:
+  //    reply_by minus a 30s margin, floored at 60s). At 600s that is a 570s
+  //    window, comfortably above the floor.
+  //  - It is deliberately NOT `holdTtlS` (1800s). That is a HUMAN decision
+  //    clock, and borrowing it for a machine backstop would make a deadlocked
+  //    pair of agents sit for half an hour.
+  crossHomeReplyByDefaultS: CROSS_HOME_REPLY_BY_DEFAULT_S,
   now: () => Date.now(),
 };
 
@@ -958,6 +986,47 @@ export class RoomHub {
   }
 
   /**
+   * Does this `request` cross a `home` boundary (wire section 8, 0.1.9)?
+   *
+   * The addressees, in the order the envelope means them: `mentions` is who is
+   * asked to act, `to` is who it was addressed to, and a request with neither is
+   * a broadcast, so everyone else in the room is an addressee. A missing `home`
+   * reads as `"local"` everywhere in this file and does here too.
+   *
+   * On a hub that admits no guests this is false for every message, which is
+   * exactly right: the default costs nothing until there is a boundary to cross.
+   */
+  private crossesHome(room: Room, sender: Member, to: string[], mentions: string[]): boolean {
+    const mine = sender.home ?? "local";
+    const ids = mentions.length > 0 ? mentions : to;
+    const addressees =
+      ids.length > 0
+        ? ids.map((id) => room.members.get(id)).filter((m): m is Member => !!m)
+        : [...room.members.values()].filter((m) => m.id !== sender.id);
+    return addressees.some((m) => (m.home ?? "local") !== mine);
+  }
+
+  /**
+   * The `message_id` of a request one of these addressees already has out to
+   * this sender and has not been answered, or null.
+   *
+   * Scope, stated rather than implied: this reads `pendingReplies`, which holds
+   * requests the hub is tracking a DEADLINE for, so a request that carried no
+   * `reply_by` is not in it. After the cross-home default above, every
+   * cross-home request does carry one, and the cross-home case is the one this
+   * annotation exists for.
+   */
+  private pendingCounterAsk(room: Room, sender: Member, addressees: string[]): string | null {
+    if (addressees.length === 0) return null;
+    const targets = new Set(addressees);
+    for (const pending of room.pendingReplies) {
+      if (!targets.has(pending.fromId)) continue;
+      if (this.findMessage(room, pending.messageId)?.mentions.includes(sender.id)) return pending.messageId;
+    }
+    return null;
+  }
+
+  /**
    * How long a held envelope waits for a human (spec 12.4). A message that
    * carries its own deadline is held against THAT deadline (minus a 30s margin
    * so the sender is still listening when the verdict lands, floored at 60s so
@@ -1340,6 +1409,14 @@ export class RoomHub {
       if (Number.isNaN(t)) throw new RfaError("bad_request", "reply_by must be an ISO 8601 date-time");
       replyBy = iso(t);
     }
+    // The hub-defaulted cross-home `reply_by` (wire section 8, 0.1.9). The only
+    // cycle recovery that survives an arbitrary counterparty framework, because
+    // it lives HERE and not in a client that may never have heard of chain ids.
+    // Stamped, not merely suggested: a request with no deadline that crosses an
+    // organization boundary is a request nothing will ever time out.
+    if (kind === "request" && !replyBy && this.cfg.crossHomeReplyByDefaultS > 0 && this.crossesHome(room, member, to, mentions)) {
+      replyBy = iso(now + this.cfg.crossHomeReplyByDefaultS * 1000);
+    }
 
     const conversationId = args.conversation_id ?? (kind === "request" ? rid("c", 4) : null);
     const envelope: Envelope = {
@@ -1362,6 +1439,16 @@ export class RoomHub {
       _meta: pickTraceMeta(args._meta),
       ext: args.ext ?? {},
     };
+    // The advisory 2-cycle annotation (wire section 8, 0.1.9): R asks A while
+    // A's request to R is still unanswered. NEVER a refusal, and the spec is
+    // explicit about why: a counter-ask is the legitimate clarifying-question
+    // idiom, and refusing it would break the most useful thing two agents do.
+    // It is a hint for a reader, hub-stamped over anything a client sent, like
+    // every other hub-derived field.
+    if (kind === "request") {
+      const counter = this.pendingCounterAsk(room, member, mentions.length > 0 ? mentions : to);
+      if (counter) envelope.ext = { ...envelope.ext, [COUNTER_ASK_EXT]: counter };
+    }
 
     // Pre-delivery policy gate (spec 12.2, v0.4.2): most severe outcome wins.
     // refuse blocks with an audit event; hold parks the envelope behind a

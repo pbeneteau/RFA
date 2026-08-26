@@ -321,6 +321,109 @@ test("seam 3: the keepalive renews EVERY lease the process holds, not the newest
   }
 });
 
+test("seam 3: a blocked turn lends its slot, and takes it back unconditionally", async () => {
+  // RFA-0.8 sect. 6.3, on the two-connection seam because that is the shape that
+  // matters: the turn that lends and the turn that borrows are different
+  // PROCESSES, and the whole point is that the borrower can start while the
+  // lender is blocked.
+  const { AccountLedger } = await import("../src/account.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-park-"));
+  const db = path.join(dir, "runs.db");
+  const blocked = new AccountLedger(db);
+  const other = new AccountLedger(db);
+  try {
+    // The effective cap of sect. 5 item 8, which is the number the freeze
+    // analysis is stated at.
+    blocked.setCap(2);
+    const a = blocked.acquire({ agent: "pm-agent", lane: "serve", runId: "run_a" });
+    const b = blocked.acquire({ agent: "scribe", lane: "serve", runId: "run_b" });
+    assert.ok(a.ok && b.ok, "two turns fill the cap");
+
+    // HEAD's freeze, asserted so the fix has something to be a fix OF: with both
+    // turns blocked on a nested ask or a card, a third turn cannot start, at zero
+    // model cost to whoever provoked it.
+    assert.equal(other.acquire({ agent: "third", lane: "serve" }).ok, false, "the account is frozen while both blocked turns hold their slots");
+
+    assert.equal(blocked.park(a.lease!.lease_id, "ask"), true, "the blocked turn lends its slot");
+    assert.equal(blocked.park(a.lease!.lease_id, "ask"), false, "parking twice is not a second lend");
+    const third = other.acquire({ agent: "third", lane: "serve" });
+    assert.ok(third.ok, "the lent slot admits real work from another process");
+    assert.equal(blocked.snapshot().in_flight, 2, "in_flight counts turns that are SPENDING, not turns that are waiting");
+    assert.equal(blocked.snapshot().parked, 1, "and the parked one is visible rather than inferred");
+    // The row survives, because the sweep and the operator's meter read rows.
+    assert.ok(blocked.leases().some((l) => l.lease_id === a.lease!.lease_id), "the lease row is kept, only its slot is lent");
+    assert.deepEqual(blocked.renewAll([a.lease!.lease_id]).lost, [], "the keepalive still renews a parked lease");
+
+    // The return. The account is full (b + third), so this is the overshoot path,
+    // and it must still succeed: the turn has already spent the operator's money
+    // and dying on admission now would be the worst of both.
+    const back = await blocked.unpark(a.lease!.lease_id, { graceMs: 150, pollMs: 25, agent: "pm-agent", lane: "serve" });
+    assert.equal(back.ok, true, "a returning turn is never refused its own lease");
+    assert.equal(back.overshoot, true, "and says so when it had to take it back over the cap");
+    assert.equal(back.leaseId, a.lease!.lease_id, "the same lease, not a new one");
+    assert.equal(blocked.snapshot().in_flight, 3, "the overshoot is real and countable, which is the price of never killing the turn");
+    assert.equal(blocked.snapshot().parked, 0);
+
+    // And when there IS room, the return is not an overshoot at all.
+    blocked.release(b.lease!.lease_id);
+    other.release(third.lease!.lease_id);
+    assert.equal(blocked.park(a.lease!.lease_id, "approval"), true);
+    const calm = await blocked.unpark(a.lease!.lease_id, { graceMs: 150, pollMs: 25, agent: "pm-agent", lane: "serve" });
+    assert.equal(calm.overshoot, false, "with capacity free, the common case is an ordinary re-entry");
+  } finally {
+    blocked.close();
+    other.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("seam 3: a turn whose lease was swept while parked re-acquires instead of dying", async () => {
+  const { AccountLedger } = await import("../src/account.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-park-swept-"));
+  const db = path.join(dir, "runs.db");
+  const led = new AccountLedger(db, { leaseTtlMs: 60 });
+  try {
+    led.setCap(2);
+    const mine = led.acquire({ agent: "pm-agent", lane: "serve", runId: "run_a" });
+    assert.ok(mine.ok);
+    led.park(mine.lease!.lease_id, "approval");
+    // The sweep takes it: the keepalive is what normally prevents this, so this
+    // is the case where the keepalive itself was starved.
+    await new Promise((r) => setTimeout(r, 80));
+    led.sweep({ alive: () => true });
+    assert.equal(led.leases().length, 0, "the row is gone");
+
+    const back = await led.unpark(mine.lease!.lease_id, { graceMs: 300, pollMs: 25, agent: "pm-agent", lane: "serve", runId: "run_a" });
+    assert.equal(back.ok, true, "a fresh lease is taken rather than the turn thrown away");
+    assert.notEqual(back.leaseId, mine.lease!.lease_id, "and it is a NEW lease, which the caller must swap into its live set");
+    assert.equal(back.overshoot, false);
+  } finally {
+    led.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("seam 3: when the account is full AND the lease was swept, the turn proceeds unslotted rather than dying", async () => {
+  // The honest failure, stated rather than hidden: this is the one path where a
+  // returning turn gets nothing back. It must not throw, because the model has
+  // already been paid for; the caller logs it and finishes the answer.
+  const { AccountLedger } = await import("../src/account.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-park-lost-"));
+  const led = new AccountLedger(path.join(dir, "runs.db"));
+  try {
+    led.setCap(1);
+    const gone = "lse_neverexisted";
+    led.acquire({ agent: "other", lane: "serve" }); // the one slot, taken by someone else
+    const back = await led.unpark(gone, { graceMs: 120, pollMs: 25, agent: "pm-agent", lane: "serve" });
+    assert.equal(back.ok, false, "no slot, and it says so");
+    assert.equal(back.leaseId, null);
+    assert.match(back.detail ?? "", /cap/, "the detail names why");
+  } finally {
+    led.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("seam 3: a named single-flight admits one holder, and a dead holder does not keep the name", async () => {
   const { AccountLedger } = await import("../src/account.js");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-sfl-"));
@@ -427,10 +530,10 @@ test("seam 4: the resident's lease scope covers everything after the slot, not j
   // Set remembers, so a leaked lease is renewed by the keepalive forever, for a
   // turn that never ran, and the account silently loses a slot.
   const src = fs.readFileSync(path.join(import.meta.dirname ?? ".", "..", "src", "resident.ts"), "utf8");
-  const openTry = src.indexOf("\n  try {", src.indexOf("const myLease = slot.lease"));
+  const openTry = src.indexOf("\n  try {", src.indexOf("const myLease = binding.leaseId"));
   const addLease = src.indexOf("liveLeases.add(myLease)");
   const enterSession = src.indexOf("sessions.enter(convoKey)");
-  const release = src.indexOf("liveLeases.delete(myLease)");
+  const release = src.indexOf("liveLeases.delete(binding.leaseId)");
   assert.ok(openTry > 0 && addLease > 0 && enterSession > 0 && release > 0, "every anchor is present");
   assert.ok(openTry < addLease, "the try opens BEFORE the lease joins the set, or a throw in between leaks it");
   assert.ok(openTry < enterSession, "and before the session is entered, or a throw leaves the conversation held");
@@ -438,6 +541,41 @@ test("seam 4: the resident's lease scope covers everything after the slot, not j
   // And the release names THIS turn's lease, never the whole set: a turn that
   // released every lease the process holds is the 2026-08-25 bug in reverse.
   assert.equal(/liveLeases\.clear\(\)/.test(src.slice(release - 400, release + 400)), false, "a turn never clears the whole set");
+  // Since rung 2 the finally must read the BINDING, not the id captured at
+  // admission: a blocked wait that lost its lease to the sweep re-acquires a new
+  // one (sect. 6.3), and releasing the captured id would leak the new lease for
+  // the life of the process, which the keepalive would then renew forever.
+  assert.equal(
+    /liveLeases\.delete\(myLease\)/.test(src),
+    false,
+    "the finally releases binding.leaseId, never the id captured before the blocked waits could swap it",
+  );
+});
+
+test("seam 4: the turn register answers only when ONE turn owns the process, and degrades rather than guessing", async () => {
+  // RFA-0.8 sect. 6.3 needs module-scope code (the nested-ask tool) to reach the
+  // running turn's lease and chain. The obvious shape is a `currentTurn` cell,
+  // and this repository has already paid for that one: a `currentLease` cell let
+  // a scheduled run and a serve run overwrite each other, so whichever finished
+  // first released the OTHER's lease. A register that returns null on ambiguity
+  // makes that class unreachable instead of unlikely.
+  const { TurnRegister } = await import("../src/turnbinding.js");
+  const reg = new TurnRegister();
+  const mk = (runId: string, leaseId: string) => ({
+    runId, leaseId, agent: "pm-agent", lane: "serve" as const, chain: null, replyBy: null, conversationId: null, taskId: null,
+  });
+  assert.equal(reg.current(), null, "no turn: nothing to park, nothing to chain");
+  const dropA = reg.bind(mk("run_a", "lse_a"));
+  assert.equal(reg.current()?.runId, "run_a");
+  const dropB = reg.bind(mk("run_b", "lse_b"));
+  assert.equal(reg.current(), null, "two turns: there is no lease that is right for BOTH, so the honest answer is none");
+  assert.equal(reg.liveCount(), 2, "and the caller can say why in its log");
+  dropB();
+  assert.equal(reg.current()?.runId, "run_a", "the survivor is unambiguous again");
+  dropB();
+  assert.equal(reg.liveCount(), 1, "unbinding twice is not a second removal");
+  dropA();
+  assert.equal(reg.current(), null);
 });
 
 test("seam 4: a throwing turn releases its conversation and its lease, and the next turn proceeds", async () => {

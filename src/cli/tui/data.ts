@@ -50,7 +50,7 @@ export interface StatusView {
   mode: "hub" | "remote";
   hub_url: string;
   hub: { running: boolean; healthy: boolean; pid: number | null; stale_pid_file: boolean; started_at: string | null; lock_heartbeat_age_ms: number | null };
-  supervisor: { running: boolean; pid: number | null; stale_pid_file: boolean; started_at: string | null; state_age_ms: number | null; account: { cap?: number; in_flight?: number; paused_until?: string | null; pause_reason?: string | null } | null };
+  supervisor: { running: boolean; pid: number | null; stale_pid_file: boolean; started_at: string | null; state_age_ms: number | null; account: { cap?: number; in_flight?: number; parked?: number; paused_until?: string | null; pause_reason?: string | null } | null };
   agents: AgentView[];
   rooms: RoomView[];
   rooms_source: "hub" | "file";

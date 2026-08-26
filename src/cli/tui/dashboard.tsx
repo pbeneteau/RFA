@@ -717,7 +717,7 @@ function Overview(props: { snap: Snapshot | null; hub: HubDir; aliasOf: (h: stri
                 <Dot state={s?.supervisor.running ? "ready" : "offline"} /> supervisor
               </Text>
             </Box>
-            <Text dimColor>{s ? (s.supervisor.running ? `pid ${s.supervisor.pid} · ${acct ? `${acct.in_flight ?? 0}/${acct.cap ?? "?"} in flight` : ""}${acct?.paused_until ? ` · PAUSED until ${acct.paused_until}` : ""}` : "not running · press u") : "…"}</Text>
+            <Text dimColor>{s ? (s.supervisor.running ? `pid ${s.supervisor.pid} · ${acct ? `${acct.in_flight ?? 0}/${acct.cap ?? "?"} in flight${acct.parked ? ` · ${acct.parked} blocked` : ""}` : ""}${acct?.paused_until ? ` · PAUSED until ${acct.paused_until}` : ""}` : "not running · press u") : "…"}</Text>
           </Box>
         </Panel>
         <Panel title={`agents (${s?.agents.length ?? 0})`} flexGrow={1}>

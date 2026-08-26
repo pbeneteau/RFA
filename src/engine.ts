@@ -13,6 +13,8 @@
 import Database from "better-sqlite3";
 import { randomBytes } from "node:crypto";
 import { Cron } from "croner";
+import { pidAlive } from "./account.js";
+import { effectClassOf, mayRetryUnsettled } from "./actionid.js";
 
 export type RunStatus = "pending" | "running" | "error" | "success" | "timeout" | "interrupted";
 export type ThreadStatus = "idle" | "busy" | "interrupted" | "error";
@@ -38,6 +40,32 @@ export interface Run {
   /** The pid that owns this run while it is `running`; NULL once it settles, or on a pre-0.8 row. */
   owner_pid: number | null;
 }
+
+/**
+ * One consumption record for one canonical action identity (RFA-0.8 sect. 6.4).
+ * The row IS the ledger the human used to be.
+ */
+export interface ActionClaim {
+  identity: string;
+  idempotency_key: string;
+  agent: string;
+  tool_name: string;
+  scope: string;
+  effect_class: string;
+  request_id: string | null;
+  run_id: string | null;
+  pid: number;
+  state: "claimed" | "settled" | "failed";
+  claimed_at: string;
+  settled_at: string | null;
+  outcome: string | null;
+}
+
+export type ActionClaimRefusal = "already_consumed" | "in_flight" | "unsettled_irreversible";
+
+export type ActionClaimResult =
+  | { ok: true; idempotency_key: string; reclaimed: "after_failure" | "after_dead_holder" | null }
+  | { ok: false; reason: ActionClaimRefusal; existing: ActionClaim; idempotency_key: string };
 
 /** The subprocess-resident checkpoint payload (spec 4.3). */
 export interface Checkpoint {
@@ -137,6 +165,34 @@ export class Engine {
       if (!cols.some((c) => c.name === "owner_pid")) this.db.exec(`ALTER TABLE runs ADD COLUMN owner_pid INTEGER`);
       this.db.exec(`CREATE INDEX IF NOT EXISTS idx_runs_owner ON runs(owner_pid) WHERE owner_pid IS NOT NULL`);
       this.db.pragma("user_version = 1");
+    }
+    if (current < 2) {
+      // RFA-0.8 sect. 6.4 item 2: approval-card consumption. The uniqueness
+      // constraint IS the mechanism, so the PRIMARY KEY on `identity` is not an
+      // index choice, it is the whole design: two processes racing one card
+      // identity both reach the INSERT and SQLite decides, which is the only
+      // decider that composes. Per-process sequencing measured 10 of 10
+      // cross-process double-fires on every durable backend tried, with no
+      // ceiling below sixteen racers.
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS action_claims (
+          identity TEXT PRIMARY KEY,
+          idempotency_key TEXT NOT NULL,
+          agent TEXT NOT NULL,
+          tool_name TEXT NOT NULL,
+          scope TEXT NOT NULL,
+          effect_class TEXT NOT NULL,
+          request_id TEXT,
+          run_id TEXT,
+          pid INTEGER NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('claimed','settled','failed')),
+          claimed_at TEXT NOT NULL,
+          settled_at TEXT,
+          outcome TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_action_claims_scope ON action_claims(scope, claimed_at);
+      `);
+      this.db.pragma("user_version = 2");
     }
   }
 
@@ -444,6 +500,132 @@ export class Engine {
     return rows.map((r) => ({ step_id: r.step_id, seq: r.seq, result: JSON.parse(r.result_json) }));
   }
 
+  // ---------------------------------------------------------------- approval-card consumption (RFA-0.8 sect. 6.4)
+
+  /**
+   * Claim the right to execute ONE approved action, exactly once.
+   *
+   * Placement is the requirement, not the mechanism: the claim is a
+   * uniqueness-constraint INSERT in a SHARED durable store, taken at the
+   * durable-state read path and BEFORE execution. `steps` above is the wrong
+   * table and it is worth saying why, because it looks close enough to reuse: a
+   * step is memoized per RUN, and the whole measured failure is a second RUN in
+   * a second PROCESS proposing the same action after a restart. Identity, not
+   * run id, is the key that survives that.
+   *
+   * Re-claim policy, which is where the effect class earns its keep:
+   *  - `settled`: refused, always. The action happened; that is the whole point.
+   *  - `claimed` by a LIVE process: refused. Somebody is executing it right now.
+   *  - `claimed` by a DEAD process: the outcome is unknown. An irreversible
+   *    action GATES here (refused, surfaced, a human settles it) rather than
+   *    compensating after; anything else may be taken over, and takes over the
+   *    ORIGINAL idempotency key so a downstream service that dedupes on it still
+   *    collapses the two attempts.
+   *  - `failed`: a fresh attempt is allowed, on the original key, for the same
+   *    reason.
+   */
+  claimAction(args: {
+    identity: string;
+    agent: string;
+    toolName: string;
+    scope: string;
+    effectClass: string;
+    requestId?: string | null;
+    runId?: string | null;
+    /** PID liveness for the takeover decision; injectable so tests need not fork. */
+    alive?: (pid: number) => boolean;
+  }): ActionClaimResult {
+    const alive = args.alive ?? pidAlive;
+    const tx = this.db.transaction((): ActionClaimResult => {
+      const existing = this.db.prepare(`SELECT * FROM action_claims WHERE identity = ?`).get(args.identity) as
+        | ActionClaim
+        | undefined;
+      if (existing) {
+        if (existing.state === "settled") {
+          return { ok: false, reason: "already_consumed", existing, idempotency_key: existing.idempotency_key };
+        }
+        if (existing.state === "claimed" && alive(existing.pid)) {
+          return { ok: false, reason: "in_flight", existing, idempotency_key: existing.idempotency_key };
+        }
+        if (existing.state === "claimed" && !mayRetryUnsettled(effectClassOf(existing.effect_class))) {
+          return { ok: false, reason: "unsettled_irreversible", existing, idempotency_key: existing.idempotency_key };
+        }
+        // Takeover or retry: same identity, same key, a new holder.
+        this.db
+          .prepare(
+            `UPDATE action_claims SET state = 'claimed', pid = ?, run_id = ?, request_id = ?, claimed_at = ?, settled_at = NULL, outcome = NULL WHERE identity = ?`,
+          )
+          .run(process.pid, args.runId ?? null, args.requestId ?? null, iso(), args.identity);
+        return {
+          ok: true,
+          idempotency_key: existing.idempotency_key,
+          reclaimed: existing.state === "failed" ? "after_failure" : "after_dead_holder",
+        };
+      }
+      const key = `idem_${randomBytes(12).toString("hex")}`;
+      this.db
+        .prepare(
+          `INSERT INTO action_claims (identity, idempotency_key, agent, tool_name, scope, effect_class, request_id, run_id, pid, state, claimed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?)`,
+        )
+        .run(
+          args.identity,
+          key,
+          args.agent,
+          args.toolName,
+          args.scope,
+          args.effectClass,
+          args.requestId ?? null,
+          args.runId ?? null,
+          process.pid,
+          iso(),
+        );
+      return { ok: true, idempotency_key: key, reclaimed: null };
+    });
+    // IMMEDIATE: two residents must not both read the absent row and then both insert.
+    return tx.immediate();
+  }
+
+  /**
+   * Record what the acting tool did. `ok: false` leaves the identity claimable
+   * again (`failed`), which is correct for a call that never reached the far
+   * side; a call whose OUTCOME is unknown must be left `claimed` instead, and
+   * the caller does that by simply not settling it.
+   */
+  settleAction(identity: string, result: { ok: boolean; outcome?: string }): void {
+    this.db
+      .prepare(`UPDATE action_claims SET state = ?, settled_at = ?, outcome = ? WHERE identity = ?`)
+      .run(result.ok ? "settled" : "failed", iso(), (result.outcome ?? "").slice(0, 500), identity);
+  }
+
+  /**
+   * The holder has stopped watching for this action's outcome (its turn ended
+   * without a tool result), but the outcome is still UNKNOWN.
+   *
+   * Not a settlement and not a failure: pid 0 is never alive, so the row now
+   * reads as an unsettled claim whose holder is gone, which is exactly the state
+   * the effect class was written to decide. An irreversible action stays gated
+   * until a human settles it; anything else may be taken over on the original
+   * idempotency key. Without this, a claim would keep this resident's live pid
+   * forever and every later proposal of the same action would read `in_flight`.
+   */
+  disownAction(identity: string): void {
+    this.db.prepare(`UPDATE action_claims SET pid = 0 WHERE identity = ? AND state = 'claimed' AND pid = ?`).run(identity, process.pid);
+  }
+
+  readAction(identity: string): ActionClaim | null {
+    return (this.db.prepare(`SELECT * FROM action_claims WHERE identity = ?`).get(identity) as ActionClaim | undefined) ?? null;
+  }
+
+  /** Claims stuck mid-flight: the operator's view of what a crash left unsettled. */
+  unsettledActions(opts: { agent?: string } = {}): ActionClaim[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM action_claims WHERE state = 'claimed'${opts.agent ? " AND agent = ?" : ""} ORDER BY claimed_at`,
+      )
+      .all(...(opts.agent ? [opts.agent] : [])) as ActionClaim[];
+  }
+
   // ---------------------------------------------------------------- schedules (Cloudflare's API shape)
 
   /**
@@ -571,15 +753,6 @@ interface ScheduleRow {
   next_fire_at: string | null;
 }
 
-/** PID liveness: EPERM is a live process we do not own. The same check the account sweep uses. */
-function pidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
 
 const iso = () => new Date().toISOString();
 const json = (v: unknown) => (v === undefined ? null : JSON.stringify(v));

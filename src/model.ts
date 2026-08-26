@@ -6,7 +6,16 @@ export type Role = "participant" | "observer" | "supervisor";
 /** Principal class, hub-derived at join (spec 14.1). Agents can never produce "human". */
 export type Origin = "human" | "agent";
 export type MessageKind = "chat" | "request" | "response" | "refuse" | "status" | "system";
-export type RefusalReason = "busy" | "ineligible" | "unauthorized" | "overloaded" | "expired" | "declined" | "deadline_expired";
+/** Wire Appendix B, all eight member-sendable (`would_deadlock` added in 0.1.9, section 8). */
+export type RefusalReason =
+  | "busy"
+  | "ineligible"
+  | "unauthorized"
+  | "overloaded"
+  | "expired"
+  | "declined"
+  | "deadline_expired"
+  | "would_deadlock";
 
 export interface AgentSkill {
   id: string;

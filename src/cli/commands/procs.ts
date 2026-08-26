@@ -170,7 +170,7 @@ interface SupervisorStateFile {
   ts?: string;
   pid?: number;
   agents?: Record<string, { pid: number | null; status: string; started_at: string | null; definition_hash: string; restarts_in_window: number }>;
-  account?: { cap?: number; in_flight?: number; paused_until?: string | null; pause_reason?: string | null };
+  account?: { cap?: number; in_flight?: number; parked?: number; paused_until?: string | null; pause_reason?: string | null };
 }
 
 function readLockHeartbeat(h: HubDir): { age_ms: number; pid: number | null } | null {
@@ -258,7 +258,7 @@ export const status: CommandDef = {
     if (ctx.flags.json) return void ctx.ui.json(s);
     const ui = ctx.ui;
     const hub = s.hub as { running: boolean; healthy: boolean; pid: number | null; stale_pid_file: boolean; started_at: string | null; lock_heartbeat_age_ms: number | null };
-    const sup = s.supervisor as { running: boolean; pid: number | null; stale_pid_file: boolean; started_at: string | null; state_age_ms: number | null; account: { cap?: number; in_flight?: number; paused_until?: string | null } | null };
+    const sup = s.supervisor as { running: boolean; pid: number | null; stale_pid_file: boolean; started_at: string | null; state_age_ms: number | null; account: { cap?: number; in_flight?: number; parked?: number; paused_until?: string | null } | null };
     ui.line(`${ui.bold(String(s.name))} · ${ui.dim(String(s.dir))}`);
     ui.blank();
     const hubLine = hub.healthy
@@ -268,7 +268,7 @@ export const status: CommandDef = {
         : `${ui.dim("○")} not running${hub.stale_pid_file ? ui.dim("   (stale pid file)") : ""}   ${ui.dim(s.mode === "remote" ? `remote hub ${s.hub_url}` : "rfa up")}`;
     ui.line(`hub          ${hubLine}`);
     const supLine = sup.running
-      ? `${ui.good("●")} running   pid ${sup.pid}   ${ui.dim(`account ${sup.account?.in_flight ?? 0}/${sup.account?.cap ?? "?"} in flight${sup.account?.paused_until ? ` · PAUSED until ${sup.account.paused_until}` : " · not paused"}${sup.started_at ? ` · up ${fmtDuration(Date.now() - Date.parse(sup.started_at))}` : ""}`)}`
+      ? `${ui.good("●")} running   pid ${sup.pid}   ${ui.dim(`account ${sup.account?.in_flight ?? 0}/${sup.account?.cap ?? "?"} in flight${sup.account?.parked ? ` · ${sup.account.parked} blocked (slot lent)` : ""}${sup.account?.paused_until ? ` · PAUSED until ${sup.account.paused_until}` : " · not paused"}${sup.started_at ? ` · up ${fmtDuration(Date.now() - Date.parse(sup.started_at))}` : ""}`)}`
       : `${ui.dim("○")} not running${sup.stale_pid_file ? ui.dim("   (stale pid file)") : ""}`;
     ui.line(`supervisor   ${supLine}`);
     ui.blank();

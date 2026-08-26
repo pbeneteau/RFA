@@ -25,6 +25,7 @@
  */
 import Database from "better-sqlite3";
 import { randomBytes } from "node:crypto";
+import { EFFECTIVE_DEFAULT_CAP } from "./hubdir.js";
 
 /** Admission classes, in the priority order of v0.4 section 7.4 layer 3. */
 export type Lane = "serve" | "schedule" | "background";
@@ -39,11 +40,42 @@ export const LANES: readonly Lane[] = ["serve", "schedule", "background"];
  */
 const RESERVE: Record<Lane, number> = { serve: 0, schedule: 1, background: 2 };
 
-/** One operator's laptop: the cap is small on purpose. Override with RFA_ACCOUNT_MAX_INFLIGHT. */
-export const DEFAULT_CAP = 3;
+/**
+ * The effective account concurrency default (RFA-0.8 sect. 5 item 8), re-exported
+ * from the manifest schema that owns it: the supervisor writes
+ * `agents.max_inflight` into the ledger at start, and every resident reads it
+ * back through `cap()`. One number, one home.
+ *
+ * The distinction below is not pedantry: it is load-bearing in the freeze
+ * analysis of sect. 6.3, where two blocked turns at cap 2 own the operator's
+ * entire account at zero model cost. Two research notes cited 3 as the effective
+ * cap and were wrong.
+ */
+export { EFFECTIVE_DEFAULT_CAP };
+
+/**
+ * The fallback when NO supervisor has ever written the cap: a bare
+ * `AccountLedger` on a fresh runs.db, a test, an `rfa` subcommand opening the
+ * store in process. Deliberately not the same number as the supervised default
+ * and deliberately not silent about it: an unsupervised ledger has no sweep
+ * behind it either, so its cap is a different fact about a different setup, not
+ * a second opinion about the same one.
+ *
+ * If you are reading this to answer "what is the cap here", the answer is
+ * `cap()`: whatever the supervisor wrote, else this.
+ */
+export const UNSUPERVISED_CAP = 3;
 
 /** A lease outlives one long turn but not a killed process. Renew from the caller's keepalive. */
 const LEASE_TTL_MS = 120_000;
+/**
+ * How long a returning turn waits for a genuine slot before taking its lent one
+ * back over the cap (sect. 6.3). Short on purpose: this is the tail of a turn
+ * that has already spent money, and the alternative to a brief overshoot is a
+ * long stall on a human who is waiting for the answer. Long enough that an
+ * ordinary turn finishing frees a slot first, which is the common case.
+ */
+const UNPARK_GRACE_MS = 5_000;
 /** Minimum account-wide hold after a provider rate limit; the supervisor escalates from here. */
 export const RATE_LIMIT_PAUSE_FLOOR_MS = 60_000;
 
@@ -55,6 +87,14 @@ export interface Lease {
   pid: number;
   acquired_at: string;
   expires_at: string;
+  /**
+   * When this lease PARKED its slot (RFA-0.8 sect. 6.3), else null. A parked
+   * lease is a turn that is alive and blocked but is not using a model slot, so
+   * it counts for nothing at admission and still counts for the sweep.
+   */
+  parked_at: string | null;
+  /** Why it parked, for the operator's meter: `ask` or `approval`. */
+  parked_reason: string | null;
 }
 
 export interface Admission {
@@ -76,7 +116,10 @@ export interface RateLimitReport {
 
 export interface AccountSnapshot {
   cap: number;
+  /** Turns holding a slot. A parked turn is NOT one of these; see `parked`. */
   in_flight: number;
+  /** Turns that are alive and blocked with their slot lent out (sect. 6.3). */
+  parked: number;
   by_lane: Record<Lane, number>;
   by_agent: Record<string, number>;
   paused_until: string | null;
@@ -150,8 +193,20 @@ export function isAuthError(err: unknown): boolean {
   return AUTH_FAILURE_RE.test(text);
 }
 
-/** PID liveness beats a TTL for a local sweep; EPERM is a live process we do not own. */
-function pidAlive(pid: number): boolean {
+/**
+ * PID liveness beats a TTL for a local sweep; EPERM is a live process we do not
+ * own. Exported because the engine's action-claim takeover asks the same
+ * question of the same kind of holder (RFA-0.8 sect. 6.4), and two hand-written
+ * copies of this are how a sweep and a claim come to disagree about who is dead.
+ */
+export function pidAlive(pid: number): boolean {
+  // Non-positive pids are not processes, and `process.kill` does NOT treat them
+  // as unknown: 0 signals the caller's whole process GROUP and -1 broadcasts, so
+  // both return success and read as "alive". Measured while building the action
+  // claim, which disowns a holder by writing pid 0: without this guard an
+  // abandoned claim looked in-flight forever, and a lease row that ever carried
+  // a 0 would never be swept.
+  if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
@@ -207,6 +262,14 @@ export class AccountLedger {
         handled INTEGER NOT NULL DEFAULT 0
       );
     `);
+    // Additive column migration for the slot park of RFA-0.8 sect. 6.3, by
+    // table_info rather than by `user_version`: the Engine owns `user_version`
+    // on THIS SAME FILE (runs.db), and a second counter on one database is two
+    // migrators disagreeing about what version means.
+    const leaseCols = this.db.prepare("PRAGMA table_info(account_leases)").all() as { name: string }[];
+    if (!leaseCols.some((c) => c.name === "parked_at")) this.db.exec(`ALTER TABLE account_leases ADD COLUMN parked_at TEXT`);
+    if (!leaseCols.some((c) => c.name === "parked_reason")) this.db.exec(`ALTER TABLE account_leases ADD COLUMN parked_reason TEXT`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_leases_parked ON account_leases(parked_at) WHERE parked_at IS NOT NULL`);
   }
 
   close(): void {
@@ -223,7 +286,13 @@ export class AccountLedger {
 
   cap(): number {
     const raw = Number(this.get("max_in_flight"));
-    return Number.isInteger(raw) && raw >= 1 ? raw : DEFAULT_CAP;
+    return Number.isInteger(raw) && raw >= 1 ? raw : UNSUPERVISED_CAP;
+  }
+
+  /** True while no supervisor has written a cap, so `cap()` is the unsupervised fallback. */
+  capIsFallback(): boolean {
+    const raw = Number(this.get("max_in_flight"));
+    return !(Number.isInteger(raw) && raw >= 1);
   }
 
   /** Per-lane admission ceiling. Clamped to 1 so a cap of 1 still admits every lane, one at a time. */
@@ -254,7 +323,10 @@ export class AccountLedger {
       }
       const cap = this.cap();
       const limit = this.laneLimit(req.lane, cap);
-      const inFlight = (this.db.prepare(`SELECT COUNT(*) AS n FROM account_leases`).get() as { n: number }).n;
+      // Only leases HOLDING a slot count. A parked lease belongs to a turn that
+      // is blocked on a nested ask or an approval card and is spending nothing
+      // (sect. 6.3): counting it would be the freeze this rung exists to remove.
+      const inFlight = this.liveSlotCount();
       if (inFlight >= limit) {
         return {
           ok: false,
@@ -272,6 +344,8 @@ export class AccountLedger {
         pid: process.pid,
         acquired_at: new Date(now).toISOString(),
         expires_at: new Date(now + this.ttlMs).toISOString(),
+        parked_at: null,
+        parked_reason: null,
       };
       this.db
         .prepare(
@@ -338,6 +412,113 @@ export class AccountLedger {
     });
     tx.immediate();
     return { renewed, lost };
+  }
+
+  // ---------------------------------------------------------------- the slot park (RFA-0.8 sect. 6.3)
+
+  /**
+   * Lend this lease's SLOT while its turn is blocked, keeping the row.
+   *
+   * A blocked turn holds its account slot today, both across a nested ask and
+   * across an approval-card wait, which block identically. That is the whole
+   * freeze: at the effective cap of 2 (`EFFECTIVE_DEFAULT_CAP`), two blocked
+   * turns own the operator's entire account for the length of a reply window at
+   * ZERO model cost. It is also the stated precondition for admitting any remote
+   * peer into a room whose local members make nested asks (sect. 13 item 4),
+   * because provoking a depth-2 chain costs the peer one request inside its own
+   * rate budget and costs the operator everything.
+   *
+   * DOWNGRADE, NOT RELEASE, and this is the deliberate decision sect. 6.3 leaves
+   * open. The SDK enforces its budgets BETWEEN model requests, so a turn that
+   * fully released its lease and then had to win a fresh admission on the way
+   * back could die on `waitForSlot` AFTER the model had already spent the
+   * operator's money: the worst of both, a bill and no answer. Keeping the row
+   * makes the return a state flip on a row this process already owns, which
+   * cannot be refused. The three alternatives and why not:
+   *   - a reserved re-entry (hold a slot back for the returning turn) is just a
+   *     slower version of not lending it at all, since the reservation is
+   *     exactly the capacity the lend was supposed to free;
+   *   - re-acquiring on return is the failure above, priced in tokens;
+   *   - accepting the freeze with an honest refusal is what HEAD already does,
+   *     and the refusal is honest but the account is still frozen.
+   *
+   * The price, stated rather than hidden: `unpark` can push the account
+   * transiently over the cap (see there). Presence and the heartbeat are NOT
+   * touched by any of this. They are a different clock, and a blocked resident
+   * that stops renewing looks `gone_quiet`, which was found live in v0.4.6 when
+   * a scribe was SIGTERMed 38 seconds after a human approved its save. Only the
+   * slot is lent; the keepalive keeps renewing a parked lease exactly as before.
+   *
+   * Returns false when the row is already gone (swept, or released by the
+   * caller), which is not an error: the caller simply has no slot to lend.
+   */
+  park(leaseId: string, reason: string): boolean {
+    return (
+      this.db
+        .prepare(`UPDATE account_leases SET parked_at = ?, parked_reason = ? WHERE lease_id = ? AND parked_at IS NULL`)
+        .run(new Date().toISOString(), reason.slice(0, 64), leaseId).changes > 0
+    );
+  }
+
+  /**
+   * Take the slot back when the blocked wait returns.
+   *
+   * This never fails the turn, by construction. Three outcomes:
+   *
+   *  1. The row is still ours and capacity exists: clear the park, done.
+   *  2. The row is still ours and the account is FULL: wait up to `graceMs` for
+   *     a genuine slot, then take it anyway and report `overshoot: true`. The
+   *     overshoot is real and bounded: at most one park per resident process
+   *     while the turn lock holds one turn per process, so the account can sit
+   *     at cap + (parked residents returning) for the tail of those turns. That
+   *     is a smaller and shorter violation than the freeze it replaces, and it
+   *     is visible in `snapshot().parked` and in the caller's log rather than
+   *     inferred. Rung 3 narrows the turn lock to one turn per SESSION; when it
+   *     does, this bound is the thing it has to keep.
+   *  3. The row is GONE (the sweep took it, or the process was out of the table
+   *     long enough for its TTL to lapse): try one honest admission for a fresh
+   *     lease within the same grace, and if that is refused, return `ok: false`
+   *     so the caller proceeds UNSLOTTED with a loud log. A turn that has
+   *     already spent tokens is never killed for want of bookkeeping.
+   */
+  async unpark(
+    leaseId: string,
+    opts: { graceMs?: number; pollMs?: number; agent?: string; lane?: Lane; runId?: string | null } = {},
+  ): Promise<{ ok: boolean; overshoot: boolean; leaseId: string | null; detail?: string }> {
+    const row = this.db.prepare(`SELECT * FROM account_leases WHERE lease_id = ?`).get(leaseId) as Lease | undefined;
+    if (!row) {
+      // Outcome 3: our row is gone. Ask for a new one, honestly, then give up
+      // rather than throw.
+      if (!opts.agent) return { ok: false, overshoot: false, leaseId: null, detail: "lease gone and no agent given to re-acquire" };
+      const again = await this.waitForSlot(
+        { agent: opts.agent, lane: opts.lane ?? "serve", runId: opts.runId ?? null },
+        { timeoutMs: opts.graceMs ?? UNPARK_GRACE_MS, pollMs: opts.pollMs ?? 250 },
+      );
+      return again.ok && again.lease
+        ? { ok: true, overshoot: false, leaseId: again.lease.lease_id }
+        : { ok: false, overshoot: false, leaseId: null, detail: again.detail ?? "no slot after the lease was swept" };
+    }
+    if (!row.parked_at) return { ok: true, overshoot: false, leaseId };
+
+    const deadline = Date.now() + (opts.graceMs ?? UNPARK_GRACE_MS);
+    const limit = this.laneLimit(row.lane);
+    while (this.liveSlotCount() >= limit && Date.now() < deadline) {
+      await sleep(Math.min(opts.pollMs ?? 250, Math.max(1, deadline - Date.now())));
+    }
+    const overshoot = this.liveSlotCount() >= limit;
+    // Unconditional: the row is ours and the turn has already paid for it.
+    this.db.prepare(`UPDATE account_leases SET parked_at = NULL, parked_reason = NULL WHERE lease_id = ?`).run(leaseId);
+    return {
+      ok: true,
+      overshoot,
+      leaseId,
+      ...(overshoot ? { detail: `resumed over the cap (lane ${row.lane} limit ${limit}); the slot was lent and is being taken back` } : {}),
+    };
+  }
+
+  /** Leases holding a slot right now: what admission counts, parked ones excluded. */
+  private liveSlotCount(): number {
+    return (this.db.prepare(`SELECT COUNT(*) AS n FROM account_leases WHERE parked_at IS NULL`).get() as { n: number }).n;
   }
 
   /** Idempotent: releasing an already-swept lease is not an error. */
@@ -409,14 +590,26 @@ export class AccountLedger {
     this.db.prepare(`DELETE FROM account_locks WHERE name = ? AND token = ?`).run(name, token);
   }
 
-  inFlight(rows: Lease[] = this.leases()): { total: number; byLane: Record<Lane, number>; byAgent: Record<string, number> } {
+  /**
+   * What is actually running. Parked leases are counted separately, not folded
+   * in: a meter that reports a blocked turn as in-flight tells the operator the
+   * account is busy when it is idle, which is the same lie the freeze told.
+   */
+  inFlight(rows: Lease[] = this.leases()): { total: number; parked: number; byLane: Record<Lane, number>; byAgent: Record<string, number> } {
     const byLane = { serve: 0, schedule: 0, background: 0 } as Record<Lane, number>;
     const byAgent: Record<string, number> = {};
+    let total = 0;
+    let parked = 0;
     for (const r of rows) {
+      if (r.parked_at) {
+        parked++;
+        continue;
+      }
+      total++;
       byLane[r.lane]++;
       byAgent[r.agent] = (byAgent[r.agent] ?? 0) + 1;
     }
-    return { total: rows.length, byLane, byAgent };
+    return { total, parked, byLane, byAgent };
   }
 
   leases(): Lease[] {
@@ -519,11 +712,12 @@ export class AccountLedger {
   /** The operator-facing view; the supervisor publishes it in supervisor-state.json. */
   snapshot(): AccountSnapshot {
     const leases = this.leases();
-    const { total, byLane, byAgent } = this.inFlight(leases);
+    const { total, parked, byLane, byAgent } = this.inFlight(leases);
     const until = this.pausedUntil();
     return {
       cap: this.cap(),
       in_flight: total,
+      parked,
       by_lane: byLane,
       by_agent: byAgent,
       paused_until: until ? new Date(until).toISOString() : null,

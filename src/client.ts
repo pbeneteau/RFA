@@ -10,11 +10,12 @@
  * Speaks the modern-era (2026-07-28) MCP wire over HTTP; works against any
  * conforming hub.
  */
+import { BlockedChains, CHAIN_EXT, readChain, wouldDeadlockDetail, type ChainRef } from "./chainid.js";
 import type { AgentCard, Envelope, Part, PresenceRecord, RefusalReason, RfaEvent, SendResult } from "./model.js";
 import { neutralize, renderWrapped } from "./wrap.js";
 
-/** Wire 12.4 (0.1.8) added `deadline_expired`; `RefusalReason` and the hub's send schema still predate it. */
-export type SendableRefusalReason = RefusalReason | "deadline_expired";
+/** Every reason in the wire Appendix B registry is member-sendable; this alias remains for callers. */
+export type SendableRefusalReason = RefusalReason;
 
 const META = {
   "io.modelcontextprotocol/protocolVersion": "2026-07-28",
@@ -108,6 +109,23 @@ export class RoomMember {
   roster: PresenceRecord[];
   private clientInfo: { name: string; version: string };
   private cardCache = new Map<string, AgentCard>();
+  /**
+   * Call chains this member is currently blocked on (wire 8, 0.1.9). Populated
+   * by `ask` for the length of its wait; read by the same wait to refuse a
+   * request that would close the cycle.
+   */
+  private readonly blockedChains = new BlockedChains();
+  /**
+   * Requests this client already answered INLINE, from inside an ask wait
+   * (today: `would_deadlock` refusals).
+   *
+   * `serve()` runs its own cursor and will fetch the very same request on its
+   * next window, so without this set the asker gets a refusal now and a real
+   * answer minutes later, from a turn nobody is waiting on. Bounded and FIFO-
+   * pruned; a message id that falls out has long since been passed by both
+   * cursors.
+   */
+  private readonly refusedInline = new Set<string>();
 
   private constructor(init: {
     hubUrl: string;
@@ -290,10 +308,23 @@ export class RoomMember {
   async ask(
     target: string,
     text: string,
-    opts: { timeoutMs?: number; conversationId?: string; extraParts?: Part[]; replyByMs?: number } = {},
+    opts: {
+      timeoutMs?: number;
+      conversationId?: string;
+      extraParts?: Part[];
+      replyByMs?: number;
+      /**
+       * The chain this ask belongs to (wire 8, 0.1.9), computed by the caller
+       * from the request it is currently serving (`nextChain`). Null or absent
+       * means "not made while serving anything", so nothing is stamped and
+       * nothing is watched: an unchained ask cannot close a chained cycle.
+       */
+      chain?: ChainRef | null;
+    } = {},
   ): Promise<AskResult> {
     const timeoutMs = opts.timeoutMs ?? 120_000;
     const messageId = mid("msg_ask_" + this.name.replace(/[^a-zA-Z0-9]/g, "").slice(0, 8));
+    const chain = opts.chain ?? null;
     const sent = await this.call("room_send", {
       message_id: messageId,
       kind: "request",
@@ -301,56 +332,113 @@ export class RoomMember {
       conversation_id: opts.conversationId,
       reply_by: new Date(Date.now() + (opts.replyByMs ?? timeoutMs)).toISOString(),
       body: [{ type: "text", text }, ...(opts.extraParts ?? [])],
+      ...(chain ? { ext: { [CHAIN_EXT]: chain } } : {}),
     });
-    // This wait runs on its OWN cursor, starting at our send's seq, and never
-    // touches `this.cursor`. Two things follow. First, ask() is now legal from
-    // a serving member (this used to throw busy_loop): the log is replayable,
-    // so two concurrent listens cannot steal each other's events, and serve()'s
-    // own filters already skip response kinds and our own traffic; only a
-    // SHARED cursor made concurrency unsafe. Second, the old bug class is gone
-    // by construction: advancing the shared cursor to our own send silently
-    // swallowed anything appended in between (an integrator hit that), and an
-    // isolated cursor has nothing to swallow from.
+    // Blocked from the moment the request is on the wire, not from the first
+    // listen: the peer can answer, and re-ask, faster than this loop turns over.
+    const unblock = chain ? this.blockedChains.enter(chain.id) : () => {};
+    try {
+      // This wait runs on its OWN cursor, starting at our send's seq, and never
+      // touches `this.cursor`. Two things follow. First, ask() is now legal from
+      // a serving member (this used to throw busy_loop): the log is replayable,
+      // so two concurrent listens cannot steal each other's events, and serve()'s
+      // own filters already skip response kinds and our own traffic; only a
+      // SHARED cursor made concurrency unsafe. Second, the old bug class is gone
+      // by construction: advancing the shared cursor to our own send silently
+      // swallowed anything appended in between (an integrator hit that), and an
+      // isolated cursor has nothing to swallow from.
 
-    const deadline = Date.now() + timeoutMs;
-    const chunks: Envelope[] = [];
-    let since = sent.seq as number;
-    while (Date.now() < deadline) {
-      const window = Math.max(1_000, Math.min(25_000, deadline - Date.now()));
-      const res = await this.call("room_listen", { since, timeout_ms: window, wait_for: "mentions" });
-      since = res.cursor as number;
-      if (res.epoch !== this.epoch) await this.refreshRoster();
-      const events = res.events as RfaEvent[];
-      for (const event of events) {
-        if (event.type === "system" && event.refs?.message_id === messageId && event.event === "timeout") {
-          throw new RfaClientError("reply_timeout", `no reply to ${messageId} before its reply_by`, { target });
-        }
-        if (event.type === "system" && event.event === "gone_quiet" && Array.isArray(event.refs.askers) && event.refs.askers.includes(this.memberId)) {
-          throw new RfaClientError("gone_quiet", `the member owing a reply went offline`, { refs: event.refs });
-        }
-        if (event.type !== "message") continue;
-        const env = event.envelope;
-        if (env.in_reply_to !== messageId) continue;
-        if (env.kind === "refuse") {
-          return { kind: "refuse", text: textOf(env.body), parts: env.body, envelope: env, refusal: env.refusal };
-        }
-        if (env.kind === "response" || env.kind === "chat") {
-          if (env.chunk && !env.chunk.final) {
-            chunks.push(env);
-            continue;
+      const deadline = Date.now() + timeoutMs;
+      const chunks: Envelope[] = [];
+      let since = sent.seq as number;
+      while (Date.now() < deadline) {
+        const window = Math.max(1_000, Math.min(25_000, deadline - Date.now()));
+        const res = await this.call("room_listen", { since, timeout_ms: window, wait_for: "mentions" });
+        since = res.cursor as number;
+        if (res.epoch !== this.epoch) await this.refreshRoster();
+        const events = res.events as RfaEvent[];
+        for (const event of events) {
+          if (event.type === "system" && event.refs?.message_id === messageId && event.event === "timeout") {
+            throw new RfaClientError("reply_timeout", `no reply to ${messageId} before its reply_by`, { target });
           }
-          const all = [...chunks, env];
-          return {
-            kind: "response",
-            text: all.map((e) => textOf(e.body)).filter(Boolean).join("\n"),
-            parts: all.flatMap((e) => e.body),
-            envelope: env,
-            refusal: null,
-          };
+          if (event.type === "system" && event.event === "gone_quiet" && Array.isArray(event.refs.askers) && event.refs.askers.includes(this.memberId)) {
+            throw new RfaClientError("gone_quiet", `the member owing a reply went offline`, { refs: event.refs });
+          }
+          if (event.type !== "message") continue;
+          const env = event.envelope;
+          // Cycle refusal (wire 8, 0.1.9). THIS is the loop that can do it: the
+          // serve loop is doubly serial, so while a turn is out on this ask it is
+          // not reading requests at all, and the incoming request that would close
+          // the cycle sits unread until reply_by. This wait, on its own cursor,
+          // sees it. Refusing here is what turns 120 s of dead air into an
+          // immediate, machine-readable answer, and it works BEFORE rung 3's
+          // dispatcher exists (Orleans-style interleaving is REJECTED and
+          // turn-splitting is PARKED, so the turn itself must not interleave).
+          if (env.kind === "request" && env.from.id !== this.memberId) {
+            const incoming = readChain(env.ext);
+            if (this.blockedChains.has(incoming?.id)) {
+              await this.refuseCycle(env, incoming!);
+              continue;
+            }
+          }
+          if (env.in_reply_to !== messageId) continue;
+          if (env.kind === "refuse") {
+            return { kind: "refuse", text: textOf(env.body), parts: env.body, envelope: env, refusal: env.refusal };
+          }
+          if (env.kind === "response" || env.kind === "chat") {
+            if (env.chunk && !env.chunk.final) {
+              chunks.push(env);
+              continue;
+            }
+            const all = [...chunks, env];
+            return {
+              kind: "response",
+              text: all.map((e) => textOf(e.body)).filter(Boolean).join("\n"),
+              parts: all.flatMap((e) => e.body),
+              envelope: env,
+              refusal: null,
+            };
+          }
         }
       }
+      throw new RfaClientError("ask_timeout", `no reply from ${target} within ${timeoutMs}ms`, { target });
+    } finally {
+      unblock();
     }
-    throw new RfaClientError("ask_timeout", `no reply from ${target} within ${timeoutMs}ms`, { target });
+  }
+
+  /**
+   * Refuse one request that would close a call chain this member is blocked on
+   * (wire 8, 0.1.9), and remember that we did, so `serve()` does not answer it
+   * again on its own cursor minutes later.
+   *
+   * Best-effort by design: a send that fails here (the room ended, a rate limit)
+   * must not take down the ask that is still waiting for its own reply. Failing
+   * to refuse degrades to exactly the pre-0.1.9 behaviour, which is the
+   * `reply_by` clock.
+   */
+  private async refuseCycle(env: Envelope, chain: ChainRef): Promise<void> {
+    this.noteInlineRefusal(env.message_id);
+    try {
+      await this.send({
+        kind: "refuse",
+        inReplyTo: env.message_id,
+        conversationId: env.conversation_id ?? undefined,
+        to: [env.from.id],
+        refusal: { reason: "would_deadlock", detail: wouldDeadlockDetail(chain) },
+        body:
+          `I am already blocked waiting on this same call chain (${chain.id}), so answering you would deadlock us both. ` +
+          `Answer with what you have, or re-ask once I am free.`,
+      });
+    } catch {
+      /* the clock is the backstop; see above */
+    }
+  }
+
+  /** Bounded FIFO: 500 ids is far more than either cursor can be behind. */
+  private noteInlineRefusal(messageId: string): void {
+    this.refusedInline.add(messageId);
+    if (this.refusedInline.size > 500) this.refusedInline.delete(this.refusedInline.values().next().value as string);
   }
 
   /**
@@ -405,6 +493,11 @@ export class RoomMember {
           const env = event.envelope;
           if (env.from.id === this.memberId) continue;
           if (env.kind !== "request" && env.kind !== "chat") continue;
+          // Already refused inline from an ask wait (wire 8's would_deadlock).
+          // Both loops read the same log on separate cursors, so without this
+          // the asker would get the refusal now and a full answer later, from a
+          // turn nobody is waiting on any more.
+          if (this.refusedInline.has(env.message_id)) continue;
           const text = textOf(env.body);
           if (!text.trim()) continue;
           try {

@@ -141,6 +141,29 @@ export const agentDefSchema = z.object({
            * it wastes the scarcest thing the platform has.
            */
           require_one_of: z.array(z.string()).optional(),
+          /**
+           * How this action fails when its outcome is UNKNOWN, which is the only
+           * question that matters after a crash between the consumption claim
+           * and the tool's answer (RFA-0.8 sect. 6.4 item 3). `irreversible`
+           * (the default, applied wherever this is absent) gates until a human
+           * settles it; the compensate-after shape is the fallback for the other
+           * two, and only for them. Measured: 0 of 500 leaked sends under
+           * gate-until-settlement versus 400 of 500 under compensation.
+           */
+          effect_class: z.enum(["irreversible", "reversible_with_cost", "reversible"]).optional(),
+          /**
+           * The input field this tool accepts an idempotency key on, if it has
+           * one. When named, the key minted by the consumption claim is merged
+           * into the call, so a service that dedupes on it collapses two
+           * attempts of one approved action.
+           *
+           * Opt-in on purpose. Injecting an undeclared field into a third-party
+           * tool's input is a schema break, and this rung must not make approved
+           * calls start failing at the tool's door: that is the same class of
+           * failure as the Linear save that died for want of a project, which is
+           * what `require_one_of` above exists to prevent.
+           */
+          idempotency_key_field: z.string().min(1).max(64).optional(),
         }),
       ]),
     )

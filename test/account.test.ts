@@ -4,7 +4,7 @@ import { test } from "node:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { AccountLedger, DEFAULT_CAP, isRateLimitError } from "../src/account.js";
+import { AccountLedger, UNSUPERVISED_CAP, isRateLimitError } from "../src/account.js";
 import { Engine } from "../src/engine.js";
 
 function tmpDb(): string {
@@ -15,7 +15,7 @@ test("the cap is the supervisor's number, and lane limits encode the priority or
   const db = tmpDb();
   const a = new AccountLedger(db);
   try {
-    assert.equal(a.cap(), DEFAULT_CAP, "an unset cap falls back to the default, never to unlimited");
+    assert.equal(a.cap(), UNSUPERVISED_CAP, "an unset cap falls back to the unsupervised fallback, never to unlimited");
     a.setCap(3);
     // serve (approvals + human-facing) may fill the cap; scheduled work leaves one
     // slot for a human; consolidation/evals/judges leave two.
@@ -185,7 +185,7 @@ test("the ledger shares runs.db with the engine, and publishes an operator view"
     assert.equal(engine.get(runId)?.status, "running");
     const snap = account.snapshot();
     assert.equal(snap.in_flight, 1);
-    assert.equal(snap.cap, DEFAULT_CAP);
+    assert.equal(snap.cap, UNSUPERVISED_CAP);
     assert.equal(snap.paused_until, null);
     assert.equal(snap.leases[0].agent, "pm-agent");
   } finally {

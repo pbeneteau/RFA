@@ -283,7 +283,24 @@ export function createHubServer(hub: RoomHub): McpServer {
             // `deadline_expired` (spec 12.4) is a clock, distinct from `declined`,
             // which is a human saying no. The sender's own client emits it; the
             // hub never speaks in a member's voice.
-            reason: z.enum(["busy", "ineligible", "unauthorized", "overloaded", "expired", "declined", "deadline_expired"]),
+            //
+            // `would_deadlock` (spec 8, 0.1.9) is sender-produced for the same
+            // reason: a member blocked on a call chain refusing a request that
+            // carries its own chain id. Accepting the reason in the enum is the
+            // whole of the hub's part in it. The hub MUST NOT refuse admission
+            // or delivery on chain-id grounds, so it does not read the chain ext
+            // at all, and a non-conforming counterparty simply fails open to the
+            // reply_by clock.
+            reason: z.enum([
+              "busy",
+              "ineligible",
+              "unauthorized",
+              "overloaded",
+              "expired",
+              "declined",
+              "deadline_expired",
+              "would_deadlock",
+            ]),
             detail: z.string().max(200).optional(),
             retry_after_s: z.number().int().optional(),
           })

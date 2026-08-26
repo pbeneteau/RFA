@@ -9,13 +9,18 @@
  * are watched by a lazy OBSERVER sidekick membership (`<name>-hitl`): cheap,
  * read-only, and it can never eat a question meant for the serve loop.
  */
-import { RoomMember } from "./client.js";
+import { ACTION_IDENTITY_EXT, EFFECT_CLASS_EXT, type EffectClass } from "./actionid.js";
 import type { AgentDef } from "./agentdef.js";
+import { RoomMember } from "./client.js";
 
 export interface InterruptRule {
   allowed_decisions?: ("approve" | "edit" | "reject" | "respond")[];
   /** Input keys of which one must be present before a human is paged (src/agentdef.ts). */
   require_one_of?: string[];
+  /** How this action fails when its outcome is unknown (RFA-0.8 sect. 6.4 item 3); default `irreversible`. */
+  effect_class?: EffectClass;
+  /** The input field this tool takes an idempotency key on, when it has one (sect. 6.4 item 2). */
+  idempotency_key_field?: string;
 }
 
 /** Match a tool name against interrupt_on keys (trailing `*` = prefix glob; an exact rule always beats a glob). */
@@ -24,8 +29,26 @@ export function interruptMatch(
   toolName: string,
 ): InterruptRule | null {
   const entries = Object.entries(interruptOn ?? {});
-  const resolve = (rule: boolean | { allowed_decisions?: InterruptRule["allowed_decisions"]; require_one_of?: string[] }): InterruptRule | null =>
-    rule === false ? null : rule === true ? {} : { allowed_decisions: rule.allowed_decisions, ...(rule.require_one_of ? { require_one_of: rule.require_one_of } : {}) };
+  const resolve = (
+    rule:
+      | boolean
+      | {
+          allowed_decisions?: InterruptRule["allowed_decisions"];
+          require_one_of?: string[];
+          effect_class?: EffectClass;
+          idempotency_key_field?: string;
+        },
+  ): InterruptRule | null =>
+    rule === false
+      ? null
+      : rule === true
+        ? {}
+        : {
+            allowed_decisions: rule.allowed_decisions,
+            ...(rule.require_one_of ? { require_one_of: rule.require_one_of } : {}),
+            ...(rule.effect_class ? { effect_class: rule.effect_class } : {}),
+            ...(rule.idempotency_key_field ? { idempotency_key_field: rule.idempotency_key_field } : {}),
+          };
   const exact = entries.find(([p]) => p === toolName);
   if (exact) return resolve(exact[1] as never);
   const glob = entries.find(([p]) => p.endsWith("*") && toolName.startsWith(p.slice(0, -1)));
@@ -39,6 +62,8 @@ export interface ApprovalOutcome {
   reason: string;
   /** A clock closed the window, not a person (wire 12.4: `expired`, never `rejected`). */
   expired?: boolean;
+  /** The card this outcome answers, recorded on the consumption claim so the ledger names which approval fired. */
+  requestId?: string;
 }
 
 /** Delivery margin subtracted from the asker's deadline, so the card dies first (spec 16.1). */
@@ -127,6 +152,22 @@ export async function requestApproval(
     allowedDecisions?: string[];
     timeoutMs?: number;
     runId?: string;
+    /**
+     * The canonical action identity (RFA-0.8 sect. 6.4 item 1) and its effect
+     * class, riding the wire ext keys registered in 0.1.9 beside the approval
+     * ext. Both are requester-supplied untrusted data the hub carries
+     * uninspected, exactly like `params`.
+     */
+    actionIdentity?: string;
+    effectClass?: EffectClass;
+    /**
+     * Run `fn` with this turn's account slot lent out (RFA-0.8 sect. 6.3). An
+     * approval wait blocks EXACTLY like a nested ask, for far longer, and a
+     * turn sitting on a card for half an hour must not hold a slot the whole
+     * time. Injected rather than reached for, because the lease belongs to the
+     * turn and this module has no business knowing about the ledger.
+     */
+    parkSlot?: <T>(reason: "approval", fn: () => Promise<T>) => Promise<T>;
   },
 ): Promise<ApprovalOutcome> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_APPROVAL_WINDOW_MS;
@@ -161,16 +202,42 @@ export async function requestApproval(
         allowed_decisions: opts.allowedDecisions ?? ["approve", "edit", "reject"],
         expires_at: new Date(Date.now() + timeoutMs).toISOString(),
       },
+      // Two sibling keys, not fields of the approval ext (wire 12.5, 0.1.9):
+      // their semantics are platform-owned and a receiver that knows neither
+      // ignores them by section 8. They exist so a decider, and a second card
+      // for the same action, can be recognised as the SAME action across
+      // retries, restarts and processes.
+      ...(opts.actionIdentity ? { [ACTION_IDENTITY_EXT]: opts.actionIdentity } : {}),
+      ...(opts.effectClass ? { [EFFECT_CLASS_EXT]: opts.effectClass } : {}),
     },
   });
 
   // Watch from the request's seq; the sidekick's cursor is ours to spend.
   sidekick.cursor = send.seq;
+  const park = opts.parkSlot ?? (async <T>(_reason: "approval", fn: () => Promise<T>) => fn());
+  return park("approval", () => waitForDecision(member, sidekick, requestId, timeoutMs));
+}
+
+/**
+ * The decision wait itself, split out so the slot park wraps exactly it: the
+ * card is already published and the turn is doing nothing but waiting, which is
+ * the whole window sect. 6.3 is about.
+ */
+async function waitForDecision(
+  member: RoomMember,
+  sidekick: RoomMember,
+  requestId: string,
+  timeoutMs: number,
+): Promise<ApprovalOutcome> {
   const deadline = Date.now() + timeoutMs + 5_000;
   while (Date.now() < deadline) {
-    // The serve loop is blocked on us, so the MAIN member's lease renewal is
-    // our job here: without this the resident goes gone_quiet mid-approval
-    // (found live) and the asker rightly gives up on it.
+    // The serve loop is blocked on us, so the MAIN member's PRESENCE lease
+    // renewal is our job here: without this the resident goes gone_quiet
+    // mid-approval (found live) and the asker rightly gives up on it. Note what
+    // this is not: the caller may have lent its ACCOUNT slot out for the length
+    // of this wait (RFA-0.8 sect. 6.3), and that is a different clock. Presence
+    // says "I am still here", the account slot says "I am spending". A blocked
+    // turn is the first and not the second.
     await member.setPresence("busy", { detail: "awaiting human approval" }).catch(() => {});
     const events = await sidekick.listenOnce({ timeoutMs: 20_000, waitFor: "all" });
     for (const e of events) {
@@ -178,18 +245,18 @@ export async function requestApproval(
         const refs = e.refs as { request_id?: string; params?: Record<string, unknown> };
         if (refs.request_id !== requestId) continue;
         return e.verb === "approve"
-          ? { approved: true, params: refs.params, reason: `approved by ${e.actor}${refs.params ? " (edited)" : ""}` }
-          : { approved: false, reason: `rejected by ${e.actor}` };
+          ? { approved: true, params: refs.params, reason: `approved by ${e.actor}${refs.params ? " (edited)" : ""}`, requestId }
+          : { approved: false, reason: `rejected by ${e.actor}`, requestId };
       }
       if (e.type === "system" && e.event === "approval_expired") {
         const refs = e.refs as { request_id?: string };
-        if (refs.request_id === requestId) return { approved: false, reason: "approval expired unanswered", expired: true };
+        if (refs.request_id === requestId) return { approved: false, reason: "approval expired unanswered", expired: true, requestId };
       }
     }
   }
   // The sweep's event never reached us, but the window closed all the same:
   // still a clock, so still `expired` rather than a human refusal (12.4).
-  return { approved: false, reason: "approval wait timed out", expired: true };
+  return { approved: false, reason: "approval wait timed out", expired: true, requestId };
 }
 
 /** The lazy observer sidekick: joined once per resident process, reused. */
