@@ -11,7 +11,7 @@ import { CliError, numberFlag, type CliContext } from "../context.js";
 import { openHubCall, type HubCall } from "../hubaccess.js";
 import { pickOne } from "../prompts.js";
 import type { CommandDef } from "../router.js";
-import { fmtAge } from "../ui.js";
+import { byRoomInterest, fmtAge } from "../ui.js";
 import { createRoomRecord } from "./init.js";
 
 /** A missing room on a terminal is a pick from the recorded rooms; with one room it is that room. */
@@ -101,6 +101,10 @@ export const roomLs: CommandDef = {
         return { alias: recorded.find((r) => r.handle === handle)?.alias ?? null, handle, topic: snap?.topic ?? recorded.find((r) => r.handle === handle)?.topic ?? "", ended: snap?.ended ?? false, members: members.length, online: members.filter((m) => m.state && m.state !== "offline").length, guests: members.filter((m) => (m.home ?? "local") !== "local").length };
       });
     }
+    // The named rooms first, ended ones last within each group: the same one
+    // comparator `rfa status` sorts with (src/cli/ui.ts), applied before --json
+    // so a script sees the decided order too.
+    rows.sort((a, b) => byRoomInterest(a as { alias?: string | null; handle?: string; ended?: boolean }, b as { alias?: string | null; handle?: string; ended?: boolean }));
     if (ctx.flags.json) return void ctx.ui.json({ source, rooms: rows });
     if (rows.length === 0) return void ctx.ui.note("no rooms: rfa room create <alias>");
     if (source === "snapshot") ctx.ui.note("from the store's snapshots (the hub is not answering, or no human key); counts may lag");

@@ -9,7 +9,7 @@
 import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { listPacks } from "../../agentdef.js";
+import { loadPack, type AgentPack } from "../../agentdef.js";
 import { daemonState, DaemonError, runForeground, startDaemon, stopDaemon, logTail } from "../../daemon.js";
 import { minimalEnv } from "../../env.js";
 import { ensureRuntime, roomsStore, type HubDir } from "../../hubdir.js";
@@ -18,7 +18,7 @@ import { CliError, numberFlag, type CliContext } from "../context.js";
 import { effectiveMode } from "../../posture.js";
 import { nativeBindingProblem } from "../preflight.js";
 import type { CommandDef } from "../router.js";
-import { fmtAge, fmtDuration } from "../ui.js";
+import { byRoomInterest, fmtAge, fmtDuration } from "../ui.js";
 
 /** What a daemon inherits: the allowlist (so residents get the model credential) plus the directory. */
 export function daemonEnv(ctx: CliContext, h: HubDir): NodeJS.ProcessEnv {
@@ -84,9 +84,18 @@ export async function upAll(ctx: CliContext, opts: { only?: "hub" | "supervisor"
       ui.done(hub.started ? `hub          pid ${hub.pid}   ${url}` : `hub          already running (pid ${hub.pid})   ${url}`, hub.started ? "console at /console" : undefined);
     }
     if (opts.only !== "hub") {
-      const packs = listPacks(h.paths.agents).length;
+      const { loadable, invalid } = packsTolerant(h);
+      const packs = loadable.length;
       supervisor = await startSupervisor(ctx, h);
       ui.done(supervisor.started ? `supervisor   pid ${supervisor.pid}   ${packs} agent${packs === 1 ? "" : "s"}` : `supervisor   already running (pid ${supervisor.pid})`);
+      // Loud, not a footnote, and it says what actually happens: the
+      // supervisor's own scan (`reconcile`, src/supervisor.ts) catches a bad
+      // definition and RETURNS, so one unparseable pack stops it from starting
+      // ANY resident, and the count above would otherwise read as reassurance
+      // over a fleet that never comes up.
+      for (const bad of invalid) {
+        ui.warn(`agents/${bad.name}/agent.md does not parse, so the supervisor will start NO resident until it is fixed or moved aside: ${bad.error}`, `rfa agent validate ${bad.name}`);
+      }
     }
   } catch (err) {
     if (err instanceof DaemonError) {
@@ -131,8 +140,47 @@ export async function downAll(ctx: CliContext): Promise<{ supervisor: string; hu
   return { supervisor, hub, strays };
 }
 
+/**
+ * Every pack directory, loaded tolerantly: the ones that parse, and separately
+ * the ones that do not, named by their directory.
+ *
+ * NOT `listPacks`, which maps `loadPack` with no catch, so ONE hand-written
+ * agent.md that fails validation throws out of every caller. `listPacks` keeps
+ * that behaviour on purpose, because the supervisor wants a loud failure. A CLI
+ * command that LISTS or STOPS the instance does not: answering `rfa up` or
+ * `rfa down` with a parse error, instead of starting or stopping everything
+ * else, is the failure this exists to prevent. Fixed in `rfa doctor` and in
+ * `collectStatus` on 2026-08-27, and in `upAll` and `strayResidents` the same
+ * day after the same defect was found in both (docs/LEDGER.md).
+ *
+ * One implementation rather than a fourth copy of the loop: a subtle scan
+ * duplicated per caller is how the four drift apart.
+ */
+function packsTolerant(h: HubDir): { loadable: AgentPack[]; invalid: { name: string; error: string }[] } {
+  const loadable: AgentPack[] = [];
+  const invalid: { name: string; error: string }[] = [];
+  const dirs = fs.existsSync(h.paths.agents)
+    ? fs.readdirSync(h.paths.agents, { withFileTypes: true }).filter((e) => e.isDirectory() && fs.existsSync(path.join(h.paths.agents, e.name, "agent.md")))
+    : [];
+  for (const entry of dirs) {
+    try {
+      loadable.push(loadPack(path.join(h.paths.agents, entry.name)));
+    } catch (err) {
+      invalid.push({ name: entry.name, error: (err as Error).message.split("\n")[0] });
+    }
+  }
+  return { loadable, invalid };
+}
+
 async function strayResidents(h: HubDir): Promise<string[]> {
-  const names = new Set(listPacks(h.paths.agents).map((p) => p.name));
+  // An invalid pack's resident is still THIS instance's resident. Dropping the
+  // unparseable ones would omit a live process from the report `rfa down` gives
+  // the operator, which is worse than naming it: a resident nobody is told
+  // about keeps serving its membership. The declared name is unreadable for
+  // those, so the directory name is the fallback (the two agree for every pack
+  // `rfa agent new` writes).
+  const { loadable, invalid } = packsTolerant(h);
+  const names = new Set([...loadable.map((p) => p.name), ...invalid.map((p) => p.name)]);
   if (names.size === 0) return [];
   return (await residentProcesses()).filter((p) => names.has(p.agent) && belongsTo(p, h.root)).map((p) => `${p.pid} ${p.agent}`);
 }
@@ -195,7 +243,8 @@ export async function collectStatus(ctx: CliContext): Promise<Record<string, unk
   } catch {
     supFile = null;
   }
-  const packs = listPacks(h.paths.agents).map((p) => {
+  const { loadable, invalid } = packsTolerant(h);
+  const packs = loadable.map((p) => {
     const hb = path.join(p.dir, "state", "heartbeat");
     const hbAge = fs.existsSync(hb) ? Date.now() - Number(fs.readFileSync(hb, "utf8")) : null;
     let member: { room?: string; spend?: { day: string; usd: number } } | null = null;
@@ -212,6 +261,14 @@ export async function collectStatus(ctx: CliContext): Promise<Record<string, unk
       offers: (p.def.offers ?? []).map((o) => o.id),
       mode: effectiveMode(p.def),
       definition: p.definitionHash.slice(7, 15),
+      /**
+       * What this pack may run at once (RFA-0.8 sect. 10 and 11). Here because
+       * the account cap on the supervisor line above is a TOTAL across every
+       * resident: `account 1/2 in flight` does not say which agent is allowed to
+       * hold both slots, and the answer is per pack.
+       */
+      concurrency: p.def.concurrency,
+      candidates: p.def.candidates,
       supervisor: supFile?.agents?.[p.name] ?? null,
       heartbeat_age_ms: hbAge,
       spend_today_usd: member?.spend?.day === today ? member.spend.usd : 0,
@@ -229,6 +286,11 @@ export async function collectStatus(ctx: CliContext): Promise<Record<string, unk
     }
   }
   if (roomsSource === "file") rooms = recorded.map((r) => ({ alias: r.alias, handle: r.handle, topic: r.topic }));
+  // One decided order, shared with `rfa room ls` (src/cli/ui.ts): the rooms an
+  // operator named first, ended ones last within each group. Sorted in the
+  // projection so the dashboard, which reads this same object, cannot disagree
+  // with the command.
+  rooms.sort((a, b) => byRoomInterest(a as { alias?: string | null; handle?: string; ended?: boolean }, b as { alias?: string | null; handle?: string; ended?: boolean }));
   return {
     name: h.manifest.name,
     dir: h.root,
@@ -244,6 +306,7 @@ export async function collectStatus(ctx: CliContext): Promise<Record<string, unk
       account: supFile?.account ?? null,
     },
     agents: packs,
+    agents_invalid: invalid,
     rooms,
     rooms_source: roomsSource,
   };
@@ -272,7 +335,7 @@ export const status: CommandDef = {
       : `${ui.dim("○")} not running${sup.stale_pid_file ? ui.dim("   (stale pid file)") : ""}`;
     ui.line(`supervisor   ${supLine}`);
     ui.blank();
-    const agents = s.agents as { name: string; model: string; room: string | null; definition: string; supervisor: { status: string } | null; heartbeat_age_ms: number | null; spend_today_usd: number }[];
+    const agents = s.agents as { name: string; model: string; room: string | null; definition: string; concurrency: number; candidates: number; supervisor: { status: string } | null; heartbeat_age_ms: number | null; spend_today_usd: number }[];
     ui.line("agents");
     if (agents.length === 0) ui.note("none yet: rfa agent new <name>");
     else
@@ -281,9 +344,17 @@ export const status: CommandDef = {
           const st = a.supervisor?.status ?? (sup.running ? "unknown" : "not supervised");
           const dot = st === "running" && a.heartbeat_age_ms !== null && a.heartbeat_age_ms < 240_000 ? ui.good("●") : st === "running" ? ui.caution("●") : ui.dim("○");
           const roomAlias = (s.rooms as { alias?: string | null; handle: string }[]).find((r) => r.handle === a.room)?.alias ?? a.room ?? "-";
-          return [dot, a.name, st, roomAlias, a.model, `$${a.spend_today_usd.toFixed(2)} today`, a.heartbeat_age_ms === null ? "no heartbeat" : `heartbeat ${fmtAge(Date.now() - a.heartbeat_age_ms)}`, ui.dim(`def ${a.definition}`)];
+          /**
+           * Which agent may use the account's slots (RFA-0.8 sect. 10). The
+           * supervisor line above shows the TOTAL cap; a serial pack renders
+           * nothing here, so the column costs no width on an instance where
+           * every pack is serial, and the one pack that is not stands out.
+           */
+          const parallel = a.concurrency > 1 ? `${a.concurrency} at once${a.candidates > 1 ? ` · ${a.candidates} candidates` : ""}` : a.candidates > 1 ? `${a.candidates} candidates` : "";
+          return [dot, a.name, st, roomAlias, a.model, parallel, `$${a.spend_today_usd.toFixed(2)} today`, a.heartbeat_age_ms === null ? "no heartbeat" : `heartbeat ${fmtAge(Date.now() - a.heartbeat_age_ms)}`, ui.dim(`def ${a.definition}`)];
         }),
       );
+    for (const bad of (s.agents_invalid as { name: string; error: string }[]) ?? []) ui.note(`${bad.name}: agent.md does not parse, so nothing runs it (${bad.error}) · rfa agent validate ${bad.name}`);
     ui.blank();
     ui.line(`rooms${s.rooms_source === "file" ? ui.dim("   (from rooms.json; the hub is not answering or no human key)") : ""}`);
     const rooms = s.rooms as Record<string, unknown>[];

@@ -7,7 +7,7 @@ import Database from "better-sqlite3";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { AccountLedger } from "../../account.js";
-import { declaredSecretNames, deriveCard, knowledgeFiles, listPacks, loadPack, parseAgentMd } from "../../agentdef.js";
+import { CONCURRENCY_GATE_LABELS, concurrencyGateFailures, declaredSecretNames, deriveCard, knowledgeFiles, listPacks, loadPack, parseAgentMd } from "../../agentdef.js";
 import { RoomMember } from "../../client.js";
 import { daemonState } from "../../daemon.js";
 import { findRoom, roomsStore, secretsStore, type HubDir, type RoomRecord } from "../../hubdir.js";
@@ -175,6 +175,14 @@ export const agentShow: CommandDef = {
       model: pack.def.model ?? "inherit",
       effort: pack.def.effort ?? null,
       definition_hash: pack.definitionHash,
+      /**
+       * RFA-0.8 sects. 10 and 11. Both are settable (`rfa agent edit --concurrency`,
+       * `--candidates`) and were until now invisible: an operator could raise the
+       * number and had no command that showed it back.
+       */
+      concurrency: pack.def.concurrency,
+      candidates: pack.def.candidates,
+      concurrency_gates: concurrencyGateFailures(pack.def),
       card: { name: card.name, skills: card.skills, digest_source: "derived from the definition" },
       tools: pack.def.tools ?? null,
       mcp_servers: pack.def.mcp_servers ?? null,
@@ -190,9 +198,27 @@ export const agentShow: CommandDef = {
     if (ctx.flags.json) return void ctx.ui.json(view);
     const ui = ctx.ui;
     ui.line(`${ui.bold(pack.name)}  ${ui.dim(pack.def.description)}`);
+    /**
+     * Why the gate line is here and not only in `rfa doctor`: above 1, the
+     * number is allowed BECAUSE the pack passes sect. 10's gates, and an
+     * operator reading `concurrency 2` with no reason beside it has to go and
+     * look up why it was accepted. `concurrencyGateFailures` is the schema's own
+     * function, so this line cannot claim a gate the loader does not enforce,
+     * and the gate NAMES come from `CONCURRENCY_GATE_LABELS` in the same module
+     * rather than being typed out here: this line said "three gates" and listed
+     * three of the four for as long as the fourth existed.
+     */
+    const parallel =
+      view.concurrency > 1 || view.candidates > 1
+        ? `${view.concurrency} turn${view.concurrency === 1 ? "" : "s"} at once, ${view.candidates} candidate${view.candidates === 1 ? "" : "s"} per task  ` +
+          (view.concurrency_gates.length === 0
+            ? ui.dim(`· passed RFA-0.8 sect. 10's gates: ${CONCURRENCY_GATE_LABELS.join(", ")}`)
+            : ui.bad(`· gates NOT passed: ${view.concurrency_gates.join("; ")}`))
+        : ui.dim("1 turn at once (serial), no candidate fan-out");
     ui.table([
       ["model", `${view.model}${view.effort ? ` (${view.effort})` : ""}`],
       ["definition", view.definition_hash],
+      ["concurrency", parallel],
       ["offers", card.skills?.map((s) => `${s.id}: ${s.description}`).join("\n") ?? "-"],
       ["room", view.binding ? `${view.binding.alias ?? view.binding.room} (${view.binding.role}, serve ${view.binding.serve})` : ui.caution("none: rfa agent bind")],
       ["membership", view.membership ? `${view.membership.member_id} in ${view.membership.room}` : ui.dim("never joined")],

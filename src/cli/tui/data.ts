@@ -25,6 +25,9 @@ export interface AgentView {
   offers: string[];
   mode: string;
   definition: string;
+  /** Turns this pack may run at once, and its default candidate fan-out (RFA-0.8 sects. 10 and 11). */
+  concurrency: number;
+  candidates: number;
   supervisor: { pid: number | null; status: string; started_at: string | null; definition_hash: string; restarts_in_window: number } | null;
   heartbeat_age_ms: number | null;
   spend_today_usd: number;

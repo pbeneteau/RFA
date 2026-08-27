@@ -210,3 +210,26 @@ export function fmtAge(isoOrMs: string | number | null | undefined, now = Date.n
   if (!Number.isFinite(t)) return "?";
   return `${fmtDuration(now - t)} ago`;
 }
+
+/**
+ * The order rooms are LISTED in, for `rfa status` and `rfa room ls` alike.
+ *
+ * The scar: on the owner's instance the two rooms an operator actually works in
+ * (`product`, `ops`) sat at the BOTTOM of thirteen rows, under ten unaliased
+ * test rooms created on 2026-08-16, because both commands rendered whatever
+ * order the hub or the filesystem handed them. Neither of those is a decision,
+ * and an order nobody decided changes when a file is rewritten.
+ *
+ * The decision: aliased rooms first, by alias, then unaliased ones by handle;
+ * ended rooms last WITHIN each group, because an ended room an operator named is
+ * still more interesting than a live room nobody did. One comparator, one
+ * definition, shared by both commands so they can never disagree.
+ */
+export function byRoomInterest<T extends { alias?: string | null; handle?: string; ended?: boolean }>(a: T, b: T): number {
+  const named = (r: T) => (r.alias ? 0 : 1);
+  if (named(a) !== named(b)) return named(a) - named(b);
+  const ended = (r: T) => (r.ended ? 1 : 0);
+  if (ended(a) !== ended(b)) return ended(a) - ended(b);
+  const key = (r: T) => r.alias ?? r.handle ?? "";
+  return key(a).localeCompare(key(b));
+}

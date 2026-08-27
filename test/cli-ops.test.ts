@@ -4,7 +4,7 @@
  * verbs in process (src/cli/hubaccess.ts) and every file through src/hubdir.ts.
  */
 import { strict as assert } from "node:assert";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
@@ -418,4 +418,332 @@ test("room adopt by alias: a recorded room without an operator membership (the m
   const unknown = await rfa(["room", "adopt", "nosuch"]);
   assert.equal(unknown.code, 2);
   assert.match(unknown.stderr, /no recorded room named nosuch/);
+});
+
+// ---------------------------------------------------------------- RFA-0.8's observing surface
+//
+// The ladder shipped its SETTING surface (rfa agent edit --concurrency, the
+// pack schema, the fence, resource claims) before anything could SEE it. These
+// tests are written against the BROKEN state in each case, because the failure
+// the rest of this file exists to prevent is a check that cannot fail: on
+// 2026-08-27 this repository shipped an eval assertion whose metric was
+// non-empty by construction and quoted it as proof (docs/LEDGER.md).
+
+/** A hand-written pack, which is how every broken state below actually arrives. */
+function writePack(name: string, frontmatter: string): void {
+  const packDir = path.join(h.paths.agents, name);
+  fs.mkdirSync(packDir, { recursive: true });
+  fs.writeFileSync(path.join(packDir, "agent.md"), `---\nrfa_agent: 1\nname: ${name}\ndescription: A pack written by hand for the doctor tests.\n${frontmatter}secrets: [RFA_TOKEN]\n---\nYou answer questions.\n`);
+}
+
+const verdicts = (checks: { id: string; verdict: string }[]) => Object.fromEntries(checks.map((c) => [c.id, c.verdict]));
+const textOf = (checks: { id: string; text: string }[], id: string) => checks.find((c) => c.id === id)?.text ?? "";
+
+test("doctor reports the write-fence declaration, the concurrency gates and definition drift per pack, and never ticks door one", async () => {
+  // Four packs, three of them in a state the ladder can produce and nothing could see.
+  writePack("writer", "tools:\n  allow: [Read, Write]\n"); // a WRITING pack: door one has to hold its declaration
+  writePack("unfenced", "tools:\n  allow: [Read, Write]\nsandbox:\n  permission_mode: acceptEdits\n"); // door one switched off before the callback
+  writePack("fast", "concurrency: 2\ntools:\n  allow: [Read, Grep]\nbudgets:\n  per_day_usd: 5\n"); // two turns at once, gates passed
+  writePack("broken", "concurrency: 3\ntools:\n  allow: [Read, Grep]\n"); // three at once with no daily ceiling: gate 3
+  type Check = { id: string; verdict: string; text: string; fix?: string };
+  const run = async () => json<Check[]>(await rfa(["doctor", "--json"]));
+  let checks = await run();
+  let by = verdicts(checks);
+
+  // (a) The declaration half of door one, from the fence's own functions.
+  assert.equal(by["fence-declaration-writer"], "ok", textOf(checks, "fence-declaration-writer"));
+  assert.match(textOf(checks, "fence-declaration-writer"), /Write/);
+  assert.equal(by["fence-declaration-unfenced"], "fail", "acceptEdits auto-approves the two tools door one exists to intercept");
+  assert.match(textOf(checks, "fence-declaration-unfenced"), /acceptEdits/);
+  // The other way door one goes off is the one no agent.md can express, because
+  // the resident computes `allowedTools`: the guarded built-in ends up
+  // pre-approved, and the bare entry auto-approves the call before canUseTool is
+  // consulted. Constructed here rather than asserted to be impossible.
+  const { fenceDeclarationCheck } = await import("../src/cli/commands/doctor.js");
+  const { loadPack } = await import("../src/agentdef.js");
+  const writerPack = loadPack(path.join(h.paths.agents, "writer"));
+  const shadowed = fenceDeclarationCheck(writerPack, ["Read", "Write"])!;
+  assert.equal(shadowed.verdict, "fail");
+  assert.match(shadowed.text, /Write is listed bare in allowedTools/);
+  assert.equal(fenceDeclarationCheck(writerPack, ["Read"])!.verdict, "ok", "the same pack, with the guarded tool kept out of the pre-approved set");
+  assert.equal(fenceDeclarationCheck(loadPack(path.join(h.paths.agents, "fast")), ["Read"]), null, "a pack with no write surface gets no fence verdict at all");
+
+  // (c) The gates, from the schema's own gate function, on the pack the schema REFUSED
+  // (which is the only pack whose gates can fail: parseAgentMd throws on the others).
+  assert.equal(by["concurrency-broken"], "fail");
+  assert.match(textOf(checks, "concurrency-broken"), /per_day_usd/);
+  assert.match(textOf(checks, "concurrency-broken"), /sect\. 10/);
+  assert.equal(by["concurrency-fast"], "ok", textOf(checks, "concurrency-fast"));
+  assert.match(textOf(checks, "concurrency-fast"), /2 turns at once/);
+  // A pack that also carries a health report has to survive it: one unparseable
+  // definition used to throw out of the middle of runChecks (listPacks maps
+  // loadPack with no catch) and doctor printed a parse error instead of a report.
+  assert.equal(by["pack-broken"], "fail", "the per-pack check still fires, and the rest of the report still arrives");
+  assert.ok(checks.some((c) => c.id === "backups"), "including the checks after the packs");
+
+  // The gates say nothing about the account cap, and a cap below the pack's own
+  // number means the extra slot can never be used.
+  assert.equal((await rfa(["config", "set", "agents.max_inflight", "1"])).code, 0);
+  checks = await run();
+  assert.equal(verdicts(checks)["concurrency-fast"], "warn", textOf(checks, "concurrency-fast"));
+  assert.match(textOf(checks, "concurrency-fast"), /max_inflight is 1/);
+
+  // ... and the cap IN FORCE is the ledger's, not the manifest's: `agents.max_inflight`
+  // needs a restart to take effect, so reading it made doctor warn about a cap of 1
+  // while `rfa status` printed the ledger's 0/2 in the same instance. The supervisor
+  // mirrors the ledger cap into its state file, which is where this reads it from.
+  const supStateFile = h.paths.supervisorState;
+  const writeSupState = (cap: number) => {
+    fs.mkdirSync(path.dirname(supStateFile), { recursive: true });
+    fs.writeFileSync(supStateFile, JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, agents: {}, account: { cap, in_flight: 0, paused_until: null } }));
+  };
+  writeSupState(2);
+  checks = await run();
+  assert.equal(verdicts(checks)["concurrency-fast"], "ok", `the ledger holds 2 and the pack declares 2, whatever the manifest still says: ${textOf(checks, "concurrency-fast")}`);
+  assert.match(textOf(checks, "concurrency-fast"), /cap at 2/, "both numbers are named");
+  assert.match(textOf(checks, "concurrency-fast"), /max_inflight on disk is 1/);
+  assert.match(textOf(checks, "concurrency-fast"), /rfa restart/, "with the thing that would make the manifest edit live");
+  // The reverse is the false reassurance the manifest read produced: the manifest
+  // is raised, the supervisor still enforces the old cap, and the extra slot is
+  // unusable. Reading the manifest here prints ok; reading the ledger warns.
+  assert.equal((await rfa(["config", "set", "agents.max_inflight", "2"])).code, 0);
+  writeSupState(1);
+  checks = await run();
+  assert.equal(verdicts(checks)["concurrency-fast"], "warn", `the manifest says 2 but nothing has applied it: ${textOf(checks, "concurrency-fast")}`);
+  assert.match(textOf(checks, "concurrency-fast"), /in force is 1/);
+  assert.match(textOf(checks, "concurrency-fast"), /max_inflight on disk is 2/);
+  fs.rmSync(supStateFile, { force: true });
+
+  // (b) Door two is established or refused on THIS host; door one is unverified,
+  // and the assertion that matters is that it is never a tick.
+  checks = await run();
+  by = verdicts(checks);
+  assert.ok(["ok", "fail"].includes(by["write-fence-sandbox"]), `a writing pack exists, so door two is answered either way: ${JSON.stringify(checks.find((c) => c.id === "write-fence-sandbox"))}`);
+  assert.notEqual(by["write-fence-callback"], "ok", "door one cannot be proven without a model call, so a green tick here would be an assertion that cannot fail");
+  assert.match(textOf(checks, "write-fence-callback"), /UNVERIFIED/);
+  assert.match(textOf(checks, "write-fence-callback"), /fence-proof/);
+
+  // (d) DEFINITION DRIFT, which is 2026-08-27's incident: the pack was edited to
+  // concurrency 2 and the running resident kept serving the previous definition.
+  // A stub process shaped exactly like a resident (src/procscan.ts is strict about
+  // the shape), plus the state file a resident writes for itself.
+  const stub = path.join(dir, "stub");
+  fs.mkdirSync(stub, { recursive: true });
+  fs.writeFileSync(path.join(stub, "resident.js"), "setTimeout(() => {}, 120000);\n");
+  const stateDir = path.join(h.paths.agents, "fast", "state");
+  fs.mkdirSync(stateDir, { recursive: true });
+  const memberFile = path.join(stateDir, "member.json");
+  const state = (hash: string) => JSON.stringify({ room: "r_stub", join_secret: null, membership_token: "t", member_id: "m_stub", name: "fast", cursor: 0, definition_hash: hash });
+  fs.writeFileSync(memberFile, state("sha256:" + "0".repeat(64)));
+  const child = spawn(process.execPath, [path.join(stub, "resident.js"), "--agent", "fast", "--dir", dir], { stdio: "ignore" });
+  try {
+    await new Promise((r) => setTimeout(r, 400));
+    checks = await run();
+    assert.equal(verdicts(checks)["definition-fast"], "warn", textOf(checks, "definition-fast"));
+    assert.match(textOf(checks, "definition-fast"), /restart owed/);
+    assert.match(checks.find((c) => c.id === "definition-fast")?.fix ?? "", /rfa agent restart fast/);
+    // And the converged state is not a warning: the same resident serving the same
+    // definition on disk reports ok, so the check distinguishes the two.
+    const onDisk = (await import("../src/agentdef.js")).loadPack(path.join(h.paths.agents, "fast")).definitionHash;
+    fs.writeFileSync(memberFile, state(onDisk));
+    checks = await run();
+    assert.equal(verdicts(checks)["definition-fast"], "ok", textOf(checks, "definition-fast"));
+  } finally {
+    child.kill("SIGKILL");
+  }
+  // Nothing is serving the other packs, so nothing can drift for them.
+  assert.equal(verdicts(await run())["definition-writer"], undefined, "a pack with no live resident gets no drift verdict, because there is nothing to compare");
+});
+
+test("doctor's sandbox check establishes door two rather than asking about it, and refuses loudly when it cannot", async () => {
+  const { writeFenceHostChecks } = await import("../src/cli/commands/doctor.js");
+  // The case the dependency checks cannot see (RFA-0.8 sect. 9 A6): srt says the
+  // platform is supported and the primitives are there, and the first wrapped
+  // command dies. doctor must report FAIL, not "supported".
+  const refused = await writeFenceHostChecks({ writing: ["writer"], establish: async () => ({ ok: false, platform: "linux", detail: "Creating new namespace failed: Operation not permitted" }) });
+  const sandbox = refused.find((c) => c.id === "write-fence-sandbox")!;
+  assert.equal(sandbox.verdict, "fail");
+  assert.match(sandbox.text, /Operation not permitted/);
+  assert.match(sandbox.fix ?? "", /refuses to serve/);
+
+  // Established: the one verdict that may be green, because something was run.
+  const good = await writeFenceHostChecks({ writing: ["writer"], establish: async () => ({ ok: true, platform: "darwin", detail: "established" }) });
+  assert.equal(good.find((c) => c.id === "write-fence-sandbox")!.verdict, "ok");
+  // ... and door one is STILL not green, whatever door two did. This is the
+  // assertion that fires if anyone ever turns the unverified state into a tick.
+  for (const set of [refused, good]) {
+    const callback = set.find((c) => c.id === "write-fence-callback")!;
+    assert.notEqual(callback.verdict, "ok");
+    assert.match(callback.text, /npm run fence-proof/);
+  }
+  // No writing pack: nothing is claimed at all, and the text says what would prove it.
+  const idle = await writeFenceHostChecks({ writing: [] });
+  assert.deepEqual(idle.map((c) => [c.id, c.verdict]), [["write-fence", "skip"]]);
+  assert.match(idle[0].text, /fence-proof/);
+});
+
+test("rooms are listed in a decided order: named first, ended last, in rfa room ls and rfa status alike", async () => {
+  const { byRoomInterest } = await import("../src/cli/ui.js");
+  // The live shape this fixes: ten unaliased test rooms from 2026-08-16 sitting
+  // above the two rooms the operator works in.
+  const live = [
+    ...Array.from({ length: 10 }, (_, i) => ({ alias: null, handle: `r_${String(i).padStart(4, "0")}`, ended: i % 3 === 0 })),
+    { alias: "product", handle: "r_9a25e48c0e", ended: false },
+    { alias: "ops", handle: "r_fb3993fc90", ended: false },
+    { alias: "old-demo", handle: "r_dead", ended: true },
+  ];
+  assert.deepEqual([...live].sort(byRoomInterest).map((r) => r.alias ?? r.handle), ["ops", "product", "old-demo", "r_0001", "r_0002", "r_0004", "r_0005", "r_0007", "r_0008", "r_0000", "r_0003", "r_0006", "r_0009"], "aliased first by alias, then unaliased by handle, ended last within each group");
+
+  // Through the commands. `aaa-old` sorts first among the aliases and is ENDED,
+  // so it proves the two rules do not collapse into one; `design` loses its
+  // record, which is how an unaliased room happens (rooms.json is the CLI's
+  // file, the room itself lives on the hub).
+  assert.equal((await rfa(["room", "create", "aaa-old", "--topic", "an ended room whose alias sorts first"])).code, 0);
+  assert.equal((await rfa(["room", "end", "aaa-old"])).code, 0);
+  const design = roomsStore(h).read().rooms.find((r) => r.alias === "design")!;
+  roomsStore(h).update((f) => {
+    f.rooms = f.rooms.filter((r) => r.alias !== "design");
+  });
+  const listed = json<{ rooms: { alias: string | null; handle: string; ended?: boolean }[] }>(await rfa(["room", "ls", "--json"])).rooms;
+  const aliases = listed.map((r) => r.alias);
+  // RELATIVE order, not the whole list: this used to assert the exact four rooms
+  // the earlier tests in this file happen to leave behind, so one new room
+  // anywhere above broke two assertions that have nothing to do with it.
+  const at = (alias: string) => listed.findIndex((r) => r.alias === alias);
+  const liveAliased = listed.filter((r) => r.alias && !r.ended).map((r) => r.alias!);
+  assert.ok(liveAliased.length > 0, `the instance needs at least one live named room for this to mean anything: ${JSON.stringify(aliases)}`);
+  assert.deepEqual(liveAliased, [...liveAliased].sort((x, y) => x.localeCompare(y)), `live named rooms in alias order: ${JSON.stringify(aliases)}`);
+  for (const alias of liveAliased) assert.ok(at(alias) < at("aaa-old"), `${alias} is live and named, so it sorts above the ENDED aaa-old whose alias sorts first: ${JSON.stringify(aliases)}`);
+  assert.equal(aliases.at(-1), null, `the room nobody named is last, not first: ${JSON.stringify(aliases)}`);
+  assert.equal(listed.at(-1)!.handle, design.handle);
+  // rfa status reads rooms.json when no hub answers, and a record carries no
+  // ended flag, so there the order is the alias order alone.
+  const statusAliases = json<{ rooms: { alias: string }[] }>(await rfa(["status", "--json"])).rooms.map((r) => r.alias);
+  assert.ok(statusAliases.includes("aaa-old"), `the ended room is still listed there: ${JSON.stringify(statusAliases)}`);
+  assert.deepEqual(statusAliases, [...statusAliases].sort((x, y) => x.localeCompare(y)), "the same comparator behind rfa status, so the dashboard cannot disagree with the command, and with no ended flag the order is the alias order alone");
+});
+
+test("agent show and status show concurrency and candidates, with the reason the number is allowed", async () => {
+  // Its own fixtures, idempotently: consuming the doctor test's packs made this
+  // test unrunnable alone (`--test-name-pattern` on it failed), and a test that
+  // only passes in file order is a test nobody can bisect with.
+  writePack("fast", "concurrency: 2\ntools:\n  allow: [Read, Grep]\nbudgets:\n  per_day_usd: 5\n");
+  writePack("writer", "tools:\n  allow: [Read, Write]\n");
+  const view = json<{ concurrency: number; candidates: number; concurrency_gates: string[] }>(await rfa(["agent", "show", "fast", "--json"]));
+  assert.equal(view.concurrency, 2);
+  assert.equal(view.candidates, 1);
+  assert.deepEqual(view.concurrency_gates, [], "the schema's own gate function, so this cannot claim a gate the loader does not enforce");
+  const human = await rfa(["agent", "show", "fast"]);
+  assert.equal(human.code, 0, human.stderr);
+  assert.match(human.stdout, /concurrency\s+2 turns at once, 1 candidate per task/);
+  assert.match(human.stdout, /sect\. 10's gates/, "above 1 the line says WHY it is allowed");
+  const serial = await rfa(["agent", "show", "writer"]);
+  assert.match(serial.stdout, /1 turn at once \(serial\)/);
+
+  const agents = json<{ agents: { name: string; concurrency: number; candidates: number }[] }>(await rfa(["status", "--json"])).agents;
+  assert.equal(agents.find((a) => a.name === "fast")!.concurrency, 2, "so an operator reading the account cap can see WHICH agent may use both slots");
+  assert.equal(agents.find((a) => a.name === "writer")!.concurrency, 1);
+  const table = await rfa(["status"]);
+  assert.match(table.stdout, /fast\s+.*2 at once/);
+  assert.ok(!/writer\s+.*at once/.test(table.stdout), "a serial pack renders nothing there, so the column costs no width on an instance without one");
+});
+
+test("task show renders the resource grant, and a key returned as a digest is labelled a digest, never a path", async () => {
+  const { renderGrants } = await import("../src/cli/commands/talk.js");
+  const { Ui } = await import("../src/cli/ui.js");
+  const ui = new Ui({ color: false, json: false, quiet: false, tty: false });
+  const capture = (fn: () => void): string => {
+    const out: string[] = [];
+    const orig = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      out.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      fn();
+    } finally {
+      process.stdout.write = orig;
+    }
+    return out.join("");
+  };
+
+  const held = capture(() =>
+    renderGrants(ui, {
+      attempt: 2,
+      owner: "m_worker",
+      lease_expires: new Date(Date.now() + 120_000).toISOString(),
+      resource_grants: [{ keys: ["local/agent-a/notes", "room/r_9a25e48c0e/board"], owner: "m_worker", attempt: 2, source: "claim", granted_at: new Date().toISOString() }],
+    }),
+  );
+  assert.match(held, /local\/agent-a\/notes/, "the keys the claim holds, which is what a task_conflict names");
+  assert.match(held, /room\/r_9a25e48c0e\/board/);
+  assert.match(held, /attempt 2/);
+  assert.match(held, /owner m_worker/);
+  assert.match(held, /lease until/);
+
+  // What a NON-LOCAL claimant is given instead of a local key (wire 10.3 item 8):
+  // an HMAC under a hub-held secret. Printed as a key it invents a path.
+  const digest = "hmac-sha256:" + "ab".repeat(32);
+  const opaque = capture(() => renderGrants(ui, { attempt: 1, owner: "m_guest", lease_expires: null, resource_grants: [{ keys: [digest], owner: "m_guest", attempt: 1, source: "claim", granted_at: new Date().toISOString() }] }));
+  assert.match(opaque, /opaque digest, NOT a path/);
+  assert.ok(!/authority hmac-sha256/.test(opaque), "it is never rendered as if its first segment were an authority");
+  assert.match(opaque, /no lease/);
+
+  // An expired lease is said so rather than printed as a date the reader has to
+  // compare by eye: every grant dies with the claim's release.
+  const expired = capture(() => renderGrants(ui, { attempt: 3, owner: "m_worker", lease_expires: new Date(Date.now() - 60_000).toISOString(), resource_grants: [] }));
+  assert.match(expired, /lease EXPIRED/);
+  assert.match(expired, /no grant/, "and a claim with no resources blocks nobody, which is also worth saying");
+
+  // Through the command, on a real task with no claim on it.
+  const created = await rfa(["task", "create", "a task with no claim", "--room", "product", "--json"]);
+  assert.equal(created.code, 0, created.stderr);
+  const id = json<{ id: string }>(created).id;
+  const shown = await rfa(["task", "show", id, "--room", "product"]);
+  assert.equal(shown.code, 0, shown.stderr);
+  assert.match(shown.stdout, /"id": "t_/, "the task object is still printed in full");
+  assert.match(shown.stdout, /no grant/);
+  assert.match(shown.stdout, /unclaimed/);
+});
+
+test("one unparseable pack does not stop `rfa up` or `rfa down` from working, and is named", async () => {
+  // `listPacks` maps `loadPack` with no catch, deliberately, because the
+  // supervisor wants a loud failure. Every CLI caller that LISTS or STOPS the
+  // instance needs the opposite: doctor and collectStatus were fixed on
+  // 2026-08-27, upAll and strayResidents the same day (docs/LEDGER.md).
+  //
+  // The invalid pack fails an RFA-0.8 sect. 10 gate rather than YAML syntax, so
+  // this also pins that a SCHEMA refusal reaches these callers the same way a
+  // parse error does.
+  const bad = path.join(h.paths.agents, "broken-pack");
+  fs.mkdirSync(bad, { recursive: true });
+  fs.writeFileSync(
+    path.join(bad, "agent.md"),
+    ["---", "rfa_agent: 1", "name: broken-pack", "description: Declares concurrency with no day ceiling, which sect. 10 gate 3 refuses.", "concurrency: 3", "tools:", "  allow: [Read, Grep]", "offers:", "  - id: answer-question", "    description: Answers.", "---", "body"].join("\n"),
+  );
+  try {
+    // --only supervisor reaches the pack listing (it runs before the daemon is
+    // spawned, which is exactly where the throw used to land) without touching
+    // the hub. The supervisor that starts will itself refuse to reconcile, which
+    // is the behaviour the warning describes.
+    const up = await rfa(["up", "--only", "supervisor"]);
+    assert.doesNotMatch(up.stderr, /definition invalid|ZodError/, "rfa up must not die with the pack's own parse error");
+    assert.match(up.stdout + up.stderr, /broken-pack/, "the invalid pack must be named");
+    assert.match(up.stdout + up.stderr, /does not parse/, "and the operator must be told no resident will start");
+
+    // `rfa down` reaches strayResidents, whose name set must still include a
+    // pack that no longer parses: a resident of one would otherwise go
+    // unreported and keep serving its membership.
+    const down = await rfa(["down"]);
+    assert.equal(down.code, 0, down.stderr);
+    assert.doesNotMatch(down.stderr, /definition invalid|ZodError/, "rfa down must not die with the pack's own parse error");
+
+    // collectStatus (fixed earlier the same day) stays tolerant too.
+    const status = await rfa(["status", "--json"]);
+    assert.equal(status.code, 0, status.stderr);
+    assert.match(status.stdout, /broken-pack/);
+  } finally {
+    await rfa(["down"]);
+    fs.rmSync(bad, { recursive: true, force: true });
+  }
 });

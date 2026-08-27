@@ -9,6 +9,7 @@ import { Engine, type CandidateSet } from "../../engine.js";
 import { loadPack } from "../../agentdef.js";
 import { JsonStore, principalsStore, roomsStore, type HubDir, type RoomRecord } from "../../hubdir.js";
 import { TERMINAL_TASK_STATES, type TaskState } from "../../model.js";
+import { isDigestKey } from "../../resources.js";
 import { packageVersion } from "../../pkg.js";
 import { CliError, numberFlag, type CliContext } from "../context.js";
 import { openHubCall } from "../hubaccess.js";
@@ -234,11 +235,64 @@ export const taskLs: CommandDef = {
   },
 };
 
+/**
+ * The resource grants a task's claim holds (wire 10.3 items 5 to 8, RFA-0.8
+ * rung 7), rendered for a human.
+ *
+ * Why this exists at all: a `task_conflict` names the BLOCKING key, and without
+ * a command that shows which task holds which keys, the operator reading that
+ * refusal has no way to find the holder. The grant is persisted on the task
+ * precisely so it can be read back, and until now nothing read it back.
+ *
+ * A key that came back as an opaque digest is LABELLED as one and never printed
+ * as a path: for a non-local claimant blocked by a `local/…` key the hub returns
+ * an HMAC under a hub-held secret, stable only while the grant lives, and a
+ * reader who mistakes it for a path goes looking for a resource that does not
+ * exist.
+ *
+ * That label is a DEFENSIVE guard here, not a shape this path produces today:
+ * `discloseKey` is applied to the refusal payloads only (`blocking_key`,
+ * `requested_key`, `reservation_offered` in `src/store.ts`), while every write to
+ * `task.resource_grants` stores the raw keys, so a grant read back from the store
+ * is never digested. It stays because the day a grant is read by a non-local
+ * principal is the day it would be, and the guard costs one call. Where digests
+ * really surface is the `task_conflict` refusal, which no CLI surface renders yet.
+ */
+export function renderGrants(ui: CliContext["ui"], t: { attempt?: number; owner?: string | null; lease_expires?: string | null; resource_grants?: { keys: string[]; owner: string; attempt: number; source: string; granted_at: string }[]; reservation_offer?: { keys: string[]; offered_at: string } | null; widen_refusals?: number }): void {
+  const grants = t.resource_grants ?? [];
+  ui.blank();
+  if (grants.length === 0) {
+    ui.line(`resources    ${ui.dim("no grant: this claim holds no resource key, so it blocks nobody (wire 10.3 item 1)")}`);
+  } else {
+    ui.line("resources");
+    ui.table(
+      grants.flatMap((g) =>
+        g.keys.map((k, i) => [
+          isDigestKey(k) ? `${k.slice(0, 24)}…` : k,
+          isDigestKey(k) ? ui.caution("opaque digest, NOT a path") : ui.dim(`authority ${k.split("/")[0]}`),
+          i === 0 ? ui.dim(`${g.source} · attempt ${g.attempt} · ${g.owner}`) : "",
+        ]),
+      ),
+    );
+  }
+  const lease = t.lease_expires ? Date.parse(t.lease_expires) : NaN;
+  ui.line(
+    `claim        ${t.owner ? `owner ${t.owner}` : ui.dim("unclaimed")}   attempt ${t.attempt ?? 0}   ` +
+      (t.lease_expires
+        ? Number.isFinite(lease) && lease < Date.now()
+          ? ui.caution(`lease EXPIRED ${fmtAge(t.lease_expires)} (a release trigger drops every grant with it)`)
+          : `lease until ${t.lease_expires}`
+        : ui.dim("no lease")),
+  );
+  if (t.reservation_offer) ui.note(`the board has offered a reservation on ${t.reservation_offer.keys.join(", ")} after ${t.widen_refusals ?? 3} refused widenings: the creator, the host or a human approves it (wire 10.3 item 6)`);
+}
+
 export const taskShow: CommandDef = {
   path: ["task", "show"],
-  summary: "One task, in full",
+  summary: "One task, in full, with the resource keys its claim holds",
   usage: "<id> [--room <alias|handle>]",
   options: { room: { type: "string" } },
+  why: "The task object as the hub holds it, plus the grant a `task_conflict` refusal points at: which resource keys this claim holds, on which attempt, for which owner, and how long the lease has left. A refusal naming a blocking key is undiagnosable without it.",
   run: async (ctx, a) => {
     const h = ctx.hubdir();
     const id = a.positionals[0];
@@ -248,6 +302,7 @@ export const taskShow: CommandDef = {
       const t = await b.call({ action: "get", id });
       if (ctx.flags.json) return void ctx.ui.json(t);
       process.stdout.write(JSON.stringify(t, null, 2) + "\n");
+      renderGrants(ctx.ui, t as Parameters<typeof renderGrants>[1]);
     } finally {
       await b.close();
     }

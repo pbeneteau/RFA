@@ -268,79 +268,107 @@ export const agentDefSchema = z.object({
     .optional(),
 });
 
-/**
- * The three gates on `concurrency > 1` (RFA-0.8 sect. 10). Separated from the
- * object literal so the reasons can be read, and so the CLI can explain a
- * refusal without re-deriving it.
- *
- * Every one of these is a thing that is merely inefficient serially and becomes
- * a correctness or a money problem at N > 1, which is why they are gates and not
- * warnings. A warning is not a control at N > 1: it scales the exposure by N and
- * changes nothing.
- */
-export function concurrencyGateFailures(def: {
+/** What a gate is asked about: the subset of a definition the gates read. */
+interface ConcurrencyGateInput {
   concurrency?: number;
   candidates?: number;
   tools?: { allow?: string[] };
   mode?: string;
   interrupt_on?: AgentDef["interrupt_on"];
   budgets?: { per_day_usd?: number };
-}): string[] {
+}
+
+/**
+ * The gates on `concurrency > 1` (RFA-0.8 sect. 10), as a list rather than a
+ * run of `if`s, so that the SHORT NAME of each gate and the check for it are one
+ * edit apart.
+ *
+ * They are separated from the object literal so the reasons can be read, and so
+ * the CLI can explain a refusal without re-deriving it. The list shape is the
+ * fix for the other half of that: `rfa agent show` and `rfa doctor` both used to
+ * hardcode "sect. 10's three gates" and enumerate three of the four, prose
+ * restating code that had already moved. `CONCURRENCY_GATE_LABELS` below is what
+ * they read now, so a fifth gate cannot be added without its label.
+ *
+ * Every one of these is a thing that is merely inefficient serially and becomes
+ * a correctness or a money problem at N > 1, which is why they are gates and not
+ * warnings. A warning is not a control at N > 1: it scales the exposure by N and
+ * changes nothing.
+ */
+const CONCURRENCY_GATES: { label: string; failure: (def: ConcurrencyGateInput, n: { concurrency: number; candidates: number }) => string | null }[] = [
+  {
+    label: "candidates within concurrency",
+    failure: (_def, { concurrency, candidates }) =>
+      candidates > concurrency
+        ? `it declares candidates: ${candidates} but concurrency: ${concurrency}: ${candidates} candidates for one task is ${candidates} turns at once, ` +
+          `each a full CLI child process, so the pack has to declare concurrency: ${candidates} or more (RFA-0.8 sect. 11)`
+        : null,
+  },
+  {
+    // Gate 1, posture, in the two halves sect. 10 gives it.
+    //
+    // The half the schema CAN see: a pack with gated acting tools. Those reach
+    // the world through third-party MCP tools whose write set this platform
+    // cannot fence at all, and NO rung of RFA-0.8 changes that: rung 6a is a CoW
+    // clone of the pack's own tree and 6b is a git publish of it, so neither
+    // touches a write that lands in a remote SaaS workspace. An acting pack
+    // therefore stays serial rather than waiting for a rung; the fence of sect. 9
+    // (rung 5, built) covers guarded BUILT-INS, which is a different surface.
+    //
+    // The half it CANNOT: a pack with a declared write surface (a guarded
+    // built-in in `tools.allow`) is allowed through here on purpose, which is a
+    // change of 2026-08-26 and the point of rung 5. Whether the two-door fence
+    // is available and ESTABLISHED for that surface is a property of this host
+    // and this SDK, not of the definition, so it is checked at resident startup
+    // and fails closed there (sect. 10's own split, and sect. 9 item 3). What the
+    // definition CAN say about the fence is checked by `writeSurfaceDefFailures`,
+    // for every pack and not only a concurrent one.
+    label: "read-only posture",
+    failure: (def) => {
+      const mode = effectiveMode(def as AgentDef);
+      return mode === "read-only"
+        ? null
+        : `its effective posture is \`${mode}\`, not read-only: an acting tool reaches the world through a third-party MCP server whose write set neither door of the write fence can trace (RFA-0.8 sect. 9), and no rung of RFA-0.8 fences those side effects, so an acting pack stays serial`;
+    },
+  },
+  {
+    // Gate 2, memory topology (sect. 4 item 2).
+    label: "no destructive memory verb",
+    failure: (def) => {
+      const declared = (def.tools?.allow ?? []).filter((t) => (MEMORY_DESTRUCTIVE_TOOLS as readonly string[]).includes(t));
+      return declared.length === 0
+        ? null
+        : `its answer-path tool surface declares ${declared.join(", ")}, which are destructive memory verbs belonging to the consolidation lane (RFA-0.8 sect. 4 item 2)`;
+    },
+  },
+  {
+    // Gate 3, a ceiling (sect. 5 item 7). Unbounded serially is a warning;
+    // unbounded times N is not something a warning can hold.
+    label: "a declared per-day ceiling",
+    failure: (def, { concurrency, candidates }) =>
+      def.budgets?.per_day_usd
+        ? null
+        : `it declares no budgets.per_day_usd: a pack with no daily ceiling goes from unbounded-serially to unbounded-times-${Math.max(concurrency, candidates)} (RFA-0.8 sect. 5 item 7)`,
+  },
+];
+
+/**
+ * The gates by short name, in the order they are checked, for the CLI's prose.
+ * Derived from `CONCURRENCY_GATES` and never written out by hand: a count or an
+ * enumeration typed into a message is a copy of code, and this one had already
+ * gone stale at four gates.
+ */
+export const CONCURRENCY_GATE_LABELS: readonly string[] = CONCURRENCY_GATES.map((g) => g.label);
+
+/** Which of the gates above this definition does NOT pass, with the reason each. */
+export function concurrencyGateFailures(def: ConcurrencyGateInput): string[] {
   const concurrency = def.concurrency ?? 1;
   const candidates = def.candidates ?? 1;
   // Candidates ride these gates rather than getting their own: N candidates IS
   // N turns at once, so a pack declaring `candidates: 3` has declared the same
   // exposure as one declaring `concurrency: 3` and answers for it here.
   if (concurrency <= 1 && candidates <= 1) return [];
-  const fails: string[] = [];
-
-  if (candidates > concurrency) {
-    fails.push(
-      `it declares candidates: ${candidates} but concurrency: ${concurrency}: ${candidates} candidates for one task is ${candidates} turns at once, ` +
-        `each a full CLI child process, so the pack has to declare concurrency: ${candidates} or more (RFA-0.8 sect. 11)`,
-    );
-  }
-
-  // Gate 1, posture, in the two halves sect. 10 gives it.
-  //
-  // The half the schema CAN see: a pack with gated acting tools. Those reach the
-  // world through third-party MCP tools whose write set this platform cannot
-  // fence at all, and NO rung of RFA-0.8 changes that: rung 6a is a CoW clone of
-  // the pack's own tree and 6b is a git publish of it, so neither touches a write
-  // that lands in a remote SaaS workspace. An acting pack therefore stays serial
-  // rather than waiting for a rung; the fence of sect. 9 (rung 5, built) covers
-  // guarded BUILT-INS, which is a different surface.
-  const mode = effectiveMode(def as AgentDef);
-  if (mode !== "read-only") {
-    fails.push(
-      `its effective posture is \`${mode}\`, not read-only: an acting tool reaches the world through a third-party MCP server whose write set neither door of the write fence can trace (RFA-0.8 sect. 9), and no rung of RFA-0.8 fences those side effects, so an acting pack stays serial`,
-    );
-  }
-  // The half it CANNOT: a pack with a declared write surface (a guarded built-in
-  // in `tools.allow`) is allowed through here on purpose, which is a change of
-  // 2026-08-26 and the point of rung 5. Whether the two-door fence is available
-  // and ESTABLISHED for that surface is a property of this host and this SDK,
-  // not of the definition, so it is checked at resident startup and fails closed
-  // there (sect. 10's own split, and sect. 9 item 3). What the definition CAN
-  // say about the fence is checked by `writeSurfaceDefFailures`, for every pack
-  // and not only a concurrent one.
-
-  // Gate 2, memory topology (sect. 4 item 2).
-  const declared = (def.tools?.allow ?? []).filter((t) => (MEMORY_DESTRUCTIVE_TOOLS as readonly string[]).includes(t));
-  if (declared.length > 0) {
-    fails.push(
-      `its answer-path tool surface declares ${declared.join(", ")}, which are destructive memory verbs belonging to the consolidation lane (RFA-0.8 sect. 4 item 2)`,
-    );
-  }
-
-  // Gate 3, a ceiling (sect. 5 item 7). Unbounded serially is a warning;
-  // unbounded times N is not something a warning can hold.
-  if (!def.budgets?.per_day_usd) {
-    fails.push(
-      `it declares no budgets.per_day_usd: a pack with no daily ceiling goes from unbounded-serially to unbounded-times-${Math.max(concurrency, candidates)} (RFA-0.8 sect. 5 item 7)`,
-    );
-  }
-  return fails;
+  return CONCURRENCY_GATES.map((g) => g.failure(def, { concurrency, candidates })).filter((f): f is string => f !== null);
 }
 
 /**
@@ -392,16 +420,29 @@ export interface AgentPack {
 
 const FRONTMATTER = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
 
-/** Parse an agent.md string. Throws with a precise message on any invalid input. */
-export function parseAgentMd(content: string): { def: AgentDef; prompt: string; definitionHash: string } {
+/**
+ * The frontmatter object and the body, before any validation.
+ *
+ * Exported for the one caller that needs a definition the loader REFUSED: `rfa
+ * doctor` reports WHICH gate of RFA-0.8 sect. 10, or which half of the write
+ * fence's door one, a rejected pack fails, and it cannot ask `loadPack` because
+ * `parseAgentMd` throws on exactly those packs. Reading the frontmatter here
+ * rather than in the CLI keeps one definition of "the frontmatter block": a
+ * second regex would drift from this one silently.
+ */
+export function splitAgentMd(content: string): { raw: unknown; body: string } {
   const m = FRONTMATTER.exec(content);
   if (!m) throw new Error("agent.md must start with a YAML frontmatter block (--- ... ---)");
-  let raw: unknown;
   try {
-    raw = YAML.parse(m[1]);
+    return { raw: YAML.parse(m[1]), body: m[2] };
   } catch (err) {
     throw new Error(`agent.md frontmatter is not valid YAML: ${(err as Error).message}`);
   }
+}
+
+/** Parse an agent.md string. Throws with a precise message on any invalid input. */
+export function parseAgentMd(content: string): { def: AgentDef; prompt: string; definitionHash: string } {
+  const { raw, body } = splitAgentMd(content);
   const parsed = agentDefSchema.safeParse(raw);
   if (!parsed.success) {
     const issue = parsed.error.issues[0];
@@ -429,7 +470,7 @@ export function parseAgentMd(content: string): { def: AgentDef; prompt: string; 
   if (serves && !(def.offers ?? []).length) {
     throw new Error("a pack that serves a room as participant must declare at least one entry in `offers` (its card skills)");
   }
-  const prompt = m[2].trim();
+  const prompt = body.trim();
   if (!prompt) throw new Error("agent.md needs a markdown body: it is the system prompt");
   return { def, prompt, definitionHash: "sha256:" + sha256hex(content) };
 }

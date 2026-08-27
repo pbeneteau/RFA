@@ -173,9 +173,24 @@ export function findBlocking(wanted: readonly string[], live: readonly LiveGrant
   return null;
 }
 
+/** The prefix every disclosed digest carries, so a reader can tell one from a key. */
+export const DIGEST_PREFIX = "hmac-sha256:";
+
 /** The documented digest: HMAC-SHA256 over the UTF-8 key, hex, with its prefix (item 8). */
 export function digestKey(key: string, secret: Buffer): string {
-  return `hmac-sha256:${createHmac("sha256", secret).update(key, "utf8").digest("hex")}`;
+  return `${DIGEST_PREFIX}${createHmac("sha256", secret).update(key, "utf8").digest("hex")}`;
+}
+
+/**
+ * Is this string an opaque disclosure rather than a resource key?
+ *
+ * A UI that prints one as the other invents a path that exists nowhere: the
+ * digest is an HMAC under a hub-held secret, it is stable only for the lifetime
+ * of the blocking grant, and it is all a non-local claimant is ever told
+ * (item 8). `rfa task show` labels it instead of rendering it as a key.
+ */
+export function isDigestKey(key: string): boolean {
+  return key.startsWith(DIGEST_PREFIX);
 }
 
 /**
