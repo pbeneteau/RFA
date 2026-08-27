@@ -5,7 +5,7 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { CONCURRENCY_GATE_LABELS, concurrencyGateFailures, loadPack, knowledgeFiles, splitAgentMd, writeSurfaceDefFailures, type AgentPack } from "../../agentdef.js";
+import { type AgentPack, CONCURRENCY_GATE_LABELS, concurrencyGateFailures, knowledgeFiles, loadPack, scanPacks, splitAgentMd, writeSurfaceDefFailures } from "../../agentdef.js";
 import { matchDigest, parsePrincipalsFile, parseTokensFile } from "../../credentials.js";
 import { daemonState } from "../../daemon.js";
 import { readJsonFile, roomsStore, secretsStore, type HubDir } from "../../hubdir.js";
@@ -316,7 +316,7 @@ export async function runChecks(ctx: CliContext, opts: { deep?: boolean } = {}):
    * supervisor's VIEW: a mirror of the ledger it wrote, and of what it believes
    * it started. Every reader below says which of those it is using and why.
    */
-  let supFile: { agents?: Record<string, { pid: number | null; status: string; definition_hash?: string }>; account?: { paused_until?: string | null; cap?: number } } | null = null;
+  let supFile: { agents?: Record<string, { pid: number | null; status: string; definition_hash?: string }>; invalid?: Record<string, string>; account?: { paused_until?: string | null; cap?: number } } | null = null;
   try {
     supFile = JSON.parse(fs.readFileSync(h.paths.supervisorState, "utf8"));
   } catch {
@@ -339,6 +339,30 @@ export async function runChecks(ctx: CliContext, opts: { deep?: boolean } = {}):
    * not been applied. That is the disk-read-as-served defect the definition-drift
    * check below exists for, so it gets the same treatment: name both numbers.
    */
+  /*
+   * What the RUNNING supervisor could not load, from its own state file, which
+   * is not the same question as what fails to parse on disk right now. The two
+   * differ for a real window: the registry is re-scanned every 30 seconds, so a
+   * pack fixed ten seconds ago still parses on disk while the supervisor has not
+   * picked it up, and a pack broken ten seconds ago still looks supervised. Only
+   * the supervisor's record says which packs are actually unsupervised, which is
+   * the CLAUDE.md rule this file has already broken once today.
+   */
+  const supervisorInvalid = Object.entries(supFile?.invalid ?? {});
+  if (supervisorInvalid.length > 0 && supState.alive) {
+    for (const [dir, why] of supervisorInvalid) {
+      const parsesNow = !scanPacks(h.paths.agents).broken.some((b) => b.name === dir);
+      checks.push(
+        warn(
+          `unsupervised-${dir}`,
+          parsesNow
+            ? `the running supervisor last failed to load agents/${dir}/agent.md (${why}), and it parses on disk now: the registry is re-scanned every 30s, so it is still unsupervised until then`
+            : `the running supervisor cannot load agents/${dir}/agent.md, so that pack is UNSUPERVISED: no start, no restart if it dies, no drain (${why})`,
+          parsesNow ? "wait for the next scan, or rfa restart to apply it now" : `rfa agent validate ${dir}`,
+        ),
+      );
+    }
+  }
   const ledgerCap = typeof supFile?.account?.cap === "number" ? supFile.account.cap : null;
   const manifestCap = h.manifest.agents.max_inflight;
   const accountCap = ledgerCap ?? manifestCap;

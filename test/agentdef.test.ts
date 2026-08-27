@@ -4,7 +4,7 @@ import { test } from "node:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { deriveCard, knowledgeFiles, listPacks, loadPack, parseAgentMd } from "../src/agentdef.js";
+import { declaredPackNames, deriveCard, knowledgeFiles, listPacks, loadPack, parseAgentMd, scanPacks } from "../src/agentdef.js";
 import { digestCard } from "../src/jcs.js";
 
 const VALID = `---
@@ -192,4 +192,51 @@ test("sandbox.isolation accepts only what is implemented: a dead safety setting 
   // A value that is not even in the enum must not be told that three refused
   // values are legal, which is zod's default enum error (RFA-0.8 sect. 8.1).
   assert.throws(() => parseAgentMd(withIsolation("vm")), /only .none. is implemented/);
+});
+
+test("scanPacks loads one pack at a time, and declaredPackNames protects a broken pack's running resident", () => {
+  // The supervisor drains any child whose name has left the registry. Before
+  // 2026-08-27 a single unparseable agent.md made its whole registry scan log
+  // one line and RETURN, so nothing was supervised at all; the naive fix
+  // (skip the bad one) is WORSE, because the bad pack then looks retired and a
+  // healthy running resident gets drained over a typo.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-scan-"));
+  const write = (dir: string, body: string) => {
+    fs.mkdirSync(path.join(root, dir), { recursive: true });
+    fs.writeFileSync(path.join(root, dir, "agent.md"), body);
+  };
+  write("good", VALID);
+  // Fails an RFA-0.8 sect. 10 gate rather than YAML syntax, so this pins that a
+  // SCHEMA refusal is handled like a parse error.
+  write("busted", VALID.replace("effort: low\n", "effort: low\nconcurrency: 3\n"));
+  // A pack whose DIRECTORY name differs from its declared name, and which is
+  // also broken: the case the naive set-building gets wrong.
+  write("odd-dir", VALID.replace("name: test-agent", "name: declared-elsewhere").replace("effort: low\n", "effort: low\nconcurrency: 3\n"));
+  // A directory with no agent.md is not a pack at all.
+  fs.mkdirSync(path.join(root, "not-a-pack"), { recursive: true });
+
+  const { packs, broken } = scanPacks(root);
+  assert.deepEqual(
+    packs.map((p) => p.name),
+    ["test-agent"],
+    "the good pack loads even though two siblings do not",
+  );
+  assert.deepEqual(broken.map((b) => b.name).sort(), ["busted", "odd-dir"], "broken packs are named by DIRECTORY, since the declared name is unreadable");
+  assert.match(broken[0].error, /concurrency|per_day_usd|gate/i, "the error says what to fix, in one line");
+
+  // No child running: the declared set is every directory that holds an agent.md.
+  const bare = declaredPackNames(packs, broken);
+  assert.ok(bare.has("test-agent") && bare.has("busted") && bare.has("odd-dir"));
+  assert.ok(!bare.has("not-a-pack"), "a directory without agent.md declares nothing");
+
+  // THE FOOTGUN: a resident is running for the pack in odd-dir under its
+  // DECLARED name. That name must be in the set, or the supervisor drains it
+  // and `rfa down` never reports it.
+  const withChild = declaredPackNames(packs, broken, [{ name: "declared-elsewhere", dir: path.join(root, "odd-dir") }]);
+  assert.ok(withChild.has("declared-elsewhere"), "a running resident of a now-broken pack is NOT treated as retired");
+
+  // A genuinely retired pack (no directory at all) is still absent, which is
+  // what keeps the retirement path working.
+  assert.ok(!withChild.has("retired-agent"));
+  fs.rmSync(root, { recursive: true, force: true });
 });

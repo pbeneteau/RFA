@@ -29,7 +29,7 @@ import type { ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { AccountLedger, RATE_LIMIT_PAUSE_FLOOR_MS, UNSUPERVISED_CAP } from "./account.js";
-import { declaredSecretNames, listPacks, loadPack, type AgentPack } from "./agentdef.js";
+import { declaredPackNames, declaredSecretNames, loadPack, scanPacks, type AgentPack } from "./agentdef.js";
 import { RoomMember } from "./client.js";
 import { Engine } from "./engine.js";
 import { minimalEnv } from "./env.js";
@@ -141,7 +141,15 @@ function writeStateFile(): void {
   }
   fs.writeFileSync(
     hubdir.paths.supervisorState,
-    JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, agents, account: account.snapshot() }, null, 1),
+    // `invalid` is the running supervisor's own record of what it could not
+    // load. The CLI reads it from here rather than re-parsing the files, so
+    // `rfa status` and `rfa doctor` report what IS unsupervised and not what a
+    // second scan guesses.
+    JSON.stringify(
+      { ts: new Date().toISOString(), pid: process.pid, agents, invalid: Object.fromEntries(invalidPacks), account: account.snapshot() },
+      null,
+      1,
+    ),
   );
 }
 
@@ -305,15 +313,56 @@ function heartbeatStale(child: Child): boolean {
   return Date.now() - ts > ttl * 1000;
 }
 
+/**
+ * Pack directories that do not parse, by directory name, with the first line of
+ * their error. Held across cycles so the log and #ops speak on CHANGE and not
+ * every 30 seconds, and so `writeStateFile` can publish them: the CLI must be
+ * able to learn this from the RUNNING supervisor's own record rather than by
+ * re-reading the files itself (the rule in CLAUDE.md, earned three times).
+ */
+const invalidPacks = new Map<string, string>();
+
 async function reconcile(): Promise<void> {
-  let packs: AgentPack[];
-  try {
-    packs = listPacks(AGENTS);
-  } catch (err) {
-    log(`registry scan failed: ${(err as Error).message}`);
-    return;
+  /*
+   * Per pack, never all-or-nothing. `listPacks` maps `loadPack` with no catch,
+   * so ONE unparseable agent.md used to make this whole function log a line and
+   * RETURN: nothing started, no wedged resident restarted, no retirement
+   * drained, every 30 seconds, and the operator's only signal was that log. The
+   * loudness `listPacks` exists to provide is kept, and moved somewhere it can
+   * actually be seen, instead of being expressed as "supervise nothing".
+   */
+  const { packs, broken: brokenList } = scanPacks(AGENTS);
+  const broken = new Map(brokenList.map((b) => [b.name, b.error]));
+
+  // Speak on change only: a 30s loop shouting the same typo is how a log stops
+  // being read. Gone-quiet transitions are announced too, so a fixed pack is
+  // visibly fixed.
+  for (const [dir, why] of broken) {
+    if (invalidPacks.get(dir) === why) continue;
+    log(`agents/${dir}/agent.md is INVALID, so it is NOT supervised and its resident is left exactly as it is: ${why}`);
+    void opsMember()
+      .then((m) => m?.send({ body: `agents/${dir}/agent.md does not parse, so that pack is unsupervised until it is fixed: ${why}`, kind: "status" }))
+      .catch((e) => log(`invalid-pack post failed: ${(e as Error).message}`));
   }
-  const seen = new Set<string>();
+  for (const dir of invalidPacks.keys()) if (!broken.has(dir)) log(`agents/${dir}/agent.md parses again; back under supervision`);
+  invalidPacks.clear();
+  for (const [dir, why] of broken) invalidPacks.set(dir, why);
+
+  /*
+   * `seen` decides RETIREMENT at the bottom of this function, so it must hold
+   * every DECLARED pack, including the ones that do not parse. A pack whose file
+   * has a typo is not a retired pack: leaving it out would drain a HEALTHY
+   * running resident over a syntax error, which is worse than the
+   * all-or-nothing this replaces. The declared name is unreadable for a broken
+   * pack, so the directory name stands in, and any child whose pack lives in
+   * that directory is protected by name as well, because a directory and a
+   * declared name are allowed to differ.
+   */
+  const seen = declaredPackNames(
+    packs,
+    brokenList,
+    [...children].map(([name, c]) => ({ name, dir: c.pack.dir })),
+  );
   for (const pack of packs) {
     seen.add(pack.name);
     const existing = children.get(pack.name);

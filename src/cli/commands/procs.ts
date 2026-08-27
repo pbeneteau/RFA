@@ -9,7 +9,7 @@
 import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { loadPack, type AgentPack } from "../../agentdef.js";
+import { declaredPackNames, scanPacks, type AgentPack, type BrokenPack } from "../../agentdef.js";
 import { daemonState, DaemonError, runForeground, startDaemon, stopDaemon, logTail } from "../../daemon.js";
 import { minimalEnv } from "../../env.js";
 import { ensureRuntime, roomsStore, type HubDir } from "../../hubdir.js";
@@ -84,7 +84,7 @@ export async function upAll(ctx: CliContext, opts: { only?: "hub" | "supervisor"
       ui.done(hub.started ? `hub          pid ${hub.pid}   ${url}` : `hub          already running (pid ${hub.pid})   ${url}`, hub.started ? "console at /console" : undefined);
     }
     if (opts.only !== "hub") {
-      const { loadable, invalid } = packsTolerant(h);
+      const { packs: loadable, broken: invalid } = scanPacks(h.paths.agents);
       const packs = loadable.length;
       supervisor = await startSupervisor(ctx, h);
       ui.done(supervisor.started ? `supervisor   pid ${supervisor.pid}   ${packs} agent${packs === 1 ? "" : "s"}` : `supervisor   already running (pid ${supervisor.pid})`);
@@ -140,38 +140,6 @@ export async function downAll(ctx: CliContext): Promise<{ supervisor: string; hu
   return { supervisor, hub, strays };
 }
 
-/**
- * Every pack directory, loaded tolerantly: the ones that parse, and separately
- * the ones that do not, named by their directory.
- *
- * NOT `listPacks`, which maps `loadPack` with no catch, so ONE hand-written
- * agent.md that fails validation throws out of every caller. `listPacks` keeps
- * that behaviour on purpose, because the supervisor wants a loud failure. A CLI
- * command that LISTS or STOPS the instance does not: answering `rfa up` or
- * `rfa down` with a parse error, instead of starting or stopping everything
- * else, is the failure this exists to prevent. Fixed in `rfa doctor` and in
- * `collectStatus` on 2026-08-27, and in `upAll` and `strayResidents` the same
- * day after the same defect was found in both (docs/LEDGER.md).
- *
- * One implementation rather than a fourth copy of the loop: a subtle scan
- * duplicated per caller is how the four drift apart.
- */
-function packsTolerant(h: HubDir): { loadable: AgentPack[]; invalid: { name: string; error: string }[] } {
-  const loadable: AgentPack[] = [];
-  const invalid: { name: string; error: string }[] = [];
-  const dirs = fs.existsSync(h.paths.agents)
-    ? fs.readdirSync(h.paths.agents, { withFileTypes: true }).filter((e) => e.isDirectory() && fs.existsSync(path.join(h.paths.agents, e.name, "agent.md")))
-    : [];
-  for (const entry of dirs) {
-    try {
-      loadable.push(loadPack(path.join(h.paths.agents, entry.name)));
-    } catch (err) {
-      invalid.push({ name: entry.name, error: (err as Error).message.split("\n")[0] });
-    }
-  }
-  return { loadable, invalid };
-}
-
 async function strayResidents(h: HubDir): Promise<string[]> {
   // An invalid pack's resident is still THIS instance's resident. Dropping the
   // unparseable ones would omit a live process from the report `rfa down` gives
@@ -179,7 +147,7 @@ async function strayResidents(h: HubDir): Promise<string[]> {
   // about keeps serving its membership. The declared name is unreadable for
   // those, so the directory name is the fallback (the two agree for every pack
   // `rfa agent new` writes).
-  const { loadable, invalid } = packsTolerant(h);
+  const { packs: loadable, broken: invalid } = scanPacks(h.paths.agents);
   const names = new Set([...loadable.map((p) => p.name), ...invalid.map((p) => p.name)]);
   if (names.size === 0) return [];
   return (await residentProcesses()).filter((p) => names.has(p.agent) && belongsTo(p, h.root)).map((p) => `${p.pid} ${p.agent}`);
@@ -243,7 +211,7 @@ export async function collectStatus(ctx: CliContext): Promise<Record<string, unk
   } catch {
     supFile = null;
   }
-  const { loadable, invalid } = packsTolerant(h);
+  const { packs: loadable, broken: invalid } = scanPacks(h.paths.agents);
   const packs = loadable.map((p) => {
     const hb = path.join(p.dir, "state", "heartbeat");
     const hbAge = fs.existsSync(hb) ? Date.now() - Number(fs.readFileSync(hb, "utf8")) : null;

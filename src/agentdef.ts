@@ -492,6 +492,66 @@ export function listPacks(root: string): AgentPack[] {
     .map((e) => loadPack(path.join(root, e.name)));
 }
 
+/** A pack directory whose `agent.md` did not load, named by its directory. */
+export interface BrokenPack {
+  /** The DIRECTORY name. The declared name is unreadable, which is the whole problem. */
+  name: string;
+  /** First line of the loader's complaint: enough to act on, short enough for one row. */
+  error: string;
+}
+
+/**
+ * Every pack under an agents root, loaded ONE AT A TIME: the ones that parse and
+ * the ones that do not, separately.
+ *
+ * `listPacks` maps `loadPack` with no catch and keeps that behaviour on purpose,
+ * because several callers genuinely want a loud failure. Everything that LISTS,
+ * STOPS or SUPERVISES an instance wants the opposite, and got it wrong four
+ * times: `rfa doctor` and `rfa status` answered with a parse error instead of
+ * the instance (fixed 2026-08-27), `rfa up` and `rfa down` died before starting
+ * or stopping anything, and the SUPERVISOR logged one line and reconciled
+ * NOTHING, so a single typo left every resident unsupervised on a 30s loop.
+ * One implementation, because a subtle scan copied per caller is how the copies
+ * drift.
+ */
+export function scanPacks(root: string): { packs: AgentPack[]; broken: BrokenPack[] } {
+  const packs: AgentPack[] = [];
+  const broken: BrokenPack[] = [];
+  if (!fs.existsSync(root)) return { packs, broken };
+  for (const e of fs.readdirSync(root, { withFileTypes: true })) {
+    if (!e.isDirectory() || !fs.existsSync(path.join(root, e.name, "agent.md"))) continue;
+    try {
+      packs.push(loadPack(path.join(root, e.name)));
+    } catch (err) {
+      broken.push({ name: e.name, error: (err as Error).message.split("\n")[0] });
+    }
+  }
+  return { packs, broken };
+}
+
+/**
+ * Every name the registry DECLARES, which is not the same as every name that
+ * parses.
+ *
+ * This exists for one decision: the supervisor drains any child whose name has
+ * left the registry, and `rfa down` reports any resident whose name is still in
+ * it. A pack with a typo in its `agent.md` is NOT a retired pack, so leaving it
+ * out of this set would drain a HEALTHY running resident over a syntax error
+ * (and, on the CLI side, omit a live resident from the report an operator is
+ * given). The declared name is unreadable for a broken pack, so its DIRECTORY
+ * name stands in, and any existing child living in that directory is protected
+ * by its own name too, because a directory name and a declared name are allowed
+ * to differ.
+ */
+export function declaredPackNames(packs: AgentPack[], broken: BrokenPack[], existing: readonly { name: string; dir: string }[] = []): Set<string> {
+  const names = new Set(packs.map((p) => p.name));
+  for (const b of broken) {
+    names.add(b.name);
+    for (const child of existing) if (path.basename(child.dir) === b.name) names.add(child.name);
+  }
+  return names;
+}
+
 /**
  * The capability card DERIVED from the definition (spec 3.1): name,
  * description, offers as card skills, and the definition hash so a definition
