@@ -9,7 +9,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import YAML from "yaml";
-import { knowledgeFiles, listPacks, type AgentPack } from "../../agentdef.js";
+import { knowledgeFiles, packByName, scanPacks, type AgentPack, type BrokenPack } from "../../agentdef.js";
 import { CHAIN_SCOPE_QUALIFIER } from "../../chain.js";
 import { runForeground } from "../../daemon.js";
 import { applyWorksheet, flagForReview, prepareWorksheet } from "../../evals/label.js";
@@ -21,18 +21,42 @@ import { describeReport, expandLogTargets, verifyLogFile, type LogReport } from 
 import { addKnowledge } from "../agentmd.js";
 import { attachKnowledge, AttachError, type Attachment } from "../attach.js";
 import { AccountLedger } from "../../account.js";
-import { CliError, numberFlag } from "../context.js";
+import { CliError, numberFlag, type CliContext } from "../context.js";
 import { askLine, pickOne } from "../prompts.js";
 import type { CommandDef } from "../router.js";
 import { daemonEnv } from "./procs.js";
 import { requireRoom } from "./room.js";
 import { describeOffers, speaker } from "./talk.js";
 
+/**
+ * The pack a command was pointed AT, by name.
+ *
+ * The by-name rule: loud for the named pack, tolerant of every other one.
+ * `listPacks(...).find(...)` was the reverse - it threw an unrelated pack's parse
+ * error before ever looking for this name, so `rfa knowledge sync pm-agent`
+ * failed on a typo in `scribe`. `packByName` in src/agentdef.ts does the
+ * tolerant half once, and the naming below is this command family's own.
+ */
 function requirePack(h: HubDir, name: string | undefined): AgentPack {
   if (!name) throw new CliError(2, "which agent? pass its name", "rfa agent ls");
-  const pack = listPacks(h.paths.agents).find((p) => p.name === name);
+  const { pack, broken } = packByName(h.paths.agents, name);
+  if (broken) throw new CliError(1, `${name}'s definition does not parse, so nothing can be resolved against it: ${broken.error}`, `rfa agent validate ${name}`);
   if (!pack) throw new CliError(2, `no agent named ${name} in ${path.relative(h.root, h.paths.agents) || "agents"}/`, "rfa agent ls");
   return pack;
+}
+
+/**
+ * Name the packs a cross-instance instrument could not read.
+ *
+ * TOLERANT and NAMED: these commands operate ACROSS the instance, where the
+ * all-or-nothing scan meant one unparseable pack stopped every OTHER pack's
+ * clones from being synced or listed. Silently skipping is not acceptable
+ * either - a pack absent from `knowledge sync` output reads as a pack with no
+ * clones - so this puts the directory name and the loader's complaint in the
+ * output beside the rows.
+ */
+function warnBroken(ctx: CliContext, broken: BrokenPack[], what: string): void {
+  for (const b of broken) ctx.ui.warn(`agents/${b.name}/agent.md does not parse, so ${what}: ${b.error}`, `rfa agent validate ${b.name}`);
 }
 
 const short = (sha: string | null) => (sha ? sha.slice(0, 10) : "?");
@@ -49,7 +73,9 @@ export const knowledgeAdd: CommandDef = {
   run: async (ctx, a) => {
     const h = ctx.hubdir();
     const usage = "rfa knowledge add <agent> <path|git remote>";
-    const name = a.positionals[0] ?? (await pickOne(ctx, "Which agent?", listPacks(h.paths.agents).map((p) => ({ value: p.name })), usage));
+    // TOLERANT: a broken pack cannot be offered as a target (knowledge attaches
+    // to a parsed definition), but it must not stop the question being asked.
+    const name = a.positionals[0] ?? (await pickOne(ctx, "Which agent?", scanPacks(h.paths.agents).packs.map((p) => ({ value: p.name })), usage));
     const source = a.positionals[1] ?? (await askLine(ctx, "A folder of markdown, or a git remote", usage, { placeholder: "./docs  or  git@host:org/handbook.git" }));
     const pack = requirePack(h, name);
     const file = path.join(pack.dir, "agent.md");
@@ -88,7 +114,13 @@ export const knowledgeSync: CommandDef = {
   why: "Nothing is copied: the pack reads the clone through its globs, so a sync is a pull. It holds the pack's new turns and waits for the running ones to finish first, because a pull under a live turn can produce one answer citing two corpus versions. --pin records the synced head as the eval corpus_version afterwards, which is what keeps an upstream edit from reading as a regression.",
   run: async (ctx, a) => {
     const h = ctx.hubdir();
-    const packs = a.positionals[0] ? [requirePack(h, a.positionals[0])] : listPacks(h.paths.agents);
+    // Named, then skipped: a clone can only be found through parsed knowledge
+    // globs, so an unreadable definition genuinely has nothing to sync here. It
+    // must not stop the OTHER packs being synced, and it must not pass for a
+    // pack with no clones.
+    const scan = a.positionals[0] ? { packs: [requirePack(h, a.positionals[0])], broken: [] } : scanPacks(h.paths.agents);
+    warnBroken(ctx, scan.broken, "its clones cannot be found, so it is not synced");
+    const packs = scan.packs;
     const waitMs = Math.max(0, (numberFlag(a.values.wait, "--wait") ?? 30) * 1000);
     const rows: { agent: string; clone: string; head: string; fresh: boolean; documents: number; error?: string }[] = [];
     /**
@@ -171,9 +203,13 @@ export const knowledgeStatusCmd: CommandDef = {
   why: "One knowledge fact must live in exactly one file. Attaching a new source without removing what it superseded produced duplicate pages, and the agent then honestly reported a fact as missing while it sat in the other copy (cost: a day of chasing a phantom eval flake). The duplicate check here is the cheapest detector of that: the same page name resolved from two places.",
   run: async (ctx) => {
     const h = ctx.hubdir();
-    const status = knowledgeStatus(h);
-    if (ctx.flags.json) return void ctx.ui.json({ agents: status });
-    if (status.length === 0) return void ctx.ui.line(ctx.ui.dim("no agents yet: rfa agent new <name>"));
+    const { agents: status, broken } = knowledgeStatus(h);
+    if (ctx.flags.json) return void ctx.ui.json({ agents: status, broken });
+    if (status.length === 0 && broken.length === 0) return void ctx.ui.line(ctx.ui.dim("no agents yet: rfa agent new <name>"));
+    // Named first: a pack whose definition does not parse has no readable
+    // knowledge globs, and a listing that silently omitted it would read as a
+    // pack with no knowledge.
+    for (const b of broken) ctx.ui.warn(`agents/${b.name}/agent.md does not parse, so what it reads cannot be listed: ${b.error}`, `rfa agent validate ${b.name}`);
     for (const s of status) {
       ctx.ui.line(`${ctx.ui.bold(s.pack)}  ${s.files} file(s) from ${s.globs.length} glob(s)`);
       for (const g of s.globs) ctx.ui.line(`     ${ctx.ui.dim(g)}`);
@@ -194,8 +230,13 @@ export const knowledgePin: CommandDef = {
     const h = ctx.hubdir();
     let sha = a.values.sha as string | undefined;
     if (!sha) {
-      const packs = a.positionals[0] ? [requirePack(h, a.positionals[0])] : listPacks(h.paths.agents);
-      const clones = packs.flatMap((p) => packClones(p).filter((c) => c.head).map((c) => ({ pack: p.name, ...c })));
+      // Named for a reason that matters here more than elsewhere: this command
+      // refuses unless it finds EXACTLY ONE clone, so a pack whose globs cannot
+      // be read changes the answer. The operator gets told which pack is
+      // invisible to the count.
+      const scan = a.positionals[0] ? { packs: [requirePack(h, a.positionals[0])], broken: [] } : scanPacks(h.paths.agents);
+      warnBroken(ctx, scan.broken, "its clones cannot be counted towards the pin");
+      const clones = scan.packs.flatMap((p) => packClones(p).filter((c) => c.head).map((c) => ({ pack: p.name, ...c })));
       if (clones.length !== 1) throw new CliError(2, clones.length === 0 ? "no clone to pin: attach one with rfa knowledge add, or pass --sha" : `${clones.length} clones: ${clones.map((c) => `${c.pack}/${c.name}`).join(", ")}`, "name the agent, or pass --sha");
       sha = clones[0].head!;
     }
@@ -239,7 +280,14 @@ export interface CaseRow {
 }
 
 export function listCases(h: HubDir): CaseRow[] {
-  const roots = [h.paths.evalCases, ...listPacks(h.paths.agents).map((p) => path.join(p.dir, "evals", "cases"))];
+  // TOLERANT: an eval case is a `case.yaml` on disk under `<pack>/evals/cases/`,
+  // and finding it needs a directory, not a parsed definition. So a broken pack's
+  // cases are still listed: they come from the directory listing, and losing the
+  // whole corpus (this feeds the dashboard's Evals tab through src/cli/tui/data.ts)
+  // over an unrelated typo was the worst trade of the seven sites.
+  const { packs, broken } = scanPacks(h.paths.agents);
+  const packDirs = [...packs.map((p) => p.dir), ...broken.map((b) => path.join(h.paths.agents, b.name))];
+  const roots = [h.paths.evalCases, ...packDirs.map((d) => path.join(d, "evals", "cases"))];
   const rows: CaseRow[] = [];
   for (const root of roots.filter((r) => fs.existsSync(r))) {
     for (const entry of fs.readdirSync(root, { withFileTypes: true })) {

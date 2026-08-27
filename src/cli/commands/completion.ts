@@ -8,7 +8,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { listPacks } from "../../agentdef.js";
+import { declaredPackNames, scanPacks } from "../../agentdef.js";
 import { roomsStore, tokensStore } from "../../hubdir.js";
 import { CliError } from "../context.js";
 import { GLOBAL_OPTIONS, GROUPS, type CommandDef, type Router } from "../router.js";
@@ -139,7 +139,19 @@ export function completionCommands(router: Router): CommandDef[] {
       const h = ctx.maybe();
       const dyn = h
         ? {
-            packs: safe(() => listPacks(h.paths.agents).map((p) => p.name)),
+            /*
+             * TOLERANT, and it offers the broken ones by DIRECTORY name. `safe`
+             * already swallowed the all-or-nothing throw, so this never crashed
+             * a shell - it silently offered NO pack name at all when one
+             * definition was bad, and `rfa agent validate <TAB>` on the pack
+             * that needs fixing is the completion most worth having at that
+             * moment. `declaredPackNames` is the same set the supervisor uses
+             * to decide what is still declared.
+             */
+            packs: safe(() => {
+              const { packs: loadable, broken } = scanPacks(h.paths.agents);
+              return [...declaredPackNames(loadable, broken)];
+            }),
             rooms: safe(() => roomsStore(h).read().rooms.map((r) => r.alias)),
             tokens: safe(() => tokensStore(h).read().tokens.map((t) => t.label)),
           }

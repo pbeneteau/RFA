@@ -68,10 +68,16 @@ export const backupNow: CommandDef = {
     const h = ctx.hubdir();
     const keep = a.values.keep ? Number(a.values.keep) : h.manifest.retention.backup_keep;
     if (!Number.isInteger(keep) || keep < 1) throw new CliError(2, "--keep takes a whole number of backups to keep, at least 1");
+    const plan = backupPlan(h);
     const sp = ctx.ui.spinner(`backing up ${h.manifest.name} to ${h.paths.backups}`);
-    const res = await runBackup({ root: h.root, ...backupPlan(h), destRoot: h.paths.backups, keep });
+    const res = await runBackup({ root: h.root, dbs: plan.dbs, dirs: plan.dirs, destRoot: h.paths.backups, keep });
     sp.stop({ ok: true, text: `backup written: ${res.dest}`, detail: `${res.files.length} database(s) + archive · ${res.kept.length} kept` });
-    if (ctx.flags.json) ctx.ui.json({ dest: res.dest, files: res.files, kept: res.kept });
+    // Named, and named accurately: the plan is built from the directory listing,
+    // so an unparseable pack's state and memory ARE in this archive. The warning
+    // exists because a broken definition is worth knowing about, not because
+    // anything was left out.
+    for (const b of plan.broken) ctx.ui.warn(`agents/${b.name}/agent.md does not parse; its state and memory are in the backup anyway: ${b.error}`, `rfa agent validate ${b.name}`);
+    if (ctx.flags.json) ctx.ui.json({ dest: res.dest, files: res.files, kept: res.kept, broken_packs: plan.broken });
   },
 };
 
@@ -143,7 +149,8 @@ export const backupRestore: CommandDef = {
       if (p.isCancel(ok) || !ok) return 1;
     }
     const stamp = `pre-restore-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-    const safety = await runBackup({ root: h.root, ...backupPlan(h), destRoot: h.paths.backups, keep: 10_000, day: stamp });
+    const safetyPlan = backupPlan(h);
+    const safety = await runBackup({ root: h.root, dbs: safetyPlan.dbs, dirs: safetyPlan.dirs, destRoot: h.paths.backups, keep: 10_000, day: stamp });
     for (const d of plan.databases) {
       fs.mkdirSync(path.dirname(d.to), { recursive: true });
       fs.copyFileSync(d.from, d.to);

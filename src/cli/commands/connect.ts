@@ -13,7 +13,7 @@ import { execFile, execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { listPacks } from "../../agentdef.js";
+import { scanPacks } from "../../agentdef.js";
 import { findRoom, roomsStore, tokensStore, writeManifest, type HubDir, type RoomRecord, type TokenRecord } from "../../hubdir.js";
 import { packageFile } from "../../pkg.js";
 import { CliError, type CliContext } from "../context.js";
@@ -55,10 +55,22 @@ async function admitInto(ctx: CliContext, h: HubDir, label: string, rooms: RoomR
   });
 }
 
-/** The skill id most likely wanted in a room: the first offer of the packs bound to it. */
+/**
+ * The skill id most likely wanted in a room: the first offer of the packs bound
+ * to it.
+ *
+ * TOLERANT, and the one site in this sweep that names nothing. `listPacks` maps
+ * `loadPack` with no catch, so an unrelated pack's typo threw out of here and
+ * failed `rfa connect` whole: the project got NO skill file rather than one with
+ * a vaguer hint, which is the wrong trade by a wide margin. Nothing is named
+ * because the only consumer of this string is a generated template that a person
+ * reads later in another repository, where a broken pack's name is noise; the
+ * operator learns it from `rfa agent ls`, `rfa doctor` and `rfa status`, in the
+ * directory where they can act on it.
+ */
 function capabilityHint(h: HubDir, room: RoomRecord): string {
-  const ids = listPacks(h.paths.agents)
-    .filter((p) => (p.def.rooms ?? []).some((b) => b.room === room.handle))
+  const ids = scanPacks(h.paths.agents)
+    .packs.filter((p) => (p.def.rooms ?? []).some((b) => b.room === room.handle))
     .flatMap((p) => (p.def.offers ?? []).map((o) => `\`${o.id}\`: ${o.description}`));
   return ids.length ? ids.join("; ") : "whatever skill ids the roster lists";
 }

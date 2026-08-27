@@ -658,14 +658,19 @@ async function nightlyPass(): Promise<void> {
   }
   try {
     const p = hubdir.paths;
+    const plan = backupPlan(hubdir);
     const res = await runBackup({
       root: hubdir.root,
-      ...backupPlan(hubdir),
+      dbs: plan.dbs,
+      dirs: plan.dirs,
       destRoot: p.backups,
       keep: OPS.backupKeep,
       day,
     });
-    log(`backup written: ${res.dest} (${res.files.length} files, ${res.kept.length} kept)`);
+    // The broken packs are in the archive (the plan reads the directory, not the
+    // definition); the log says so, because `reconcile` above has already told
+    // this operator those packs are unsupervised and the two facts differ.
+    log(`backup written: ${res.dest} (${res.files.length} files, ${res.kept.length} kept)${plan.broken.length ? `; included the files of ${plan.broken.length} unparseable pack(s): ${plan.broken.map((b) => b.name).join(", ")}` : ""}`);
     const m = await opsMember();
     await m?.send({ body: `nightly backup written to ${res.dest} (${res.kept.length} kept)`, kind: "status" }).catch(() => {});
   } catch (err) {

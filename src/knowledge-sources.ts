@@ -22,7 +22,7 @@
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { knowledgeFiles, listPacks, type AgentPack } from "./agentdef.js";
+import { knowledgeFiles, scanPacks, type AgentPack, type BrokenPack } from "./agentdef.js";
 import type { HubDir } from "./hubdir.js";
 
 const git = (args: string[], cwd: string): string => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -168,8 +168,20 @@ export interface PackKnowledge {
   duplicates: { name: string; paths: string[] }[];
 }
 
-export function knowledgeStatus(h: HubDir): PackKnowledge[] {
-  return listPacks(h.paths.agents).map((pack) => {
+/**
+ * What every pack reads, plus the packs whose definition could not be read at
+ * all.
+ *
+ * TOLERANT across the instance: `listPacks` maps `loadPack` with no catch, so one
+ * unparseable `agent.md` answered `rfa knowledge status` with a parse error
+ * instead of the corpus, which also took the duplicate-page detector with it -
+ * the cheapest instrument against the one-fact-one-file rule, off, because of an
+ * unrelated pack. The broken names ride in the shape rather than being dropped:
+ * a pack missing from a knowledge listing reads as a pack with no knowledge.
+ */
+export function knowledgeStatus(h: HubDir): { agents: PackKnowledge[]; broken: BrokenPack[] } {
+  const { packs, broken } = scanPacks(h.paths.agents);
+  const agents = packs.map((pack) => {
     const files = knowledgeFiles(pack);
     const byName = new Map<string, string[]>();
     for (const f of files) {
@@ -179,6 +191,7 @@ export function knowledgeStatus(h: HubDir): PackKnowledge[] {
     const duplicates = [...byName].filter(([, p]) => p.length > 1).map(([name, paths]) => ({ name, paths }));
     return { pack: pack.name, globs: pack.def.knowledge ?? [], files: files.length, clones: packClones(pack), duplicates };
   });
+  return { agents, broken };
 }
 
 /** The eval corpus is a PINNED sha (sect. 19.4), so an upstream edit cannot read as a regression. */

@@ -39,7 +39,7 @@ import * as http from "node:http";
 import * as path from "node:path";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
-import { listPacks, parseAgentMd } from "./agentdef.js";
+import { parseAgentMd, scanPacks } from "./agentdef.js";
 import { matchDigest, parsePrincipalsFile, parseTokensFile, tokenDigest, WatchedFile } from "./credentials.js";
 import { createHubServer } from "./hub.js";
 import { ensureRuntime, HubDirError, maybeHubDir, roomsStore, type HubDir, type LocalHubConfig, type PrincipalRecord, type TokenRecord } from "./hubdir.js";
@@ -767,7 +767,18 @@ function agentStatus(): unknown[] {
   const sup = fs.existsSync(stateFile)
     ? (JSON.parse(fs.readFileSync(stateFile, "utf8")) as { agents?: Record<string, unknown> })
     : { agents: {} };
-  return listPacks(AGENTS_DIR).map((p) => {
+  /*
+   * TOLERANT. `listPacks` maps `loadPack` with no catch, so one bad definition
+   * threw inside this handler and `GET /api/agents` answered 500: the whole
+   * workbench Agents tab went blank, and with it the raw-definition editor that
+   * is the fastest way to FIX the bad definition. The broken pack therefore gets
+   * a row of its own, named by DIRECTORY (its declared name is what is
+   * unreadable) with `broken` carrying the loader's complaint, because the
+   * console addresses `/api/agents/<dir>/definition` by that same name.
+   * The response stays an ARRAY: the console iterates it.
+   */
+  const { packs, broken } = scanPacks(AGENTS_DIR);
+  const rows = packs.map((p) => {
     const hb = path.join(p.dir, "state", "heartbeat");
     const hbAge = fs.existsSync(hb) ? Math.round((Date.now() - Number(fs.readFileSync(hb, "utf8"))) / 1000) : null;
     return {
@@ -780,8 +791,24 @@ function agentStatus(): unknown[] {
       offers: (p.def.offers ?? []).map((o) => o.id),
       heartbeat_age_s: hbAge,
       supervisor: (sup.agents as Record<string, unknown>)?.[p.name] ?? null,
+      broken: null as string | null,
     };
   });
+  return [
+    ...rows,
+    ...broken.map((b) => ({
+      name: b.name,
+      description: `agent.md does not parse: ${b.error}`,
+      model: null,
+      effort: null,
+      definition_hash: null,
+      rooms: [],
+      offers: [],
+      heartbeat_age_s: null,
+      supervisor: (sup.agents as Record<string, unknown>)?.[b.name] ?? null,
+      broken: b.error,
+    })),
+  ];
 }
 
 async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pathname: string): Promise<void> {

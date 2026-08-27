@@ -945,7 +945,16 @@ export class RoomHub {
     // who opens the console in the morning (found in review, 2026-08-22).
     let history: RfaEvent[] = [];
     let truncated = false;
-    const seesBack = room.policies.history_visibility === "member" || (member.origin === "human" && (member.home ?? "local") === "local");
+    // The home condition is OUTSIDE the disjunction on purpose. Spec 5.4 makes
+    // `joined_after` the effective policy for any member whose home is not local
+    // "whatever the room policy says", and `visibleSince` already honours that
+    // for `since`; without this the join contract would not, so a guest in a
+    // `history_visibility: "member"` room could ask for `history_limit: 500` and
+    // be handed 500 pre-join events. Inert today (the join path hard-codes
+    // `local`), which is exactly why it is written before admission can expose
+    // it (review 2026-08-27).
+    const local = (member.home ?? "local") === "local";
+    const seesBack = local && (room.policies.history_visibility === "member" || member.origin === "human");
     if (seesBack && args.historyLimit > 0) {
       const before = room.events.filter((e) => e.seq < joinSeq);
       history = before.slice(-args.historyLimit);

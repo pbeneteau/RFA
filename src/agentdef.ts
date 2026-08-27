@@ -530,6 +530,27 @@ export function scanPacks(root: string): { packs: AgentPack[]; broken: BrokenPac
 }
 
 /**
+ * ONE pack, by the name the operator typed, from a tolerant scan.
+ *
+ * The rule for a by-name command: stay LOUD for the pack that was ASKED about,
+ * and stop dying because a DIFFERENT pack is broken. `listPacks(...).find(...)`
+ * gave the opposite of both - a parse error from an unrelated directory, with
+ * the asked-for pack never looked at. So the scan is tolerant, and the caller
+ * decides the wording: `broken` is set when the name matches a pack that exists
+ * and does not parse (fail with its error), `pack` when it parses, and neither
+ * when the name is not there at all (the caller's own not-found error).
+ *
+ * A loadable pack matches on its DECLARED name, a broken one on its DIRECTORY
+ * name, because the declared name is precisely what is unreadable. The two agree
+ * for every pack `rfa agent new` writes, and where they differ the operator has
+ * only the directory to point at anyway.
+ */
+export function packByName(root: string, name: string): { pack: AgentPack | null; broken: BrokenPack | null } {
+  const { packs, broken } = scanPacks(root);
+  return { pack: packs.find((p) => p.name === name) ?? null, broken: broken.find((b) => b.name === name) ?? null };
+}
+
+/**
  * Every name the registry DECLARES, which is not the same as every name that
  * parses.
  *

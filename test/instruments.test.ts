@@ -223,6 +223,17 @@ test("evals ls ignores the scaffold's example case (a placeholder that runs fail
   assert.deepEqual(cases.map((c) => c.id), ["protocol-ask-cycle"], "only the active case rfa init seeded from templates/evals");
   assert.ok(!cases.some((c) => c.where.includes("agents/")), "an answerer's scaffolded case is an example the runner ignores: a placeholder that runs fails the gate by construction");
   assert.ok(fs.existsSync(path.join(h.paths.agents, "scribe", "evals", "cases", "scribe-01", "case.yaml.example")), "the template is there to edit into a real case");
+  // Including a spec-expert, whose question DOES have a true answer (2026-08-27,
+  // owner's call): seeding it active made a fresh instance's first gate run need
+  // a room, a resident, a credential and a few cents, so a new operator met the
+  // reliability gate by watching it fail. Every scaffolded kind now ships inert.
+  const se = await rfa(["agent", "new", "specialist", "--kind", "spec-expert"]);
+  assert.equal(se.code, 0, se.stderr);
+  const seCase = path.join(h.paths.agents, "specialist", "evals", "cases", "specialist-01");
+  assert.ok(fs.existsSync(path.join(seCase, "case.yaml.example")), "a spec-expert's own case ships INERT too");
+  assert.ok(!fs.existsSync(path.join(seCase, "case.yaml")), "and is NOT active, or the first rfa evals run needs a credential");
+  const ls2 = await rfa(["evals", "ls", "--json"]);
+  assert.deepEqual(json<{ cases: { id: string }[] }>(ls2).cases.map((c) => c.id), ["protocol-ask-cycle"], "scaffolding a spec-expert adds nothing the gate runs");
   const nothing = await rfa(["evals", "promote", "product", "--conversation", "c_none", "--id", "c1"]);
   assert.equal(nothing.code, 1, "nothing linked to that conversation is an error, not an empty case");
   assert.match(nothing.stderr, /nothing linked to c_none/);

@@ -270,14 +270,22 @@ export const secretsLs: CommandDef = {
   run: async (ctx) => {
     const h = ctx.hubdir();
     const s = secretsStore(h).read();
-    const { listPacks, declaredSecretNames } = await import("../../agentdef.js");
+    // TOLERANT and named. `listPacks` maps `loadPack` with no catch, so one bad
+    // definition answered `rfa secrets ls` with a parse error instead of the
+    // secrets. Named because the "declared by" column is the whole point of this
+    // listing and a broken pack's declarations are unreadable: without the
+    // warning, a secret only that pack needs reads as "declared by no pack",
+    // which is an invitation to unset it.
+    const { scanPacks, declaredSecretNames } = await import("../../agentdef.js");
+    const { packs, broken } = scanPacks(h.paths.agents);
     const users = new Map<string, string[]>();
-    for (const p of listPacks(h.paths.agents)) for (const n of declaredSecretNames(p.def)) users.set(n, [...(users.get(n) ?? []), p.name]);
+    for (const p of packs) for (const n of declaredSecretNames(p.def)) users.set(n, [...(users.get(n) ?? []), p.name]);
     const rows = Object.keys(s).sort().map((n) => ({ name: n, length: s[n].length, declared_by: users.get(n) ?? [] }));
     const missing = [...users.keys()].filter((n) => !(n in s));
-    if (ctx.flags.json) return void ctx.ui.json({ secrets: rows, missing });
+    if (ctx.flags.json) return void ctx.ui.json({ secrets: rows, missing, broken_packs: broken });
     ctx.ui.table(rows.map((r) => [r.name, ctx.ui.dim(`${r.length} chars`), r.declared_by.length ? `used by ${r.declared_by.join(", ")}` : ctx.ui.dim("declared by no pack")]));
     for (const n of missing) ctx.ui.warn(`${n} is declared by ${users.get(n)!.join(", ")} and not set`, `rfa secrets set ${n}`);
+    for (const b of broken) ctx.ui.warn(`agents/${b.name}/agent.md does not parse, so the secrets IT declares are missing from the column above: ${b.error}`, `rfa agent validate ${b.name}`);
   },
 };
 

@@ -4,7 +4,7 @@
  * verbs in process (src/cli/hubaccess.ts) and every file through src/hubdir.ts.
  */
 import { strict as assert } from "node:assert";
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
@@ -745,5 +745,191 @@ test("one unparseable pack does not stop `rfa up` or `rfa down` from working, an
   } finally {
     await rfa(["down"]);
     fs.rmSync(bad, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------- the rest of the listPacks sweep (2026-08-27)
+//
+// `listPacks` maps `loadPack` with no catch and keeps doing so on purpose. The
+// four callers fixed earlier that day (doctor, collectStatus, upAll,
+// strayResidents) are covered by the test above; these cover the seven that
+// followed. The rule, per site: a command that LISTS or operates ACROSS the
+// instance is tolerant AND names the broken pack, and a command that targets ONE
+// pack by name stays loud for THAT pack while no longer dying over a different
+// one.
+
+/**
+ * A pack directory whose definition cannot be read at all, with files under it
+ * worth keeping.
+ *
+ * Broken by SCHEMA (concurrency: 3 with no `budgets.per_day_usd`, RFA-0.8 sect.
+ * 10 gate 3) and not by YAML syntax, because a schema refusal and a parse error
+ * must reach every caller identically and it is the schema half that arrives in
+ * real life: the operator raised a number, not corrupted a file.
+ */
+function writeUnreadablePack(name: string): string {
+  const dir = path.join(h.paths.agents, name);
+  fs.mkdirSync(path.join(dir, "memory"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "state"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "memory", "note.md"), "# a fact this pack learned\n");
+  fs.writeFileSync(
+    path.join(dir, "agent.md"),
+    ["---", "rfa_agent: 1", `name: ${name}`, "description: Declares concurrency with no day ceiling, which sect. 10 gate 3 refuses.", "concurrency: 3", "tools:", "  allow: [Read, Grep]", "offers:", "  - id: answer-question", "    description: Answers.", "---", "body"].join("\n"),
+  );
+  return dir;
+}
+
+test("rfa agent ls survives an unparseable pack and gives it a row of its own", async () => {
+  const good = await rfa(["agent", "new", "sweep-ok", "--kind", "answerer", "--json"]);
+  assert.equal(good.code, 0, good.stderr);
+  const bad = writeUnreadablePack("sweep-bad");
+  try {
+    const ls = await rfa(["agent", "ls", "--json"]);
+    assert.equal(ls.code, 0, ls.stderr);
+    const rows = json<{ name: string; status: string; broken?: string | null }[]>(ls);
+    const ok = rows.find((r) => r.name === "sweep-ok");
+    assert.ok(ok, "the pack that parses is listed at all, which the throw prevented for every pack at once");
+    assert.equal(ok.broken ?? null, null, "and it is not marked broken");
+    const shown = rows.find((r) => r.name === "sweep-bad");
+    // A ROW, not an omission. Silently skipping is the failure mode this asserts
+    // against: a pack absent from `agent ls` reads as a RETIRED pack, and the
+    // next move after that misreading is `rfa agent new` on a name in use.
+    assert.ok(shown, "the broken pack is named, by its directory, because the declared name is what is unreadable");
+    assert.equal(shown.status, "definition invalid");
+    assert.match(shown.broken ?? "", /RFA-0\.8 sect\. 10/, "with the loader's own first line, so nobody has to re-run the parse to find out why");
+
+    const human = await rfa(["agent", "ls"]);
+    assert.equal(human.code, 0, human.stderr);
+    assert.match(human.stdout, /sweep-bad/, "the table names it too, not only --json");
+    assert.match(human.stdout, /sweep-ok/);
+    assert.match(human.stdout + human.stderr, /does not parse/, "and says what it means: nothing supervises that pack");
+    assert.doesNotMatch(human.stderr, /definition invalid at|ZodError/, "never the raw loader error as the command's own failure");
+  } finally {
+    fs.rmSync(bad, { recursive: true, force: true });
+    fs.rmSync(path.join(h.paths.agents, "sweep-ok"), { recursive: true, force: true });
+  }
+});
+
+test("a by-name command stays loud for the pack it was asked about and no longer dies over a different one", async () => {
+  const good = await rfa(["agent", "new", "sweep-named", "--kind", "answerer", "--json"]);
+  assert.equal(good.code, 0, good.stderr);
+  const bad = writeUnreadablePack("sweep-other");
+  try {
+    // Half one: a DIFFERENT pack is broken, and the question asked about
+    // sweep-named is answered. This is the half `listPacks(...).find(...)` got
+    // wrong: it threw sweep-other's error before ever looking for this name.
+    const other = await rfa(["agent", "mode", "sweep-named", "--json"]);
+    assert.equal(other.code, 0, other.stderr);
+    assert.equal(json<{ name: string; mode: string }>(other).name, "sweep-named");
+
+    // Half two: the NAMED pack is the broken one, so it fails, with its own
+    // error and a way to fix it. The operator asked about this pack
+    // specifically; answering "no pack" or answering nothing would both be lies.
+    const named = await rfa(["agent", "mode", "sweep-other"]);
+    assert.equal(named.code, 1, `expected a loud failure, got ${named.code}: ${named.stdout}${named.stderr}`);
+    assert.match(named.stderr, /does not parse/);
+    assert.match(named.stderr, /RFA-0\.8 sect\. 10/, "the loader's reason, not a generic refusal");
+    assert.match(named.stderr, /rfa agent validate sweep-other/, "and the command that shows it in full");
+
+    // Third branch, unchanged: a name that is not there at all is still the
+    // not-found error, which must not be confused with the broken case.
+    const absent = await rfa(["agent", "mode", "sweep-absent"]);
+    assert.equal(absent.code, 2, absent.stderr);
+    assert.match(absent.stderr, /no pack agents\/sweep-absent/);
+    assert.doesNotMatch(absent.stderr, /does not parse/);
+  } finally {
+    fs.rmSync(bad, { recursive: true, force: true });
+    fs.rmSync(path.join(h.paths.agents, "sweep-named"), { recursive: true, force: true });
+  }
+});
+
+test("the backup planner is tolerant of an unparseable pack, and backs up strictly MORE than the loud version did", async () => {
+  const { backupPlan } = await import("../src/platform.js");
+  const bad = writeUnreadablePack("sweep-backup");
+  const dest = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-backup-"));
+  try {
+    const plan = backupPlan(h);
+    assert.ok(
+      plan.broken.some((b) => b.name === "sweep-backup" && /RFA-0\.8 sect\. 10/.test(b.error)),
+      "the plan names the pack it could not read, so `rfa backup now` can say so",
+    );
+    // The point of the whole site: nothing in this plan comes from a parsed
+    // definition, so a pack whose agent.md is refused STILL has its state and
+    // its memory backed up. A "tolerant" fix that merely skipped the broken pack
+    // would pass a test that only checked the command's exit code, and would
+    // quietly stop backing up the memory of the one pack in trouble.
+    assert.ok(plan.dbs.includes(path.join(h.paths.agents, "sweep-backup", "state", "memory.db")), "its memory DB is in the plan");
+    assert.ok(plan.dirs.includes(path.relative(h.root, path.join(h.paths.agents, "sweep-backup", "memory"))), "so is its memory directory");
+    assert.ok(plan.dbs.includes(h.paths.runsDb), "and the engine DB, which the throw took down with everything else");
+
+    // End to end, because "in the plan" is not "in the archive".
+    const cfg = await rfa(["config", "set", "retention.backup_dir", dest]);
+    assert.equal(cfg.code, 0, cfg.stderr);
+    const now = await rfa(["backup", "now", "--json"]);
+    assert.equal(now.code, 0, now.stderr);
+    const res = json<{ dest: string; files: string[]; broken_packs: { name: string }[] }>(now);
+    assert.deepEqual(res.broken_packs.map((b) => b.name).filter((n) => n === "sweep-backup"), ["sweep-backup"]);
+    // The human run, because `ui.warn` is a deliberate no-op under --json (the
+    // JSON field above is that mode's channel). What the operator is told
+    // matters as much as the fact: the pack was INCLUDED, not skipped.
+    const human = await rfa(["backup", "now"]);
+    assert.equal(human.code, 0, human.stderr);
+    assert.match(human.stderr, /sweep-backup/);
+    assert.match(human.stderr, /in the backup anyway/);
+    const tar = res.files.find((f) => f.endsWith("dirs.tar.gz"));
+    assert.ok(tar, "the archive was written");
+    const listing = execFileSync("tar", ["-tzf", tar], { encoding: "utf8" });
+    assert.match(listing, /agents\/sweep-backup\/memory\/note\.md/, "the unreadable pack's own file is really in the archive");
+  } finally {
+    fs.rmSync(bad, { recursive: true, force: true });
+    fs.rmSync(dest, { recursive: true, force: true });
+  }
+});
+
+test("the remaining cross-instance listings stay up and name the pack they could not read", async () => {
+  const good = await rfa(["agent", "new", "sweep-listed", "--kind", "answerer", "--json"]);
+  assert.equal(good.code, 0, good.stderr);
+  const bad = writeUnreadablePack("sweep-unread");
+  try {
+    // knowledge status: a pack missing from this listing reads as a pack with no
+    // knowledge, and the duplicate-page detector it carries is the cheapest
+    // instrument against the one-fact-one-file rule. Both were off.
+    const know = await rfa(["knowledge", "status", "--json"]);
+    assert.equal(know.code, 0, know.stderr);
+    const ks = json<{ agents: { pack: string }[]; broken: { name: string; error: string }[] }>(know);
+    assert.ok(ks.agents.some((a) => a.pack === "sweep-listed"));
+    assert.ok(ks.broken.some((b) => b.name === "sweep-unread" && /RFA-0\.8 sect\. 10/.test(b.error)));
+    const knowHuman = await rfa(["knowledge", "status"]);
+    assert.equal(knowHuman.code, 0, knowHuman.stderr);
+    assert.match(knowHuman.stdout + knowHuman.stderr, /sweep-unread/);
+
+    // secrets ls: the "declared by" column is the whole point of the listing, so
+    // a broken pack's declarations being unreadable has to be said. Without it a
+    // secret only that pack needs reads as "declared by no pack".
+    const sec = await rfa(["secrets", "ls"]);
+    assert.equal(sec.code, 0, sec.stderr);
+    assert.match(sec.stdout + sec.stderr, /sweep-unread/);
+    assert.match(sec.stderr, /missing from the column above/);
+
+    // eval cases: found by directory, so a broken pack's cases are still listed
+    // rather than the whole corpus being lost with them.
+    const { listCases } = await import("../src/cli/commands/instruments.js");
+    fs.mkdirSync(path.join(bad, "evals", "cases", "sweep-unread-01"), { recursive: true });
+    fs.writeFileSync(path.join(bad, "evals", "cases", "sweep-unread-01", "case.yaml"), "id: sweep-unread-01\nkind: replay\nsubject: answer-question\n");
+    assert.ok(
+      listCases(h).some((c) => c.id === "sweep-unread-01"),
+      "a case.yaml is a file on disk; losing the corpus over an unrelated definition was the worst trade of the seven sites",
+    );
+
+    // tab completion: it never crashed (a catch already swallowed the throw) but
+    // it silently offered NO pack name at all, and the name most worth
+    // completing at that moment is the broken pack's own.
+    const comp = await rfa(["__complete", "--", "agent", "validate", ""]);
+    assert.equal(comp.code, 0, comp.stderr);
+    assert.match(comp.stdout, /sweep-unread/);
+    assert.match(comp.stdout, /sweep-listed/);
+  } finally {
+    fs.rmSync(bad, { recursive: true, force: true });
+    fs.rmSync(path.join(h.paths.agents, "sweep-listed"), { recursive: true, force: true });
   }
 });

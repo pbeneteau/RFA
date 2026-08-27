@@ -52,7 +52,7 @@ import { ObsStore } from "./obs.js";
 import { consolidate } from "./consolidate.js";
 import { EpisodeLog, FactStore, GatedMemory } from "./memoryfs.js";
 import { SessionBook } from "./sessions.js";
-import { TurnRegister, type TurnBinding } from "./turnbinding.js";
+import { TurnRegister, provenanceFromTurn, type TurnBinding } from "./turnbinding.js";
 import { actionIdentity, actionScope, effectClassOf, mayRetryUnsettled, type EffectClass } from "./actionid.js";
 import { nextChain, readChain, type ChainRef } from "./chainid.js";
 import type { Part } from "./model.js";
@@ -420,10 +420,9 @@ const memory = new GatedMemory(path.join(pack.dir, "memory"), gate, member.membe
   // turn in this process, and each of them may be answering a different
   // organization (RFA-0.8 sect. 4 item 5). `turns.current()` is the rung-3
   // AsyncLocalStorage binding, so this is THIS turn's requester and not the
-  // newest one's.
-  const t = turns.current();
-  if (!t) return null;
-  return { requester_home: t.requesterHome ?? "local", room: t.room ?? null };
+  // newest one's. The mapping itself is shared code (`provenanceFromTurn`), so
+  // the e2e scenario that drives `GatedMemory` cannot pass on a stale copy of it.
+  return provenanceFromTurn(turns.current());
 });
 
 // ---------------------------------------------------------------- in-process MCP tools

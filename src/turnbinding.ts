@@ -27,6 +27,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { Lane } from "./account.js";
 import type { ChainRef } from "./chainid.js";
+import type { WriteProvenance } from "./memoryfs.js";
 
 export interface TurnBinding {
   runId: string;
@@ -61,6 +62,19 @@ export interface TurnBinding {
   requesterHome?: string | null;
   room?: string | null;
 }
+
+/**
+ * A turn's binding as `GatedMemory`'s write provenance (RFA-0.8 sect. 4 item 5).
+ *
+ * Shared code, not a copied expression, because it had already been copied once:
+ * `scripts/e2e.ts`'s cross-org memory scenario restated the resident's provider
+ * line for line, so a change to the resident's own provider (dropping
+ * `requester_home`, capping the turn at construction) would have left the
+ * scenario passing on its private copy and reporting the quarantine as working.
+ * Both call it now.
+ */
+export const provenanceFromTurn = (t: TurnBinding | null): WriteProvenance | null =>
+  t ? { requester_home: t.requesterHome ?? "local", room: t.room ?? null } : null;
 
 export class TurnRegister {
   private live: TurnBinding[] = [];

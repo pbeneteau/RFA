@@ -326,13 +326,24 @@ specific enough that the agent should follow it exactly rather than improvise.
 `,
   );
   const skillId = parsed.def.offers?.[0]?.id ?? "answer-question";
-  // A spec-expert has a true answer to assert, so its case runs. Any other kind
-  // gets the same file as an EXAMPLE the runner ignores: a placeholder case that
-  // runs fails the gate by construction, and for a tool user it makes the agent
-  // act on every gate run (found live: the gate asked a Linear agent the
-  // placeholder question, with its key set).
+  /*
+   * EVERY kind gets its case as an EXAMPLE the runner ignores, including
+   * spec-expert (2026-08-27, owner's call).
+   *
+   * The original reasons for the split stand and are why no kind gets an active
+   * placeholder: a placeholder case that runs fails the gate by construction,
+   * and for a tool user it makes the agent ACT on every gate run (found live:
+   * the gate asked a Linear agent the placeholder question, with its key set).
+   * What changed is the spec-expert side. Its question does have a true answer,
+   * but seeding it ACTIVE made a fresh instance's first `rfa evals run` need a
+   * room, a running resident, a model credential and a few cents, while
+   * everything else in the seeded corpus scores offline. A new operator's first
+   * encounter with the reliability gate was therefore it failing for want of a
+   * credential, which teaches them the gate is broken. Off by default costs one
+   * rename to opt in; on by default cost a confused first run every time.
+   */
   write(
-    path.join("evals", "cases", `${o.name}-01`, o.kind === "spec-expert" ? "case.yaml" : "case.yaml.example"),
+    path.join("evals", "cases", `${o.name}-01`, "case.yaml.example"),
     `id: ${o.name}-01
 kind: live
 subject_capability: ${skillId}

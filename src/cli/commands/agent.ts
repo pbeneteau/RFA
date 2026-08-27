@@ -7,7 +7,7 @@ import Database from "better-sqlite3";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { AccountLedger } from "../../account.js";
-import { CONCURRENCY_GATE_LABELS, concurrencyGateFailures, declaredSecretNames, deriveCard, knowledgeFiles, listPacks, loadPack, parseAgentMd } from "../../agentdef.js";
+import { CONCURRENCY_GATE_LABELS, concurrencyGateFailures, declaredSecretNames, deriveCard, knowledgeFiles, loadPack, packByName, parseAgentMd, scanPacks } from "../../agentdef.js";
 import { RoomMember } from "../../client.js";
 import { daemonState } from "../../daemon.js";
 import { findRoom, roomsStore, secretsStore, type HubDir, type RoomRecord } from "../../hubdir.js";
@@ -113,7 +113,17 @@ export const agentLs: CommandDef = {
   summary: "Packs with their supervisor status, room, model and spend today",
   run: async (ctx) => {
     const h = ctx.hubdir();
-    const packs = listPacks(h.paths.agents);
+    /*
+     * TOLERANT, and the broken pack gets a ROW rather than a footnote. This is
+     * the command an operator reaches for when something is wrong, so it is the
+     * command that most needs to show the pack that is wrong: `listPacks` maps
+     * `loadPack` with no catch, and one unparseable definition answered
+     * `rfa agent ls` with a Zod error instead of the registry. Skipping it
+     * silently would be worse than the throw, because a pack absent from
+     * `agent ls` reads as a RETIRED pack, and the next move after that
+     * misreading is `rfa agent new` on a name that is already taken.
+     */
+    const { packs, broken } = scanPacks(h.paths.agents);
     const sup = supervisorView(h);
     const rooms = roomsStore(h).read().rooms;
     const today = new Date().toISOString().slice(0, 10);
@@ -139,11 +149,30 @@ export const agentLs: CommandDef = {
         definition: p.definitionHash.slice(7, 15),
       };
     });
-    if (ctx.flags.json) return void ctx.ui.json(rows);
-    if (rows.length === 0) return void ctx.ui.note("no packs: rfa agent new <name>");
-    ctx.ui.table(
-      rows.map((r) => [r.status === "running" ? ctx.ui.good("●") : ctx.ui.dim("○"), r.name, r.status, r.room ?? "-", r.model, r.mode === "bypass" ? ctx.ui.bad(r.mode) : r.mode === "read-only" ? ctx.ui.dim(r.mode) : r.mode, `$${r.spend_today_usd.toFixed(2)} today`, r.heartbeat_age_ms === null ? ctx.ui.dim("no heartbeat") : `heartbeat ${fmtAge(Date.now() - r.heartbeat_age_ms)}`, ctx.ui.dim(r.offers.join(", "))]),
-    );
+    // Named by DIRECTORY, because the declared name is exactly what is
+    // unreadable. `status: "definition invalid"` keeps the JSON row shape one
+    // array of agents (the console and the dashboard iterate it), and `broken`
+    // carries the loader's own complaint so nobody has to re-run the parse.
+    const brokenRows = broken.map((b) => ({
+      name: b.name,
+      status: "definition invalid",
+      pid: null,
+      room: null,
+      model: null,
+      mode: null,
+      offers: [] as string[],
+      heartbeat_age_ms: null,
+      spend_today_usd: 0,
+      definition: null,
+      broken: b.error,
+    }));
+    if (ctx.flags.json) return void ctx.ui.json([...rows, ...brokenRows]);
+    if (rows.length === 0 && brokenRows.length === 0) return void ctx.ui.note("no packs: rfa agent new <name>");
+    ctx.ui.table([
+      ...rows.map((r) => [r.status === "running" ? ctx.ui.good("●") : ctx.ui.dim("○"), r.name, r.status, r.room ?? "-", r.model, r.mode === "bypass" ? ctx.ui.bad(r.mode) : r.mode === "read-only" ? ctx.ui.dim(r.mode) : r.mode, `$${r.spend_today_usd.toFixed(2)} today`, r.heartbeat_age_ms === null ? ctx.ui.dim("no heartbeat") : `heartbeat ${fmtAge(Date.now() - r.heartbeat_age_ms)}`, ctx.ui.dim(r.offers.join(", "))]),
+      ...brokenRows.map((r) => [ctx.ui.bad("✗"), r.name, ctx.ui.bad(r.status), "-", "-", "-", "-", "-", ctx.ui.dim(r.broken)]),
+    ]);
+    for (const b of broken) ctx.ui.warn(`agents/${b.name}/agent.md does not parse, so nothing supervises that pack: ${b.error}`, `rfa agent validate ${b.name}`);
   },
 };
 
@@ -475,10 +504,22 @@ export const agentEdit: CommandDef = {
   },
 };
 
-/** A missing pack name on a terminal is a pick from the packs that exist; elsewhere it is the usage error. */
+/**
+ * A missing pack name on a terminal is a pick from the packs that exist;
+ * elsewhere it is the usage error.
+ *
+ * TOLERANT: a broken pack cannot be OFFERED (its declared name is unknown, and
+ * every caller of this goes on to load the pack by that name), but it must not
+ * crash the picker either. `listPacks` maps `loadPack` with no catch, so one
+ * unparseable definition turned every interactive `rfa agent show`, `mode`,
+ * `edit` and `reflect` into a parse error before the question was even asked.
+ * Nothing is named here because a prompt is not a report: the operator who types
+ * the broken pack's name explicitly gets its error loudly from the command
+ * itself, and `rfa agent ls` is where the list lives.
+ */
 async function packArg(ctx: CliContext, h: HubDir, given: string | undefined, usage: string): Promise<string> {
   if (given) return given;
-  return pickOne(ctx, "Which agent?", listPacks(h.paths.agents).map((p) => ({ value: p.name, hint: (p.def.offers ?? []).map((o) => o.id).join(", ") })), usage);
+  return pickOne(ctx, "Which agent?", scanPacks(h.paths.agents).packs.map((p) => ({ value: p.name, hint: (p.def.offers ?? []).map((o) => o.id).join(", ") })), usage);
 }
 
 // ---------------------------------------------------------------- reflect
@@ -522,7 +563,12 @@ export const agentMode: CommandDef = {
   run: async (ctx, a) => {
     const h = ctx.hubdir();
     const name = await packArg(ctx, h, a.positionals[0], "rfa agent mode <name> [ask|plan|bypass]");
-    const pack = listPacks(h.paths.agents).find((p) => p.name === name);
+    // The by-name rule: loud for the pack the operator NAMED, tolerant of every
+    // other. `listPacks(...).find(...)` used to answer a question about
+    // `pm-agent` with a Zod error from `scribe`, which is neither.
+    const found = packByName(h.paths.agents, name);
+    if (found.broken) throw new CliError(1, `agents/${name}/agent.md does not parse, so its mode cannot be read or set: ${found.broken.error}`, `rfa agent validate ${name}`);
+    const pack = found.pack;
     if (!pack) throw new CliError(2, `no pack agents/${name}`, "rfa agent ls");
     const current = effectiveMode(pack.def);
     const wanted = a.positionals[1];
