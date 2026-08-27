@@ -279,12 +279,24 @@ export async function provision(ctx: CliContext, target: string, answers: InitAn
     fs.copyFileSync(packageFile("templates", "gate.json"), h.paths.gate);
     ui.done("policies/gate.json", "three default rules: alert on injection markers, refuse private keys, hold on a review marker");
   }
-  // The eval corpus a new instance starts from: the versioned judge rubric and
-  // one tenant-neutral replay case over the protocol itself, so `rfa evals run`
-  // has something true to score on day one and `--judged` has a rubric whose
-  // sha is on every judge row. NOT a baseline: a baseline is MEASURED (the
-  // gate's own rule is that one captured while the stack was unhealthy is
-  // vacuous), so the first `rfa evals run --update-baseline` writes it.
+  // The eval corpus a new instance starts from:
+  //
+  //  - the versioned judge rubric, so `--judged` has a rubric whose sha is on
+  //    every judge row;
+  //  - ONE tenant-neutral REPLAY case over the protocol itself, active, so
+  //    `rfa evals run` has something true to score on day one with no room, no
+  //    resident, no credential and no money;
+  //  - one live-concurrent PAIR case shipped as `case.yaml.example`, inert until
+  //    the operator renames it to `case.yaml`. It is the only case shape that can
+  //    catch two conversations bleeding into each other, and it needs a room, a
+  //    running resident and a credential: 8 live answers per run, roughly 0.22
+  //    dollars. Seeding it active would have made a fresh hub's first
+  //    `rfa evals run` exit 3 for want of a room, including with
+  //    --update-baseline, which is the day-one baseline flow.
+  //
+  // NOT a baseline: a baseline is MEASURED (the gate's own rule is that one
+  // captured while the stack was unhealthy is vacuous), so the first
+  // `rfa evals run --update-baseline` writes it.
   const seededEvals: string[] = [];
   for (const [from, to] of [
     [packageFile("templates", "evals", "rubric.md"), h.paths.evalRubric],
@@ -295,7 +307,13 @@ export async function provision(ctx: CliContext, target: string, answers: InitAn
     fs.cpSync(from, to, { recursive: true });
     seededEvals.push(path.relative(h.root, to));
   }
-  if (seededEvals.length) ui.done(seededEvals.join(", "), "the judge rubric and one protocol replay case; rfa evals run scores it, --update-baseline measures the first baseline");
+  if (seededEvals.length) {
+    ui.done(
+      seededEvals.join(", "),
+      "the judge rubric, one protocol replay case that scores with no room or credential, and a live concurrent-pair case shipped as case.yaml.example (rename it to case.yaml to run it: 8 live answers, about $0.22 per run)",
+    );
+    ui.note("rfa evals run scores the replay case now; --update-baseline measures the first baseline.");
+  }
   if (!fs.existsSync(h.paths.gitignore) || !fs.readFileSync(h.paths.gitignore, "utf8").includes(".rfa/")) {
     const prev = fs.existsSync(h.paths.gitignore) ? fs.readFileSync(h.paths.gitignore, "utf8") : "";
     fs.writeFileSync(h.paths.gitignore, (prev && !prev.endsWith("\n") ? prev + "\n" : prev) + GITIGNORE);

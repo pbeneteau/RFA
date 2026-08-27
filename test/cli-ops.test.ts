@@ -10,6 +10,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { before, test } from "node:test";
+import YAML from "yaml";
 import { matchDigest } from "../src/credentials.js";
 import { loadHubDir, principalsStore, roomsStore, secretsStore, tokensStore, type HubDir } from "../src/hubdir.js";
 import { PrincipalSet } from "../src/principals.js";
@@ -275,18 +276,51 @@ test("packs: new binds to the first room, validate checks what the supervisor wo
 });
 
 test("a fresh hub directory is seeded with a scoreable eval corpus, and never with a baseline", async () => {
-  // The rubric's sha rides every judge row and the replay case scores with no
-  // hub, no model and no credential, so `rfa evals run` means something on day
-  // one. A BASELINE is deliberately not seeded: it is measured, and the gate's
-  // own rule is that one captured while the stack was unhealthy is vacuous.
+  // What is seeded: the judge rubric (whose sha rides every judge row), ONE
+  // active replay case that scores with no hub, no model and no credential, and
+  // one live concurrent-pair case shipped inert as case.yaml.example. So
+  // `rfa evals run` means something on day one without needing money. A BASELINE
+  // is deliberately not seeded: it is measured, and the gate's own rule is that
+  // one captured while the stack was unhealthy is vacuous.
   assert.ok(fs.existsSync(path.join(dir, "evals", "rubric.md")), "the versioned judge rubric");
   const seeded = path.join(dir, "evals", "cases", "protocol-ask-cycle", "case.yaml");
   assert.ok(fs.existsSync(seeded), "one tenant-neutral replay case over the protocol itself");
   assert.ok(fs.existsSync(path.join(dir, "evals", "cases", "protocol-ask-cycle", "reference.ndjson")), "with the event slice it replays");
   assert.ok(!fs.existsSync(path.join(dir, "evals", "baseline.json")), "no baseline: rfa evals run --update-baseline measures the first one");
+  // The other seeded case is live-concurrent - one trial is one simultaneous PAIR
+  // of protocol questions, the only shape that can catch two conversations
+  // bleeding into each other - and it ships INERT, as case.yaml.example. A live
+  // case seeded active would mean a fresh hub's first `rfa evals run` needs a
+  // room, a running resident, a credential and money, and with no room it exits 3
+  // including under --update-baseline, which is the day-one baseline flow.
+  const pairDir = path.join(dir, "evals", "cases", "protocol-concurrent-pair");
+  assert.ok(!fs.existsSync(path.join(pairDir, "case.yaml")), "the concurrent pair is NOT active on day one");
+  const exampleFile = path.join(pairDir, "case.yaml.example");
+  assert.ok(fs.existsSync(exampleFile), "it ships as an example the operator activates by renaming it");
+  const raw = fs.readFileSync(exampleFile, "utf8");
+  assert.match(raw, /Rename this file to `case\.yaml`/, "the header says what to rename it to");
+  assert.match(raw, /8 live[\s#]+answers, roughly 0\.22 dollars/, "and what activating it costs per run");
+  const pair = YAML.parse(raw) as { subject_capability: string; asks: { must_mention: string[]; must_not_mention: string[] }[]; trials: number; expect_overlap?: boolean };
+  assert.equal(pair.subject_capability, "answer-protocol-question", "the scaffolded spec-expert's capability, so the case resolves once activated");
+  assert.equal(pair.asks.length, 2, "a tuple, not an ask");
+  assert.equal(pair.trials, 4, "4 trials, because GATE_K is 4: below it the gate can only hold a point estimate");
+  assert.equal(pair.expect_overlap, undefined, "unset on purpose: a correct concurrency-1 pack must not fail the gate");
+  // The markers a CORRECT answer must survive: the bare word "evidence" fired on
+  // ordinary prose ("as evidenced by"), so the forbidden marker is the field name.
+  assert.deepEqual(pair.asks[1].must_not_mention, ["evidence_required"], "a forbidden marker must be a token only the sibling's answer can produce");
+  // And ask 1 REQUIRES that same field name rather than accepting the bare word as
+  // an alternative: its question names the field, and it is what makes ask 2's
+  // forbidden token a real detector, since an ask-1 answer that only ever said
+  // "evidence" would leave the sibling nothing to be contaminated BY.
+  assert.deepEqual(pair.asks[0].must_mention, ["evidence_required", "accept"]);
+  assert.match(pair.asks[1].must_mention.join(" "), /card_summary skill_ids/, "and ask 2 demands both, which is what its wording now asks for");
   const ls = await rfa(["evals", "ls", "--json"]);
   assert.equal(ls.code, 0, ls.stderr);
-  assert.deepEqual(json<{ cases: { id: string; kind: string }[] }>(ls).cases.map((c) => [c.id, c.kind]), [["protocol-ask-cycle", "replay"]], "and the runner discovers it without being told");
+  assert.deepEqual(
+    json<{ cases: { id: string; kind: string }[] }>(ls).cases.map((c) => [c.id, c.kind]),
+    [["protocol-ask-cycle", "replay"]],
+    "so the gate a fresh hub runs is exactly the case that needs nothing live",
+  );
 });
 
 test("numeric flags are strict, and evals run refuses --json by name: NaN and silence never become behaviour", async () => {

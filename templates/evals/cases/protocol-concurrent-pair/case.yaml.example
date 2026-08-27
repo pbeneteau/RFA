@@ -1,0 +1,73 @@
+# NOT ACTIVE. Rename this file to `case.yaml` (in this same directory) to run it.
+#
+# It ships inert because it is a LIVE case, and `rfa evals run` on a fresh hub
+# directory must score something true without needing a room, a running resident,
+# a model credential and money. With no room every live case is BLOCKED and the
+# run exits 3, which would have broken the day-one `--update-baseline` flow that
+# measures the first baseline.
+#
+# What activating it costs, per `rfa evals run`: 4 trials x 2 questions = 8 live
+# answers, roughly 0.22 dollars at the scaffolded model tier, about 4 percent of
+# the 5.00 dollar per_day_usd a scaffolded pack declares. Activate it once the
+# instance has a room, a resident answering in it, and a credential.
+#
+# What it catches that nothing else does: cross-talk between two conversations
+# one resident is holding AT THE SAME MOMENT. No number of sequential
+# single-question trials can see it.
+id: protocol-concurrent-pair
+kind: live-concurrent
+# The capability `rfa agent new --kind spec-expert` advertises (src/cli/scaffold.ts),
+# so this case resolves on an instance whose first agent is the scaffolded
+# protocol answerer. Nothing here is tenant-specific: both answers are in the
+# wire spec the pack is seeded with.
+subject_capability: answer-protocol-question
+# ONE TRIAL IS ONE SIMULTANEOUS PAIR, not one ask: both questions go out at the
+# same moment, each from its own fresh probe.
+#
+# The markers are chosen so the two right answers cannot be confused, and so that
+# a CORRECT answer cannot trip them:
+#
+#  - `evidence_required` is the schema field name. The bare English word
+#    "evidence" was forbidden here before, and it fires on ordinary correct prose
+#    ("as evidenced by", "no evidence that"), scoring a right answer
+#    CONTAMINATED. A forbidden marker must be a token only the sibling's answer
+#    can produce.
+#  - ask 1 REQUIRES the field name `evidence_required`, rather than accepting the
+#    bare word as an alternative. Its own question names the field, so requiring it
+#    is fair, and it is what keeps ask 2's forbidden `evidence_required` a real
+#    contamination detector: while ask 1 could satisfy its marker with the bare
+#    word alone, a correct ask-1 answer might never contain the token ask 2
+#    forbids, and the detector would have nothing to detect.
+asks:
+  - ask: "When a task has evidence_required set, what must happen before it can reach the completed state?"
+    must_mention: ["evidence_required", "accept"]
+    must_not_mention: ["skill_ids", "card_summary"]
+  - ask: "In a room roster, name BOTH the member field that tells an asker what a member can do AND the list inside that field which carries the capability ids, so a request can be addressed by capability instead of by name."
+    must_mention: ["card_summary", "skill_ids"]
+    must_not_mention: ["evidence_required"]
+# 4 trials, because GATE_K is 4: below it the gate scores this case on a point
+# estimate forever, where a single failure is a 0.50 drop against a 0.15 band.
+trials: 4
+# 120s of model time per ANSWER. The runner multiplies this by the number of asks
+# for the per-ask deadline, because both clocks start at t0: a pack at
+# `concurrency: 1` (the default) SERIALIZES the pair, so the second ask waits out
+# the first answer before its own begins, and one answer's worth of ceiling would
+# record that queueing as a timeout.
+timeout_ms: 120000
+expect:
+  # Applied per ask, to each answer's own slice. `expect.output` and
+  # `expect.state` are rejected at load for a tuple: its expectations are per ask.
+  protocol: [citations_present]
+# expect_overlap is deliberately UNSET. A fresh instance runs `concurrency: 1`,
+# where serializing the pair is CORRECT behaviour, and asserting overlap would
+# fail a correct configuration. The overlap is still measured every trial and
+# reported (console line, overlap column of evals/latest.md, and the run's json),
+# so the operator can see whether the pair genuinely interleaved. Set it to true
+# only on an instance whose pack runs `concurrency: 2` or more.
+#
+# What the overlap is measured ON: the SUBJECT's own run windows (started_at and
+# ended_at of its rows in .rfa/data/runs.db). Not the harness's send-to-reply
+# windows - those all start in the same tick, so their intersection is non-empty
+# however thoroughly the resident serialized the pair, and a metric built on them
+# reported overlap on a fully serialized pack. When the run rows cannot be read
+# the overlap is UNMEASURED, and `expect_overlap: true` FAILS on unmeasured.

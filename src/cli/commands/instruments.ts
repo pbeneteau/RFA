@@ -259,7 +259,11 @@ export function listCases(h: HubDir): CaseRow[] {
       });
     }
   }
-  return rows;
+  // Sorted, because readdirSync order is the filesystem's and not a promise: two
+  // tests deepEqual this list, and on another filesystem they would compare a
+  // different order for the same corpus. The runner sorts its own discovery the
+  // same way, so `evals ls` prints the order the gate runs in.
+  return rows.sort((a, b) => a.id.localeCompare(b.id) || a.where.localeCompare(b.where));
 }
 
 export const evalsLs: CommandDef = {

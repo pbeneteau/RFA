@@ -84,9 +84,14 @@ acme/                          a hub directory: any folder holding rfa.json
 ├── policies/
 │   ├── gate.json              the pre-delivery policy gate (tracked; was deploy/gate.json)
 │   └── trusted-keys.json      optional: kid -> public JWK for card verification (tracked)
-├── evals/                     cases/, baseline.json, rubric.md, parity.json (tracked). `rfa init` seeds
-│                               rubric.md and one tenant-neutral replay case from the package's templates/evals,
-│                               so the gate scores something true on day one; a BASELINE is measured, never seeded
+├── evals/                     cases/, baseline.json, rubric.md, parity.json (tracked). `rfa init` seeds, from the
+│                               package's templates/evals: rubric.md, one tenant-neutral REPLAY case (active: it scores
+│                               offline, with no room, resident, credential or money) and one tenant-neutral
+│                               live-concurrent PAIR case shipped inert as case.yaml.example, which the operator
+│                               activates by renaming it to case.yaml (8 live answers per run, about $0.22).
+│                               A BASELINE is measured, never seeded. A pack scaffolded by `rfa agent new` brings its
+│                               own case under agents/<name>/evals/cases/, and for --kind spec-expert that one is ACTIVE
+│                               and LIVE, so on such an instance the first run needs a room, a resident and a credential
 ├── peers/                     admission records, when the guest path lands (tracked: hashes and thumbprints only)
 ├── .gitignore                 written by init
 └── .rfa/                      runtime, owned by the tool. Gitignored. Mode 0700.
@@ -360,7 +365,10 @@ $ npx agent-com init
  ✔ .rfa/secrets.json  (0600)                 RFA_TOKEN, the bearer your agents and this CLI use to reach the hub
  ✔ .rfa/principals.json, .rfa/tokens.json    hashes only; plaintext never rests here
  ✔ policies/gate.json                        three default rules: alert on injection markers, refuse private keys, hold on a review marker
- ✔ evals/rubric.md, evals/cases              the judge rubric and one protocol replay case, from templates/evals
+ ✔ evals/rubric.md, evals/cases              the judge rubric, one protocol replay case that scores with no room or credential, and a live
+                                             concurrent-pair case shipped as case.yaml.example (rename it to case.yaml to run it: 8 live
+                                             answers, about $0.22 per run)
+     rfa evals run scores the replay case now; --update-baseline measures the first baseline.
  ✔ .gitignore                                .rfa/, agents/*/state/, knowledge clones
  ✔ model credential                          `claude` is logged in (oauth). Agents inherit it from the supervisor's shell.
 
