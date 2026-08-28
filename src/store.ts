@@ -10,13 +10,14 @@ import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { hashedForm } from "./chain.js";
 import { COUNTER_ASK_EXT } from "./chainid.js";
 import { CROSS_HOME_REPLY_BY_DEFAULT_S } from "./hubdir.js";
 import { RfaError } from "./errors.js";
 import { canonicalize, digestCard, sha256hex } from "./jcs.js";
 import { verifyCard, type Jwk, type VerificationDetail } from "./signing.js";
 import { TERMINAL_TASK_STATES } from "./model.js";
-import { discloseKey, findBlocking, validateKeys, type LiveGrant, type ResourceGrant } from "./resources.js";
+import { discloseGrantKey, discloseKey, findBlocking, redactGrantsFor, validateKeys, type LiveGrant, type ResourceGrant } from "./resources.js";
 import { consoleNameFor, PrincipalSet } from "./principals.js";
 import { foldWhitespace, neutralize, renderWrapped } from "./wrap.js";
 import { bearerSha256 } from "./reqcontext.js";
@@ -518,6 +519,12 @@ const WIDEN_REFUSALS_BEFORE_OFFER = 3;
  * digest is KEYED rather than a plain hash because an unsalted hash of a
  * guessable key shape is confirmable by dictionary and would disclose the
  * operator's layout anyway, which is the whole thing item 8 protects.
+ *
+ * ONE secret for both disclosure surfaces: the refusal payload of item 8 and
+ * the board redaction of item 7. Wherever both digest the same key, they must
+ * produce the same string, or a reader could not tell that the resource which
+ * blocked it is the one still held, and the digest would stop being usable for
+ * back-off at exactly the moment it is needed.
  */
 const KEY_DIGEST_SECRET = randomBytes(32);
 
@@ -986,7 +993,7 @@ export class RoomHub {
       },
       roster: this.rosterSnapshot(room),
       epoch: room.epoch,
-      history: { events: this.withWrapped(history), cursor: room.seq, truncated },
+      history: { events: this.withWrapped(member, history), cursor: room.seq, truncated },
       instructions,
     };
   }
@@ -999,6 +1006,56 @@ export class RoomHub {
   }
 
   /**
+   * The per-reader projection of ONE event, and the chain stamp it owes.
+   *
+   * Task events carry the whole task object (10.3 item 7), grants included, so
+   * the board's redaction has to happen here as well as on `get` and `list` or
+   * a guest simply reads the layout off its own event stream instead. Applied
+   * at DELIVERY, never at append: the log keeps the true keys, which is what
+   * the operator's own audit, `rfa log verify` and the hash chain read.
+   *
+   * THE CONSEQUENCE, and it is why this function stamps rather than only
+   * projecting. `prev_hash` is computed over the APPENDED event, so a copy
+   * whose grant keys were rewritten does not reproduce it, and the next event's
+   * link fails for that reader. An earlier version of this comment claimed
+   * nothing regressed because `matches()` filters ambient events out of every
+   * stream so no member ever holds a contiguous run: that is WRONG, and it was
+   * wrong when it shipped. `wait_for: "all"` matches every event (see
+   * `matches`), so any member can take a contiguous run from its join point to
+   * the tip, which is exactly what a verifier needs, and wire 9.6 explicitly
+   * anticipates peers verifying what they RECEIVE rather than what was stored.
+   * Found by reading sect. 13's own chain rules against this change, not by a
+   * failing test.
+   *
+   * So a CHANGED task event carries `content_hash`: the hex SHA-256 over the
+   * JCS canonical form of the event exactly as appended, the identical
+   * construction `prev_hash` and 12.1's `content_hash` already use, which hands
+   * a verifier the appended form's hash without the appended form. The field is
+   * 12.1's, reused deliberately rather than duplicated under a new name: one
+   * field, one construction and one verifier rule ("if `content_hash` is
+   * present it IS this event's link"), and on the one event where both
+   * producers could meet - a 12.1-redacted task event delivered to a guest -
+   * the two want the same value, whereas a second field would put two
+   * disagreeing hashes on one event and make a verifier choose. `redacted` is
+   * deliberately NOT set: 12.1's redaction removes content from every future
+   * read for everyone, and this removes nothing from the record. That
+   * distinction is the discriminator, and wire 9.4 now says so.
+   */
+  private eventForReader(member: Member, e: RfaEvent): RfaEvent {
+    if (e.type !== "task") return e;
+    const projected = this.projectTask(e.task, member);
+    // Only a CHANGED event is stamped. An untouched event still verifies by
+    // plain recomputation, and stamping it anyway would paper over a future
+    // divergence with a hash the hub computed from the same bytes it served.
+    if (!projected.changed) return e;
+    // An existing `content_hash` (a 12.1 redaction) is already the appended
+    // form's hash and already this event's link: never overwrite it.
+    if (typeof e.content_hash === "string") return { ...e, task: projected.task };
+    const stamp = sha256hex(canonicalize(hashedForm(e as unknown as Record<string, unknown>)));
+    return { ...e, task: projected.task, content_hash: stamp };
+  }
+
+  /**
    * Attach the hub's own boundary rendering to every message event leaving the
    * hub (spec 9.6). A stranger's client cannot be trusted to wrap peer content
    * before handing it to a model, and a client that skips it is the wormable
@@ -1006,9 +1063,13 @@ export class RoomHub {
    * Derived, never authoritative: `body` stays the content of record, and this
    * is a RESULT field that is never stored in the log or counted against the
    * envelope cap.
+   *
+   * Every event also passes `eventForReader`, so the one long-poll path applies
+   * both per-reader projections in one place.
    */
-  private withWrapped(events: RfaEvent[]): RfaEvent[] {
-    return events.map((e) => {
+  private withWrapped(member: Member, events: RfaEvent[]): RfaEvent[] {
+    return events.map((raw) => {
+      const e = this.eventForReader(member, raw);
       if (e.type !== "message") return e;
       const text = e.envelope.body
         .filter((p): p is Extract<Part, { type: "text" }> => p.type === "text")
@@ -1187,6 +1248,70 @@ export class RoomHub {
       }
     }
     return out;
+  }
+
+  /**
+   * THE READER PROJECTION OF A TASK (spec 10.3 item 7, amended 2026-08-28).
+   *
+   * Every path that hands a task object to a member goes through here: `get`,
+   * `list`, the result of every mutating verb, and the task carried by every
+   * task EVENT (`eventForReader`). One function, because the hole this closes
+   * was exactly a second path that did not have the rule.
+   *
+   * WHY IT EXISTS. Item 8 digests the operator's `local/...` key layout in a
+   * refusal so a guest cannot map it; item 7 puts grants on the task object,
+   * and the board handed the same guest the same layout verbatim. A protection
+   * that one read defeats is worse than no protection, because an operator
+   * reads item 8 and believes the layout is private. Found on 2026-08-27 by
+   * running rung 7's guest branches against a real hub (docs/LEDGER.md), and
+   * invisible before that: every member on every hub here was `home: "local"`,
+   * which is the branch that hands back every key unchanged.
+   *
+   * `discloseGrantKey` owns the per-key decision and states the rationale for
+   * each namespace. `reservation_offer.keys` is redacted with the same rule and
+   * for the same reason: it is a second key list on the same object, so leaving
+   * it raw would rebuild the hole one field to the left.
+   *
+   * NOT redacted, deliberately: nothing else on the task. `owner`, `attempt`
+   * and the task's own text are the coordination surface the room exists for,
+   * and this ruling is about the operator's internal resource NAMES, not about
+   * who is working on what.
+   *
+   * There is no `home === "local"` shortcut here on purpose, even though it
+   * would skip a copy on the branch every read on this hub takes today: the
+   * per-key policy, the local reader included, lives in ONE function so that
+   * changing it is one edit in one place. Two policy points is the exact shape
+   * of the defect being fixed.
+   */
+  private taskForReader(task: RfaTask, member: Member): RfaTask {
+    return this.projectTask(task, member).task;
+  }
+
+  /**
+   * The same projection, reporting whether it CHANGED anything.
+   *
+   * Split out for `eventForReader` alone, which owes a chain stamp on exactly
+   * the events it rewrote and on no others. The copy is unconditional even when
+   * nothing changed, because these are the hub's own live task objects and
+   * handing one to a caller would make the result alias the record.
+   */
+  private projectTask(task: RfaTask, member: Member): { task: RfaTask; changed: boolean } {
+    const readerHome = member.home ?? "local";
+    const opts = { readerHome, roomHandle: task.room, secret: KEY_DIGEST_SECRET };
+    const out: RfaTask = { ...task };
+    let changed = false;
+    if (task.resource_grants && task.resource_grants.length > 0) {
+      const redacted = redactGrantsFor(task.resource_grants, opts);
+      changed ||= redacted.some((g, i) => g.keys.some((k, j) => k !== task.resource_grants![i].keys[j]));
+      out.resource_grants = redacted;
+    }
+    if (task.reservation_offer) {
+      const offered = task.reservation_offer.keys;
+      const keys = offered.map((k) => discloseGrantKey(k, opts));
+      changed ||= keys.some((k, i) => k !== offered[i]);
+      out.reservation_offer = { ...task.reservation_offer, keys };
+    }
+    return { task: out, changed };
   }
 
   /** Every non-terminal task this member owns, released with one reason. */
@@ -2622,7 +2747,7 @@ export class RoomHub {
     if (matched.length > 0 || timeoutMs === 0 || room.ended) {
       const compacted = Math.max(0, matched.length - this.cfg.replayCap);
       return {
-        events: this.withWrapped(matched.slice(-this.cfg.replayCap)),
+        events: this.withWrapped(member, matched.slice(-this.cfg.replayCap)),
         cursor: room.seq,
         epoch: room.epoch,
         lease_expires: iso(member.leaseExpires),
@@ -2654,7 +2779,7 @@ export class RoomHub {
     const member = room.members.get(waiter.memberId)!;
     member.observedEpoch = room.epoch;
     waiter.resolve({
-      events: this.withWrapped(waiter.matched),
+      events: this.withWrapped(member, waiter.matched),
       cursor: room.seq,
       epoch: room.epoch,
       lease_expires: iso(member.leaseExpires),
@@ -2769,9 +2894,14 @@ export class RoomHub {
 
     const emit = (action: string, task: RfaTask): RfaTask => {
       task.updated_at = iso(now);
+      // The EVENT carries the true task: the log is the record, and every
+      // recipient's copy is redacted at delivery (`eventForReader`).
       this.appendEvent(room, { type: "task", action, actor: member.id, task: { ...task } });
       this.writeMeta(room);
-      return task;
+      // The RESULT is the caller's copy, so it is redacted here, which is what
+      // makes every mutating verb obey item 7's redaction without each branch
+      // remembering to.
+      return this.taskForReader(task, member);
     };
     const get = (id: string | undefined): RfaTask => {
       const t = id ? room.tasks.get(id) : undefined;
@@ -2831,9 +2961,9 @@ export class RoomHub {
         return emit("create", task);
       }
       case "get":
-        return { ...get(args.id) };
+        return this.taskForReader(get(args.id), member);
       case "list":
-        return { tasks: [...room.tasks.values()].map((t) => ({ ...t })) };
+        return { tasks: [...room.tasks.values()].map((t) => this.taskForReader(t, member)) };
       case "claim": {
         const task = get(args.id);
         /**
@@ -2877,7 +3007,7 @@ export class RoomHub {
           }
           const held = new Set((task.resource_grants ?? []).flatMap((g) => g.keys));
           const fresh = wanted.filter((k) => !held.has(k));
-          if (fresh.length === 0) return { ...task } as RfaTask;
+          if (fresh.length === 0) return this.taskForReader(task, member);
           const blocker = findBlocking(fresh, this.liveGrants(room, task.id));
           if (blocker) {
             const refusals = (task.widen_refusals ?? 0) + 1;
@@ -3275,7 +3405,7 @@ export class RoomHub {
     let replayed = 0;
     for (const e of room.events) {
       if (e.seq > watchSince && this.matches(room, e, member, filter)) {
-        args.deliver({ room: room.handle, member: member.id, cursor: e.seq, event: e });
+        args.deliver({ room: room.handle, member: member.id, cursor: e.seq, event: this.eventForReader(member, e) });
         replayed++;
       }
     }
@@ -3309,7 +3439,7 @@ export class RoomHub {
       for (const e of events) {
         if (!this.matches(room, e, member, w.filter)) continue;
         try {
-          w.deliver({ room: room.handle, member: member.id, cursor: e.seq, event: e });
+          w.deliver({ room: room.handle, member: member.id, cursor: e.seq, event: this.eventForReader(member, e) });
           notified.add(member.id);
           // Receiving proves the connection is alive: extend the lease.
           member.leaseExpires = Math.max(member.leaseExpires, this.cfg.now() + member.ttlS * 1000);

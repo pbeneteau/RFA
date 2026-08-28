@@ -208,3 +208,59 @@ export function discloseKey(key: string, opts: { claimantHome: string; secret: B
   if (isLocalKey && opts.claimantHome !== "local") return digestKey(key, opts.secret);
   return key;
 }
+
+/**
+ * What a READER may be told a live grant's keys are (item 7, amended 2026-08-28).
+ *
+ * THE HOLE THIS CLOSES, and it is worth stating because the two rules only make
+ * sense together. Item 8 digests the operator's `local/...` layout in a REFUSAL
+ * so a guest cannot map it. Item 7 puts grants on the task object, and
+ * `room_task get`/`list` handed that same guest every live grant's raw keys, so
+ * the refusal path hid the layout while the board published it: the digest
+ * protected nothing while LOOKING like a protection, which is worse than not
+ * existing at all. Found on 2026-08-27 by driving rung 7's guest branches
+ * against a real hub (docs/LEDGER.md), invisible until then because no member
+ * on any hub here had ever carried a non-local home.
+ *
+ * THE RULE. Coordination needs to know THAT a resource is taken, not the
+ * operator's internal name for it, so a non-local reader gets the digest for
+ * every key it could not have named itself, and the key everywhere it could:
+ *
+ * - reader `home === "local"`: every key verbatim, INCLUDING a peer's own
+ *   `<home>/...` keys. Local members need the real keys to work, `rfa task
+ *   show` prints them, and an operator who cannot see which peer resource is
+ *   held cannot answer a question about their own board. This is the one
+ *   branch that is not symmetric, and it is a deliberate asymmetry: the hub is
+ *   the operator's.
+ * - `room/<this room's handle>/...`: verbatim to everyone. Shared ground by
+ *   definition, and the namespace where local and remote claims legitimately
+ *   meet, so this is the disclosure that makes back-off possible at all.
+ * - the reader's OWN `<home>/...`: verbatim. Item 2 makes that namespace
+ *   claimable only by the peer whose home it is, so those are the peer's own
+ *   names and never the operator's layout; two memberships of one home really
+ *   do collide inside it, so the peer needs to see contention there for the
+ *   same reason it needs it under `room/`; and item 8 already hands that peer
+ *   exactly these keys in a refusal, so digesting them here would recreate the
+ *   very disagreement between the two rules that this amendment removes.
+ * - everything else (`local/...`, another peer's `<home>/...`): the digest of
+ *   item 8, through `digestKey`, never a second implementation.
+ *
+ * The digest is stable for the grant's lifetime, so a reader can still tell one
+ * held resource from another and tell that the thing which blocked it before is
+ * still held. That is what a back-off consumer needs and it is all it gets.
+ */
+export function discloseGrantKey(key: string, opts: { readerHome: string; roomHandle: string; secret: Buffer }): string {
+  if (opts.readerHome === "local") return key;
+  const segs = segmentsOf(key);
+  if (segs[0] === RESERVED_HOME && segs[1] === opts.roomHandle) return key;
+  if (segs[0] === opts.readerHome) return key;
+  return digestKey(key, opts.secret);
+}
+
+/** `discloseGrantKey` over one grant's key list, preserving order and the rest of the grant. */
+export function redactGrantsFor(
+  grants: readonly ResourceGrant[],
+  opts: { readerHome: string; roomHandle: string; secret: Buffer },
+): ResourceGrant[] {
+  return grants.map((g) => ({ ...g, keys: g.keys.map((k) => discloseGrantKey(k, opts)) }));
+}

@@ -1,7 +1,8 @@
 /**
  * Resource claims (wire 10.3's `resources[]` block, RFA-0.8 rung 7): the key
- * grammar with its authority segment, canonical form, the intersection rule, and
- * the disclosure digest.
+ * grammar with its authority segment, canonical form, the intersection rule, the
+ * disclosure digest, and the per-reader redaction of grant keys that makes the
+ * digest worth having (item 7, amended 2026-08-28).
  *
  * The intersection tests are written FIRST and deliberately: prefix-or-equal on
  * SEGMENTS is the single easiest thing in this rung to get wrong, a naive
@@ -10,7 +11,7 @@
  */
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { MAX_KEYS, MAX_KEY_BYTES, digestKey, discloseKey, intersects, segmentsOf, validateKeys } from "../src/resources.js";
+import { MAX_KEYS, MAX_KEY_BYTES, digestKey, discloseGrantKey, discloseKey, intersects, redactGrantsFor, segmentsOf, validateKeys } from "../src/resources.js";
 
 // ---------------------------------------------------------------- intersection
 
@@ -142,6 +143,45 @@ test("a non-local claimant blocked by a local key sees a digest, never the key",
   assert.equal(discloseKey("room/r_1/board", { claimantHome: "acme", secret }), "room/r_1/board");
   // As does a guest blocked by its OWN org's key.
   assert.equal(discloseKey("acme/thing", { claimantHome: "acme", secret }), "acme/thing");
+});
+
+test("a grant's keys are redacted per reader, by authority segment, through the same digest", () => {
+  // Item 7 as amended 2026-08-28. The board used to publish exactly what item 8
+  // digests in a refusal, so the digest protected nothing while LOOKING like a
+  // protection. The reader's home decides, not the claimant's.
+  const secret = Buffer.from("test-secret");
+  const room = "r_1";
+  const at = (readerHome: string) => (k: string) => discloseGrantKey(k, { readerHome, roomHandle: room, secret });
+
+  const toLocal = at("local");
+  for (const k of ["local/pm-agent/handbook", `room/${room}/board`, "acme/thing"]) {
+    assert.equal(toLocal(k), k, "a local reader needs the real keys to work, and `rfa task show` prints them");
+  }
+
+  const toGuest = at("acme");
+  // Shared ground: verbatim, because it is the namespace the guest can itself
+  // contend in, which is what makes back-off possible.
+  assert.equal(toGuest(`room/${room}/board`), `room/${room}/board`);
+  // Its own home: verbatim. Those are the peer's own names, never the operator's,
+  // and item 8 already hands the peer exactly these keys in a refusal.
+  assert.equal(toGuest("acme/thing"), "acme/thing");
+  assert.equal(toGuest("acme"), "acme", "the authority segment alone is still its own");
+  // The operator's layout, and another peer's: opaque, through item 8's helper.
+  assert.equal(toGuest("local/pm-agent/handbook"), digestKey("local/pm-agent/handbook", secret));
+  assert.equal(toGuest("orgb.example/agent-a"), digestKey("orgb.example/agent-a", secret));
+  // ANOTHER room's shared namespace is not this reader's shared ground either.
+  assert.equal(toGuest("room/r_2/board"), digestKey("room/r_2/board", secret));
+  // A prefix of the home is not the home: `acme-corp` must not read as `acme`.
+  assert.equal(at("acme")("acme-corp/thing"), digestKey("acme-corp/thing", secret));
+
+  // The whole grant travels: order and every other field preserved, keys mapped.
+  const grant = { keys: ["local/pm-agent/handbook", `room/${room}/board`], owner: "m_1", attempt: 2, source: "claim" as const, granted_at: "2026-08-28T00:00:00.000Z" };
+  const [redacted] = redactGrantsFor([grant], { readerHome: "acme", roomHandle: room, secret });
+  assert.deepEqual(redacted.keys, [digestKey("local/pm-agent/handbook", secret), `room/${room}/board`]);
+  assert.equal(redacted.owner, "m_1");
+  assert.equal(redacted.attempt, 2);
+  assert.equal(redacted.source, "claim");
+  assert.deepEqual(grant.keys, ["local/pm-agent/handbook", `room/${room}/board`], "the caller's grant is not mutated: the store's copy stays the record");
 });
 
 test("the digest is stable under one secret and unguessable without it", () => {

@@ -26,9 +26,15 @@
  *      (stamp before hashing) and the extra exclusions are now WRONG: applying
  *      them fails every message link. INTEROP.md still told peers to do it in
  *      three places.
- *   3. A redacted event is verified through its `content_hash`, not by
- *      recomputing over the blanked body (sect. 12.1). Otherwise redaction, the
- *      one legitimate rewrite of the log, would read as tampering.
+ *   3. An event carrying `content_hash` is verified through it, not by
+ *      recomputing over the served bytes. Two things produce that field and both
+ *      are legitimate rewrites that would otherwise read as tampering: a sect.
+ *      12.1 redaction, which blanks the body for everyone and also sets
+ *      `redacted: true`; and the per-reader grant redaction of sect. 10.3 item
+ *      7, which rewrites a task event's grant keys for ONE reader and sets
+ *      `content_hash` alone. The rule is one line either way - if the field is
+ *      there, it IS this event's link - which is the whole reason 10.3 reuses
+ *      12.1's field instead of adding a second one.
  */
 import { canonicalize, sha256hex } from "./jcs.js";
 
@@ -48,13 +54,20 @@ export function hashedForm(event: Record<string, unknown>): Record<string, unkno
 /**
  * The link a given event contributes to the chain.
  *
- * For an ordinary event this is JCS-SHA256 over its hashed form. For a REDACTED
- * event it is the `content_hash` the hub stamped at redaction time, which is the
- * same construction over the event's own pre-redaction form (sect. 12.1), so a
- * verifier has one hash function and one canonicalization rather than two.
+ * For an ordinary event this is JCS-SHA256 over its hashed form. For an event
+ * carrying `content_hash` it is that field, which is the same construction over
+ * the form the hub APPENDED (sect. 12.1 for a redaction, sect. 10.3 item 7 for a
+ * per-reader grant redaction), so a verifier has one hash function and one
+ * canonicalization rather than two.
+ *
+ * The test is the field's presence, not `redacted === true`. It was the pair
+ * until 2026-08-28, when item 7's per-reader redaction became a second producer
+ * that stamps `content_hash` WITHOUT `redacted`, because it removes nothing from
+ * the record: a verifier that demanded the flag would have rejected a served
+ * event whose stamp was sitting right there.
  */
 export function linkOf(event: Record<string, unknown>): { hash: string; source: "computed" | "content_hash" } {
-  if (event.redacted === true && typeof event.content_hash === "string") {
+  if (typeof event.content_hash === "string") {
     return { hash: event.content_hash, source: "content_hash" };
   }
   return { hash: sha256hex(canonicalize(hashedForm(event))), source: "computed" };
@@ -86,7 +99,16 @@ export interface ChainResult {
    * tampered, which is how a tamper detector gets switched off.
    */
   unchainedPrefix: number;
-  redactedLinks: number;
+  /**
+   * Links taken from a `content_hash` stamp rather than recomputed.
+   *
+   * Called `redactedLinks` until 2026-08-28, when 10.3 item 7's per-reader grant
+   * redaction became a second producer of the stamp. On a log read off disk the
+   * count is still 12.1 redactions and nothing else, because that stamp is the
+   * only one the hub ever WRITES; on a stream of received events it may also be
+   * item 7's. The name no longer asserts which.
+   */
+  stampedLinks: number;
   genesisOk: boolean | null;
   divergences: ChainDivergence[];
   ok: boolean;
@@ -115,7 +137,7 @@ export function verifyChain(
 ): ChainResult {
   const divergences: ChainDivergence[] = [];
   let linksChecked = 0;
-  let redactedLinks = 0;
+  let stampedLinks = 0;
   let genesisOk: boolean | null = null;
 
   // Skip the pre-chain prefix: events appended before 0.1.7 carry no prev_hash.
@@ -145,7 +167,7 @@ export function verifyChain(
   for (let i = start + 1; i < events.length; i++) {
     const prev = events[i - 1];
     const link = linkOf(prev);
-    if (link.source === "content_hash") redactedLinks++;
+    if (link.source === "content_hash") stampedLinks++;
     const found = events[i].prev_hash;
     if (typeof found !== "string") {
       divergences.push({
@@ -175,7 +197,7 @@ export function verifyChain(
     events: events.length,
     linksChecked,
     unchainedPrefix,
-    redactedLinks,
+    stampedLinks,
     genesisOk,
     divergences,
     ok: divergences.length === 0,

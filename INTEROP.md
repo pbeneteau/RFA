@@ -962,7 +962,7 @@ against the specification where you can, but do not depend on any of the right-h
 | `room_end` / retention / export | Retention window stated in `instructions`; export for a leaving member | `instructions` states neither today; no export command exists (section 9) |
 | Extensions in discovery | `spec_version` and `profiles` in `server/discover` capabilities | Carried in the server `description` and as an `rfa={...}` line in `instructions` instead |
 | The room-closing `system` event | Named `room_ending` | Emits `room_ended` (read from the implementation, not triggered live). Match either spelling (4.3) |
-| Hash-chain canonical form | Served form is the hashed form; strip derived fields | No deviation since 2026-08-18 (before that date the hub stamped `envelope.seq`/`envelope.ts` AFTER hashing, and documents of that era told verifiers to zero both fields; that procedure now fails every message link). `wrapped` is the only exclusion (Appendix C) |
+| Hash-chain canonical form | Served form is the hashed form; strip derived fields | No deviation since 2026-08-18 (before that date the hub stamped `envelope.seq`/`envelope.ts` AFTER hashing, and documents of that era told verifiers to zero both fields; that procedure now fails every message link). `wrapped` is the only exclusion. Since 2026-08-28 there is a second thing to handle beside the exclusion: an event carrying `content_hash` supplies its own link and must not be recomputed, and a per-reader grant redaction stamps that field WITHOUT `redacted: true` (Appendix C) |
 | `ambient_skipped` | Not specified at all | Exact on the replay path; the build measured on 2026-08-18 reported `0` on the long-poll path even when events were skipped. A fix landed after that build; treat the field as a lower bound either way (4.1) |
 | *`wrapped` on join history | Every message event carries it, on every read path | Present from `room_listen` AND join-contract history (re-measured 2026-08-25 at `9f71ed5`; the 2026-08-18 build omitted it from history). Still absent from `room_watch` deliveries: on push, render your own boundary (2.4) |
 | `policies.join` | The room's admission rule | `"invite"` IS enforced as "a valid credential is required" (measured 2026-08-21). What does not exist is the invite-TOKEN path the name suggests (3.4) |
@@ -983,11 +983,30 @@ appended**. The genesis link, on the room's first event, is the hex SHA-256 of t
 string. The current chain head is not returned by any call, so you verify links between adjacent
 events you already hold, and you cannot anchor the chain to anything the hub attests to separately.
 
-**"As appended" differs from what you received in exactly one way: remove `wrapped`.** It is a
-derived result field (1.3), computed at read time, never stored. Nothing else: `prev_hash` itself
-participates, and `envelope.seq` and `envelope.ts` are hashed as served (true since 2026-08-18;
-Appendix B, "Hash-chain canonical form", for the divergence before that date). Do not add or default
-any absent key; a redacted event's own recorded `content_hash` is what you use for it.
+**"As appended" differs from what you received in two ways, and only two** (the second was added
+2026-08-28; before that date this paragraph said one).
+
+1. **Remove `wrapped`.** It is a derived result field (1.3), computed at read time, never stored.
+   Nothing else is removed: `prev_hash` itself participates, and `envelope.seq` and `envelope.ts` are
+   hashed as served (true since 2026-08-18; Appendix B, "Hash-chain canonical form", for the
+   divergence before that date). Do not add or default any absent key.
+2. **If an event carries `content_hash`, that string IS its link. Use it; do not recompute.** The hub
+   stamps it whenever the form it served you is not the form it appended, and it is the same
+   construction (hex SHA-256 over the JCS canonical form of the appended event), so you still need
+   only one hash function. Two things produce it. A *redaction* (wire 12.1) blanks a body for
+   everyone and also sets `redacted: true`. A *per-reader grant redaction* (wire 10.3 item 7) rewrites
+   a task event's `resource_grants[].keys` for you alone, when your `home` is not the hub's own, and
+   sets `content_hash` **without** `redacted`, because nothing was removed from the record. **Test for
+   the field, not for the flag**: a verifier that requires `redacted: true` will reject the stamp
+   sitting right in front of it and report a healthy log as tampered. Events the hub did not rewrite
+   for you carry no `content_hash` and must verify by recomputation, so this is not a blanket escape
+   hatch.
+
+If you are a guest reading a board (6.2), case 2 is the case you will actually meet: it is what keeps
+the chain verifiable for you while the operator's `local/...` resource names stay digested. Measured
+2026-08-28 against a running reference hub: a guest's contiguous `wait_for: "all"` segment spanning a
+redacted task event verifies end to end through the stamp, fails without it, and an untouched task
+event in the same segment verifies by plain recomputation.
 
 **Measured on the live room**: with `wrapped` removed and nothing else touched, 3,652 of 3,652 links
 verify over the whole 3,922-event room log. The hub ships the verifier that produced that number,

@@ -15,6 +15,8 @@ import * as net from "node:net";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { spawnTsx, stopTree } from "../src/proc.js";
+import { hashedForm, verifyChain } from "../src/chain.js";
+import { canonicalize, sha256hex } from "../src/jcs.js";
 import { generateSigningKey, signCard } from "../src/signing.js";
 
 const FULL = process.argv.includes("--full");
@@ -667,8 +669,10 @@ await scenario("rung 7 guest: authority segments enforce, on SEGMENTS, across th
 });
 
 // 5e. Item 3: the layout a guest may learn, and where the disclosure digest is
-// actually reachable. Honestly, which means NOT manufacturing the digest state.
-await scenario("rung 7 guest: the local key layout, the digest's real reachability, and the history clamp", async () => {
+// actually reachable. Honestly, which means NOT manufacturing the digest state
+// on the refusal path, and asserting the BOARD projection where it really lives
+// (item 7's per-reader redaction, ruled on 2026-08-28).
+await scenario("rung 7 guest: the local key layout, the board redaction, the digest's real reachability, and the history clamp", async () => {
   const u = guestHub.url;
   const room = R.disc;
   const hostTok = G["disc-host"].tok;
@@ -784,15 +788,149 @@ await scenario("rung 7 guest: the local key layout, the digest's real reachabili
   assert(echoed.every((e) => e.asked.some((k) => k.includes(SECRET_KEY))), `a refusal MESSAGE handed a guest a key it never asked for: ${JSON.stringify(echoed.filter((e) => !e.asked.some((k) => k.includes(SECRET_KEY))))}`);
   assert(echoed.length > 0, "the echo path ran at all; if it stopped, the authority refusal stopped naming the key and this sweep is measuring nothing");
 
-  // 3. THE OTHER DISCLOSURE SURFACE, MEASURED AND NOT ENDORSED. `room_task get`
-  //    and `list` return `resource_grants` verbatim to every member of the room,
-  //    guest included, so the same layout the refusal rule protects is readable
-  //    off the board. Asserted so the measurement is not lost and so a fix has to
-  //    come here and say so; recorded as a finding for the owner (ledger
-  //    2026-08-27). It is not a contradiction of item 8, which governs the
-  //    refusal payload, and item 7 does put grants on the task object.
+  // 3. THE OTHER DISCLOSURE SURFACE, now ruled on and enforced. The board used
+  //    to hand a guest every live grant's RAW keys, so the layout item 8
+  //    carefully digests in a refusal was readable off `room_task get` and
+  //    `list` (measured here on 2026-08-27; ledger). Item 7 now redacts grant
+  //    keys PER READER, by authority segment, through the same digest helper:
+  //    `room/<handle>/…` verbatim because that is the shared ground a guest can
+  //    itself contend in and back-off needs it, everything else opaque.
+  //
+  //    ONE task carrying ONE key of each kind, so the two halves are proven in
+  //    the SAME read and a redaction that simply blanked everything would fail
+  //    the `room/…` half.
+  const BOARD_LOCAL = "local/pm-agent/ledger";
+  const BOARD_SHARED = `room/${room}/ledger`;
+  const twoNs = await mkTask("one task, two namespaces");
+  const asOwner = await call(u, "room_task", { room, membership_token: G["disc-local"].tok, action: "claim", id: twoNs, resources: [BOARD_LOCAL, BOARD_SHARED] });
+  assert(asOwner.resource_grants.flatMap((g: { keys: string[] }) => g.keys).join() === `${BOARD_LOCAL},${BOARD_SHARED}`, `the local claimant's own result is verbatim: ${JSON.stringify(asOwner.resource_grants)}`);
+
+  // The CONTROL for the chain half below, appended after the redacted event: a
+  // task whose grant the guest's projection does not touch, because every key on
+  // it is already visible to a guest. It does two jobs - it gives the redacted
+  // event a successor, so its link is really checked, and it is the event that
+  // must still verify by plain RECOMPUTATION with no stamp. And a trailing
+  // message, so the last task event has a successor too and the same segment
+  // carries a `wrapped` event, which is the OTHER thing sect. 13 makes a verifier
+  // handle.
+  const PLAIN_SHARED = `room/${room}/plain`;
+  const plain = await mkTask("a task whose grants need no redaction");
+  await call(u, "room_task", { room, membership_token: G["disc-local"].tok, action: "claim", id: plain, resources: [PLAIN_SHARED] });
+  await call(u, "room_send", {
+    room, membership_token: hostTok, message_id: "e2e_chain_tail", kind: "chat",
+    body: [{ type: "text", text: "tail of the segment the guest verifies" }],
+  });
+
+  const keysOf = (t: { resource_grants?: { keys: string[] }[] }): string[] => (t.resource_grants ?? []).flatMap((g) => g.keys);
+  const guestGet = await call(u, "room_task", { room, membership_token: G["disc-guest"].tok, action: "get", id: twoNs });
+  const guestKeys = keysOf(guestGet);
+  assert(guestKeys.length === 2, `the guest still sees TWO grants, so it can count contention: ${JSON.stringify(guestKeys)}`);
+  assert(guestKeys.includes(BOARD_SHARED), `the shared namespace stays verbatim, or a guest cannot back off in the only namespace it may claim: ${JSON.stringify(guestKeys)}`);
+  assert(!guestKeys.includes(BOARD_LOCAL), `the operator's key reached a guest off the board: ${JSON.stringify(guestKeys)}`);
+  const opaque = guestKeys.find((k) => k !== BOARD_SHARED)!;
+  assert(/^hmac-sha256:[0-9a-f]{64}$/.test(opaque), `the redaction is item 8's documented digest form, not an ad-hoc mask: ${opaque}`);
+
+  // The local reader is untouched: both keys verbatim, no digest anywhere in the
+  // read. Local members need the real keys to work and `rfa task show` prints them.
+  const localGet = await call(u, "room_task", { room, membership_token: G["disc-local"].tok, action: "get", id: twoNs });
+  assert(keysOf(localGet).join() === `${BOARD_LOCAL},${BOARD_SHARED}`, `a local reader sees both keys verbatim: ${JSON.stringify(keysOf(localGet))}`);
+  assert(!JSON.stringify(localGet).includes("hmac-sha256:"), `and no digest reaches a local reader at all: ${JSON.stringify(localGet)}`);
+  // Including the GUEST's own key on the GUEST's task, which is the half of the
+  // local rule that is not already implied by "your own home is yours": an
+  // operator who cannot see which peer resource is held cannot answer a question
+  // about their own board. `wide` holds `<GUEST_HOME>/widen` from the guest's
+  // claim and `room/<room>/board/deeper` from the approved reservation.
+  const guestTaskAsLocal = await call(u, "room_task", { room, membership_token: G["disc-local"].tok, action: "get", id: wide });
+  assert(keysOf(guestTaskAsLocal).includes(`${GUEST_HOME}/widen`), `a local reader sees a PEER's key on a peer's task verbatim: ${JSON.stringify(keysOf(guestTaskAsLocal))}`);
+  assert(!JSON.stringify(guestTaskAsLocal).includes("hmac-sha256:"), `no digest reaches a local reader on a peer's task either: ${JSON.stringify(guestTaskAsLocal)}`);
+
+  // THE CHOICE ON A GUEST'S OWN HOME, pinned: verbatim, not digested. Item 2
+  // makes `<home>/…` claimable only by that peer, so those are the peer's own
+  // names and never the operator's; two memberships of one home really do
+  // collide inside it (5d), so the peer needs contention there for the same
+  // reason it needs it under `room/`; and item 8 already hands that peer exactly
+  // these keys in a refusal.
+  const ownHome = await call(u, "room_task", { room, membership_token: G["disc-guest"].tok, action: "get", id: wide });
+  assert(keysOf(ownHome).includes(`${GUEST_HOME}/widen`), `a guest reads its OWN home's keys verbatim: ${JSON.stringify(keysOf(ownHome))}`);
+  assert(keysOf(ownHome).includes(`${shared}/deeper`), `and the reservation's room/ key too: ${JSON.stringify(keysOf(ownHome))}`);
+
+  // `list` agrees with `get`, key for key: one projection, not two. The digest is
+  // the SAME string across reads, which is what makes it usable for back-off -
+  // a guest can tell the resource that refused it is the one still held.
   const boardAsGuest = await call(u, "room_task", { room, membership_token: G["disc-guest"].tok, action: "list" });
-  assert(JSON.stringify(boardAsGuest).includes(SECRET_KEY), "MEASURED: a guest reads the operator's live resource keys off room_task list (if this now fails, the redaction landed: update the ledger)");
+  const listed = boardAsGuest.tasks.find((t: { id: string }) => t.id === twoNs);
+  assert(keysOf(listed).join() === guestKeys.join(), `list and get project identically: ${JSON.stringify(keysOf(listed))} vs ${JSON.stringify(guestKeys)}`);
+  assert(!JSON.stringify(boardAsGuest).includes(BOARD_LOCAL), `the WHOLE board a guest reads carries no local/ key: ${BOARD_LOCAL}`);
+
+  // And the task EVENT, redacted per RECIPIENT. Without this the redaction would
+  // be theatre: a guest listening to the room reads the same grants off its own
+  // event stream a moment after the board refuses them.
+  const evKeys = (v: { events: { type: string; task?: { id: string; resource_grants?: { keys: string[] }[] } }[] }): string[] =>
+    v.events.filter((e) => e.type === "task" && e.task?.id === twoNs).flatMap((e) => keysOf(e.task!));
+  const guestStream = await call(u, "room_listen", { room, membership_token: G["disc-guest"].tok, since: 0, timeout_ms: 0, wait_for: "all" });
+  const localStream = await call(u, "room_listen", { room, membership_token: G["disc-local"].tok, since: 0, timeout_ms: 0, wait_for: "all" });
+  assert(evKeys(guestStream).includes(opaque) && evKeys(guestStream).includes(BOARD_SHARED), `the guest's task events carry the same projection: ${JSON.stringify(evKeys(guestStream))}`);
+  assert(!evKeys(guestStream).includes(BOARD_LOCAL), `a task EVENT handed the guest the operator's key: ${JSON.stringify(evKeys(guestStream))}`);
+  assert(evKeys(localStream).includes(BOARD_LOCAL), `the local member's own event stream is unredacted, or the log stopped being the record: ${JSON.stringify(evKeys(localStream))}`);
+
+  // 3b. THE CHAIN OVER WHAT THE GUEST RECEIVED (wire sect. 13, and 9.6's note
+  //     that a peer verifies what it RECEIVES rather than what was stored).
+  //
+  //     Redacting an APPENDED field breaks the chain for the member it is applied
+  //     to, and it is reachable: `wait_for: "all"` matches every event, so a
+  //     member can take a contiguous run from its join point to the tip, which is
+  //     exactly what a verifier needs. So the hub stamps a CHANGED task event with
+  //     `content_hash`, the appended form's hash under the identical construction
+  //     `prev_hash` uses, and the verifier below is the integrator's procedure and
+  //     nothing more: strip `wrapped`, take the stamp where there is one,
+  //     recompute everything else, walk the links. Preserved because it matters
+  //     most for precisely the member this redaction targets - a counterparty in
+  //     another organization, where the log is bilateral evidence.
+  const segment = guestStream.events as Record<string, unknown>[];
+  const seqOf = (e: Record<string, unknown>) => Number(e.seq);
+  assert(segment.length > 2 && segment.every((e, i) => i === 0 || seqOf(e) === seqOf(segment[i - 1]) + 1), `the guest's own stream IS contiguous under wait_for: "all", which is the premise: ${JSON.stringify(segment.map(seqOf))}`);
+  assert(segment.some((e) => typeof e.wrapped === "string"), "and it carries a wrapped message event, so both of sect. 13's cases are in one segment");
+
+  // STAMPED EXACTLY WHEN THE PROJECTION REWROTE SOMETHING, over the whole
+  // segment. The projection's only edit is replacing a key with a digest, so
+  // "this served task contains an `hmac-sha256:`" is precisely "this event was
+  // changed for this reader" - which makes this an equivalence, not a spot check.
+  for (const e of segment) {
+    const digested = e.type === "task" && JSON.stringify(e.task).includes("hmac-sha256:");
+    assert(digested === (typeof e.content_hash === "string"), `seq ${seqOf(e)} (${String(e.type)}): stamped=${typeof e.content_hash === "string"} but rewritten=${digested}; the stamp must land on changed events and on nothing else`);
+    assert(e.redacted === undefined, `seq ${seqOf(e)} claims content was REMOVED; 12.1's flag is a different thing and per-reader redaction removes nothing`);
+  }
+
+  const idx = (pred: (e: Record<string, unknown>) => boolean, what: string): number => {
+    const i = segment.findIndex(pred);
+    assert(i >= 0 && i + 1 < segment.length, `${what} is in the segment with a successor, or its link is never checked`);
+    return i;
+  };
+  const iRedacted = idx((e) => e.type === "task" && (e.task as { id: string }).id === twoNs && JSON.stringify(e.task).includes("hmac-sha256:"), "the redacted task event");
+  assert(segment[iRedacted + 1].prev_hash === segment[iRedacted].content_hash, `the stamp IS the next event's link: ${String(segment[iRedacted].content_hash)} vs ${String(segment[iRedacted + 1].prev_hash)}`);
+  assert(sha256hex(canonicalize(hashedForm(segment[iRedacted]))) !== segment[iRedacted + 1].prev_hash, "and recomputing over the served form does NOT reproduce it, which is why the stamp has to exist");
+
+  // The UNTOUCHED task event, with grants, verifies by recomputation and carries
+  // no stamp: the stamp is not papering over every task event.
+  const iPlain = idx((e) => e.type === "task" && (e.task as { id: string }).id === plain && JSON.stringify(e.task).includes(PLAIN_SHARED), "the untouched task event");
+  assert(segment[iPlain].content_hash === undefined, "an untouched task event is not stamped");
+  assert(segment[iPlain + 1].prev_hash === sha256hex(canonicalize(hashedForm(segment[iPlain]))), `and it verifies by plain recomputation: ${JSON.stringify(segment[iPlain])}`);
+
+  const chain = verifyChain(segment);
+  assert(chain.ok && chain.linksChecked > 0, `the whole segment the guest received verifies: ${JSON.stringify(chain.divergences)}`);
+  assert(chain.stampedLinks > 0 && chain.stampedLinks < chain.linksChecked, `some links came from a stamp and most did not: ${chain.stampedLinks} of ${chain.linksChecked}`);
+  // The stamps are load-bearing: strip them and the same segment reads as
+  // tampered. This is the negative half of the assertion above, kept permanent so
+  // a future change that drops the stamp cannot pass by making both halves vacuous.
+  const unstamped = segment.map(({ content_hash: _c, ...rest }) => rest);
+  assert(!verifyChain(unstamped).ok, "without the stamp the guest's segment reads as tampered, which is the consequence this closes");
+
+  // And the LOCAL reader, whose events are never rewritten, verifies with no
+  // stamp anywhere: the hub did not simply start stamping everything.
+  const localSegment = localStream.events as Record<string, unknown>[];
+  assert(localSegment.every((e) => e.content_hash === undefined), `a local reader's stream carries no stamp at all: ${JSON.stringify(localSegment.filter((e) => e.content_hash !== undefined).map(seqOf))}`);
+  const localChain = verifyChain(localSegment);
+  assert(localChain.ok && localChain.stampedLinks === 0 && localChain.linksChecked > 0, `and verifies by pure recomputation: ${JSON.stringify(localChain.divergences)}`);
 
   // 4. The disclosure rule that DOES hold for a guest on the wire: the
   //    `since`-CLAMP half of wire 5.4. The clamp comes FIRST for a non-local
@@ -815,7 +953,7 @@ await scenario("rung 7 guest: the local key layout, the digest's real reachabili
   assert(!hasPreJoin(guestSees), "a GUEST is clamped to its own join point even under history_visibility: member");
   assert(!JSON.stringify(guestSees).includes("PRE-JOIN-ROOM-SECRET"), "and the text itself never reaches it");
 
-  return `${refusedAtGrammar} shapes refused at the grammar, ${admittedElsewhere} admitted elsewhere, 0 digests reachable, 3 refusal carriers plain, reservation granted after 3 refusals, guest clamped to its join point; MEASURED: room_task list still shows a guest the raw local grants`;
+  return `${refusedAtGrammar} shapes refused at the grammar, ${admittedElsewhere} admitted elsewhere, 0 digests reachable through a refusal, 3 refusal carriers plain, reservation granted after 3 refusals, guest clamped to its join point; grant keys redacted per reader on get, list and the task event (room/ verbatim, local/ digested) and verbatim for a local reader; the guest's contiguous ${segment.length}-event segment verifies through the stamp and fails without it`;
 });
 
 // 5f. Item 4: the two fairness budgets, and the rejoin case a naive keying gets wrong.

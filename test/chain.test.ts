@@ -174,11 +174,58 @@ test("a redacted event verifies through content_hash, so redaction does not read
   const next = { seq: 5, ts: "2026-08-19T10:00:01.000Z", type: "system", event: "z", prev_hash: preRedactionLink };
   const res = verifyChain([redacted, next] as Record<string, unknown>[]);
   assert.equal(res.ok, true, "the chain survives a legitimate redaction");
-  assert.equal(res.redactedLinks, 1, "and says so, rather than hiding that a link came from a stamp");
+  assert.equal(res.stampedLinks, 1, "and says so, rather than hiding that a link came from a stamp");
 
   // A redaction whose content_hash was itself forged does NOT verify.
   const forged = { ...redacted, content_hash: sha256hex("something else") };
   assert.equal(verifyChain([forged, next] as Record<string, unknown>[]).ok, false);
+});
+
+test("a per-reader redaction verifies through content_hash WITHOUT `redacted`", () => {
+  // Wire 10.3 item 7 as amended 2026-08-28. The hub rewrites a task event's grant
+  // keys for ONE reader, so the served event no longer canonicalizes to the form
+  // the hub hashed, and it stamps the appended form's hash. It does NOT set
+  // `redacted`, because nothing was removed from the record: 12.1's flag means
+  // content is gone from every future read, and this reader's copy is a
+  // projection. `linkOf` therefore tests the FIELD, not the flag - it tested the
+  // pair until this amendment, which would have rejected the stamp sitting right
+  // there.
+  const appended = {
+    seq: 11,
+    ts: "2026-08-28T10:00:00.000Z",
+    type: "task",
+    prev_hash: "prevlink",
+    action: "claim",
+    actor: "m_local",
+    task: { id: "t_1", room: "r_1", resource_grants: [{ keys: ["local/pm-agent/ledger", "room/r_1/ledger"] }] },
+  } as Record<string, unknown>;
+  const appendedLink = sha256hex(canonicalize(appended));
+
+  const asServedToGuest = {
+    ...appended,
+    task: { id: "t_1", room: "r_1", resource_grants: [{ keys: [`hmac-sha256:${"ab".repeat(32)}`, "room/r_1/ledger"] }] },
+    content_hash: appendedLink,
+  } as Record<string, unknown>;
+  assert.equal(asServedToGuest.redacted, undefined, "no content was removed, so nothing claims it was");
+
+  const link = linkOf(asServedToGuest);
+  assert.equal(link.source, "content_hash");
+  assert.equal(link.hash, appendedLink);
+  assert.notEqual(sha256hex(canonicalize(hashedForm(asServedToGuest))), appendedLink, "recomputing over the served form gives the WRONG link, which is the whole reason for the stamp");
+
+  const next = { seq: 12, ts: "2026-08-28T10:00:01.000Z", type: "system", event: "z", prev_hash: appendedLink };
+  assert.equal(verifyChain([asServedToGuest, next] as Record<string, unknown>[]).ok, true, "a guest verifies the segment it received");
+
+  // Without the stamp the same segment breaks: the assertion above is not vacuous.
+  const { content_hash: _c, ...unstamped } = asServedToGuest;
+  assert.equal(verifyChain([unstamped, next] as Record<string, unknown>[]).ok, false);
+
+  // And an UNTOUCHED task event verifies by plain recomputation, with no stamp:
+  // the hub stamps what it changed and nothing else.
+  const untouched = { seq: 13, ts: "2026-08-28T10:00:02.000Z", type: "task", prev_hash: appendedLink, action: "create", actor: "m_local", task: { id: "t_2", room: "r_1" } } as Record<string, unknown>;
+  assert.equal(linkOf(untouched).source, "computed");
+  const after = { seq: 14, ts: "2026-08-28T10:00:03.000Z", type: "system", event: "y", prev_hash: sha256hex(canonicalize(untouched)) };
+  assert.equal(verifyChain([asServedToGuest, untouched, after] as Record<string, unknown>[]).ok, true);
 });
 
 test("the scope qualifier says what the chain is NOT worth", () => {

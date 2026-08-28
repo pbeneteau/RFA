@@ -73,7 +73,9 @@ export function describeReport(r: LogReport): string[] {
   if (r.unchainedPrefix > 0) sub(`${r.unchainedPrefix} leading event(s) carry no prev_hash and were skipped: they predate the chain (0.1.7), which is not a break`);
   if (r.genesisOk === true) sub(`genesis link matches sha256("${r.handle}")`);
   if (r.genesisOk === null && r.unchainedPrefix > 0) sub("genesis NOT checked: this room's chain starts mid-log, so there is nothing to compare");
-  if (r.redactedLinks > 0) sub(`${r.redactedLinks} link(s) verified through content_hash (redacted events, wire 12.1)`);
+  // On a log read off DISK a stamp can only be a 12.1 redaction: the per-reader
+  // stamp of 10.3 item 7 is applied on the way out and never written here.
+  if (r.stampedLinks > 0) sub(`${r.stampedLinks} link(s) verified through content_hash (redacted events, wire 12.1)`);
   if (r.torn > 0) sub("final line unparseable (torn append, the ordinary result of a kill mid-write); prefix verified");
   if (r.badMid > 0) sub(`WARNING: ${r.badMid} unparseable line(s) NOT at end of file: that is not a torn append`);
   for (const d of r.divergences) {

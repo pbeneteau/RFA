@@ -194,8 +194,19 @@ export interface RfaTask {
 /** Distributes Omit over a union (plain Omit collapses discriminated unions). */
 export type EventInput = RfaEventBody extends infer E ? (E extends RfaEventBody ? Omit<E, "seq" | "ts"> : never) : never;
 
-/** Every appended event carries a hash chain link: SHA-256 over the JCS form of the previous event (spec 0.4 sect. 7.1). */
-export type RfaEvent = RfaEventBody & { prev_hash?: string };
+/**
+ * Every appended event carries a hash chain link: SHA-256 over the JCS form of the
+ * previous event (spec 0.4 sect. 7.1).
+ *
+ * `content_hash` is the event's own link when the served form is not the appended
+ * form, so a verifier of what it RECEIVED still has the appended form's hash (wire
+ * 9.4, 12.1 and sect. 13). It has two producers and one construction: a 12.1
+ * redaction, which also sets `redacted: true` because content really was removed
+ * from every future read; and the per-reader grant redaction of 10.3 item 7, which
+ * sets `content_hash` ALONE because nothing was removed from the record. Neither is
+ * ever written to the log: both are stamped on the way out.
+ */
+export type RfaEvent = RfaEventBody & { prev_hash?: string; content_hash?: string; redacted?: boolean };
 
 type RfaEventBody =
   | ({ seq: number; ts: string; type: "message" } & {

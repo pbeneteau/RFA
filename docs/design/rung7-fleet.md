@@ -99,6 +99,13 @@ that makes the advertisement honest.
   nothing in the log says why.
 - `discloseKey(key, {claimantHome, secret})` returns the key, or `hmac-sha256:<hex>` when
   the claimant is non-local and the key is under `local/...`.
+- AMENDED 2026-08-28, after the guest scenarios measured the hole: `discloseGrantKey(key,
+  {readerHome, roomHandle, secret})` is the same rule read at the other moment, for a
+  READER of a grant rather than a refused claimant. A local reader gets every key; a
+  non-local reader gets `room/<this handle>/...` and its own `<home>/...` and the digest
+  for everything else, through the same `digestKey`. It exists because item 8 without it
+  is a refusal path hiding a layout the board publishes. `taskForReader` in the store is
+  the single projection every task-bearing surface goes through, task EVENTS included.
 
 The store's `claim` case gains, between the existing seam and the commit: key validation
 (`bad_request`), intersection against every live grant in the room (`task_conflict` with

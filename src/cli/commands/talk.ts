@@ -250,13 +250,14 @@ export const taskLs: CommandDef = {
  * reader who mistakes it for a path goes looking for a resource that does not
  * exist.
  *
- * That label is a DEFENSIVE guard here, not a shape this path produces today:
- * `discloseKey` is applied to the refusal payloads only (`blocking_key`,
- * `requested_key`, `reservation_offered` in `src/store.ts`), while every write to
- * `task.resource_grants` stores the raw keys, so a grant read back from the store
- * is never digested. It stays because the day a grant is read by a non-local
- * principal is the day it would be, and the guard costs one call. Where digests
- * really surface is the `task_conflict` refusal, which no CLI surface renders yet.
+ * That label is a DEFENSIVE guard on THIS surface and a live shape on the wire.
+ * `task.resource_grants` stores the raw keys, and since the item 7 amendment of
+ * 2026-08-28 the hub redacts them PER READER on the way out
+ * (`taskForReader` in `src/store.ts`), so a non-local reader really does read a
+ * board of digests. This CLI reads with the operator's own local membership,
+ * which is the branch that gets every key verbatim, so the guard should not fire
+ * here; it stays because the day this command is pointed at a task read through
+ * a guest membership is the day it would, and the guard costs one call.
  */
 export function renderGrants(ui: CliContext["ui"], t: { attempt?: number; owner?: string | null; lease_expires?: string | null; resource_grants?: { keys: string[]; owner: string; attempt: number; source: string; granted_at: string }[]; reservation_offer?: { keys: string[]; offered_at: string } | null; widen_refusals?: number }): void {
   const grants = t.resource_grants ?? [];
