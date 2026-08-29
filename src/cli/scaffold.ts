@@ -73,8 +73,19 @@ export interface ToolSpec {
 }
 
 /** The servers this package ships, for `--builtin <name>` and the onboarding's first choice. */
-export const BUILTIN_SERVERS: Record<string, { description: string; tools: string[]; defaultTool: string; envSecrets: string[] }> = {
-  linear: { description: "finds Linear projects and saves documents into them (dry-run drafts without the key)", tools: ["search_project", "save_document"], defaultTool: "save_document", envSecrets: ["LINEAR_API_KEY"] },
+export const BUILTIN_SERVERS: Record<
+  string,
+  { description: string; tools: string[]; defaultTool: string; envSecrets: string[]; sandbox: { network: "none" | "allowlist"; allowedDomains: string[]; allowWrite: string[] } }
+> = {
+  linear: {
+    description: "finds Linear projects and saves documents into them (dry-run drafts without the key)",
+    tools: ["search_project", "save_document"],
+    defaultTool: "save_document",
+    envSecrets: ["LINEAR_API_KEY"],
+    // RFA-0.9 sect. 5.4: this platform spawns this server, so it declares what
+    // it may reach and where it may write, or the definition is refused.
+    sandbox: { network: "allowlist", allowedDomains: ["api.linear.app"], allowWrite: ["state/drafts"] },
+  },
 };
 
 export function builtinTool(name: string, toolId?: string, server?: string): ToolSpec {
@@ -132,6 +143,13 @@ export function renderAgentMd(o: ScaffoldOptions): string {
       : `knowledge:
   # Globs are relative to this directory; out-of-pack paths work too.
   - "knowledge/**/*.md"`;
+  const serverSandbox = (o.tool?.builtin ? BUILTIN_SERVERS[o.tool.builtin]?.sandbox : undefined) ?? {
+    network: "allowlist" as const,
+    // A hand-written server gets a placeholder the operator must edit: naming a
+    // host they did not choose would be a policy this scaffold invented.
+    allowedDomains: ["api.example.com"],
+    allowWrite: ["state/drafts"],
+  };
   const toolsBlock =
     kind === "tool"
       ? `tools:
@@ -146,6 +164,13 @@ mcp_servers:
 ${o.tool?.builtin ? `    builtin: ${o.tool.builtin}   # shipped in this package; the resident starts it from its own entry` : `    command: ${JSON.stringify(o.tool?.command ?? "npx")}
     args: ${JSON.stringify(o.tool?.args ?? ["-y", "your-mcp-server"])}`}
     env_secrets: ${JSON.stringify(o.tool?.envSecrets ?? [])}
+    # RFA-0.9 sect. 5.4: this platform SPAWNS this server, so it is spawned inside
+    # its own OS sandbox and has to say what that sandbox permits. Without this
+    # block the definition is refused: a stdio MCP child that is not wrapped runs
+    # outside the query's sandbox entirely (measured, probe E5).
+    sandbox:
+      network: ${serverSandbox.network}${serverSandbox.network === "allowlist" ? `\n      allowed_domains: ${JSON.stringify(serverSandbox.allowedDomains)}` : ""}
+      allow_write: ${JSON.stringify(serverSandbox.allowWrite)}   # pack-relative, and refused outside the pack
 interrupt_on:
   # Every tool named here pauses for a human approve/edit/reject decision.
   # Name the exact tool id; a trailing * is a prefix match.
@@ -207,7 +232,6 @@ ${kind === "tool" ? `mode: ${o.mode ?? "ask"}   # ask: cards for every acting to
                       # engages only for a pack that declares a guarded built-in
                       # (Write/Edit/NotebookEdit), which no scaffolded kind does.
   permission_mode: default
-  network: none
 # Names only, never values. The supervisor injects these from .rfa/secrets.json.
 # RFA_TOKEN: the bearer that reaches the hub; residents join their room with it.
 secrets: [RFA_TOKEN${o.tool?.envSecrets?.length ? `, ${o.tool.envSecrets.join(", ")}` : ""}]
@@ -255,7 +279,7 @@ export function scaffoldPack(h: HubDir, o: ScaffoldOptions): ScaffoldResult {
   if (o.knowledge && !fs.existsSync(path.resolve(o.knowledge))) throw new Error(`knowledge directory ${o.knowledge} does not exist`);
   o = { ...o, knowledge: knowledgeRelativeToPack(h, o.name, o.knowledge) };
   const content = renderAgentMd(o);
-  const parsed = parseAgentMd(content); // a generated pack can never be one the platform then refuses
+  const parsed = parseAgentMd(content, { dir }); // a generated pack can never be one the platform then refuses
   const files: string[] = [];
   const kept: string[] = [];
   const write = (rel: string, text: string): void => {

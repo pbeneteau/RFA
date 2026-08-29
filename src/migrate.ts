@@ -177,7 +177,7 @@ export function planMigration(legacyRoot: string, target: string, opts: Migratio
         if (!fs.existsSync(file)) continue;
         let globs: string[] = [];
         try {
-          globs = parseAgentMd(fs.readFileSync(file, "utf8")).def.knowledge ?? [];
+          globs = parseAgentMd(fs.readFileSync(file, "utf8"), { dir: path.dirname(file) }).def.knowledge ?? [];
         } catch {
           warnings.push(`agents/${entry.name}/agent.md does not parse; its knowledge globs are moved as they are`);
           continue;
@@ -324,7 +324,7 @@ export function applyMigration(plan: MigrationPlan, opts: MigrationOptions = pla
       const text = fs.readFileSync(step.to, "utf8");
       const next = rewriteKnowledgeGlobs(text, step.rewrites);
       try {
-        parseAgentMd(next);
+        parseAgentMd(next, { dir: path.dirname(step.to) });
       } catch (err) {
         skipped.push(`${step.detail} (the rewritten agent.md would not parse: ${(err as Error).message.split("\n")[0]}; left as it was)`);
         continue;

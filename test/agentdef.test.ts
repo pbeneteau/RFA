@@ -77,7 +77,19 @@ test("tools.allow_subagents: fan-out is opt-in and the refusal names the tool (s
   assert.deepEqual(opted.def.tools?.allow, ["Read", "Agent"]);
   // `deny` is not an admission, and a lookalike tool name is not fan-out.
   assert.ok(parseAgentMd(VALID.replace("allow: [Read, Grep]", "allow: [Read]\n  deny: [Agent, Task]")));
-  assert.ok(parseAgentMd(VALID.replace("allow: [Read, Grep]", "allow: [Read, TaskBoard, AgentCard]")));
+  // A lookalike name is not fan-out - and since RFA-0.9 sect. 3.2 it is not a
+  // tool either: an unclassified entry is REFUSED rather than landing verbatim
+  // in the SDK's base tool set. The refusal must be the classification one and
+  // not the subagent one, or the lookalike would be being read as fan-out after
+  // all. This is the cost Appendix B item 5 records, taken deliberately.
+  assert.throws(
+    () => parseAgentMd(VALID.replace("allow: [Read, Grep]", "allow: [Read, TaskBoard, AgentCard]")),
+    (err: Error) => {
+      assert.match(err.message, /`TaskBoard` is not a classified built-in/);
+      assert.doesNotMatch(err.message, /spawns subagents/);
+      return true;
+    },
+  );
 });
 
 test("deriveCard: card comes from the definition and its digest rotates with it", () => {
@@ -145,7 +157,10 @@ test("concurrency: defaults to 1, and above 1 needs all three gates of RFA-0.8 s
   assert.throws(
     () =>
       parseAgentMd(
-        CONC("concurrency: 2\nbudgets:\n  per_day_usd: 5\ninterrupt_on:\n  \"mcp__linear__*\": true\n").replace("allow: [Read, Grep]", "allow: [Read, mcp__linear__save_document]"),
+        CONC("concurrency: 2\nbudgets:\n  per_day_usd: 5\ninterrupt_on:\n  \"mcp__linear__*\": true\n").replace(
+          "allow: [Read, Grep]",
+          "allow: [Read, mcp__linear__save_document]\nmcp_servers:\n  linear:\n    builtin: linear",
+        ),
       ),
     /read-only/,
   );

@@ -875,7 +875,7 @@ async function workbench(req: http.IncomingMessage, res: http.ServerResponse, pa
         const b = await body(req);
         if (typeof b.content !== "string") return send(res, 400, { error: "body.content required" });
         try {
-          const parsed = parseAgentMd(b.content);
+          const parsed = parseAgentMd(b.content, { dir: path.dirname(file) });
           fs.writeFileSync(file, b.content); // the supervisor's file watch does the versioned drain
           return send(res, 200, { definition_hash: parsed.definitionHash });
         } catch (err) {

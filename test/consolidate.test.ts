@@ -33,7 +33,7 @@ let dbPath: string;
 
 /** Gate the extract pass so a test can hold a consolidation mid-flight. */
 function fakeLlm(hold?: () => Promise<void>): LlmFn {
-  return async (_cwd, system) => {
+  return async (system) => {
     if (hold) await hold();
     if (system.includes("reconcile")) return { text: JSON.stringify({ memory: [{ text: FACT, event: "ADD", importance: 0.9 }] }), cost: 0.002 };
     return { text: JSON.stringify({ facts: [FACT] }), cost: 0.001 };
@@ -194,7 +194,7 @@ test("gate-skipped facts are counted in the pass result, so a skip is visible ra
   seedEpisodes(2);
   // A "fact" that is the asker's own words verbatim: the gate refuses it at the
   // fact door, and the pass reports the skip instead of swallowing it.
-  const parrot: LlmFn = async (_cwd, system) => {
+  const parrot: LlmFn = async (system) => {
     // The asker's own words, back verbatim: the exact worm-persistence move the
     // fact-door gate exists to refuse.
     const text = askerText(0);

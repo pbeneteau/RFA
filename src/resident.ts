@@ -18,7 +18,7 @@ import { createSdkMcpServer, query, tool, type McpServerConfig } from "@anthropi
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as z from "zod";
-import { deriveCard, knowledgeFiles, loadPack, type AgentPack } from "./agentdef.js";
+import { deriveCard, knowledgeFiles, loadPack, resolvePackCwd, type AgentPack } from "./agentdef.js";
 import { cloneHeads } from "./knowledge-sources.js";
 import { HubDirError, requireHubDir, roomsStore, type HubDir } from "./hubdir.js";
 import { entryFor, nodeArgsFor } from "./proc.js";
@@ -36,6 +36,9 @@ import {
   type ClaimHeld,
 } from "./writefence.js";
 import { guardedToProbe, probeGuardedBuiltin, probeIsFatal } from "./fenceprobe.js";
+import { declaredOfClass, fenceApplies } from "./toolclass.js";
+import { isWrappableServer, MCP_SANDBOX_ENV, mcpServerPolicy } from "./mcpsandbox.js";
+import { EGRESS_TOOL_NAME, egressBackstopMessage, egressPolicy, postureView } from "./egress.js";
 
 const PLAN_MODE_NOTE = `
 
@@ -732,11 +735,41 @@ function packMcpServers(): Record<string, McpServerConfig> {
   for (const [name, def] of Object.entries(pack.def.mcp_servers ?? {})) {
     const wanted = [...(("env_secrets" in def ? def.env_secrets : undefined) ?? []), ...("bearer_secret" in def && def.bearer_secret ? [def.bearer_secret] : [])];
     for (const n of wanted) if (process.env[n] === undefined) log(`mcp server ${name}: secret ${n} is not set; add it with \`rfa secrets set ${n}\` (the server runs without it)`);
+    /**
+     * RFA-0.9 sect. 5.4, rung 8: a server this platform SPAWNS is spawned through
+     * the launcher, which establishes that server's own sandbox in its own
+     * process and execs the real server inside it. Probe E5 measured what the
+     * unwrapped shape buys: a stdio MCP child reached a host `strictAllowlist`
+     * denied to `Bash` in the same run and wrote a file outside
+     * `filesystem.allowWrite` that was on disk afterwards.
+     *
+     * The policy is the server's OWN declaration and never the pack's posture
+     * (sect. 4.1 says the posture does not govern MCP servers, and reusing it
+     * would make that sentence false). `parseAgentMd` has already refused a
+     * `command` or `builtin` server that declares none, so `sandbox` is present
+     * here by construction; the fallback below still refuses rather than
+     * silently running one unconfined, because "unreachable" is not a fence.
+     */
+    const launch = (real: { command: string; args?: string[] }, env: Record<string, string>): McpServerConfig => {
+      const sandbox = "sandbox" in def ? def.sandbox : undefined;
+      if (!sandbox) {
+        log(`FATAL: mcp server ${name} has no sandbox block and this platform spawns it; refusing to run it unconfined (RFA-0.9 sect. 5.4)`);
+        process.exit(1);
+      }
+      const policy = mcpServerPolicy(pack.dir, name, sandbox);
+      const launcher = entryFor(import.meta.url, "mcplaunch");
+      return {
+        type: "stdio",
+        command: process.execPath,
+        args: [...nodeArgsFor(launcher), "--", real.command, ...(real.args ?? [])],
+        env: { ...env, [MCP_SANDBOX_ENV]: JSON.stringify(policy) },
+      };
+    };
     if ("builtin" in def) {
       const entry = entryFor(import.meta.url, path.join("servers", def.builtin));
-      out[name] = { type: "stdio", command: process.execPath, args: nodeArgsFor(entry), env: { ...base, ...pick(def.env_secrets) } };
+      out[name] = launch({ command: process.execPath, args: nodeArgsFor(entry) }, { ...base, ...pick(def.env_secrets) });
     } else if ("command" in def) {
-      out[name] = { type: "stdio", command: def.command, args: def.args, env: { ...base, ...(def.env ?? {}), ...pick(def.env_secrets) } };
+      out[name] = launch({ command: def.command, args: def.args }, { ...base, ...(def.env ?? {}), ...pick(def.env_secrets) });
     } else {
       const bearer = def.bearer_secret ? process.env[def.bearer_secret] : undefined;
       out[name] = { type: "http", url: def.url, ...(bearer ? { headers: { authorization: `Bearer ${bearer}` } } : {}) };
@@ -744,8 +777,14 @@ function packMcpServers(): Record<string, McpServerConfig> {
   }
   return out;
 }
+// RFA-0.9 sect. 7.2: a definition warning has to reach somebody. The resident is
+// the one reader that sees every pack on every boot.
+for (const w of pack.warnings) log(`definition warning: ${w}`);
 const packServers = packMcpServers();
-if (Object.keys(packServers).length > 0) log(`mcp servers from the pack: ${Object.keys(packServers).join(", ")}`);
+if (Object.keys(packServers).length > 0) {
+  const forms = Object.entries(pack.def.mcp_servers ?? {}).map(([n, d]) => `${n} (${isWrappableServer(d) ? "sandboxed per its own declaration" : "url form: NOT ours to spawn, so unconfined, RFA-0.9 sect. 5.4"})`);
+  log(`mcp servers from the pack: ${forms.join(", ")}`);
+}
 
 // ---- approval bridge (v0.4.6): interrupt_on tools pause on a human decision ----
 
@@ -786,7 +825,20 @@ const MCP_TOOLS = [
  * roots REPLACE its own arguments) would otherwise be handed the hub directory,
  * `.rfa/secrets.json` included. Found live on 2026-08-23.
  */
-const BRAIN_CWD = pack.def.sandbox?.cwd ? path.resolve(HUB_ROOT, pack.def.sandbox.cwd) : pack.dir;
+const BRAIN_CWD = ((): string => {
+  if (!pack.def.sandbox?.cwd) return pack.dir;
+  // RFA-0.9 sect. 3.4b: the key must resolve INSIDE the pack directory, and the
+  // definition loader has already refused it otherwise. This re-asks through the
+  // same function rather than trusting that, because a resident that widened its
+  // own read surface on a value nobody checked is exactly the finding (E9: a
+  // Read inside the working directory never reaches the callback at all).
+  const resolved = resolvePackCwd(pack.dir, pack.def.sandbox.cwd);
+  if (!resolved.ok) {
+    console.error(`FATAL: ${resolved.reason}`);
+    process.exit(1);
+  }
+  return resolved.path;
+})();
 
 /**
  * The working directory for ONE run, and for a fenced run it is not the pack's
@@ -808,7 +860,7 @@ const BRAIN_CWD = pack.def.sandbox?.cwd ? path.resolve(HUB_ROOT, pack.def.sandbo
  * regression that cost three days on 2026-08-26.
  */
 function runCwd(run: { scratchDir?: string | null }): string {
-  return WRITING_PACK && run.scratchDir ? run.scratchDir : BRAIN_CWD;
+  return FENCED_PACK && run.scratchDir ? run.scratchDir : BRAIN_CWD;
 }
 
 /**
@@ -827,10 +879,54 @@ function runCwd(run: { scratchDir?: string | null }): string {
  * and rung 6 is what publishes it, and removed if the run wrote nothing, so a
  * writing pack answering ordinary questions leaves no litter.
  */
+/**
+ * The one sentence RFA-0.9 sect. 4.7's alarm says, wherever it is thrown.
+ *
+ * Two throw sites reach it - the result branch, when the interrupt this alarm
+ * fired lands first, and the end of the message loop otherwise - and a message
+ * written twice is a message that will differ once.
+ */
+function egressAlarmMessage(host: string): string {
+  return (
+    `egress alarm: this run established a network policy at door two with strictAllowlist, under which \`${EGRESS_TOOL_NAME}\` cannot reach door one at all, ` +
+    `and it did, for ${host}. The sandbox runtime has stopped honouring strictAllowlist on this host or this version, so the pack's declared posture is not in force. ` +
+    `Failing the run (RFA-0.9 sect. 4.7). Re-run \`npm run egress-proof\`: this behaviour is version-fragile by design.`
+  );
+}
+
 const SCRATCH_ROOT = path.join(pack.dir, "scratch");
 
-/** Does this pack declare a write surface (a guarded built-in)? Fixed at load. */
+/**
+ * Does this pack declare a write surface (a guarded built-in)? Fixed at load.
+ * This decides DOOR ONE's per-run path guard, which has nothing to guard without
+ * one.
+ */
 const WRITING_PACK = hasWriteSurface(pack.def);
+
+/**
+ * Is this run FENCED at all (RFA-0.9 sect. 3.3)? Guarded OR command.
+ *
+ * The predicate that governs whether door two is established, whether a scratch
+ * directory is minted, and whether the startup fence checks run and fail closed.
+ * It is wider than `WRITING_PACK` by exactly one case and that case was the hole:
+ * a pack declaring `Bash` and no guarded built-in got no OS sandbox, and its
+ * `Bash` sits pre-approved in `allowedTools` so it never reached door one either.
+ * It had no egress decision at all, not even the accidental one E10b measured.
+ */
+const FENCED_PACK = fenceApplies(pack.def);
+
+/** The command-class built-ins this pack declares: door two's whole reason on a non-writing pack. */
+const COMMAND_BUILTINS = declaredOfClass(pack.def.tools?.allow, "command");
+
+/**
+ * This pack's declared network posture, as door two's policy (RFA-0.9 sect. 4).
+ * Computed once: it is passed to every fenced run AND established at boot, and
+ * the two disagreeing would mean the boot proved a policy no run uses.
+ */
+const EGRESS_POLICY = egressPolicy(pack.def);
+
+/** The same posture as a sentence, for the boot log; it always carries sect. 4.1's scope. */
+const POSTURE = postureView(pack.def);
 
 function makeScratch(runId: string): string {
   const dir = path.join(SCRATCH_ROOT, runId);
@@ -931,8 +1027,10 @@ function scratchNote(run: { scratchDir?: string | null; candidateSet?: string | 
     // Told plainly, because a model that learns the boundary from a refusal
     // spends a turn on it. The fence refuses either way; this is what makes the
     // refusal unnecessary rather than what makes it work.
-    (WRITING_PACK
-      ? ` It is the ONLY place you may write: every other path, including this pack's own files, its knowledge and the hub directory, is refused by the file tools AND by the shell, so do not try a shell command as a way around a refused write. Say in your answer where you put anything you created.`
+    (FENCED_PACK
+      ? ` It is the ONLY place you may write: every other path, including this pack's own files, its knowledge and the hub directory, is refused` +
+        (WRITING_PACK ? ` by the file tools AND by the shell, so do not try a shell command as a way around a refused write.` : ` by the shell itself.`) +
+        ` Say in your answer where you put anything you created.`
       : "") +
     (run.candidateSet
       ? ` This task is being answered independently several times and ONE answer will be kept, so work the problem yourself: do not coordinate, and put everything a reader needs into your final message.`
@@ -1289,12 +1387,18 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
    * deletion), which is why the mint is conditional and the cleanup below only
    * touches what this turn made.
    */
-  if (WRITING_PACK && !run.scratchDir) {
+  if (FENCED_PACK && !run.scratchDir) {
     mintedScratch = makeScratch(run.runId);
     run.scratchDir = mintedScratch;
   }
-  const fencedScratch = WRITING_PACK ? (run.scratchDir ?? null) : null;
+  const fencedScratch = FENCED_PACK ? (run.scratchDir ?? null) : null;
   const cwd = runCwd(run);
+  /**
+   * Set by sect. 4.7's backstop when the synthetic egress name reaches door one
+   * on a run whose posture established a policy. Local to the turn, so an
+   * overlapping run can never inherit another turn's alarm.
+   */
+  let egressAlarm: string | null = null;
   const q = query({
     prompt,
     options: {
@@ -1359,6 +1463,18 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
               // deliberately NOT here: it is denied by construction (allow-only),
               // and naming it would carve the run out of its own workspace.
               denyWrite: [path.join(pack.dir, "state"), path.join(pack.dir, "knowledge"), path.join(HUB_ROOT, ".rfa")],
+              /**
+               * Door two's NETWORK half (RFA-0.9 sect. 4.2), derived from the
+               * pack's declared posture and never omitted. Omitting the key is
+               * the ask path (E1, E10): the sandbox routes each outbound host to
+               * `canUseTool` as a synthetic `SandboxNetworkAccess` call and
+               * whoever answers decides it, which E10a measured returning
+               * HTTP:200 under an allowing callback. With `strictAllowlist: true`
+               * the runtime enforces the list deterministically and never
+               * consults the callback at all, which is what makes sect. 4.7's
+               * branch a backstop rather than the decision point.
+               */
+              network: EGRESS_POLICY,
             }),
           }
         : {}),
@@ -1386,6 +1502,55 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
          * nothing it can act on. It does NOT replace the card when the pack
          * declared one: see the fall-through at the end of the branch.
          */
+        /**
+         * The EGRESS BACKSTOP (RFA-0.9 sect. 4.7), first because its arrival is
+         * an alarm and nothing after it should get a chance to reinterpret it.
+         *
+         * E10 measured that with no network policy in force the OS sandbox
+         * surfaces each outbound host to this callback as a synthetic
+         * `SandboxNetworkAccess` call with a `host` argument, and that this
+         * callback's answer decides it. Under sect. 4.3's mandatory
+         * `strictAllowlist` that path is closed by construction: the runtime
+         * enforces the allowlist deterministically and never falls through here.
+         *
+         * So this branch never decides from the posture - that would be a second
+         * and weaker authority over a question door two has already answered -
+         * and on a run that established a policy its ARRIVAL means
+         * `strictAllowlist` stopped being honoured. The run is failed loudly
+         * rather than continued on a deny that happens to be correct.
+         *
+         * `interrupt_on` cannot reach this name: a rule matching it is refused at
+         * definition load, so the branch is above the rule lookup deliberately.
+         */
+        if (toolName === EGRESS_TOOL_NAME) {
+          const host = String((input as { host?: unknown } | null | undefined)?.host ?? "");
+          /**
+           * A policy was established for THIS run exactly when door two was
+           * established for it, which is `fencedScratch !== null` - the coverage
+           * predicate of sect. 3.3, not the command surface. A guarded-only pack
+           * is fenced too, and `sandboxPolicy` gives it the same
+           * `allowedDomains: []` + `strictAllowlist: true`, so the name arriving
+           * on one of its runs is the same alarm.
+           */
+          const established = fencedScratch !== null;
+          const message = egressBackstopMessage(host, established);
+          log(`EGRESS BACKSTOP: ${toolName} reached door one for ${host || "(no host named)"}; ${established ? "a policy WAS established for this run, so this is an alarm" : "no policy governs this pack"}`);
+          if (established) {
+            egressAlarm = host || "(no host named)";
+            /**
+             * `interrupt()` returns a PROMISE, so a synchronous try/catch cannot
+             * catch its rejection: the first version of this line would have
+             * taken the whole resident down with an unhandled rejection instead
+             * of failing one run. It is fired and forgotten to stop paying for a
+             * turn that is already doomed; the alarm is raised by `egressAlarm`,
+             * which the result branch below reads BEFORE it reports a generic
+             * brain error - otherwise the interrupt's own error would mask the
+             * one sentence an operator needs to see.
+             */
+            void q.interrupt().catch((err: Error) => log(`egress alarm: interrupt of ${run.runId} did not land: ${err.message}`));
+          }
+          return { behavior: "deny" as const, message };
+        }
         const rule = interruptMatch(pack.def.interrupt_on, toolName);
         if (isGuardedBuiltin(toolName)) {
           if (posture.onActing === "refuse-plan") {
@@ -1679,6 +1844,11 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
         // printing the subtype verbatim made the refusal read "brain error:
         // success: Failed to authenticate…" at the worst possible moment. The
         // subtype is plumbing; name it only when it says something.
+        // The egress alarm wins over the generic report: this turn was
+        // interrupted BECAUSE of it, so "brain error: interrupted" would bury
+        // the one sentence that says the pack's declared posture stopped being
+        // in force (RFA-0.9 sect. 4.7).
+        if (egressAlarm) throw new Error(egressAlarmMessage(egressAlarm));
         const detail = "result" in msg ? String(msg.result).slice(0, 200) : "";
         throw new Error(`brain error: ${[msg.subtype === "success" ? "" : msg.subtype, detail].filter(Boolean).join(": ") || "the SDK reported an error with no detail"}`);
       }
@@ -1688,6 +1858,13 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
       tokens = { input: u?.input_tokens ?? null, output: u?.output_tokens ?? null };
     }
   }
+  /**
+   * RFA-0.9 sect. 4.7: the backstop's arrival is the alarm. Thrown AFTER the
+   * loop, so the turn's real cost is still settled and the operator still sees
+   * the run row, and thrown rather than swallowed because a deny that happens to
+   * be correct is not a policy being enforced - it is the policy having stopped.
+   */
+  if (egressAlarm) throw new Error(egressAlarmMessage(egressAlarm));
   if (!text) throw new Error("brain returned an empty result");
   return { text, costUsd, numTurns, tokens, retrieved: [...retrieved], refusal: clockRefusal };
   } finally {
@@ -1839,20 +2016,38 @@ process.on("warning", (w: Error & { code?: string }) => {
   process.exit(1);
 });
 
-if (startupPosture.guarded.length > 0) {
+/**
+ * The startup fence checks, gated on RFA-0.9 sect. 3.3's COVERAGE PREDICATE and
+ * no longer on the write surface alone.
+ *
+ * The case this widening adds is a pack of class `command` with no guarded
+ * built-in: it used to get no OS sandbox at all, and its `Bash` sits pre-approved
+ * in `allowedTools` so it never reached door one either. Such a pack now gets
+ * door two with the same filesystem policy a writing pack gets (sect. 3.4) and
+ * refuses to boot if that door cannot be established. It does NOT get door one's
+ * path guard or the deny probe, because it declares nothing door one can guard,
+ * and both of those loops are empty for it by construction rather than by a
+ * special case.
+ */
+if (FENCED_PACK) {
   const guarded = startupPosture.guarded;
-  log(`write fence: establishing for ${guarded.join(", ")} (RFA-0.8 sect. 9)`);
+  const surface = [...guarded, ...COMMAND_BUILTINS];
+  log(`fence: establishing for ${surface.join(", ")} (RFA-0.8 sect. 9, coverage per RFA-0.9 sect. 3.3)`);
 
   // 1. The shadowing assert. True by construction after rung 5 (`preApproved`
   //    strips the guarded built-ins), so this is here for the edit that breaks
   //    it, and for the permission mode, which a pack CAN still set to
   //    `acceptEdits` and thereby auto-accept the very two tools door one exists
-  //    to intercept.
-  const shadowed = shadowingFailures({
-    guarded,
-    allowedTools: [...startupPosture.allowedTools, ...MCP_TOOLS],
-    permissionMode: startupPosture.permissionMode,
-  });
+  //    to intercept. Skipped for a command-only pack: it has no door one to
+  //    shadow, and asserting about an empty set would be theatre.
+  const shadowed =
+    guarded.length > 0
+      ? shadowingFailures({
+          guarded,
+          allowedTools: [...startupPosture.allowedTools, ...MCP_TOOLS],
+          permissionMode: startupPosture.permissionMode,
+        })
+      : [];
   if (shadowed.length > 0) {
     for (const f of shadowed) log(`FATAL: ${f}`);
     process.exit(1);
@@ -1876,12 +2071,15 @@ if (startupPosture.guarded.length > 0) {
   const sandbox =
     forceFail === "sandbox"
       ? { ok: false, platform: process.platform, detail: "RFA_FENCE_FORCE_FAIL=sandbox (refusal-only test hook)" }
-      : await sandboxAvailable();
+      // sect. 4.2: door two carries the network policy on any pack sect. 3.3
+      // fences, guarded-only included - the same predicate that established it.
+      : await sandboxAvailable(undefined, undefined, FENCED_PACK ? EGRESS_POLICY : null);
   if (!sandbox.ok) {
     log(
-      `FATAL: this pack declares the write surface ${guarded.join(", ")} and the OS sandbox cannot establish itself here ` +
+      `FATAL: this pack declares ${surface.join(", ")} and the OS sandbox cannot establish itself here ` +
         `(${sandbox.platform}: ${sandbox.detail}). Door two is the ONLY door for Bash, so running with door one alone would be a fence ` +
-        `with a hole the size of the shell. Refusing to serve rather than serving unfenced (RFA-0.8 sect. 9 item 3).`,
+        `with a hole the size of the shell, and for a pack that declares Bash and no guarded built-in there would be no door at all ` +
+        `(RFA-0.9 sect. 3.3). Refusing to serve rather than serving unfenced (RFA-0.8 sect. 9 item 3).`,
     );
     process.exit(1);
   }
@@ -1917,10 +2115,21 @@ if (startupPosture.guarded.length > 0) {
   // per-pack degrade sect. 9 item 2 also permits. Implying isolation you do not
   // have is the failure that paragraph is guarding against.
   log(
-    `write fence ESTABLISHED, per RUN: door one (canUseTool path guard + claim fence) over ${guarded.join(", ")}, ` +
-      `door two (${sandbox.platform} OS sandbox, allowWrite = this run's scratch/<runId>, unsandboxed commands refused) over everything else including Bash. ` +
-      `Startup probe cost $${probeCost.toFixed(4)}.`,
+    `fence ESTABLISHED, per RUN: ` +
+      (guarded.length > 0
+        ? `door one (canUseTool path guard + claim fence) over ${guarded.join(", ")}, `
+        : `door one has nothing to guard on this pack (it declares no Write, Edit or NotebookEdit), so door two is its ONLY door, `) +
+      `door two (${sandbox.platform} OS sandbox, allowWrite = this run's scratch/<runId>, unsandboxed commands refused) over everything else` +
+      (COMMAND_BUILTINS.length > 0 ? ` including ${COMMAND_BUILTINS.join(", ")}` : ` including Bash`) +
+      `. Startup probe cost $${probeCost.toFixed(4)}.`,
   );
+  /**
+   * RFA-0.9 sect. 4.1 and 4.5: the posture, what the boot ESTABLISHED about it,
+   * and the scope - together, because a posture read as total is how a partial
+   * control becomes a false one, and because "established" without saying what
+   * was established is the reassuring-instrument shape this project has paid for.
+   */
+  log(`egress: ${POSTURE.summary}. Boot establishment: ${sandbox.detail}. Scope: ${POSTURE.scope}.`);
 }
 
 /**

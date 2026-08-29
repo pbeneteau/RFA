@@ -15,6 +15,11 @@ import { genesisFor, verifyChain } from "../../chain.js";
 import { type CliContext } from "../context.js";
 import { checkEnvironment, realProbe } from "../environment.js";
 import { agentPosture, effectiveMode } from "../../posture.js";
+import { postureView } from "../../egress.js";
+import { fenceApplies } from "../../toolclass.js";
+import { surfaceReport } from "../../surface.js";
+import { deprecatedOffers } from "../../offers.js";
+import { artifactDrift, artifactsStore } from "../../artifacts.js";
 import { GUARDED_BUILTINS, guardedBuiltinsOf, sandboxAvailable, shadowingFailures, type SandboxCheck } from "../../writefence.js";
 import { credentialAdvice, modelCredentialStatus, nativeBindingProblem, portFree } from "../preflight.js";
 import type { CommandDef } from "../router.js";
@@ -67,6 +72,26 @@ function refusedDeclaration(dir: string): { concurrency: number; candidates: num
     ...(budgets ? { budgets: { per_day_usd: typeof budgets.per_day_usd === "number" ? budgets.per_day_usd : undefined } } : {}),
     ...(sandbox ? { sandbox: { permission_mode: typeof sandbox.permission_mode === "string" ? sandbox.permission_mode : undefined } } : {}),
   };
+}
+
+/**
+ * Which of RFA-0.9 sect. 4.6's inert keys this pack's agent.md actually carries.
+ *
+ * Read from the FRONTMATTER rather than from the parsed definition, because
+ * `network` has a schema default: a parsed `AgentDef` says `network: "none"` for
+ * every pack, including the ones that never wrote the line. Only the raw object
+ * can tell "the operator declared this" from "zod filled it in".
+ */
+export function inertNetworkKeys(dir: string): string[] {
+  let raw: unknown;
+  try {
+    raw = splitAgentMd(fs.readFileSync(path.join(dir, "agent.md"), "utf8")).raw;
+  } catch {
+    return [];
+  }
+  const sandbox = raw && typeof raw === "object" ? (raw as Record<string, unknown>).sandbox : undefined;
+  if (!sandbox || typeof sandbox !== "object" || Array.isArray(sandbox)) return [];
+  return ["network", "allowed_domains"].filter((k) => k in (sandbox as Record<string, unknown>));
 }
 
 /** The definition hash the RUNNING resident recorded for itself, or null. */
@@ -134,12 +159,16 @@ export async function writeFenceHostChecks(input: { writing: string[]; deep?: bo
     return [
       skip(
         "write-fence",
-        `no pack declares ${GUARDED_BUILTINS.join(", ")}, so no run needs the two-door write fence yet (RFA-0.8 sect. 9); rfa doctor --deep establishes door two anyway, and npm run fence-proof proves both doors`,
+        `no pack declares ${GUARDED_BUILTINS.join(", ")} or Bash, so RFA-0.9 sect. 3.3's coverage predicate fences no run here yet and none needs door two (RFA-0.8 sect. 9); ` +
+          `rfa doctor --deep establishes door two anyway, and npm run fence-proof proves both doors`,
       ),
     ];
   }
   const out: Check[] = [];
   const who = input.writing.length > 0 ? `, needed by ${input.writing.join(", ")}` : ", needed by no pack yet";
+  // "writing" is the parameter's historical name; since RFA-0.9 sect. 3.3 the caller
+  // passes every FENCED pack, which includes a command-only one that declares no
+  // guarded built-in at all.
   const sb = await (input.establish ?? (() => sandboxAvailable()))();
   out.push(
     sb.ok
@@ -148,8 +177,8 @@ export async function writeFenceHostChecks(input: { writing: string[]; deep?: bo
           "write-fence-sandbox",
           `door two could NOT be established on ${sb.platform}${who}: ${sb.detail}`,
           input.writing.length > 0
-            ? "a writing pack refuses to serve rather than serve with one door (RFA-0.8 sect. 9 item 3), so those agents will not boot here; npm run fence-proof for the full picture. On macOS the usual cause is doctor itself running inside a sandbox: nested sandbox-exec is refused"
-            : "nothing writes here yet, so nothing is broken now; a writing pack on this host would refuse to boot",
+            ? "a fenced pack refuses to serve rather than serve with one door (RFA-0.8 sect. 9 item 3), so those agents will not boot here; npm run fence-proof for the full picture. On macOS the usual cause is doctor itself running inside a sandbox: nested sandbox-exec is refused"
+            : "nothing here is fenced yet, so nothing is broken now; a pack declaring Write, Edit, NotebookEdit or Bash on this host would refuse to boot",
         ),
   );
   out.push(
@@ -273,6 +302,100 @@ export async function runChecks(ctx: CliContext, opts: { deep?: boolean } = {}):
     } catch (err) {
       refusedPacks.push({ name: entry.name, dir });
       checks.push(fail(`pack-${entry.name}`, `agents/${entry.name}/agent.md: ${(err as Error).message}`, "rfa agent validate " + entry.name));
+    }
+  }
+
+  /**
+   * The inert `sandbox.network` line (RFA-0.9 sect. 1.1 finding 1, sect. 4.6).
+   *
+   * READ FROM DISK, and it says so: the finding IS the file. `sandbox.network`
+   * and `sandbox.allowed_domains` have no reader anywhere in the platform, and
+   * `rfa agent new` wrote `network: none` into every pack it ever generated,
+   * beside two settings that are read. A resident's `state/member.json` records
+   * no posture, so there is nothing running to compare against and CLAUDE.md's
+   * configured-versus-happening rule is answered by naming the source instead.
+   */
+  for (const pack of loadedPacks) {
+    const view = postureView(pack.def);
+    const carried = inertNetworkKeys(pack.dir);
+    // A posture that governs something is reported with its scope, never alone.
+    if (!view.inert) {
+      checks.push(ok(`network-${pack.name}`, `${pack.name}: ${view.summary}. Scope: ${view.scope} (read from agent.md on disk: a resident's state/member.json records no posture)`));
+      continue;
+    }
+    // Inert: the pack has no sandboxed command surface, so the field governs
+    // nothing here (RFA-0.9 sect. 4.2). Still reported, because sect. 10.1 asks
+    // for the posture PER PACK and "nothing is in force here" is the answer an
+    // operator needs; it is a warning only where the operator actually wrote the
+    // key, which is what every pre-rung-1 scaffold did.
+    checks.push(
+      carried.length === 0
+        ? skip(`network-${pack.name}`, `${pack.name}: ${view.summary} (read from disk: a resident's state/member.json records no posture)`)
+        : warn(
+            `inert-network-${pack.name}`,
+            `${pack.name}'s agent.md carries ${carried.map((k) => `sandbox.${k}`).join(" and ")} and ${view.summary} (read from disk, not from the running resident)`,
+            `rfa agent edit ${pack.name} --drop-network removes the line through the same validated write every other edit uses; ` +
+              `every pack rfa agent new wrote before RFA-0.9 rung 1 carries it, and a setting that reads as a control while governing nothing is what that rung exists to remove`,
+          ),
+    );
+  }
+
+  /**
+   * RFA-0.9 sect. 10.1: every unconfined surface a pack holds, the reachable
+   * tool count above the threshold, the `reach` built-ins, and the deprecated
+   * offers. All FROM DISK, and each line says so, because a resident records
+   * none of it and a check that read agent.md and presented it as what is being
+   * served is exactly the defect CLAUDE.md's rule was written for.
+   */
+  for (const pack of loadedPacks) {
+    const report = surfaceReport(pack.def);
+    for (const u of report.surfaces) {
+      const id = `surface-${u.kind}-${pack.name}`;
+      // A `reach` built-in and an MCP server are things the operator chose and
+      // must keep in view; the platform's own injected tools are always there,
+      // so they are a note rather than a warning.
+      checks.push(
+        u.kind === "platform-tool" || u.kind === "mcp-confined"
+          ? skip(id, `${pack.name} holds ${u.what} (from disk): ${u.why}`)
+          : warn(id, `${pack.name} holds an UNCONFINED surface, ${u.what} (from disk): ${u.why}`, u.kind === "subagent" ? "npm run egress-proof establishes it on this host" : "this is a rendering, not a control: RFA-0.9 sect. 5 records that no door covers it"),
+      );
+    }
+    if (report.toolWarning) checks.push(warn(`tool-count-${pack.name}`, `${pack.name}: ${report.toolWarning}`, "drop what the pack does not use, or accept the count deliberately"));
+    for (const w of pack.warnings) if (!report.toolWarning || w !== report.toolWarning) checks.push(warn(`defwarn-${pack.name}`, `${pack.name}: ${w}`));
+  }
+
+  /** Sect. 8.1: every deprecated offer with its successor, and the locality caveat with it. */
+  const deprecated = deprecatedOffers(loadedPacks);
+  for (const d of deprecated) {
+    checks.push(
+      warn(
+        `deprecated-offer-${d.pack}-${d.offer.id}`,
+        `${d.pack}: ${d.note}`,
+        d.offer.superseded_by
+          ? `local selectors prefer ${d.offer.superseded_by}; a selector reading card_summary.skill_ids off the ROSTER cannot see the flag, so an asker in the room may still name the old id`
+          : "name a superseded_by, or remove the offer once nothing asks for it",
+      ),
+    );
+  }
+
+  /**
+   * Sect. 8.2: `rfa connect --skill` writes offer ids and their descriptions into
+   * ANOTHER repository and recorded the destination nowhere. Now it records; this
+   * compares each recorded destination that still exists against the live set.
+   */
+  const store = artifactsStore(h);
+  if (store.exists()) {
+    const live = loadedPacks.map((p) => ({ name: p.name, definitionHash: p.definitionHash, rooms: (p.def.rooms ?? []).map((r) => r.room ?? "") }));
+    const drift = artifactDrift(store.read().artifacts, live);
+    if (drift.length === 0) checks.push(ok("artifacts", `${store.read().artifacts.length} generated artifact record(s), none drifted from the packs they were generated from`));
+    for (const d of drift) {
+      const parts = [
+        ...d.moved.map((m) => `${m.pack}'s definition moved ${m.then.slice(7, 15)} -> ${m.now.slice(7, 15)}`),
+        ...d.added.map((a) => `${a} now binds to the room and is not in the file`),
+        ...d.removed.map((r) => `${r} is in the file and no longer binds to the room`),
+        ...d.skipped.map((sk) => `${sk} was BROKEN when the file was generated, so its offers were silently missing from it`),
+      ];
+      checks.push(warn(`artifact-drift-${path.basename(path.dirname(d.present[0]))}`, `${d.present.join(", ")} is behind the packs it was generated from: ${parts.join("; ")}`, `rfa connect claude-code --room ${d.record.room} --skill re-generates it in that project`));
     }
   }
 
@@ -400,7 +523,12 @@ export async function runChecks(ctx: CliContext, opts: { deep?: boolean } = {}):
   }
 
   // Door two, established on this host; door one, honestly unverified.
-  checks.push(...(await writeFenceHostChecks({ writing: loadedPacks.filter((p) => guardedBuiltinsOf(p.def).length > 0).map((p) => p.name), deep: opts.deep })));
+  // RFA-0.9 sect. 3.3: the predicate that decides whether door two is
+  // established is `fenceApplies` (guarded OR command), not the write surface.
+  // Keyed on the narrower one, this check printed "no run needs the fence" on a
+  // hub whose fenced packs are command-only - the instrument disagreeing with
+  // the resident that refuses to boot without it.
+  checks.push(...(await writeFenceHostChecks({ writing: loadedPacks.filter((p) => fenceApplies(p.def)).map((p) => p.name), deep: opts.deep })));
 
   // Rooms allow the operator bearer (snapshots: reconnaissance only).
   try {

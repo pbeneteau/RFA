@@ -8,6 +8,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { AccountLedger } from "../../account.js";
 import { CONCURRENCY_GATE_LABELS, concurrencyGateFailures, declaredSecretNames, deriveCard, knowledgeFiles, loadPack, packByName, parseAgentMd, scanPacks } from "../../agentdef.js";
+import { surfaceReport } from "../../surface.js";
 import { RoomMember } from "../../client.js";
 import { daemonState } from "../../daemon.js";
 import { findRoom, roomsStore, secretsStore, type HubDir, type RoomRecord } from "../../hubdir.js";
@@ -78,7 +79,7 @@ export const agentNew: CommandDef = {
     const opts = { name, kind, room: room?.handle ?? null, model: a.values.model as string | undefined, knowledge: a.values.knowledge as string | undefined, tool, mode: modeFlag as AgentMode | undefined };
     if (a.values["dry-run"]) {
       const content = renderAgentMd({ ...opts, knowledge: knowledgeRelativeToPack(h, name, opts.knowledge) });
-      parseAgentMd(content);
+      parseAgentMd(content, { dir: path.join(h.paths.agents, name) });
       process.stdout.write(content);
       return;
     }
@@ -216,6 +217,15 @@ export const agentShow: CommandDef = {
       tools: pack.def.tools ?? null,
       mcp_servers: pack.def.mcp_servers ?? null,
       interrupt_on: pack.def.interrupt_on ?? null,
+      /**
+       * RFA-0.9 sect. 10.1: the network posture with its scope, every unconfined
+       * surface the pack holds, and the reachable tool count. All FROM DISK, and
+       * the rendering says so: a resident's `state/member.json` records no
+       * posture, no tool surface and no fence state, so there is nothing running
+       * to compare against and inventing a comparison would be the defect
+       * CLAUDE.md's rule was written for.
+       */
+      surface: surfaceReport(pack.def),
       knowledge: { globs: pack.def.knowledge ?? [], files: files.map((f) => path.relative(h.root, f)) },
       budgets: pack.def.budgets ?? null,
       spend_today_usd: member?.spend?.day === new Date().toISOString().slice(0, 10) ? member!.spend!.usd : 0,
@@ -256,9 +266,13 @@ export const agentShow: CommandDef = {
       ["spend today", `$${view.spend_today_usd.toFixed(2)}`],
       ["secrets", declared.length ? declared.map((n) => (view.secrets.missing.includes(n) ? ui.bad(`${n} (missing)`) : n)).join(", ") : "-"],
       ["mcp servers", view.mcp_servers ? Object.keys(view.mcp_servers).join(", ") : "-"],
+      ["egress", `${view.surface.posture.summary}\n${ui.dim(`read from agent.md on disk: a resident's state/member.json records no posture`)}\n${ui.dim(`scope: ${view.surface.scope}`)}`],
+      ["tools reachable", `${view.surface.tools.total} (${view.surface.tools.builtins.length} built-in, ${view.surface.tools.mcp.length} declared MCP, ${view.surface.tools.platform.length} injected by the platform)` + (view.surface.toolWarning ? `\n${ui.caution(view.surface.toolWarning)}` : "")],
+      ["unconfined", view.surface.surfaces.map((u) => `${u.what} ${ui.dim("(from disk)")}\n${ui.dim(u.why)}`).join("\n") || ui.dim("none named")],
       ["interrupts", view.interrupt_on ? Object.keys(view.interrupt_on).join(", ") : "-"],
       ["knowledge", `${files.length} file${files.length === 1 ? "" : "s"} from ${view.knowledge.globs.length} glob${view.knowledge.globs.length === 1 ? "" : "s"}`],
     ]);
+    for (const w of pack.warnings) ui.note(ui.caution(w));
     for (const f of view.knowledge.files.slice(0, 20)) ui.note(f);
     if (view.knowledge.files.length > 20) ui.note(`… and ${view.knowledge.files.length - 20} more`);
   },
@@ -289,6 +303,11 @@ export const agentValidate: CommandDef = {
         for (const n of declaredSecretNames(pack.def)) if (!held.includes(n)) problems.push(`secret ${n} is declared and not set (rfa secrets set ${n})`);
         if ((pack.def.knowledge ?? []).length && knowledgeFiles(pack).length === 0) problems.push("knowledge globs resolve to zero files");
         if (!pack.def.budgets?.per_task_usd && !pack.def.budgets?.per_day_usd) problems.push("no cost ceiling: neither per_task_usd nor per_day_usd");
+        // RFA-0.9 sect. 7.2's threshold is a warning, not a refusal, so the
+        // loader hands it out rather than throwing. This is the command an
+        // operator runs to ask "is this pack all right", so it is the one place
+        // a warning nobody surfaces would most obviously be a wish.
+        problems.push(...pack.warnings);
         results.push({ name, ok: problems.length === 0, problems });
       } catch (err) {
         results.push({ name, ok: false, problems: [(err as Error).message] });
@@ -399,12 +418,12 @@ export async function applyPackEdit(ctx: CliContext, h: HubDir, name: string, ch
 export async function editInEditor(ctx: CliContext, name: string, file: string): Promise<number> {
   const editor = ctx.env.VISUAL || ctx.env.EDITOR;
   if (!editor) throw new CliError(2, "no $EDITOR set", `edit ${path.relative(process.cwd(), file)} by hand; rfa agent validate ${name} checks it`);
-  const before = parseAgentMd(fs.readFileSync(file, "utf8")).definitionHash;
+  const before = parseAgentMd(fs.readFileSync(file, "utf8"), { dir: path.dirname(file) }).definitionHash;
   const [cmd, ...args] = editor.split(/\s+/);
   const code = await new Promise<number>((resolve) => spawn(cmd, [...args, file], { stdio: "inherit" }).on("exit", (c) => resolve(c ?? 1)));
   if (code !== 0) throw new CliError(1, `${editor} exited ${code}`);
   try {
-    const after = parseAgentMd(fs.readFileSync(file, "utf8")).definitionHash;
+    const after = parseAgentMd(fs.readFileSync(file, "utf8"), { dir: path.dirname(file) }).definitionHash;
     if (after === before) ctx.ui.step("unchanged");
     else ctx.ui.done(`${name} edited`, `definition ${before.slice(7, 15)} -> ${after.slice(7, 15)}; a running supervisor drains and respawns it`);
   } catch (err) {
@@ -413,7 +432,7 @@ export async function editInEditor(ctx: CliContext, name: string, file: string):
   return 0;
 }
 
-const EDIT_FLAGS = ["model", "description", "offer", "offer-description", "per-task", "per-day", "max-turns", "mode", "room", "knowledge", "concurrency", "candidates"] as const;
+const EDIT_FLAGS = ["model", "description", "offer", "offer-description", "per-task", "per-day", "max-turns", "mode", "room", "knowledge", "concurrency", "candidates", "drop-network"] as const;
 
 /** The flags of `rfa agent edit` as the changes `editPack` takes; null when no flag was given. */
 export function changesFromFlags(h: HubDir, current: ReturnType<typeof currentSettings>, v: Record<string, string | boolean | undefined>): PackChanges | null {
@@ -461,16 +480,20 @@ export function changesFromFlags(h: HubDir, current: ReturnType<typeof currentSe
     if (!Number.isInteger(n) || n < 1 || n > 16) throw new CliError(2, "--concurrency takes a whole number from 1 to 16");
     c.concurrency = n;
   }
+  // RFA-0.9 sect. 4.6: the inert `sandbox.network` line every pre-rung-1
+  // scaffold wrote. Nothing read it, so a pack carrying it advertises an egress
+  // policy the platform never had; `rfa doctor` names the pack and this flag.
+  if (v["drop-network"]) c.dropNetwork = true;
   return c;
 }
 
 export const agentEdit: CommandDef = {
   path: ["agent", "edit"],
   summary: "Change a pack's settings: alone on a terminal the walkthrough, with flags headless, --editor opens agent.md",
-  usage: '<name> [--model haiku|sonnet|opus] [--description "<text>"] [--offer <id>] [--offer-description "<text>"] [--per-task <usd>] [--per-day <usd>] [--max-turns <n>] [--mode ask|plan|bypass] [--room <alias|handle>] [--knowledge <dir|git remote> [--docs <subdir>]] [--concurrency <n>] [--candidates <n>] [--editor]',
-  options: { model: { type: "string" }, description: { type: "string" }, offer: { type: "string" }, "offer-description": { type: "string" }, "per-task": { type: "string" }, "per-day": { type: "string" }, "max-turns": { type: "string" }, mode: { type: "string" }, room: { type: "string" }, knowledge: { type: "string" }, docs: { type: "string" }, concurrency: { type: "string" }, candidates: { type: "string" }, editor: { type: "boolean", default: false } },
+  usage: '<name> [--model haiku|sonnet|opus] [--description "<text>"] [--offer <id>] [--offer-description "<text>"] [--per-task <usd>] [--per-day <usd>] [--max-turns <n>] [--mode ask|plan|bypass] [--room <alias|handle>] [--knowledge <dir|git remote> [--docs <subdir>]] [--concurrency <n>] [--candidates <n>] [--drop-network] [--editor]',
+  options: { model: { type: "string" }, description: { type: "string" }, offer: { type: "string" }, "offer-description": { type: "string" }, "per-task": { type: "string" }, "per-day": { type: "string" }, "max-turns": { type: "string" }, mode: { type: "string" }, room: { type: "string" }, knowledge: { type: "string" }, docs: { type: "string" }, concurrency: { type: "string" }, candidates: { type: "string" }, "drop-network": { type: "boolean" }, editor: { type: "boolean", default: false } },
   why: "Every setting rfa agent new asks for can be changed afterwards on the same screen, pre-filled with what the pack has; the flags are the headless form of every answer, and --editor is agent.md itself for the prompt and everything else. Each change rewrites only its line or block (the rest of the file byte for byte) and the whole is validated through the supervisor's own schema before a single write, so an edit can never produce a pack the platform refuses. A change rotates the definition: a running supervisor drains the resident and respawns it, and the room sees the digest change.",
-  examples: ["rfa agent edit pm-agent", "rfa agent edit pm-agent --model sonnet --per-day 10", 'rfa agent edit pm-agent --offer answer-fee-question --offer-description "Answers fee questions from the handbook, citing the page."', "rfa agent edit pm-agent --knowledge ./handbook", "rfa agent edit pm-agent --editor", "rfa agent edit pm-agent --concurrency 2", "rfa agent edit pm-agent --concurrency 3 --candidates 3"],
+  examples: ["rfa agent edit pm-agent", "rfa agent edit pm-agent --model sonnet --per-day 10", 'rfa agent edit pm-agent --offer answer-fee-question --offer-description "Answers fee questions from the handbook, citing the page."', "rfa agent edit pm-agent --knowledge ./handbook", "rfa agent edit pm-agent --editor", "rfa agent edit pm-agent --concurrency 2", "rfa agent edit pm-agent --concurrency 3 --candidates 3", "rfa agent edit pm-agent --drop-network"],
   run: async (ctx, a) => {
     const h = ctx.hubdir();
     const name = await packArg(ctx, h, a.positionals[0], "rfa agent edit <name> [--model …]");

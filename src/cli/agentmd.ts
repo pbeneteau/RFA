@@ -9,6 +9,7 @@
  * never produce a pack the platform then refuses.
  */
 import * as fs from "node:fs";
+import * as path from "node:path";
 import YAML from "yaml";
 import { parseAgentMd, type AgentDef } from "../agentdef.js";
 import { effectiveMode, type AgentMode } from "../posture.js";
@@ -84,9 +85,10 @@ export const setRoomsBlock = (text: string, block: string): string => setTopBloc
 /** Rewrite the binding in a pack's agent.md, validated before the write. Returns the definition hashes. */
 export function bindPack(file: string, room: string, opts: { role?: "participant" | "observer"; serve?: boolean } = {}): { before: string; after: string } {
   const text = fs.readFileSync(file, "utf8");
-  const before = parseAgentMd(text).definitionHash;
+  const dir = path.dirname(file);
+  const before = parseAgentMd(text, { dir }).definitionHash;
   const next = setRoomsBlock(text, roomsBlock(room, opts));
-  const after = parseAgentMd(next).definitionHash;
+  const after = parseAgentMd(next, { dir }).definitionHash;
   if (after !== before) fs.writeFileSync(file, next);
   return { before, after };
 }
@@ -94,10 +96,11 @@ export function bindPack(file: string, room: string, opts: { role?: "participant
 /** Add knowledge globs to a pack's agent.md (deduplicated, order kept), validated before the write. */
 export function addKnowledge(file: string, globs: string[]): { before: string; after: string; knowledge: string[] } {
   const text = fs.readFileSync(file, "utf8");
-  const parsed = parseAgentMd(text);
+  const dir = path.dirname(file);
+  const parsed = parseAgentMd(text, { dir });
   const merged = [...new Set([...(parsed.def.knowledge ?? []), ...globs])];
   const next = setTopBlock(text, "knowledge", knowledgeBlock(merged));
-  const after = parseAgentMd(next).definitionHash;
+  const after = parseAgentMd(next, { dir }).definitionHash;
   if (after !== parsed.definitionHash) fs.writeFileSync(file, next);
   return { before: parsed.definitionHash, after, knowledge: merged };
 }
@@ -123,14 +126,64 @@ export function setTopScalar(text: string, key: string, line: string, opts: { af
   return `${m[1]}${lines.join("\n")}${m[3]}${m[4]}`;
 }
 
+/**
+ * Remove one key line from inside a nested block of the frontmatter, together
+ * with the comment lines that continue it, and remove the block header too when
+ * nothing is left under it.
+ *
+ * This exists for RFA-0.9 sect. 4.6: `sandbox.network` and
+ * `sandbox.allowed_domains` were INERT settings written into every scaffolded
+ * pack, and the cleanup has to reach packs already on disk. It removes a LINE
+ * rather than re-serializing the block, for the same reason every other function
+ * in this file does: the file is the operator's, and a YAML round-trip would
+ * rewrite comments and ordering the operator wrote by hand.
+ *
+ * The header goes when the block empties because YAML would otherwise read
+ * `sandbox:` with nothing under it as `null`, which the schema refuses - a
+ * cleanup that leaves the pack unloadable is worse than the line it removed.
+ */
+export function dropNestedKey(text: string, block: string, key: string): string {
+  const m = FRONTMATTER.exec(text);
+  if (!m) throw new Error("agent.md must start with a YAML frontmatter block (--- ... ---)");
+  const lines = m[2].split("\n");
+  const head = lines.findIndex((l) => new RegExp(`^${block}:`).test(l));
+  if (head < 0) return text;
+  const out = lines.slice(0, head + 1);
+  let i = head + 1;
+  let removed = false;
+  let remaining = 0;
+  while (i < lines.length && (/^\s+\S/.test(lines[i]) || lines[i].trim() === "")) {
+    const line = lines[i];
+    const indent = /^(\s*)/.exec(line)![1].length;
+    if (new RegExp(`^\\s+${key}:`).test(line)) {
+      removed = true;
+      i++;
+      // The comment lines that continue this key: comment-only and indented
+      // deeper than the key itself (how the scaffold writes a multi-line note).
+      while (i < lines.length && /^\s+#/.test(lines[i]) && /^(\s*)/.exec(lines[i])![1].length > indent) i++;
+      continue;
+    }
+    if (/^\s+\S/.test(line) && !/^\s+#/.test(line)) remaining++;
+    out.push(line);
+    i++;
+  }
+  if (!removed) return text;
+  // Nothing left under the header: drop the header (and any comment-only
+  // remnants that belonged to it) rather than leaving `sandbox: null`.
+  if (remaining === 0) out.length = head;
+  out.push(...lines.slice(i));
+  return `${m[1]}${out.join("\n")}${m[3]}${m[4]}`;
+}
+
 export const MODE_LINE = (mode: AgentMode): string => `mode: ${mode}   # ask: cards for every acting tool · plan: proposes, never acts · bypass: acts without asking`;
 
 /** Set a pack's mode in its agent.md, validated before the write. */
 export function setAgentMode(file: string, mode: "ask" | "plan" | "bypass"): { before: string; after: string } {
   const text = fs.readFileSync(file, "utf8");
-  const before = parseAgentMd(text).definitionHash;
+  const dir = path.dirname(file);
+  const before = parseAgentMd(text, { dir }).definitionHash;
   const next = setTopScalar(text, "mode", MODE_LINE(mode));
-  const after = parseAgentMd(next).definitionHash;
+  const after = parseAgentMd(next, { dir }).definitionHash;
   if (after !== before) fs.writeFileSync(file, next);
   return { before, after };
 }
@@ -173,6 +226,14 @@ export interface PackChanges {
    * because N candidates IS N turns at once.
    */
   candidates?: number;
+  /**
+   * Strip the inert `sandbox.network` and `sandbox.allowed_domains` lines
+   * (RFA-0.9 sect. 4.6). Every pack `rfa agent new` wrote before rung 1 carries
+   * `network: none`, a line with no reader anywhere, and a setting that reads as
+   * a control while doing nothing is the exact defect RFA-0.9 exists to remove.
+   * `rfa doctor` names the pack and this flag as its fix.
+   */
+  dropNetwork?: boolean;
 }
 
 export interface EditResult {
@@ -204,7 +265,8 @@ export function currentSettings(def: AgentDef): Required<Pick<PackChanges, "desc
  */
 export function editPack(file: string, c: PackChanges): EditResult {
   const original = fs.readFileSync(file, "utf8");
-  const parsed = parseAgentMd(original);
+  const packDir = path.dirname(file);
+  const parsed = parseAgentMd(original, { dir: packDir });
   const def = parsed.def;
   const now = currentSettings(def);
   let text = original;
@@ -260,8 +322,15 @@ export function editPack(file: string, c: PackChanges): EditResult {
     text = setTopScalar(text, "candidates", `candidates: ${c.candidates}   # ways to answer ONE task; you pay for all of them, one is kept`, { after: "concurrency" });
     changed.push("candidates");
   }
+  if (c.dropNetwork) {
+    const stripped = dropNestedKey(dropNestedKey(text, "sandbox", "network"), "sandbox", "allowed_domains");
+    if (stripped !== text) {
+      text = stripped;
+      changed.push("sandbox.network (inert, removed)");
+    }
+  }
   // Validated as a whole before anything touches the disk: a refused edit leaves the file as it was.
-  const after = parseAgentMd(text).definitionHash;
+  const after = parseAgentMd(text, { dir: packDir }).definitionHash;
   if (after !== parsed.definitionHash) fs.writeFileSync(file, text);
   return { before: parsed.definitionHash, after, changed };
 }

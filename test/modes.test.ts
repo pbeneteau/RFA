@@ -22,6 +22,15 @@ const toolPack = (mode?: string) => parseAgentMd([
   "tools:",
   "  allow: [Read, Grep, mcp__linear__search_project, mcp__linear__save_document]",
   "  allow_subagents: false",
+  // RFA-0.9 sect. 3.2: an `mcp__` name for a server the pack does not declare is
+  // refused now, so the fixture declares the server it names.
+  "mcp_servers:",
+  "  linear:",
+  "    builtin: linear",
+  // RFA-0.9 sect. 5.4: a server this platform spawns declares its own sandbox.
+  "    sandbox:",
+  "      network: allowlist",
+  "      allowed_domains: [api.linear.app]",
   "interrupt_on:",
   '  "mcp__linear__save_document":',
   "    allowed_decisions: [approve, edit, reject]",
@@ -89,6 +98,7 @@ test("the mode line is replaced in place or inserted before sandbox:, and the re
   const file = path.join(dir, "agent.md");
   fs.writeFileSync(file, [
     "---", "rfa_agent: 1", "name: scribe", "description: d", "tools:", "  allow: [Read, mcp__l__save]", "  allow_subagents: false",
+    "mcp_servers:", "  l:", "    command: /bin/true", "    sandbox:", "      network: none",
     "interrupt_on:", '  "mcp__l__save": true', "offers:", "  - id: act", "    description: a", "---", "prompt", "",
   ].join("\n"));
   const r = setAgentMode(file, "bypass");

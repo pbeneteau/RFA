@@ -29,7 +29,7 @@ let dir: string;
 let h: HubDir;
 
 /** The injected model: lessons on the extract pass, ADDs on the reconcile pass; the parroted lesson is the gate's job to kill. */
-const fake: LlmFn = async (_cwd, system, _prompt) => {
+const fake: LlmFn = async (system, _prompt) => {
   if (system.includes("reconcile")) {
     return { text: JSON.stringify({ memory: [{ text: LESSON, event: "ADD", importance: 0.8 }, { text: QUESTION, event: "ADD", importance: 0.4 }] }), cost: 0.001 };
   }

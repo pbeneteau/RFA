@@ -35,23 +35,28 @@
  *     "operation not permitted", set the parameter, and write into the pack tree
  *     on the retry. Every fenced query passes `false`.
  */
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentDef } from "./agentdef.js";
+import { GUARDED_BUILTINS, type GuardedBuiltin } from "./toolclass.js";
+import { ALLOWLIST_DENY_REASON, classifyDenial, ESTABLISHMENT_HOST, NO_APPROVER_DENY_REASON, type EgressPolicy } from "./egress.js";
 
 /**
- * The write-shaped built-ins this SDK offers (`sdk-tools.d.ts` on 0.3.233:
- * FileWriteInput, FileEditInput, NotebookEditInput; there is no MultiEdit).
+ * The write-shaped built-ins this SDK offers, re-exported from the class table
+ * that now owns them (`src/toolclass.ts`, RFA-0.9 sect. 3.1) so the fence and
+ * the classification cannot disagree about which tools are guarded.
  *
- * `Bash` is deliberately absent. Its write set cannot be traced from its
- * arguments even when the callback fires, so it belongs to door two alone;
- * refusing untraceable shapes rather than pretending to trace them is the
- * surveyed precedent (W5 sect. 2.2).
+ * `Bash` is deliberately absent from THIS set. Its write set cannot be traced
+ * from its arguments even when the callback fires, so it belongs to door two
+ * alone; refusing untraceable shapes rather than pretending to trace them is the
+ * surveyed precedent (W5 sect. 2.2). It is class `command`, and RFA-0.9 sect.
+ * 3.3 makes a pack declaring it fenced for exactly that reason: door two is the
+ * only door for Bash, which is a statement about MECHANISM, and it was being
+ * read as one about COVERAGE.
  */
-export const GUARDED_BUILTINS = ["Write", "Edit", "NotebookEdit"] as const;
-export type GuardedBuiltin = (typeof GUARDED_BUILTINS)[number];
+export { GUARDED_BUILTINS, type GuardedBuiltin } from "./toolclass.js";
 
 /** Which input field each guarded built-in writes to. An unlisted one is refused, never allowed. */
 const TARGET_FIELD: Record<GuardedBuiltin, string> = {
@@ -70,17 +75,29 @@ export function guardedBuiltinsOf(def: Pick<AgentDef, "tools">): GuardedBuiltin[
 }
 
 /**
- * Is this a WRITING pack?
+ * Is this a WRITING pack? A pack declaring a guarded built-in, and only that.
  *
  * `agentPosture()` calls a pack `read-only` when `interrupt_on` names none of
  * its tools, so a pack declaring the built-in `Write` with no interrupt rule is
  * `read-only` by that definition and could write the whole hub directory - a
  * bare `allowedTools` entry auto-approves it before `canUseTool` is ever
  * consulted. Sect. 10 gate 1 needs the second predicate, and this is it.
+ *
+ * NOT the fence's coverage predicate any more. RFA-0.9 sect. 3.3 widens that one
+ * to `fenceApplies` (guarded OR command), and the two questions are genuinely
+ * different: this one asks "does door one have anything to guard", which decides
+ * the path guard and the startup deny probe; `fenceApplies` asks "does this run
+ * need door two", which a command-only pack needs and this predicate misses.
  */
 export function hasWriteSurface(def: Pick<AgentDef, "tools">): boolean {
   return guardedBuiltinsOf(def).length > 0;
 }
+
+/**
+ * The fence's coverage predicate (RFA-0.9 sect. 3.3), re-exported here because
+ * every existing caller reaches for the fence module when it asks this question.
+ */
+export { fenceApplies } from "./toolclass.js";
 
 /**
  * Permission modes that auto-approve BEFORE the callback, and so switch door one
@@ -330,6 +347,13 @@ export interface SandboxPolicy {
   allowUnsandboxedCommands: false;
   autoAllowBashIfSandboxed: true;
   filesystem: { allowWrite: string[]; denyWrite: string[] };
+  /**
+   * Door two's NETWORK half (RFA-0.9 sect. 4). Never absent and never without
+   * `strictAllowlist: true`: omitting the key is E1/E10, the ask path, whose
+   * outcome is decided by whoever answers the callback, and E10a measured that
+   * resolving as HTTP:200.
+   */
+  network: EgressPolicy;
 }
 
 /**
@@ -346,7 +370,7 @@ export interface SandboxPolicy {
  * inside the pack tree denies the scratch, which is a fence that fences the run
  * out of its own workspace.
  */
-export function sandboxPolicy(input: { scratchDir: string; denyWrite: string[] }): SandboxPolicy {
+export function sandboxPolicy(input: { scratchDir: string; denyWrite: string[]; network: EgressPolicy }): SandboxPolicy {
   const scratch = realResolve(input.scratchDir, input.scratchDir);
   const deny: string[] = [];
   for (const d of input.denyWrite) {
@@ -362,6 +386,7 @@ export function sandboxPolicy(input: { scratchDir: string; denyWrite: string[] }
     allowUnsandboxedCommands: false,
     autoAllowBashIfSandboxed: true,
     filesystem: { allowWrite: [scratch], denyWrite: deny },
+    network: { ...input.network, strictAllowlist: true },
   };
 }
 
@@ -377,7 +402,36 @@ export interface SandboxProbe {
   checkDependenciesAsync(): Promise<{ errors?: string[]; warnings?: string[] }>;
   initialize(config: unknown): Promise<void>;
   wrapWithSandbox(command: string, shell?: string): Promise<string>;
+  /**
+   * The argv+env form (RFA-0.9 sect. 4.5). The network half CANNOT use
+   * `wrapWithSandbox`: the proxy credentials and `HTTPS_PROXY` ride in the argv
+   * this returns, and a command run without them reaches nothing at all, which
+   * would make an establishment check pass for the wrong reason.
+   */
+  wrapWithSandboxArgv?(
+    command: string,
+    shell?: string,
+    customConfig?: unknown,
+    signal?: unknown,
+    cwd?: string,
+    options?: { commandId?: string },
+  ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }>;
+  waitForNetworkInitialization?(): Promise<boolean>;
+  annotateStderrWithSandboxFailures?(commandId: string, stderr: string): string;
+  reset?(): Promise<void>;
 }
+
+/**
+ * How the establishment check RUNS a command, asynchronously.
+ *
+ * Asynchronously is not a style choice and it cost an hour to find: srt's egress
+ * proxy runs IN THIS PROCESS, so a synchronous `execFileSync` blocks the event
+ * loop and the proxy can never accept the connection the sandboxed command is
+ * making. Every host then times out - the allowed one included - and a check
+ * that read that as "denied" would pass on every host on a broken proxy. The
+ * filesystem half above is synchronous and stays that way; it touches no proxy.
+ */
+export type AsyncRunner = (argv: string[], env: NodeJS.ProcessEnv, cwd: string) => Promise<{ stdout: string; stderr: string }>;
 
 /** Injectable for the same reason: the establishment step has to actually RUN something. */
 export type ShellRunner = (command: string) => { ok: boolean; detail: string };
@@ -398,6 +452,14 @@ const CHECK_SHELL = ["/bin/zsh", "/bin/bash", "/bin/sh"].find((sh) => {
     return false;
   }
 }) ?? "/bin/sh";
+
+function runAsync(argv: string[], env: NodeJS.ProcessEnv, cwd: string): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    execFile(argv[0], argv.slice(1), { encoding: "utf8", timeout: 45_000, env, cwd }, (err, stdout, stderr) => {
+      resolve({ stdout: String(stdout ?? ""), stderr: String(stderr ?? (err as Error | null)?.message ?? "") });
+    });
+  });
+}
 
 function runInShell(command: string): { ok: boolean; detail: string } {
   try {
@@ -421,7 +483,23 @@ function runInShell(command: string): { ok: boolean; detail: string } {
  * are its problem to detect, and re-deriving the answer here would be a second
  * opinion that can disagree with the thing actually doing the work.
  */
-export async function sandboxAvailable(probe?: SandboxProbe, run: ShellRunner = runInShell): Promise<SandboxCheck> {
+export async function sandboxAvailable(
+  probe?: SandboxProbe,
+  run: ShellRunner = runInShell,
+  /**
+   * The pack's OWN network policy (RFA-0.9 sect. 4.5). The call below used to
+   * pass `network: {}`, deliberately asking for no policy - which means this
+   * check established the filesystem half and proved NOTHING about the half the
+   * posture is supposed to carry. Passing the pack's policy is what makes the
+   * establishment an establishment.
+   *
+   * `null` is "this pack has no sandboxed command surface": the filesystem half
+   * is still established, and the network half is skipped because there is
+   * nothing for it to govern (sect. 4.2's inert case).
+   */
+  network: EgressPolicy | null = null,
+  runAsyncCmd: AsyncRunner = runAsync,
+): Promise<SandboxCheck> {
   let srt: SandboxProbe;
   if (probe) srt = probe;
   else {
@@ -458,7 +536,10 @@ export async function sandboxAvailable(probe?: SandboxProbe, run: ShellRunner = 
      * an empty block leaves the proxy and its mux socket unstarted, so this check
      * leaves nothing running behind it in a long-lived resident.
      */
-    await srt.initialize({ network: {}, filesystem: { allowWrite: [dir] } });
+    // sect. 4.5: the pack's OWN policy, never `network: {}`. With `{}` the proxy
+    // never starts, the ask path is what would decide a real request, and this
+    // check would be establishing a property no run ever has.
+    await srt.initialize({ network: network ?? {}, filesystem: { allowWrite: [dir] } });
     const witness = path.join(dir, "fence-check.txt");
     const inside = run(await srt.wrapWithSandbox(`echo ok > ${JSON.stringify(witness)}`, CHECK_SHELL));
     if (!inside.ok || !fs.existsSync(witness)) {
@@ -479,11 +560,75 @@ export async function sandboxAvailable(probe?: SandboxProbe, run: ShellRunner = 
       return { ok: false, platform: process.platform, detail: `a sandboxed command wrote OUTSIDE its allowWrite root, so what established here does not fence anything` };
     }
 
+    /**
+     * The NETWORK half (sect. 4.5), and the DENY half of it only.
+     *
+     * One request to an RFC 2606 `.invalid` host, which cannot resolve to a
+     * third party, so no resident boot depends on reaching anyone. The verdict
+     * is checked for the ALLOW-LIST reason and explicitly NOT for the
+     * no-approver one: E2 versus E3 is the whole property, and E10a measured the
+     * no-approver path resolving as an ALLOW under a callback that says yes. A
+     * boot that accepted `(user denied)` would be establishing a property of the
+     * deployment rather than of the pack.
+     *
+     * The allow half belongs to `npm run egress-proof`, which runs against a
+     * platform-controlled host and not on every boot.
+     */
+    let egress = "";
+    if (network) {
+      if (!srt.wrapWithSandboxArgv || !srt.annotateStderrWithSandboxFailures) {
+        return { ok: false, platform: process.platform, detail: "this sandbox runtime exposes no argv+env wrap, so door two's network half cannot be established (the proxy credentials ride in that argv)" };
+      }
+      if (srt.waitForNetworkInitialization && !(await srt.waitForNetworkInitialization())) {
+        return { ok: false, platform: process.platform, detail: "the sandbox runtime's egress proxy did not come up, so no network policy is in force" };
+      }
+      const id = `rfa-egress-establishment-${process.pid}`;
+      const wrapped = await srt.wrapWithSandboxArgv(
+        `curl -sS -m 12 -o /dev/null -w "HTTP:%{http_code}" https://${ESTABLISHMENT_HOST}/`,
+        CHECK_SHELL,
+        undefined,
+        undefined,
+        dir,
+        { commandId: id },
+      );
+      const out = await runAsyncCmd(wrapped.argv, wrapped.env, dir);
+      const annotated = srt.annotateStderrWithSandboxFailures(id, out.stderr);
+      const kind = classifyDenial(annotated, /HTTP:[1-5]\d\d/.test(out.stdout));
+      if (kind === "reached") {
+        return { ok: false, platform: process.platform, detail: `a host that is not on this pack's allow list was REACHED (${ESTABLISHMENT_HOST}), so door two's network half fences nothing` };
+      }
+      if (kind === "no-approver") {
+        return {
+          ok: false,
+          platform: process.platform,
+          detail:
+            `the refusal came back as \`${NO_APPROVER_DENY_REASON}\` rather than \`${ALLOWLIST_DENY_REASON}\`, so strictAllowlist is not being honoured: ` +
+            `the outcome is being decided by whoever answers the ask, and probe E10a measured that same shape returning HTTP:200 under a callback that says yes (RFA-0.9 sect. 4.3)`,
+        };
+      }
+      if (kind === "unclear") {
+        return {
+          ok: false,
+          platform: process.platform,
+          detail: `the establishment request to ${ESTABLISHMENT_HOST} neither reached it nor was refused for a reason this platform recognizes (${annotated.replace(/\s+/g, " ").slice(0, 200) || "no output"}); "we could not tell" is not "it is fenced"`,
+        };
+      }
+      egress = `, egress denied by the allow list (${network.allowedDomains.length === 0 ? "empty allowlist" : network.allowedDomains.join(", ")}, strictAllowlist)`;
+    }
+
     const warnings = deps.warnings ?? [];
-    return { ok: true, platform: process.platform, detail: warnings.length > 0 ? `established (warnings: ${warnings.join("; ")})` : "established" };
+    return { ok: true, platform: process.platform, detail: (warnings.length > 0 ? `established (warnings: ${warnings.join("; ")})` : "established") + egress };
   } catch (err) {
     return { ok: false, platform: process.platform, detail: `the sandbox could not be established: ${(err as Error).message}` };
   } finally {
+    // The egress proxy runs in THIS process and would otherwise stay listening
+    // for the resident's whole life. Every real run gets its own sandbox through
+    // the SDK's per-query option, so nothing here needs it after the check.
+    try {
+      await srt.reset?.();
+    } catch {
+      /* a check that cannot tear down its own proxy is not a reason to refuse a boot */
+    }
     for (const d of [dir, outside]) {
       try {
         fs.rmSync(d, { recursive: true, force: true });

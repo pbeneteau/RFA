@@ -16,6 +16,8 @@ import { ensureRuntime, roomsStore, type HubDir } from "../../hubdir.js";
 import { belongsTo, residentProcesses } from "../../procscan.js";
 import { CliError, numberFlag, type CliContext } from "../context.js";
 import { effectiveMode } from "../../posture.js";
+import { NETWORK_SCOPE_NOTE, postureView } from "../../egress.js";
+import { declaredOfClass } from "../../toolclass.js";
 import { nativeBindingProblem } from "../preflight.js";
 import type { CommandDef } from "../router.js";
 import { byRoomInterest, fmtAge, fmtDuration } from "../ui.js";
@@ -237,6 +239,16 @@ export async function collectStatus(ctx: CliContext): Promise<Record<string, unk
        */
       concurrency: p.def.concurrency,
       candidates: p.def.candidates,
+      /**
+       * RFA-0.9 sects. 4.1 and 5.3. The posture is shown WITH its scope (a
+       * posture displayed without it is read as total), and a pack declaring a
+       * `reach` built-in is named because neither door covers those and no value
+       * of the posture describes them. Both read from agent.md on disk: the
+       * resident records neither.
+       */
+      egress: postureView(p.def).inert ? null : postureView(p.def).summary,
+      egress_scope: NETWORK_SCOPE_NOTE,
+      reach: declaredOfClass(p.def.tools?.allow, "reach"),
       supervisor: supFile?.agents?.[p.name] ?? null,
       heartbeat_age_ms: hbAge,
       spend_today_usd: member?.spend?.day === today ? member.spend.usd : 0,
@@ -322,6 +334,10 @@ export const status: CommandDef = {
           return [dot, a.name, st, roomAlias, a.model, parallel, `$${a.spend_today_usd.toFixed(2)} today`, a.heartbeat_age_ms === null ? "no heartbeat" : `heartbeat ${fmtAge(Date.now() - a.heartbeat_age_ms)}`, ui.dim(`def ${a.definition}`)];
         }),
       );
+    for (const a of (s.agents as { name: string; egress: string | null; egress_scope: string; reach: string[] }[]) ?? []) {
+      if (a.egress) ui.note(`${a.name} egress: ${a.egress} · read from agent.md on disk, not from the running resident · scope: ${a.egress_scope}`);
+      if (a.reach.length) ui.note(ui.caution(`${a.name} declares ${a.reach.join(", ")}: network I/O in the SDK's own process, which NEITHER door of the fence covers and no network posture describes (RFA-0.9 sect. 5.3)`));
+    }
     for (const bad of (s.agents_invalid as { name: string; error: string }[]) ?? []) ui.note(`${bad.name}: agent.md does not parse, so nothing runs it (${bad.error}) · rfa agent validate ${bad.name}`);
     ui.blank();
     ui.line(`rooms${s.rooms_source === "file" ? ui.dim("   (from rooms.json; the hub is not answering or no human key)") : ""}`);

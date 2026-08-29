@@ -211,7 +211,7 @@ try {
     assert(code === 1, `expected exit 1, got ${code}\n${log}`);
     assert(/FATAL:.*OS sandbox cannot establish itself/.test(log), `no loud refusal in the log:\n${log}`);
     assert(/Refusing to serve rather than serving unfenced/.test(log), "the refusal must say it is refusing, not merely warn");
-    assert(!/write fence ESTABLISHED/.test(log), "nothing may claim the fence is established after it failed");
+    assert(!/fence ESTABLISHED/.test(log), "nothing may claim the fence is established after it failed");
     return `exit 1, refused loudly, never served`;
   });
 
@@ -225,7 +225,10 @@ try {
 
   // ------------------------------------------------------------------ the fence, live
 
-  const boot = await runResident({}, /write fence ESTABLISHED/, 240_000);
+  // RFA-0.9 sect. 3.3 widened the coverage predicate, so the resident's line is
+  // "fence ESTABLISHED" (a command-only pack has no WRITE surface and is fenced
+  // all the same). The proof matches the wider string deliberately.
+  const boot = await runResident({}, /fence ESTABLISHED/, 240_000);
   resident = boot.child;
   assert(resident, `the resident never established its fence:\n${boot.log}`);
   let residentLog = boot.log;
@@ -236,9 +239,19 @@ try {
     for (const tool of ["Write", "Edit"]) {
       assert(new RegExp(`write fence: ${tool} still falls through to canUseTool on this SDK`).test(residentLog), `${tool} was not probed:\n${residentLog}`);
     }
-    assert(/write fence ESTABLISHED, per RUN/.test(residentLog), "the log must say WHICH fence this deployment got");
+    assert(/fence ESTABLISHED, per RUN/.test(residentLog), "the log must say WHICH fence this deployment got");
     assert(/door two \(darwin|door two \(linux/.test(residentLog), "the log must name the OS sandbox actually in use");
-    return residentLog.split("\n").find((l) => l.includes("ESTABLISHED"))?.slice(0, 160) ?? "";
+    // RFA-0.9 sect. 4.5: this pack declares Bash, so the boot ALSO established
+    // door two's network half against an RFC 2606 `.invalid` host, and refused
+    // to boot if the refusal had come back as `user denied` instead of the
+    // allow-list reason. Asserted here because the fence-proof pack is the only
+    // resident in this repository that has a command surface.
+    assert(
+      /egress: .*Boot establishment: .*egress denied by the allow list/.test(residentLog),
+      `the boot never established door two's NETWORK half (RFA-0.9 sect. 4.5):\n${residentLog}`,
+    );
+    assert(/Scope: the posture governs/.test(residentLog), "sect. 4.1: a posture is never rendered without its scope");
+    return (residentLog.split("\n").find((l) => l.includes("ESTABLISHED"))?.slice(0, 120) ?? "") + " | " + (residentLog.split("\n").find((l) => l.includes("egress:"))?.slice(11, 200) ?? "");
   });
 
   // The fence line is printed at boot, well before `serve()` starts reading, so

@@ -183,7 +183,7 @@ function parseProposal(file: string): ProposalPayload {
  * Reconcile lessons against the existing store and commit them, gate first.
  * Shared by --apply (fresh pass) and --apply <proposal> (a reviewed file).
  */
-async function commit(hubdir: HubDir, dbPath: string, payload: ProposalPayload, model: string, llm: LlmFn): Promise<{ counts: NonNullable<ReflectResult["applied"]>; cost: number }> {
+async function commit(dbPath: string, payload: ProposalPayload, model: string, llm: LlmFn): Promise<{ counts: NonNullable<ReflectResult["applied"]>; cost: number }> {
   const gate = new MemoryGate();
   for (const q of payload.material) if (q.trim()) gate.inspectText(q, "asker");
   const facts = new FactStore(dbPath, gate, "self");
@@ -191,7 +191,6 @@ async function commit(hubdir: HubDir, dbPath: string, payload: ProposalPayload, 
     const candidateMap = new Map<number, string>();
     for (const l of payload.lessons) for (const c of facts.candidates(l.text, 4)) candidateMap.set(c.id, c.text);
     const rec = await llm(
-      hubdir.root,
       RECONCILE_SYSTEM,
       `Existing memory candidates:\n${[...candidateMap.entries()].map(([id, t]) => `${id}: ${t}`).join("\n") || "(none)"}\n\nNew facts:\n${payload.lessons.map((l) => `- ${l.text}`).join("\n")}`,
       model,
@@ -247,7 +246,7 @@ export async function reflect(agentName: string, opts: { hubdir?: HubDir; model?
       } catch (err) {
         return { ...empty, deferred: (err as Error).message };
       }
-      const { counts, cost } = await commit(hubdir, dbPath, payload, model, llm);
+      const { counts, cost } = await commit(dbPath, payload, model, llm);
       fs.appendFileSync(opts.applyFile, `applied: ${new Date().toISOString()} (+${counts.added} added, ~${counts.updated} updated, -${counts.invalidated} invalidated, ${counts.skipped} skipped)\n`);
       meta.setMeta(WATERMARK, String(Math.max(payload.watermark, Number(meta.getMeta(WATERMARK) ?? 0))));
       return { ...empty, lessons: payload.lessons.length, proposal: opts.applyFile, applied: counts, cost_usd: cost, watermark: payload.watermark };
@@ -262,7 +261,7 @@ export async function reflect(agentName: string, opts: { hubdir?: HubDir; model?
       if (watermark > since) meta.setMeta(WATERMARK, String(watermark));
       return { ...empty, scanned, watermark };
     }
-    const ext = await llm(hubdir.root, EXTRACT_SYSTEM, `Judged incidents:\n\n${material(incidents)}`, model);
+    const ext = await llm(EXTRACT_SYSTEM, `Judged incidents:\n\n${material(incidents)}`, model);
     const lessons = wellFormed(extractJson<unknown>(ext.text, "lessons"));
     const origin: ProposalPayload["origin"] = incidents.every((i) => i.signals.every((s) => s.source === "human")) ? "human" : "agent";
     const payload: ProposalPayload = { agent: agentName, watermark, origin, lessons, material: incidents.map((i) => i.question).filter(Boolean) };
@@ -275,7 +274,7 @@ export async function reflect(agentName: string, opts: { hubdir?: HubDir; model?
       // human (or an explicit --apply) commits what it produced.
       return { ...empty, scanned, incidents: incidents.length, lessons: lessons.length, proposal: file, cost_usd: ext.cost, watermark: since };
     }
-    const { counts, cost } = await commit(hubdir, dbPath, payload, model, llm);
+    const { counts, cost } = await commit(dbPath, payload, model, llm);
     fs.appendFileSync(file, `applied: ${new Date().toISOString()} (+${counts.added} added, ~${counts.updated} updated, -${counts.invalidated} invalidated, ${counts.skipped} skipped)\n`);
     meta.setMeta(WATERMARK, String(watermark));
     return { scanned, incidents: incidents.length, lessons: lessons.length, proposal: file, applied: counts, cost_usd: ext.cost + cost, watermark };

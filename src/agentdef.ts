@@ -16,6 +16,9 @@ import * as path from "node:path";
 import YAML from "yaml";
 import { effectiveMode } from "./posture.js";
 import { guardedBuiltinsOf, shadowingFailures } from "./writefence.js";
+import { declaredOfClass, fenceApplies, toolCountWarning, toolsAllowFailures } from "./toolclass.js";
+import { interruptOnEgressFailures, networkPostureFailures } from "./egress.js";
+import { mcpSandboxFailures } from "./mcpsandbox.js";
 import * as z from "zod";
 import { sha256hex } from "./jcs.js";
 import type { AgentCard } from "./model.js";
@@ -71,6 +74,31 @@ const toolsSchema = z
  */
 export const MEMORY_DESTRUCTIVE_TOOLS = ["mcp__memory__delete", "mcp__memory__rename", "mcp__memory__str_replace"] as const;
 
+/**
+ * The per-server sandbox block (RFA-0.9 sect. 5.4, rung 8; owner's decision of
+ * 2026-08-30 that the policy is DECLARED and never derived).
+ *
+ * Optional here and REQUIRED by `mcpSandboxFailures`, which runs in
+ * `parseAgentMd` where the pack directory is known: `allow_write` has to be
+ * resolved against the pack to be checked at all, and a field-level schema
+ * cannot see it. The refusal for a missing block names the block to add.
+ *
+ * It is a separate field from the pack's own `sandbox.network` on purpose. v0.9
+ * sect. 4.1 says the pack posture governs its sandboxed COMMAND surface and
+ * explicitly not its MCP servers; reusing it here would make that scope sentence
+ * false everywhere it is rendered.
+ */
+const mcpServerSandboxSchema = z
+  .object({
+    network: z.enum(["none", "allowlist", "open"], {
+      error: "the postures are `none` and `allowlist`; `open` is listed only so it can be refused BY NAME with what it would require (RFA-0.9 sect. 4.2)",
+    }),
+    allowed_domains: z.array(z.string()).optional(),
+    /** Paths this server may write, relative to the PACK directory and refused outside it. */
+    allow_write: z.array(z.string()).optional(),
+  })
+  .optional();
+
 export const agentDefSchema = z.object({
   rfa_agent: z.literal(1),
   name: z.string().min(1).max(64),
@@ -79,6 +107,24 @@ export const agentDefSchema = z.object({
   effort: z.enum(["low", "medium", "high", "xhigh", "max"]).optional(),
   tools: toolsSchema.optional(),
   skills: z.array(z.string()).optional(),
+  /**
+   * The acknowledgement RFA-0.9 sect. 5.3 requires of a pack that declares a
+   * built-in of class `reach` (`WebFetch`, `WebSearch`).
+   *
+   * Those execute in the SDK's own process, which the sandbox's network settings
+   * explicitly carve out, so NEITHER door covers them and no value of
+   * `sandbox.network` could describe them. This is a rendering-and-confirmation
+   * requirement and never a posture-keyed refusal: refusing a posture value
+   * because of a `reach` declaration would leave a pack that declares `WebFetch`
+   * and no `Bash` with no legal value of that field at all.
+   *
+   * It lives IN THE DEFINITION rather than behind a command prompt because
+   * nothing owns `tools.allow`: `rfa agent edit` has no tools flag, and the only
+   * path that adds a built-in is the free-form `--editor`, so a confirmation
+   * promised at the command line would be unenforceable at the only place the
+   * tool can actually arrive.
+   */
+  unconfined_reach_acknowledged: z.boolean().optional(),
   /**
    * MCP servers this pack brings (v0.4 sect. 3.2), by the name that prefixes
    * their tool ids (`mcp__<name>__<tool>`). A stdio server is a command; an HTTP
@@ -95,16 +141,26 @@ export const agentDefSchema = z.object({
           /** Secret NAMES to inject into the server process's environment. */
           env_secrets: z.array(z.string()).optional(),
           env: z.record(z.string(), z.string()).optional(),
+          sandbox: mcpServerSandboxSchema,
         }),
         z.object({
           url: z.string().url(),
           /** The secret NAME whose value is sent as `Authorization: Bearer`. */
           bearer_secret: z.string().optional(),
+          /**
+           * Accepted by the SHAPE only so it can be refused BY NAME (RFA-0.9
+           * sect. 5.4): `z.object` silently strips an unknown key, so without
+           * this field an operator who declared a sandbox on a `url` server
+           * would get a server with no confinement and no error anywhere - the
+           * exact defect sect. 7.3 fixes for `offers`.
+           */
+          sandbox: mcpServerSandboxSchema,
         }),
         z.object({
           /** A server this package ships (`src/servers/`), run through the tool's own entry. */
           builtin: z.enum(["linear"]),
           env_secrets: z.array(z.string()).optional(),
+          sandbox: mcpServerSandboxSchema,
         }),
       ]),
     )
@@ -114,11 +170,35 @@ export const agentDefSchema = z.object({
   knowledge: z.array(z.string()).optional(),
   offers: z
     .array(
-      z.object({
-        id: z.string().min(1),
-        description: z.string().min(1).max(1024),
-        input_schema: z.record(z.string(), z.unknown()).optional(),
-      }),
+      z
+        .object({
+          id: z.string().min(1),
+          description: z.string().min(1).max(1024),
+          input_schema: z.record(z.string(), z.unknown()).optional(),
+          /**
+           * Capability lifecycle (RFA-0.9 sect. 8.1). An offer that is removed
+           * disappears from the roster on the next digest rotation and every
+           * consumer discovers it by failing; this is the softer exit.
+           *
+           * PACK-LOCAL, deliberately (sect. 8.3): the agent card the hub serves
+           * is unchanged, so no roster, no remote member and no interop client
+           * sees a new field, and wire Appendix F gains no row. The cost of that
+           * decision has to be stated wherever this feature is: **a selector that
+           * reads `card_summary.skill_ids` from the roster CANNOT see this flag**,
+           * so the guarantee below is local to selectors that read pack
+           * definitions on this host, and is never a room-wide one.
+           */
+          deprecated: z.boolean().optional(),
+          /** The offer id that replaces this one, when there is one. Same locality caveat as `deprecated`. */
+          superseded_by: z.string().min(1).optional(),
+        })
+        /**
+         * Sect. 7.3: an unknown key is REFUSED rather than silently discarded,
+         * which is what `z.object`'s default does. An operator who mistyped a key
+         * on a capability card got a card missing that field and no error
+         * anywhere.
+         */
+        .strict(),
     )
     .optional(),
   memory: z
@@ -159,7 +239,32 @@ export const agentDefSchema = z.object({
             "only `none` is implemented. `worktree` is rejected on the merits (RFA-0.8 Appendix A: a worktree materializes tracked files only, and a pack's mutable bulk is gitignored by design), `container` is parked with its own trigger, and `clone` becomes legal with RFA-0.8 rung 6a. Per-run write isolation today is the two-door fence of RFA-0.8 sect. 9, which needs no isolation setting.",
         }),
       permission_mode: z.enum(["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk", "auto"]).default("default"),
-      network: z.enum(["none", "allowlist", "open"]).default("none"),
+      /**
+       * The pack's outbound network posture (RFA-0.9 sect. 4, amending v0.4
+       * sect. 3.2), governing its SANDBOXED COMMAND surface and nothing else.
+       *
+       * It and `allowed_domains` were INERT until RFA-0.9 (sect. 1.1 finding 1):
+       * zero readers anywhere outside this schema line, while `rfa agent new`
+       * wrote `network: none` into every generated pack beside two settings that
+       * ARE read. `src/egress.ts` is what reads them now; the semantics, the
+       * refusals and the scope sentence all live there, because a field's
+       * meaning belongs with the code that enforces it and not with the shape
+       * that parses it.
+       *
+       * `open` stays in the enum so it can be refused BY NAME with what it would
+       * require, exactly as `sandbox.isolation` above refuses its dead values;
+       * zod's generic enum error would advertise it as legal.
+       *
+       * `none` parses for every pack, including one that never wrote the line
+       * (it is the default). The line is stripped from packs already on disk by
+       * `rfa agent edit <name> --drop-network`, which `rfa doctor` names on any
+       * pack where it is inert.
+       */
+      network: z
+        .enum(["none", "allowlist", "open"], {
+          error: "the postures are `none` (the default) and `allowlist`; `open` is listed only so it can be refused BY NAME with what it would require (RFA-0.9 sect. 4.2)",
+        })
+        .default("none"),
       allowed_domains: z.array(z.string()).optional(),
       cwd: z.string().optional(),
     })
@@ -396,6 +501,71 @@ export function writeSurfaceDefFailures(def: {
   }).map((f) => `it declares the write surface ${guarded.join(", ")} and ${f}`);
 }
 
+/**
+ * Where a pack's `sandbox.cwd` actually lands, and why it is constrained on
+ * EVERY pack rather than only a fenced one (RFA-0.9 sect. 3.4b).
+ *
+ * The setting was read into a resident's working directory with no constraint on
+ * where it may point, so `cwd: "."` put a resident at the hub root, where
+ * `.rfa/secrets.json` sits. That matters because of a measurement, not a theory:
+ * a `Read` INSIDE the working directory is auto-approved and never reaches
+ * `canUseTool` at all (probe E9), so the read surface a pack holds is decided
+ * entirely by where this key points. Relative paths resolve against the PACK
+ * directory, which is the only base under which the containment rule can be
+ * stated at all; no pack in `templates/`, in the scaffold, or on this instance
+ * writes the key, so no existing pack changes meaning.
+ *
+ * On a FENCED pack it is refused outright rather than silently overridden: a
+ * fenced run's working directory IS its scratch surface (RFA-0.8 sect. 9), so
+ * honouring the key would be a lie and ignoring it would be a different one.
+ */
+export function resolvePackCwd(packDir: string, cwd: string): { ok: true; path: string } | { ok: false; reason: string } {
+  const abs = path.resolve(packDir, cwd);
+  const rel = path.relative(packDir, abs);
+  if (rel !== "" && (rel.startsWith("..") || path.isAbsolute(rel))) {
+    return {
+      ok: false,
+      reason:
+        `sandbox.cwd ${JSON.stringify(cwd)} resolves to ${abs}, outside this pack's own directory (${packDir}). ` +
+        `The working directory decides the pack's READ surface: a Read inside it is auto-approved by the SDK and never reaches canUseTool ` +
+        `(RFA-0.9 sect. 3.4b), so a cwd at or above the hub root hands the pack .rfa/secrets.json. Point it inside the pack, or leave the key out.`,
+    };
+  }
+  return { ok: true, path: abs };
+}
+
+/**
+ * RFA-0.9 sect. 5.3: a pack declaring `WebFetch` or `WebSearch` must say, in its
+ * own definition, that it knows those are outside both doors.
+ *
+ * One half of the claim is measured and one is not, and the refusal says which:
+ * the `sandbox.network` settings are documented to be "enforced for sandboxed
+ * commands only - in-process tools such as WebFetch are not gated by this
+ * setting", which names `WebFetch` and not `WebSearch`, and no probe in this
+ * repository exercises either (Appendix B item 9). The rendering is correct
+ * either way, because it claims no confinement for them.
+ */
+export function reachAcknowledgementFailure(def: { tools?: { allow?: string[] }; unconfined_reach_acknowledged?: boolean }): string | null {
+  const reach = declaredOfClass(def.tools?.allow, "reach");
+  if (reach.length === 0 || def.unconfined_reach_acknowledged) return null;
+  return (
+    `it declares ${reach.join(", ")}, which ${reach.length === 1 ? "is a built-in" : "are built-ins"} of class \`reach\`: network I/O inside the SDK's own process, which the sandbox's network settings ` +
+    `explicitly carve out. NEITHER door of the fence covers ${reach.length === 1 ? "it" : "them"}, and no value of \`sandbox.network\` can, because the posture governs the sandboxed command surface only ` +
+    `(RFA-0.9 sects. 4.1 and 5.3). Add \`unconfined_reach_acknowledged: true\` to the definition to say so deliberately; this is an acknowledgement, not a control.`
+  );
+}
+
+/** Sect. 3.4b's other half: on a fenced pack the key is not in force, so it is refused rather than overridden. */
+export function fencedCwdFailure(def: { tools?: { allow?: string[] }; sandbox?: { cwd?: string } }): string | null {
+  if (!def.sandbox?.cwd || !fenceApplies(def)) return null;
+  const surface = [...declaredOfClass(def.tools?.allow, "guarded"), ...declaredOfClass(def.tools?.allow, "command")];
+  return (
+    `sandbox.cwd is set and this pack is FENCED (it declares ${surface.join(", ")}), so the key is not in force: a fenced run's working directory ` +
+    `is its own scratch/<runId> surface, which is what makes door two's policy a per-run one (RFA-0.8 sect. 9, RFA-0.9 sect. 3.4b). ` +
+    `It is refused here rather than silently overridden. Remove the key.`
+  );
+}
+
 export type AgentDef = z.infer<typeof agentDefSchema>;
 
 /** Every secret NAME a pack needs injected: its own `secrets` plus what its MCP servers declare. */
@@ -416,6 +586,8 @@ export interface AgentPack {
   prompt: string;
   /** sha256 over the full agent.md content: the deployed-version marker. */
   definitionHash: string;
+  /** Non-fatal complaints from definition load (RFA-0.9 sect. 7.2), for whoever can print them. */
+  warnings: string[];
 }
 
 const FRONTMATTER = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
@@ -440,8 +612,15 @@ export function splitAgentMd(content: string): { raw: unknown; body: string } {
   }
 }
 
-/** Parse an agent.md string. Throws with a precise message on any invalid input. */
-export function parseAgentMd(content: string): { def: AgentDef; prompt: string; definitionHash: string } {
+/**
+ * Parse an agent.md string. Throws with a precise message on any invalid input.
+ *
+ * `dir` is the pack's own directory when the caller has one. It is optional
+ * because several callers legitimately validate a STRING (the console editor,
+ * a test), and only the checks that need a base path are skipped without it;
+ * `loadPack` always passes it, so no resident ever boots without them.
+ */
+export function parseAgentMd(content: string, opts: { dir?: string } = {}): { def: AgentDef; prompt: string; definitionHash: string; warnings: string[] } {
   const { raw, body } = splitAgentMd(content);
   const parsed = agentDefSchema.safeParse(raw);
   if (!parsed.success) {
@@ -453,12 +632,54 @@ export function parseAgentMd(content: string): { def: AgentDef; prompt: string; 
   // literal so `agentDefSchema` stays the plain shared schema every caller
   // reaches for, and beside the `offers` rule below, which is the same kind of
   // check: a cross-field truth the field-level schema cannot see.
+  // RFA-0.9 sect. 3.2: every tools.allow entry must be a classified built-in or
+  // an MCP name for a server this pack can reach. FIRST of the cross-field
+  // checks, because every one below reads `tools.allow` - a concurrency gate or
+  // a fence predicate reasoning about an entry nobody classified is reasoning
+  // about a name that would land verbatim in the SDK's base tool set.
+  const unclassified = toolsAllowFailures(def);
+  if (unclassified.length > 0) {
+    throw new Error(
+      `agent.md declares ${unclassified.length === 1 ? "a tool this platform cannot classify" : `${unclassified.length} tools this platform cannot classify`} (RFA-0.9 sect. 3.2):\n` +
+        unclassified.map((u) => `  - ${u}`).join("\n"),
+    );
+  }
+  // RFA-0.9 sect. 4: the network posture, which is the field this document makes
+  // real. Every refusal names what the value would require, in the manner
+  // RFA-0.8 sect. 8.1 refuses `sandbox.isolation`.
+  const network = [...networkPostureFailures(def), ...interruptOnEgressFailures(def)];
+  if (network.length > 0) {
+    throw new Error(
+      `agent.md declares a network posture this platform refuses (RFA-0.9 sect. 4):\n` + network.map((n) => `  - ${n}`).join("\n"),
+    );
+  }
+  // RFA-0.9 sect. 5.4: a `command` or `builtin` MCP server this platform spawns
+  // must declare what it may reach and where it may write, or it would run
+  // OUTSIDE the query's sandbox - which probe E5 measured. Checked only where
+  // the pack directory is known, because `allow_write` is pack-relative and an
+  // unresolved path cannot be contained.
+  if (opts.dir) {
+    const mcp = mcpSandboxFailures(opts.dir, def);
+    if (mcp.length > 0) {
+      throw new Error(
+        `agent.md declares an MCP server this platform cannot confine as written (RFA-0.9 sect. 5.4):\n` + mcp.map((m) => `  - ${m}`).join("\n"),
+      );
+    }
+  }
+  const reach = reachAcknowledgementFailure(def);
+  if (reach) throw new Error(`agent.md cannot be served as written: ${reach}`);
   const gates = concurrencyGateFailures(def);
   if (gates.length > 0) {
     throw new Error(
       `agent.md declares concurrency: ${def.concurrency}${def.candidates > 1 ? ` and candidates: ${def.candidates}` : ""} but ${gates.length === 1 ? "does not pass a gate" : `does not pass ${gates.length} gates`} (RFA-0.8 sect. 10):\n` +
         gates.map((g) => `  - ${g}`).join("\n"),
     );
+  }
+  const fencedCwd = fencedCwdFailure(def);
+  if (fencedCwd) throw new Error(`agent.md cannot be served as written: ${fencedCwd}`);
+  if (opts.dir && def.sandbox?.cwd) {
+    const resolved = resolvePackCwd(opts.dir, def.sandbox.cwd);
+    if (!resolved.ok) throw new Error(`agent.md cannot be served as written: ${resolved.reason}`);
   }
   const fence = writeSurfaceDefFailures(def);
   if (fence.length > 0) {
@@ -472,15 +693,23 @@ export function parseAgentMd(content: string): { def: AgentDef; prompt: string; 
   }
   const prompt = body.trim();
   if (!prompt) throw new Error("agent.md needs a markdown body: it is the system prompt");
-  return { def, prompt, definitionHash: "sha256:" + sha256hex(content) };
+  /**
+   * Sect. 7.2's threshold is a WARNING, so it rides out beside the definition
+   * rather than throwing. Every caller that has somewhere to put it prints it:
+   * the resident at boot (`src/resident.ts`), `rfa agent show`, `rfa agent
+   * validate`, and `rfa doctor`. A warning nobody surfaces is a wish, so a new
+   * reader is added here rather than the list being trimmed to match.
+   */
+  const warnings = [toolCountWarning(def)].filter((w): w is string => w !== null);
+  return { def, prompt, definitionHash: "sha256:" + sha256hex(content), warnings };
 }
 
 /** Load a pack directory (`agents/<name>/`). */
 export function loadPack(dir: string): AgentPack {
   const file = path.join(dir, "agent.md");
   const content = fs.readFileSync(file, "utf8");
-  const { def, prompt, definitionHash } = parseAgentMd(content);
-  return { name: def.name, dir, def, prompt, definitionHash };
+  const { def, prompt, definitionHash, warnings } = parseAgentMd(content, { dir });
+  return { name: def.name, dir, def, prompt, definitionHash, warnings };
 }
 
 /** List every pack under an agents root, skipping directories without agent.md. */

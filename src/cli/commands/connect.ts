@@ -14,6 +14,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { scanPacks } from "../../agentdef.js";
+import { recordGeneratedArtifacts } from "../../artifacts.js";
+import { selectOffers } from "../../offers.js";
 import { findRoom, roomsStore, tokensStore, writeManifest, type HubDir, type RoomRecord, type TokenRecord } from "../../hubdir.js";
 import { packageFile } from "../../pkg.js";
 import { CliError, type CliContext } from "../context.js";
@@ -68,20 +70,53 @@ async function admitInto(ctx: CliContext, h: HubDir, label: string, rooms: RoomR
  * operator learns it from `rfa agent ls`, `rfa doctor` and `rfa status`, in the
  * directory where they can act on it.
  */
-function capabilityHint(h: HubDir, room: RoomRecord): string {
-  const ids = scanPacks(h.paths.agents)
-    .packs.filter((p) => (p.def.rooms ?? []).some((b) => b.room === room.handle))
-    .flatMap((p) => (p.def.offers ?? []).map((o) => `\`${o.id}\`: ${o.description}`));
-  return ids.length ? ids.join("; ") : "whatever skill ids the roster lists";
+function capabilityHint(h: HubDir, room: RoomRecord): { hint: string; sources: { pack: string; definition_hash: string }[]; skipped: string[] } {
+  const scan = scanPacks(h.paths.agents);
+  const bound = scan.packs.filter((p) => (p.def.rooms ?? []).some((b) => b.room === room.handle));
+  const ids: string[] = [];
+  for (const p of bound) {
+    /**
+     * RFA-0.9 sect. 8.1: this is a selector that reads pack definitions LOCALLY,
+     * so the deprecation rule binds it, and it applies that rule through the
+     * shipped function rather than a copy. A deprecated offer is left out while a
+     * non-deprecated one exists, and named as deprecated when it goes in anyway -
+     * which is the only honest thing to write into another repository's skill
+     * file, since the reader of that file has no way to ask.
+     */
+    for (const o of selectOffers(p.def.offers ?? []).chosen) {
+      ids.push(`\`${o.id}\`${o.deprecated ? ` (DEPRECATED${o.superseded_by ? `, use \`${o.superseded_by}\`` : ""})` : ""}: ${o.description}`);
+    }
+  }
+  return {
+    hint: ids.length ? ids.join("; ") : "whatever skill ids the roster lists",
+    sources: bound.map((p) => ({ pack: p.name, definition_hash: p.definitionHash })),
+    // sect. 8.2: a pack this scan skipped is part of what the hint was generated
+    // FROM, and it was recorded nowhere at all.
+    skipped: scan.broken.map((b) => b.name),
+  };
 }
 
 function renderTemplate(file: string, vars: Record<string, string>): string {
   return fs.readFileSync(file, "utf8").replace(/\{\{(\w+)\}\}/g, (_m, k: string) => vars[k] ?? `{{${k}}}`);
 }
 
-/** Write the consult-room skill and the ask-room command into a project's .claude/. Exported for tests. */
+/**
+ * Write the consult-room skill and the ask-room command into a project's
+ * `.claude/`, and RECORD what was written and what it was generated from
+ * (RFA-0.9 sect. 8.2).
+ *
+ * The recording is the point. This writes offer ids and their full descriptions
+ * into a DIFFERENT repository, at `process.cwd()`, and recorded the destination
+ * nowhere; the hint is generated from every pack bound to the room through a
+ * tolerant scan that silently skips broken ones. So the artifact could drift
+ * from the packs indefinitely and nothing on this side knew it existed. This is
+ * CLAUDE.md's configured-versus-happening rule applied to an artifact that lives
+ * outside the hub directory: `rfa doctor` compares each recorded destination
+ * that still exists against the live set.
+ */
 export function writeProjectSkill(project: string, h: HubDir, room: RoomRecord): string[] {
-  const vars = { ROOM_ALIAS: room.alias, ROOM_HANDLE: room.handle, CAPABILITY_HINT: capabilityHint(h, room) };
+  const generated = capabilityHint(h, room);
+  const vars = { ROOM_ALIAS: room.alias, ROOM_HANDLE: room.handle, CAPABILITY_HINT: generated.hint };
   const out: string[] = [];
   for (const [src, dest] of [
     [packageFile("templates", "skills", "consult-room", "SKILL.md"), path.join(project, ".claude", "skills", "consult-room", "SKILL.md")],
@@ -91,6 +126,7 @@ export function writeProjectSkill(project: string, h: HubDir, room: RoomRecord):
     fs.writeFileSync(dest, renderTemplate(src, vars));
     out.push(dest);
   }
+  recordGeneratedArtifacts(h, { room: room.handle, files: out.map((f) => path.resolve(f)), sources: generated.sources, skipped: generated.skipped });
   return out;
 }
 

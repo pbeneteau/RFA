@@ -218,7 +218,7 @@ You answer questions.
   // assertion is about what reached it and nothing else.
   let material = "";
   const markersIn = (text: string) => ["LOSER-ALPHA", "WINNER-BETA", "LOSER-GAMMA"].filter((m) => text.includes(m));
-  const llm: LlmFn = async (_cwd, system, prompt) => {
+  const llm: LlmFn = async (system, prompt) => {
     if (system.includes("reconcile")) {
       // Echo back one fact per marker the extraction step was SHOWN, so the
       // assertion below is about what reached consolidation and nothing else.
