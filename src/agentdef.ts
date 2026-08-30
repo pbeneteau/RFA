@@ -821,25 +821,77 @@ export function deriveCard(pack: AgentPack): AgentCard {
   };
 }
 
-/** Resolve the pack's knowledge globs to existing absolute file paths (for prompt instructions, not stuffing). */
-export function knowledgeFiles(pack: AgentPack): string[] {
-  const out: string[] = [];
-  for (const pattern of pack.def.knowledge ?? []) {
-    const base = path.resolve(pack.dir, pattern.replace(/\*\*?.*$/, ""));
-    if (pattern.includes("*")) {
-      walk(base, out);
-    } else if (fs.existsSync(base)) {
-      out.push(base);
+/**
+ * One knowledge glob as a regex over the file's ABSOLUTE posix path.
+ *
+ * `**` crosses directory separators, `*` and `?` stay within one segment. The
+ * pattern is resolved against the pack directory first, so `../../x/**\/*.bru`
+ * anchors where the author pointed it (wildcard segments pass through
+ * `path.resolve` untouched).
+ *
+ * This exists because the first implementation was not a matcher at all: it
+ * truncated the pattern at the first `*`, walked EVERYTHING under that prefix,
+ * and filtered to a hardcoded `.md`. Measured consequences (dogfood
+ * 2026-08-30): a directory attach of a repo matched 623 files of which 616
+ * were node_modules dependency docs; the 262 .bru files the pack existed for
+ * could not be admitted by any pattern; `*.md` could not mean top-level-only;
+ * and the `**\/*.mdx` glob that `rfa knowledge add` itself writes into every
+ * pack had never matched anything, silently. A pattern that is displayed to
+ * the operator but not enforced is a config-vs-in-force lie, the defect class
+ * this repository documents.
+ */
+export function knowledgeGlobToRegex(packDir: string, pattern: string): RegExp {
+  const abs = path.resolve(packDir, pattern).split(path.sep).join("/");
+  let re = "";
+  for (const seg of abs.split("/")) {
+    if (seg === "") continue;
+    if (seg === "**") {
+      // `**` swallows zero or more whole segments, separator included.
+      re += "(?:[^/]+/)*";
+      continue;
     }
+    re += seg.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]") + "/";
   }
-  return [...new Set(out)].filter((f) => f.endsWith(".md") && fs.existsSync(f));
+  return new RegExp("^/" + re.replace(/\/$/, "") + "$");
 }
 
-function walk(dir: string, out: string[]): void {
+/**
+ * Resolve the pack's knowledge globs to existing absolute file paths (for
+ * prompt instructions, not stuffing). THE one matcher: every surface that
+ * counts or serves knowledge goes through this, so the "N files match" line
+ * and what the resident actually reads cannot disagree.
+ *
+ * What a file must be: matched by the PATTERN, extension included - a
+ * `**\/*.bru` glob admits .bru files, and a single-file pattern admits the
+ * file it names whatever its extension. What is never admitted, whatever the
+ * pattern says: anything under `node_modules` or `.git`, and dot-entries -
+ * vendored trees are not knowledge, and the first implementation's walk
+ * pulling 616 dependency READMEs into a pack is the measurement behind the
+ * rule.
+ */
+export function knowledgeFiles(pack: AgentPack): string[] {
+  const out = new Set<string>();
+  for (const pattern of pack.def.knowledge ?? []) {
+    if (!pattern.includes("*") && !pattern.includes("?")) {
+      const one = path.resolve(pack.dir, pattern);
+      if (fs.existsSync(one) && fs.statSync(one).isFile()) out.add(one);
+      continue;
+    }
+    const prefix = path.resolve(pack.dir, pattern.slice(0, pattern.search(/[*?]/)).replace(/[^/\\]*$/, ""));
+    const rx = knowledgeGlobToRegex(pack.dir, pattern);
+    walk(prefix, (f) => {
+      if (rx.test(f.split(path.sep).join("/").replace(/^\/?/, "/"))) out.add(f);
+    });
+  }
+  return [...out].sort();
+}
+
+function walk(dir: string, visit: (file: string) => void): void {
   if (!fs.existsSync(dir)) return;
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
     const p = path.join(dir, entry.name);
-    if (entry.isDirectory()) walk(p, out);
-    else out.push(p);
+    if (entry.isDirectory()) walk(p, visit);
+    else visit(p);
   }
 }

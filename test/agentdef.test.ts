@@ -112,7 +112,7 @@ test("deriveCard: card comes from the definition and its digest rotates with it"
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("knowledgeFiles: resolves globs and plain paths to existing .md files only", () => {
+test("knowledgeFiles: the globs are real globs - extension truth comes from the pattern", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-know-"));
   const packDir = path.join(dir, "a");
   fs.mkdirSync(path.join(packDir, "knowledge", "sub"), { recursive: true });
@@ -122,7 +122,52 @@ test("knowledgeFiles: resolves globs and plain paths to existing .md files only"
   fs.writeFileSync(path.join(packDir, "knowledge", "ignored.txt"), "x");
   fs.writeFileSync(path.join(dir, "plain.md"), "x");
   const files = knowledgeFiles(loadPack(packDir)).map((f) => path.basename(f)).sort();
-  assert.deepEqual(files, ["one.md", "plain.md", "two.md"]);
+  assert.deepEqual(files, ["one.md", "plain.md", "two.md"], "an .md glob admits .md and nothing else");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("knowledgeFiles: non-markdown globs work, * stays in its segment, vendored trees never match", () => {
+  // The first implementation was not a matcher (dogfood 2026-08-30, F15): it
+  // truncated the pattern at the first `*`, walked everything under the prefix,
+  // and filtered to a hardcoded .md. Consequences, each pinned here: .bru/.tsv
+  // knowledge was impossible whatever the glob said; `*.md` could not mean
+  // top-level-only (616 of 623 attached files were node_modules READMEs); and
+  // the `**/*.mdx` glob the attach itself writes had never matched anything.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-know2-"));
+  const packDir = path.join(dir, "a");
+  fs.mkdirSync(path.join(packDir, "knowledge"), { recursive: true });
+  const repo = path.join(dir, "repo");
+  fs.mkdirSync(path.join(repo, "generali", "deep"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "node_modules", "dep"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "docs"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "generali", "a.bru"), "x");
+  fs.writeFileSync(path.join(repo, "generali", "deep", "b.bru"), "x");
+  fs.writeFileSync(path.join(repo, "generali", "notes.md"), "x");
+  fs.writeFileSync(path.join(repo, "node_modules", "dep", "README.md"), "x");
+  fs.writeFileSync(path.join(repo, "node_modules", "dep", "c.bru"), "x");
+  fs.writeFileSync(path.join(repo, "README.md"), "x");
+  fs.writeFileSync(path.join(repo, "docs", "guide.mdx"), "x");
+  fs.writeFileSync(path.join(repo, "data.tsv"), "x");
+  fs.writeFileSync(
+    path.join(packDir, "agent.md"),
+    VALID.replace(
+      "rooms:",
+      'knowledge:\n  - "../repo/generali/**/*.bru"\n  - "../repo/*.md"\n  - "../repo/docs/**/*.mdx"\n  - "../repo/data.tsv"\nrooms:',
+    ),
+  );
+  const files = knowledgeFiles(loadPack(packDir)).map((f) => path.relative(repo, f)).sort();
+  assert.deepEqual(files, [
+    "README.md", // `*.md` is TOP-LEVEL only: * does not cross the separator, so node_modules/dep/README.md is out twice over
+    "data.tsv", // a single-file pattern admits the file it names, whatever the extension
+    path.join("docs", "guide.mdx"), // the glob the attach writes finally matches what it says
+    path.join("generali", "a.bru"),
+    path.join("generali", "deep", "b.bru"), // ** crosses directories
+  ]);
+  // node_modules never matches, even when a glob would reach it explicitly
+  fs.writeFileSync(path.join(packDir, "agent.md"), VALID.replace("rooms:", 'knowledge:\n  - "../repo/**/*.bru"\nrooms:'));
+  const all = knowledgeFiles(loadPack(packDir));
+  assert.equal(all.some((f) => f.includes("node_modules")), false, "vendored trees are not knowledge, whatever the pattern says");
+  assert.equal(all.length, 2);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
