@@ -267,6 +267,14 @@ export interface AskObservation {
    */
   index: number;
   ask: ConcurrentAsk;
+  /**
+   * The run this ask actually produced, resolved from the STORE rather than read
+   * off the answer (wire 14 item 12; `src/evals/runresolve.ts`). Null when the
+   * store could not resolve it, in which case the distinctness check below falls
+   * back to the self-reported ids and SAYS SO: a subject that stamps two
+   * invented distinct ids satisfies that weaker form outright.
+   */
+  resolvedRunId?: string | null;
   /** The question + answer slice, exactly what a single live trial scores. */
   events: RfaEvent[];
   /**
@@ -455,7 +463,17 @@ export function scoreConcurrentTrial(observations: AskObservation[], subject: st
     ? `${noJson.length}/${observations.length} answer(s) carried no json part, so no run id could be read: this tuple is UNMEASURABLE (excluded, not scored 0)`
     : null;
 
-  const runIds = observations.map((o) => o.json?.runId ?? null);
+  /**
+   * The distinctness assertion, on RESOLVED ids where the store could supply
+   * them (wire 14 item 12). It exists to prove the tuple really ran in separate
+   * run contexts, and on self-reported ids it proves nothing: a subject that
+   * stamps two invented distinct ids passes it outright. Resolved ids are used
+   * whenever every observation carries one; otherwise the weaker check still
+   * runs, because it catches the shared-context bug it was written for, and the
+   * note says what it rests on.
+   */
+  const resolvedAll = observations.every((o) => typeof o.resolvedRunId === "string" && o.resolvedRunId);
+  const runIds = resolvedAll ? observations.map((o) => o.resolvedRunId as string) : observations.map((o) => o.json?.runId ?? null);
   if (!unmeasurable) {
     const missing = runIds.filter((r) => !r).length;
     if (missing) {
@@ -466,6 +484,9 @@ export function scoreConcurrentTrial(observations: AskObservation[], subject: st
     if (present.length > 1 && new Set(present).size !== present.length) {
       ok = false;
       notes.push(`run_id SHARED across the tuple (${present.join(", ")}): the concurrent answers ran in one run context`);
+    }
+    if (present.length > 1 && !resolvedAll) {
+      notes.push("run_id distinctness rests on SELF-REPORTED ids: the store could not resolve every ask to a run, so this check is weaker than it looks (wire 14 item 12)");
     }
   }
 

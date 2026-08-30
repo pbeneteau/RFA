@@ -484,6 +484,7 @@ export const evalsParity: CommandDef = {
       const verdicts: ParityVerdict[] = await runParity({
         me,
         subjectId: target.id,
+        subjectName: target.name,
         fixtures,
         obsDb: h.paths.obsDb,
         capture: Boolean(a.values.capture),

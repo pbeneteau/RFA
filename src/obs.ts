@@ -211,6 +211,27 @@ export class ObsStore {
     return rows.map(hydrate);
   }
 
+  /**
+   * The rows one agent's answer path produced inside a window, for the eval
+   * harness's honest run resolution (wire 14 item 12, `src/evals/runresolve.ts`).
+   *
+   * Narrow on purpose. The harness used to key its writes on a run id the
+   * SUBJECT reported in its own answer body, which is a self-report driving an
+   * automated decision; this is the query that lets it check that claim against
+   * the store the write targets instead. A resident names its rows
+   * `<kind>:<pack>`, so the suffix match is what identifies the agent, and the
+   * window is the ask's own send-to-reply span.
+   */
+  runsForAgent(agent: string, from: number, to: number): { id: string; name: string; group_id: string | null; status: string; start_time: number; end_time: number }[] {
+    return this.db
+      .prepare(
+        `SELECT id, name, group_id, status, start_time, end_time FROM runs
+          WHERE run_type = 'agent_span' AND name LIKE ('%:' || ?) AND start_time >= ? AND start_time <= ?
+          ORDER BY start_time`,
+      )
+      .all(agent, from, to) as { id: string; name: string; group_id: string | null; status: string; start_time: number; end_time: number }[];
+  }
+
   markReview(id: string, needs: boolean): void {
     this.db.prepare(`UPDATE runs SET needs_review = ? WHERE id = ?`).run(needs ? 1 : 0, id);
   }

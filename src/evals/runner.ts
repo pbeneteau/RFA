@@ -21,6 +21,7 @@ import YAML from "yaml";
 import { RoomMember, type AskResult } from "../client.js";
 import type { Envelope, RfaEvent } from "../model.js";
 import { ObsStore } from "../obs.js";
+import { corroborateRefusal, resolveRun, type RunLookup } from "./runresolve.js";
 import { claudeJudge } from "./judge.js";
 import { loadPack } from "../agentdef.js";
 import { findRoom, HubDirError, requireHubDir, roomsStore, type HubDir } from "../hubdir.js";
@@ -308,25 +309,57 @@ async function runLive(def: CaseDef, env: LiveEnv, obs: ObsStore | null, judged:
     const refused: string[] = [];
     const comments: string[] = [];
     let judge: CaseResult["judge"];
+    // The subject's OWN record, not its word (wire 14 item 12). `null` when the
+    // store cannot be read at all, which `runresolve` treats as fail-closed.
+    const lookup: RunLookup = obs
+      ? ({ agent, from, to }) => {
+          try {
+            return obs.runsForAgent(agent, from, to);
+          } catch {
+            return null;
+          }
+        }
+      : () => null;
     for (let i = 0; i < (def.trials ?? 1); i++) {
       const asker = i === 0 ? probe : await pool.mint(`t${i + 1}`);
+      const from = Date.now();
       const answer = await asker.ask(subjectRec.id, def.ask!, { timeoutMs: def.timeout_ms ?? 120_000 });
+      const to = Date.now();
       // Found live: a $3/day answerer hit its ceiling halfway through a gate run
-      // and the gate reported two REGRESSIONS.
+      // and the gate reported two REGRESSIONS. So a refusal still leaves pass^k
+      // alone - but only when the subject's own run rows corroborate it, because
+      // otherwise a member lowers the denominator of its own gate by declaring
+      // its state (wire 14 item 12; `src/evals/runresolve.ts`).
       if (answer.kind === "refuse") {
         const why = refusalOf(answer);
-        refused.push(why);
-        comments.push(`trial ${i + 1}: REFUSED ${why}`);
+        const verdict = corroborateRefusal({ agent: subjectRec.name, from, to, lookup });
+        if (verdict.excluded) {
+          refused.push(why);
+          comments.push(`trial ${i + 1}: REFUSED ${why} - ${verdict.detail}`);
+          continue;
+        }
+        trials.push(false);
+        comments.push(`trial ${i + 1}: REFUSED ${why} - ${verdict.detail}`);
         continue;
       }
       const events = askedAnsweredSlice(asker, def.ask!, answer);
       const reward = computeReward(events, subjectRec.id, def.expect);
       trials.push(reward.score === 1);
       comments.push(`trial ${i + 1}: ${reward.comment}`);
-      const runId = runIdOf(answer);
-      if (runId && obs) {
-        obs.feedback({ run_id: runId, key: `eval:${def.id}`, score: reward.score, comment: reward.comment, source_type: "evaluator" });
-        if (reward.score === 0) obs.markReview(runId, true);
+      // The run id the answer CLAIMS is a hint to be checked, never the key.
+      // Writing on an unchecked one is how a failing answer misses the review
+      // queue: every write below is `... WHERE id = ?` or an unconstrained
+      // INSERT, so a wrong id is silently no rows, or an orphan.
+      const resolved = obs ? resolveRun({ claimed: runIdOf(answer), agent: subjectRec.name, from, to, lookup }) : null;
+      if (obs && resolved) {
+        if (resolved.ok) {
+          obs.feedback({ run_id: resolved.runId, key: `eval:${def.id}`, score: reward.score, comment: reward.comment, source_type: "evaluator" });
+          if (reward.score === 0) obs.markReview(resolved.runId, true);
+        } else {
+          // Never silent: a score that could not be attached is a hole in the
+          // judged record, and the review queue is what a human reads.
+          comments.push(`trial ${i + 1}: score NOT recorded - ${resolved.reason}`);
+        }
       }
       if (judged && i === 0) {
         // Cross-tier (spec 20.1): pass the subject's own model so the judge
@@ -336,12 +369,17 @@ async function runLive(def: CaseDef, env: LiveEnv, obs: ObsStore | null, judged:
         });
         if (j.score >= 0) {
           judge = { score: j.score, comment: j.comment };
-          if (runId && obs) {
+          // Same rule as the evaluator score above: the judge's verdict is
+          // attached to the run the STORE says happened, or to nothing, and a
+          // failure to attach is reported rather than swallowed.
+          if (obs && resolved?.ok) {
             obs.feedback({
-              run_id: runId, key: "judge", score: j.score,
+              run_id: resolved.runId, key: "judge", score: j.score,
               comment: `${j.comment}${j.judge_model ? ` [judged by ${j.judge_model}]` : ""}`,
               source_type: "model", rubric_hash: j.rubric_hash ?? null,
             });
+          } else if (obs) {
+            comments.push(`trial ${i + 1}: judge score NOT recorded - ${resolved && !resolved.ok ? resolved.reason : "no run could be resolved"}`);
           }
         }
       }
@@ -401,7 +439,20 @@ async function runLiveConcurrent(def: CaseDef, env: LiveEnv, obs: ObsStore | nul
     slice: askedAnsweredSlice,
     json: jsonPartOf,
   });
-  const outcome = await runConcurrentCase(def, port, { obs });
+  const outcome = await runConcurrentCase(def, port, {
+    obs,
+    // The subject's own rows, so each ask's score attaches to the run the STORE
+    // says happened rather than to the id the answer reported (wire 14 item 12).
+    runs: obs
+      ? ({ agent, from, to }) => {
+          try {
+            return obs.runsForAgent(agent, from, to);
+          } catch {
+            return null;
+          }
+        }
+      : null,
+  });
   const overlap = outcome.perTrial.length ? overlapVerdict(outcome.perTrial, def.expect_overlap === true) : undefined;
   const base = {
     id: def.id,
@@ -427,13 +478,31 @@ async function runLiveConcurrent(def: CaseDef, env: LiveEnv, obs: ObsStore | nul
     });
     if (j.score >= 0) {
       judge = { score: j.score, comment: j.comment };
-      const runId = first[0].json?.runId;
-      if (runId && obs) {
+      // Resolved, never self-reported (wire 14 item 12). This is the concurrent
+      // path's own judge write and it had the same defect as the single-ask one.
+      const resolved = obs
+        ? resolveRun({
+            claimed: first[0].json?.runId ?? null,
+            agent: subject.name,
+            from: first[0].client.startedAt,
+            to: first[0].client.endedAt,
+            lookup: ({ agent, from, to }) => {
+              try {
+                return obs.runsForAgent(agent, from, to);
+              } catch {
+                return null;
+              }
+            },
+          })
+        : null;
+      if (obs && resolved?.ok) {
         obs.feedback({
-          run_id: runId, key: "judge", score: j.score,
+          run_id: resolved.runId, key: "judge", score: j.score,
           comment: `${j.comment}${j.judge_model ? ` [judged by ${j.judge_model}]` : ""}`,
           source_type: "model", rubric_hash: j.rubric_hash ?? null,
         });
+      } else if (obs && resolved && !resolved.ok) {
+        outcome.comments.push(`judge score NOT recorded - ${resolved.reason}`);
       }
     }
   }

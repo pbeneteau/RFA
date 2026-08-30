@@ -15,6 +15,7 @@
 import * as fs from "node:fs";
 import type { RoomMember } from "../client.js";
 import { ObsStore } from "../obs.js";
+import { resolveRun, type RunLookup } from "./runresolve.js";
 
 export interface ParityFixture {
   question: string;
@@ -31,6 +32,8 @@ export interface ParityVerdict {
   missing: string[];
   excerpt: string;
   runId: string | null;
+  /** Set when the score could not be attached to a run: never silent (wire 14 item 12). */
+  unrecorded?: string;
 }
 
 const norm = (s: string) => s.toLowerCase().replace(/[\s ]/g, "");
@@ -47,6 +50,8 @@ export function loadFixtures(file: string): ParityFixture[] {
 export async function runParity(o: {
   me: RoomMember;
   subjectId: string;
+  /** The subject's NAME, which is what its run rows are keyed on. See `src/evals/runresolve.ts`. */
+  subjectName: string;
   fixtures: ParityFixture[];
   obsDb?: string;
   capture?: boolean;
@@ -54,6 +59,15 @@ export async function runParity(o: {
   onVerdict?: (v: ParityVerdict) => void;
 }): Promise<ParityVerdict[]> {
   const obs = o.obsDb && fs.existsSync(o.obsDb) ? new ObsStore(o.obsDb) : null;
+  const lookup: RunLookup = obs
+    ? ({ agent, from, to }) => {
+        try {
+          return obs.runsForAgent(agent, from, to);
+        } catch {
+          return null;
+        }
+      }
+    : () => null;
   const verdicts: ParityVerdict[] = [];
   try {
     for (const f of o.fixtures) {
@@ -64,8 +78,16 @@ export async function runParity(o: {
       const missing = f.must_mention.filter((m) => !m.split("|").some((alt) => norm(text).includes(norm(alt))));
       const cited = /knowledge\/|\.mdx?\b/.test(text) || JSON.stringify(a.parts).includes("sources");
       const ok = a.kind === "response" && missing.length === 0 && cited;
-      const runId = (a.parts.find((p) => p.type === "json")?.value as { run_id?: string } | undefined)?.run_id ?? null;
-      const v: ParityVerdict = { question: f.question, ok, ms, kind: a.kind, cited, missing, excerpt: text.slice(0, 200).replace(/\n/g, " "), runId };
+      const claimed = (a.parts.find((p) => p.type === "json")?.value as { run_id?: string } | undefined)?.run_id ?? null;
+      // The subject's own record decides which run this was, never its word
+      // (wire 14 item 12; `src/evals/runresolve.ts`). An unresolvable trial is
+      // reported on the verdict rather than written somewhere wrong or nowhere.
+      const resolved = obs ? resolveRun({ claimed, agent: o.subjectName, from: t0, to: Date.now(), lookup }) : null;
+      const runId = resolved?.ok ? resolved.runId : null;
+      const v: ParityVerdict = {
+        question: f.question, ok, ms, kind: a.kind, cited, missing, excerpt: text.slice(0, 200).replace(/\n/g, " "), runId,
+        ...(resolved && !resolved.ok ? { unrecorded: resolved.reason } : {}),
+      };
       verdicts.push(v);
       o.onVerdict?.(v);
       if (runId && obs) {

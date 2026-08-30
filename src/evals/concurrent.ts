@@ -14,6 +14,7 @@ import Database from "better-sqlite3";
 import * as fs from "node:fs";
 import type { PresenceRecord, RfaEvent } from "../model.js";
 import type { AskResult } from "../client.js";
+import { resolveRun, type RunLookup } from "./runresolve.js";
 import {
   measureInFlightTogether,
   measureRunOverlap,
@@ -240,7 +241,15 @@ const refusalText = (answer: AskResult): string =>
 export async function runConcurrentCase(
   def: ConcurrentCaseDef,
   port: ConcurrentPort,
-  opts: { obs?: FeedbackSink | null } = {},
+  opts: {
+    obs?: FeedbackSink | null;
+    /**
+     * The subject's own run rows, for resolving which run each ask produced
+     * (wire 14 item 12). Absent means unresolvable, which reports rather than
+     * writing on the answer's self-reported id.
+     */
+    runs?: RunLookup | null;
+  } = {},
 ): Promise<ConcurrentOutcome> {
   const asks = def.asks ?? [];
   // Defense in depth: the case is also validated at load (validateConcurrentCase).
@@ -335,9 +344,16 @@ export async function runConcurrentCase(
 
       const observations: AskObservation[] = done.map((d) => {
         const json = port.json(d.answer);
-        const runId = json?.runId ?? null;
+        // Resolved from the store first, with the answer's own id as a claim to
+        // be checked (wire 14 item 12). The window is then looked up on the
+        // RESOLVED id, so a subject cannot point the overlap metric at somebody
+        // else's run by stamping its id.
+        const resolution = opts.runs ? resolveRun({ claimed: json?.runId ?? null, agent: subject.name, from: d.client.startedAt, to: d.client.endedAt, lookup: opts.runs }) : null;
+        const resolvedRunId = resolution?.ok ? resolution.runId : null;
+        const runId = resolvedRunId ?? json?.runId ?? null;
         const run = runId ? port.runWindow(runId) : null;
         return {
+          resolvedRunId,
           index: d.index,
           ask: asks[d.index],
           events: port.slice(d.asker, asks[d.index].ask, d.answer),
@@ -372,8 +388,22 @@ export async function runConcurrentCase(
       if (!out.firstScored) out.firstScored = observations;
 
       for (const o of observations) {
-        const runId = o.json?.runId;
-        if (!runId || !obs) continue;
+        if (!obs) continue;
+        /**
+         * The run this ask produced, decided by the store and not by the answer
+         * (wire 14 item 12; `src/evals/runresolve.ts`). The overlap metric above
+         * already fails closed on an unresolvable id - an unreadable window is
+         * UNMEASURED and fails the case - but these two writes did not: they
+         * keyed on `o.json.runId` straight out of the peer's own body, so a
+         * wrong id attached the score to another run or to none and a failing
+         * answer never reached the review queue.
+         */
+        const resolved = resolveRun({ claimed: o.json?.runId ?? null, agent: subject.name, from: o.client.startedAt, to: o.client.endedAt, lookup: opts.runs ?? (() => null) });
+        if (!resolved.ok) {
+          out.comments.push(`trial ${i + 1} ask ${o.index + 1}: score NOT recorded - ${resolved.reason}`);
+          continue;
+        }
+        const runId = resolved.runId;
         const per = res.perAsk.find((p) => p.index === o.index);
         obs.feedback({
           run_id: runId,
