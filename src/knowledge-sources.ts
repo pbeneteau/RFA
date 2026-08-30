@@ -61,6 +61,33 @@ export function countDocs(dir: string): number {
   return n;
 }
 
+/**
+ * What a directory attach did NOT match, grouped by extension - so the "N files
+ * match" line stops hiding what it left out (dogfood 2026-08-30, F12/F14: an
+ * attach reported 623 matches while 616 were node_modules and the 262 files the
+ * pack existed for were excluded). `node_modules`, `.git` and dot-entries are
+ * NOT counted as skipped: the matcher excludes them by rule, and reporting a
+ * vendored tree as "skipped knowledge" would be its own noise.
+ */
+export function skippedByExtension(root: string, matched: Iterable<string>): { ext: string; count: number }[] {
+  if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) return [];
+  const keep = new Set([...matched].map((f) => path.resolve(f)));
+  const counts = new Map<string, number>();
+  const walk = (dir: string) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (e.name.startsWith(".") || e.name === "node_modules") continue;
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (!keep.has(path.resolve(full))) {
+        const ext = path.extname(e.name).toLowerCase() || "(no extension)";
+        counts.set(ext, (counts.get(ext) ?? 0) + 1);
+      }
+    }
+  };
+  walk(root);
+  return [...counts.entries()].map(([ext, count]) => ({ ext, count })).sort((a, b) => b.count - a.count);
+}
+
 /** The clones under a pack's knowledge directory, with what git says about each. */
 export function packClones(pack: AgentPack): CloneInfo[] {
   const kdir = path.join(pack.dir, "knowledge");

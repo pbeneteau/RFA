@@ -35,6 +35,7 @@ export const GLOBAL_OPTIONS: ParseArgsOptionsConfig = {
   color: { type: "boolean" },
   debug: { type: "boolean", default: false },
   help: { type: "boolean", short: "h", default: false },
+  version: { type: "boolean", short: "v", default: false },
 };
 
 export const GROUPS: { name: string; summary: string }[] = [

@@ -16,7 +16,7 @@ import { applyWorksheet, flagForReview, prepareWorksheet } from "../../evals/lab
 import { loadFixtures, runParity, type ParityVerdict } from "../../evals/parity.js";
 import { promoteCase } from "../../evals/promote.js";
 import type { HubDir } from "../../hubdir.js";
-import { countDocs, fileProvenance, isGitRemote, knowledgeStatus, packClones, pinCorpus, syncClone } from "../../knowledge-sources.js";
+import { countDocs, fileProvenance, isGitRemote, knowledgeStatus, packClones, pinCorpus, skippedByExtension, syncClone } from "../../knowledge-sources.js";
 import { describeReport, expandLogTargets, verifyLogFile, type LogReport } from "../../logverify.js";
 import { addKnowledge } from "../agentmd.js";
 import { attachKnowledge, AttachError, type Attachment } from "../attach.js";
@@ -98,9 +98,21 @@ export const knowledgeAdd: CommandDef = {
     }
     const { globs, attached } = att;
     const r = addKnowledge(file, globs);
-    const files = knowledgeFiles(requirePack(h, name)).length;
-    if (ctx.flags.json) return void ctx.ui.json({ agent: name, attached, globs, knowledge: r.knowledge, files, definition_changed: r.before !== r.after });
+    const matched = knowledgeFiles(requirePack(h, name));
+    const files = matched.length;
+    // What the attach left out (dogfood F12/F14): the "N files match" line hid
+    // that most of a repo attach was node_modules and the files the pack
+    // existed for were excluded by the md-only default. A directory attach now
+    // reports the top skipped extensions so the operator can widen a glob.
+    const walkRoot = att.clone ? att.clone.docsDir : (fs.existsSync(path.resolve(source)) && fs.statSync(path.resolve(source)).isDirectory() ? path.resolve(source) : null);
+    const skipped = walkRoot ? skippedByExtension(walkRoot, matched) : [];
+    if (ctx.flags.json) return void ctx.ui.json({ agent: name, attached, globs, knowledge: r.knowledge, files, skipped, definition_changed: r.before !== r.after });
     ctx.ui.done(`${name} reads ${attached}`, `${files} file(s) match its knowledge globs now`);
+    if (skipped.length) {
+      const top = skipped.slice(0, 4).map((x) => `${x.count} ${x.ext}`).join(", ");
+      const more = skipped.length > 4 ? `, +${skipped.length - 4} more type(s)` : "";
+      ctx.ui.note(`not matched: ${top}${more}`, `the globs match ${globs.map((g) => g.replace(/^.*\//, "")).join(", ")}; add a glob to agent.md to include another type (e.g. **/*.bru), or point --docs at a subdirectory`);
+    }
     if (r.before === r.after) ctx.ui.note("agent.md already listed these globs; nothing changed");
     else ctx.ui.note(`agent.md: knowledge now lists ${r.knowledge.length} glob(s)`, `the running resident keeps its old definition: rfa agent restart ${name}`);
   },

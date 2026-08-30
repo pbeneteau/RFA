@@ -58,12 +58,20 @@ async function main(argv: string[]): Promise<number> {
   } catch {
     globals = { values: {} };
   }
-  const g = globals.values as { dir?: string; json?: boolean; yes?: boolean; quiet?: boolean; color?: boolean; debug?: boolean; help?: boolean };
+  const g = globals.values as { dir?: string; json?: boolean; yes?: boolean; quiet?: boolean; color?: boolean; debug?: boolean; help?: boolean; version?: boolean };
   const tty = Boolean(process.stdout.isTTY && process.stdin.isTTY);
   const color = g.color === false ? false : g.color === true ? true : tty && !process.env.NO_COLOR && !g.json;
   const ui = new Ui({ color, json: Boolean(g.json), quiet: Boolean(g.quiet), tty });
   const ctx = new CliContext({ dir: g.dir, json: Boolean(g.json), yes: Boolean(g.yes), quiet: Boolean(g.quiet), debug: Boolean(g.debug) }, ui);
 
+  // `rfa --version` / `-v`: the flag every user reaches for first. It routed to
+  // the help with exit 2 until 2026-08-31 (dogfood F4); now it prints the same
+  // line the `version` command does. A real command word still wins (so
+  // `rfa agent --version` is not swallowed), which no command actually uses.
+  if (g.version && Router.commandWords(argv).length === 0) {
+    await version.run(ctx, { values: {}, positionals: [] } as never);
+    return 0;
+  }
   const found = router.find(argv);
   const words = Router.commandWords(argv);
   if (!found) {

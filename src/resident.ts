@@ -36,7 +36,7 @@ import {
   type ClaimHeld,
 } from "./writefence.js";
 import { guardedToProbe, probeGuardedBuiltin, probeIsFatal } from "./fenceprobe.js";
-import { declaredOfClass, fenceApplies } from "./toolclass.js";
+import { declaredOfClass, fenceApplies, toolHead } from "./toolclass.js";
 import { isWrappableServer, MCP_SANDBOX_ENV, mcpServerPolicy } from "./mcpsandbox.js";
 import { EGRESS_TOOL_NAME, egressBackstopMessage, egressPolicy, postureView } from "./egress.js";
 
@@ -50,7 +50,7 @@ const PLAN_MODE_NOTE = `
 
 MODE: plan. You propose and never act. Your acting tools are refused in this mode, so do not call them, do not write a plan file, and do not call ExitPlanMode: none of that exists here. Your ANSWER is the plan. Write it in full: every tool call you would make, in order, with the complete arguments (for a document, the complete title and content), so that a human can run it as written or switch you to ask mode and say "go".`;
 import { neutralize, renderWrapped, wrapTaskText } from "./wrap.js";
-import { approvalWindowMs, interruptMatch, joinSidekick, refusalForOutcome, requestApproval } from "./bridge.js";
+import { approvalWindowMs, CardLedger, interruptMatch, joinSidekick, refusalForOutcome, requestApproval } from "./bridge.js";
 import { MemoryGate, RoomMember, ServeRefusal, type ServeContext } from "./client.js";
 import { Engine, type ActionClaim } from "./engine.js";
 import { AccountLedger, isAuthError, isRateLimitError, pidAlive, spendDay, type Lane } from "./account.js";
@@ -947,6 +947,16 @@ function egressAlarmMessage(host: string): string {
   );
 }
 
+function cardBackstopMessage(tool: string): string {
+  return (
+    `card alarm: this pack cards \`${tool}\` (its \`interrupt_on\` names it), so every execution must pause on a human approval, ` +
+    `and one ran without a card. The SDK approves a tool once per session and then stops consulting the callback, so a later ` +
+    `execution of an already-approved tool is not offered to a human (measured 2026-08-30). Failing the run: an approval that ` +
+    `becomes session-wide permission is not the promise the pack made. A carded command pack should serve one command per run, ` +
+    `or the approval model needs a per-call hook rather than the SDK's cached callback.`
+  );
+}
+
 const SCRATCH_ROOT = path.join(pack.dir, "scratch");
 
 /**
@@ -970,6 +980,12 @@ const FENCED_PACK = fenceApplies(pack.def);
 
 /** The command-class built-ins this pack declares: door two's whole reason on a non-writing pack. */
 const COMMAND_BUILTINS = declaredOfClass(pack.def.tools?.allow, "command");
+/**
+ * The command-class built-ins this pack CARDS (its `interrupt_on` names them):
+ * the tools the card backstop watches. A command pack that cards none of its
+ * commands makes no per-execution promise, so there is nothing to backstop.
+ */
+const CARDED_COMMANDS = new Set(COMMAND_BUILTINS.filter((t) => interruptMatch(pack.def.interrupt_on, t) !== null));
 
 /**
  * This pack's declared network posture, as door two's policy (RFA-0.9 sect. 4).
@@ -1452,6 +1468,20 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
    * overlapping run can never inherit another turn's alarm.
    */
   let egressAlarm: string | null = null;
+  /**
+   * The CARD BACKSTOP (RFA-0.4 sect. 3.12, the approval promise). A pack whose
+   * `interrupt_on` names a command-class built-in has asked for a human card on
+   * every one of its executions. The SDK caches a permission decision per
+   * session, so after the first approvals `canUseTool` stops firing and later
+   * executions of the same tool run with no card (measured live 2026-08-30: two
+   * approved Bash cards, then 16 commands with none). This counts cards reached
+   * against executions seen: an execution with no card ahead of it is the cache
+   * bypassing the promise, and its arrival is an alarm exactly as the egress
+   * backstop's is. Keyed per tool HEAD, turn-local so an overlapping run cannot
+   * inherit another's count.
+   */
+  const cardLedger = new CardLedger(CARDED_COMMANDS);
+  let cardBypass: string | null = null;
   const q = query({
     prompt,
     options: {
@@ -1537,6 +1567,12 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
       allowedTools: [...posture.allowedTools, ...MCP_TOOLS],
       disallowedTools: pack.def.tools?.deny,
       canUseTool: async (toolName, input) => {
+        // Card backstop bookkeeping: this callback firing for a carded command
+        // tool IS the card being reached. Counted before any branch, because
+        // every path below (guarded fall-through, the card, a deny) still means
+        // door one was consulted for this call - which is the thing the SDK's
+        // permission cache later skips.
+        cardLedger.reached(toolHead(toolName));
         /**
          * Door one, reached by FALL-THROUGH (RFA-0.8 sect. 9 item 1).
          *
@@ -1826,6 +1862,16 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
       // lookup.
       for (const block of (msg.message.content ?? []) as { type?: string; id?: string; name?: string; input?: unknown }[]) {
         if (block.type !== "tool_use" || typeof block.name !== "string") continue;
+        // Card backstop: a carded command tool executing without a card ahead of
+        // it means the SDK's permission cache skipped door one. canUseTool fires
+        // BEFORE execution, so cardsReached must lead cardedExec; when it does
+        // not, this execution was never offered to a human.
+        const bypass = cardLedger.executed(toolHead(block.name));
+        if (bypass && !cardBypass) {
+          cardBypass = bypass;
+          log(`CARD BACKSTOP: ${bypass} executed without a card ahead of it; the SDK's session permission cache skipped door one, so the approval promise stopped being in force`);
+          void q.interrupt().catch((err: Error) => log(`card alarm: interrupt of ${run.runId} did not land: ${err.message}`));
+        }
         const target = retrievalTarget(block.name, block.input);
         if (target) retrieved.add(target);
         // Correlate a claimed action back to the SDK's own tool_use id, so the
@@ -1902,6 +1948,7 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
         // the one sentence that says the pack's declared posture stopped being
         // in force (RFA-0.9 sect. 4.7).
         if (egressAlarm) throw new Error(egressAlarmMessage(egressAlarm));
+        if (cardBypass) throw new Error(cardBackstopMessage(cardBypass));
         const detail = "result" in msg ? String(msg.result).slice(0, 200) : "";
         throw new Error(`brain error: ${[msg.subtype === "success" ? "" : msg.subtype, detail].filter(Boolean).join(": ") || "the SDK reported an error with no detail"}`);
       }
@@ -1918,6 +1965,7 @@ async function brainTurn(prompt: string, convoKey: string, run: RunContext): Pro
    * be correct is not a policy being enforced - it is the policy having stopped.
    */
   if (egressAlarm) throw new Error(egressAlarmMessage(egressAlarm));
+  if (cardBypass) throw new Error(cardBackstopMessage(cardBypass));
   if (!text) throw new Error("brain returned an empty result");
   return { text, costUsd, numTurns, tokens, retrieved: [...retrieved], refusal: clockRefusal };
   } finally {

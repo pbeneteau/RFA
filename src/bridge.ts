@@ -66,6 +66,40 @@ export function interruptMatch(
   return glob ? resolve(glob[1] as never) : null;
 }
 
+/**
+ * The card backstop's ledger (RFA-0.4 sect. 3.12's approval promise).
+ *
+ * A pack that cards a command tool has asked for a human approval on EVERY
+ * execution of it. The SDK caches a permission decision per session: after the
+ * first approvals `canUseTool` stops firing, so later executions of the same
+ * tool run with no card (measured live 2026-08-30: two approved Bash cards,
+ * then sixteen commands with none). This ledger makes the bypass observable.
+ *
+ * `canUseTool` fires BEFORE a tool executes, so a card must always lead its
+ * execution. `reached()` counts a card (the callback firing for the tool);
+ * `executed()` counts an execution and returns the tool NAME when that
+ * execution had no card ahead of it - the moment the cache skipped door one.
+ * Keyed per tool head; one ledger per turn.
+ */
+export class CardLedger {
+  private readonly cards = new Map<string, number>();
+  private readonly execs = new Map<string, number>();
+  constructor(private readonly carded: ReadonlySet<string>) {}
+
+  /** A carded tool reached the callback (a card was offered). No-op for others. */
+  reached(head: string): void {
+    if (this.carded.has(head)) this.cards.set(head, (this.cards.get(head) ?? 0) + 1);
+  }
+
+  /** A tool executed. Returns its head when the execution outran its cards (a bypass), else null. */
+  executed(head: string): string | null {
+    if (!this.carded.has(head)) return null;
+    const exec = (this.execs.get(head) ?? 0) + 1;
+    this.execs.set(head, exec);
+    return exec > (this.cards.get(head) ?? 0) ? head : null;
+  }
+}
+
 export interface ApprovalOutcome {
   approved: boolean;
   /** Edit-before-approve: the params the human substituted, when they did. */

@@ -96,3 +96,25 @@ test("over the real corpus, hints are distinct and none is a header fragment", (
     `${duplicated} of ${files.length} hints are shared with another file, so they cannot discriminate`,
   );
 });
+
+test("skippedByExtension: names what a directory attach left out, ignoring vendored trees", async () => {
+  const { skippedByExtension } = await import("../src/knowledge-sources.js");
+  const fs = await import("node:fs"); const os = await import("node:os"); const path = await import("node:path");
+  const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "rfa-skip-"));
+  try {
+    fs.mkdirSync(path.join(root, "sub"), { recursive: true });
+    fs.mkdirSync(path.join(root, "node_modules", "dep"), { recursive: true });
+    fs.writeFileSync(path.join(root, "a.md"), "x");
+    fs.writeFileSync(path.join(root, "b.md"), "x");
+    fs.writeFileSync(path.join(root, "c.bru"), "x");
+    fs.writeFileSync(path.join(root, "sub", "d.bru"), "x");
+    fs.writeFileSync(path.join(root, "e.tsv"), "x");
+    fs.writeFileSync(path.join(root, "node_modules", "dep", "README.md"), "x"); // vendored: never counted
+    // matched = the two .md files (what an md glob would take)
+    const matched = [path.join(root, "a.md"), path.join(root, "b.md")];
+    const skipped = skippedByExtension(root, matched);
+    assert.deepEqual(skipped, [{ ext: ".bru", count: 2 }, { ext: ".tsv", count: 1 }], "the .bru and .tsv left out are named; node_modules is not");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
