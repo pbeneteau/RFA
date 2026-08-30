@@ -37,7 +37,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { parseAgentMd } from "../src/agentdef.js";
-import { ALLOWLIST_DENY_REASON, EGRESS_TOOL_NAME, egressPolicy, ESTABLISHMENT_HOST, NO_APPROVER_DENY_REASON } from "../src/egress.js";
+import { ALLOWLIST_DENY_REASON, classifySubagentReport, EGRESS_TOOL_NAME, egressPolicy, ESTABLISHMENT_HOST, NO_APPROVER_DENY_REASON } from "../src/egress.js";
 import { MCP_SANDBOX_ENV, mcpServerPolicy } from "../src/mcpsandbox.js";
 import { nodeArgsFor } from "../src/proc.js";
 
@@ -415,23 +415,22 @@ await proof("whether a subagent-class child inherits the parent query's sandbox 
       maxTurns: 10,
     });
     const wrote = fs.existsSync(marker);
-    const reached = /HTTP:[1-5]\d\d/.test(r.text);
-    // Every shape the runtime's refusal actually takes, rather than only the
-    // annotated one: a subagent's report reaches the parent through a summary
-    // that may keep any of them.
-    const refused =
-      r.text.includes(ALLOWLIST_DENY_REASON) ||
-      r.text.includes("sandbox_violations") ||
-      r.text.includes("CONNECT tunnel failed") ||
-      /HTTP:000/.test(r.text) ||
-      /[Oo]peration not permitted|[Pp]ermission denied|not permitted/.test(r.text);
-    if (wrote || reached) {
-      return `MEASURED: a subagent child does NOT inherit the parent query's sandbox (wrote outside the allow root: ${wrote}; reached a host off the allow list: ${reached}); $${r.cost.toFixed(4)}`;
+    // The report is classified by src/egress.ts's own recognizer, pinned by
+    // test/egress.test.ts, instead of an inline regex list: the first version
+    // of this proof read curl's HTTP:000 as a refusal, and HTTP:000 is the one
+    // shape BOTH outcomes print (the confined refusal and an unsandboxed curl
+    // of an unresolvable host), so a degraded run reported "INHERITS" in green.
+    const report = classifySubagentReport(r.text);
+    if (wrote || report === "reached") {
+      return `MEASURED: a subagent child does NOT inherit the parent query's sandbox (wrote outside the allow root: ${wrote}; reached a host off the allow list: ${report === "reached"}); $${r.cost.toFixed(4)}`;
     }
-    if (refused) {
-      return `MEASURED: a subagent child INHERITS the parent query's sandbox (nothing was written outside the allow root, and the off-list host was refused); $${r.cost.toFixed(4)}`;
+    if (report === "refused") {
+      return `MEASURED: a subagent child INHERITS the parent query's sandbox (nothing was written outside the allow root, and the off-list host was refused with the sandbox's own voice); $${r.cost.toFixed(4)}`;
     }
-    last = r.text.slice(0, 300);
+    // "unsandboxed-shape" lands here on purpose: the child resolving the host
+    // itself is evidence AGAINST confinement, but a confined child that lost
+    // its proxy env prints the same thing, so it decides nothing alone.
+    last = `[${report}] ${r.text.slice(0, 300)}`;
   }
   throw new Error(
     `UNMEASURED after 2 attempts: the run neither escaped nor produced a refusal this platform recognizes. RFA-0.9 Appendix B item 8 stands - a pack with allow_subagents ` +

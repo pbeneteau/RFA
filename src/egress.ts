@@ -76,6 +76,48 @@ export function classifyDenial(annotated: string, reached: boolean): DenialKind 
   return "unclear";
 }
 
+/** What a subagent's second-hand report establishes about its own confinement. */
+export type SubagentReportKind = "refused" | "reached" | "unsandboxed-shape" | "unclear";
+
+/**
+ * Classify a SUBAGENT'S report of curling an off-list host (egress-proof 5).
+ *
+ * The report is second-hand text - whatever the child printed and the parent
+ * chose to repeat - so this reads only shapes that discriminate:
+ *
+ *   refused   a proxy-side refusal marker. Only the sandbox's own voice counts:
+ *             the allow-list reason, an srt violation record, the CONNECT
+ *             refusal, or the seatbelt's "operation not permitted".
+ *   reached   an actual HTTP status. The child got an answer from the network.
+ *   unsandboxed-shape   curl resolving the host ITSELF and failing (`curl: (6)`,
+ *             "Could not resolve host"). A confined child never resolves the
+ *             host - the proxy does - so this is evidence AGAINST confinement;
+ *             but a confined child that lost its proxy env prints the same
+ *             thing, so alone it proves nothing. It exists as its own kind so
+ *             the caller reports UNMEASURED instead of either verdict.
+ *   unclear   none of the above.
+ *
+ * `HTTP:000` is deliberately NOT a refusal marker. It is curl's "no response"
+ * code, printed by BOTH outcomes this classifier exists to tell apart - the
+ * confined refusal (RFA-0.9 sect. 4.3's measured shape) and an unsandboxed curl
+ * of an unresolvable host - so reading it as a refusal turns an unmeasurable
+ * run into a green "INHERITS" verdict. That disjunct shipped in the first
+ * version of proof 5 and was the audit's rank-2 finding (2026-08-30).
+ */
+export function classifySubagentReport(text: string): SubagentReportKind {
+  if (
+    text.includes(ALLOWLIST_DENY_REASON) ||
+    text.includes("sandbox_violations") ||
+    text.includes("CONNECT tunnel failed") ||
+    /[Oo]peration not permitted|[Pp]ermission denied|not permitted/.test(text)
+  ) {
+    return "refused";
+  }
+  if (/HTTP:[1-5]\d\d/.test(text)) return "reached";
+  if (/curl: \(6\)|[Cc]ould not resolve host/.test(text)) return "unsandboxed-shape";
+  return "unclear";
+}
+
 /** The subset of srt's `NetworkConfig` this platform sets. `strictAllowlist` is never optional (sect. 4.3). */
 export interface EgressPolicy {
   allowedDomains: string[];

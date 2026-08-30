@@ -25,11 +25,11 @@ import { surfaceReport } from "../src/surface.js";
 import { isWrappableServer, mcpServerPolicy, shellQuote } from "../src/mcpsandbox.js";
 import { hasWriteSurface, sandboxAvailable, sandboxPolicy, type SandboxProbe } from "../src/writefence.js";
 import { renderWrapped } from "../src/wrap.js";
-import { classifyDenial, egressBackstopMessage, egressPolicy, postureView } from "../src/egress.js";
+import { classifyDenial, egressBackstopMessage, egressPolicy, postureView, classifySubagentReport } from "../src/egress.js";
 import { dropNestedKey, editPack } from "../src/cli/agentmd.js";
 import { inertNetworkKeys } from "../src/cli/commands/doctor.js";
 import { consolidationQueryOptions, llmOnce, withIsolatedCwd } from "../src/consolidate.js";
-import { importsSdkQuery, siteDeclarationFailures, unlistedQueryModules } from "../src/querysites.js";
+import { importsSdkQuery, siteDeclarationFailures, unlistedQueryModules, spawnsClaudeCli } from "../src/querysites.js";
 
 // ---------------------------------------------------------------- rung 1 (sect. 4.6)
 
@@ -692,4 +692,41 @@ test("14.11: the verifier's note is peer text and goes inside the task boundary"
   assert.match(src, /verificationNote\(t\) \? `verification\.note: \$\{verificationNote\(t\)\}` : null/, "the note is a bounded field");
   assert.match(src, /verification: v \? \{ pending: v\.pending, verifier: v\.verifier, verifier_home: v\.verifier_home, verdict: v\.verdict, rejections: v\.rejections \} : v/, "and meta keeps only the hub-stamped half");
   assert.doesNotMatch(src, /reply_by: t\.reply_by, verification: t\.verification/, "the whole verification object must not go back into meta");
+});
+
+test("classifySubagentReport: HTTP:000 is the shape both outcomes print, so it decides nothing", () => {
+  // The audit's rank-2 finding (2026-08-30): the first version of egress-proof 5
+  // read HTTP:000 as a refusal. The confined refusal prints it (RFA-0.9 sect.
+  // 4.3's measured shape) - and so does an UNSANDBOXED curl of an unresolvable
+  // host, which is exactly the degraded run the proof exists to catch.
+  assert.equal(classifySubagentReport("the subagent reported: HTTP:000"), "unclear", "HTTP:000 alone proves nothing and must fall to UNMEASURED");
+  // the sandbox's own voice, in any of its shapes, is a refusal
+  assert.equal(classifySubagentReport("curl failed: host is not on the allow list\nHTTP:000"), "refused");
+  assert.equal(classifySubagentReport("stderr: CONNECT tunnel failed, response 403\nHTTP:000"), "refused");
+  assert.equal(classifySubagentReport("sandbox_violations: [net]"), "refused");
+  assert.equal(classifySubagentReport("sh: Operation not permitted"), "refused");
+  // an actual status line is the network answering: the child got OUT
+  assert.equal(classifySubagentReport("here is the output HTTP:200"), "reached");
+  assert.equal(classifySubagentReport("HTTP:403 from the origin"), "reached");
+  // the child resolving the host ITSELF is the unsandboxed shape - named, not
+  // read as either verdict, because a confined child without its proxy env
+  // prints the same thing
+  assert.equal(classifySubagentReport("curl: (6) Could not resolve host: rfa-egress-establishment.invalid\nHTTP:000"), "unsandboxed-shape");
+  assert.equal(classifySubagentReport("could not resolve host"), "unsandboxed-shape");
+  // a refusal marker beats the DNS shape when both appear: the proxy spoke
+  assert.equal(classifySubagentReport("curl: (6) Could not resolve host\nhost is not on the allow list"), "refused");
+});
+
+test("the third reach: a claude-CLI spawn in prompt mode is a model call the inventory must name", () => {
+  // The judge reached the model with no SDK import for as long as the scan
+  // anchored on imports alone (audit 2026-08-30, rank 4). The detector anchors
+  // on prompt mode, because the binary name alone also matches `claude auth
+  // status` and `claude --version`, which spend no tokens - the first draft
+  // flagged both.
+  assert.equal(spawnsClaudeCli('spawn("claude", ["-p", "--model", m], { cwd })'), true);
+  assert.equal(spawnsClaudeCli("execFileSync('claude', ['--print', prompt])"), true);
+  assert.equal(spawnsClaudeCli('execFileSync("claude", ["auth", "status"])'), false, "a metadata subcommand is not a model call");
+  assert.equal(spawnsClaudeCli('execFileSync("claude", ["--version"])'), false);
+  assert.equal(spawnsClaudeCli('// spawn("claude", ["-p"]) in a comment'), false, "comments are stripped, as the import anchor strips them");
+  assert.equal(spawnsClaudeCli('spawnEntry("resident.ts", ["-p"])'), false, "tsx entries are not the CLI");
 });

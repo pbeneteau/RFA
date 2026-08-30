@@ -223,7 +223,11 @@
   <form id="join-form">
     <label>Room handle <input id="f-room" placeholder="r_XXXXXXXXXX" required autocomplete="off"></label>
     <label>Join secret <input id="f-secret" placeholder="required unless the room is open" autocomplete="off"></label>
-    <label>Your name <input id="f-name" value="console" required maxlength="64"></label>
+    <!-- NOT "console": that is a reserved first token (wire 4.1) and the guard
+         refuses it for an observer join, which carries no human key. A
+         supervisor join presenting the key may still type it: the operator
+         principal is the exemption. -->
+    <label>Your name <input id="f-name" value="viewer" required maxlength="64"></label>
     <label>Role
       <select id="f-role">
         <option value="observer" selected>observer (read-only)</option>

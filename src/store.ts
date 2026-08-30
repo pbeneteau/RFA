@@ -2671,12 +2671,16 @@ export class RoomHub {
           room.policies.max_members = n;
           changes.max_members = n;
         }
-        // The two 0.1.9 task budgets, settable like every other room policy
-        // (spec 5.1). Both were MEASURED ABSENT in Appendix F, so shipping them
-        // without a way to tune them would just move the problem.
+        // The FOUR task policies of spec 5.1, settable like every other room
+        // policy: 5.1 says "all mutable via set_policy" and this loop held only
+        // two of them until 2026-08-30 (audit rank 7), while max_rejections
+        // already had a live reader (the 10.4 cap below) that could never be
+        // tuned and max_attempts_default had no reader at all.
         for (const [key, lo, hi] of [
           ["max_claims_per_member", 1, 100],
           ["task_actions_per_min", 1, 600],
+          ["max_rejections", 1, 100],
+          ["max_attempts_default", 1, 100],
         ] as const) {
           if (patch[key] === undefined) continue;
           const n = Number(patch[key]);
@@ -2725,7 +2729,7 @@ export class RoomHub {
         if (Object.keys(changes).length === 0) {
           throw new RfaError(
             "bad_request",
-            "set_policy accepts params.policies with mode, moderator, attention, max_members, member_rpm, max_pending_requests, join_bearer_sha256, history_visibility, max_claims_per_member, task_actions_per_min",
+            "set_policy accepts params.policies with mode, moderator, attention, max_members, member_rpm, max_pending_requests, join_bearer_sha256, history_visibility, max_claims_per_member, task_actions_per_min, max_rejections, max_attempts_default",
           );
         }
         intervene(null, { changes });
@@ -3017,7 +3021,15 @@ export class RoomHub {
           // while create silently dropped it, so every task was born single-attempt
           // and one network hiccup burned a remote worker's only try. The creator
           // caps its own task here; RAISING it later stays privileged (see update).
-          ...(args.max_attempts !== undefined ? { max_attempts: args.max_attempts } : {}),
+          // Absent, it defaults from the room policy (spec 10.2: "max_attempts
+          // defaults from policies.max_attempts_default"), STAMPED at create so
+          // the task carries the number it was born under; that policy had zero
+          // readers until 2026-08-30 (audit rank 7).
+          ...(args.max_attempts !== undefined
+            ? { max_attempts: args.max_attempts }
+            : room.policies.max_attempts_default !== undefined
+              ? { max_attempts: room.policies.max_attempts_default }
+              : {}),
           verification: { pending: false, verifier: null, verdict: null, note: null },
           note: args.note ?? null,
           created_at: iso(now),
@@ -3135,7 +3147,9 @@ export class RoomHub {
         // document or moved money in infrastructure this hub cannot see, and a
         // terminal `failed` would assert that it did not.
         const attempt = (task.attempt ?? 0) + 1;
-        const maxAttempts = task.max_attempts ?? DEFAULT_MAX_ATTEMPTS;
+        // Tasks born before the policy existed carry no field; the room policy
+        // is the spec's fallback before the constant (5.1, default 1).
+        const maxAttempts = task.max_attempts ?? room.policies.max_attempts_default ?? DEFAULT_MAX_ATTEMPTS;
         if (attempt > maxAttempts) {
           const privileged = member.id === task.created_by || member.isHost || member.origin === "human";
           if (!privileged) {
@@ -3475,7 +3489,10 @@ export class RoomHub {
     let replayed = 0;
     for (const e of room.events) {
       if (e.seq > watchSince && this.matches(room, e, member, filter)) {
-        args.deliver({ room: room.handle, member: member.id, cursor: e.seq, event: this.eventForReader(member, e) });
+        // withWrapped, not eventForReader alone: 9.6's MUST names the push
+        // plane, and this replay path shipped without the boundary rendering
+        // until 2026-08-30 while two surfaces claimed it was everywhere.
+        args.deliver({ room: room.handle, member: member.id, cursor: e.seq, event: this.withWrapped(member, [e])[0] });
         replayed++;
       }
     }
@@ -3509,7 +3526,8 @@ export class RoomHub {
       for (const e of events) {
         if (!this.matches(room, e, member, w.filter)) continue;
         try {
-          w.deliver({ room: room.handle, member: member.id, cursor: e.seq, event: this.eventForReader(member, e) });
+          // Same rule as the replay path above: the push plane owes `wrapped`.
+          w.deliver({ room: room.handle, member: member.id, cursor: e.seq, event: this.withWrapped(member, [e])[0] });
           notified.add(member.id);
           // Receiving proves the connection is alive: extend the lease.
           member.leaseExpires = Math.max(member.leaseExpires, this.cfg.now() + member.ttlS * 1000);

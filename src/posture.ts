@@ -22,6 +22,7 @@
  */
 import type { AgentDef } from "./agentdef.js";
 import { interruptMatch } from "./bridge.js";
+import { toolHead } from "./toolclass.js";
 import { guardedBuiltinsOf } from "./writefence.js";
 
 export const MODES = ["ask", "plan", "bypass"] as const;
@@ -48,7 +49,21 @@ export type SdkPermissionMode = "default" | "acceptEdits" | "bypassPermissions" 
  * blocklist could never promise.
  */
 export function declaredBuiltins(def: AgentDef): string[] {
-  return (def.tools?.allow ?? []).filter((t) => !t.startsWith("mcp__"));
+  // HEADS, deduplicated: this list is the SDK's base `tools` option, whose
+  // grammar is tool NAMES. A specifier entry (`Bash(git:*)`) is a permission
+  // rule and belongs in `allowedTools`, where `preApproved` keeps it verbatim;
+  // passing it here as a "name" declares nothing the SDK recognizes.
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const t of def.tools?.allow ?? []) {
+    if (t.startsWith("mcp__")) continue;
+    const head = toolHead(t);
+    if (!seen.has(head)) {
+      seen.add(head);
+      out.push(head);
+    }
+  }
+  return out;
 }
 
 export interface Posture {
@@ -92,7 +107,10 @@ export function actingTools(def: AgentDef): string[] {
  * removing every check this platform puts behind it.
  */
 function preApproved(allow: string[], acting: string[], guarded: string[]): string[] {
-  return allow.filter((t) => !acting.includes(t) && !guarded.includes(t));
+  // `guarded` is HEADS (see `guardedBuiltinsOf`), so the exclusion compares the
+  // entry's head: `Write(scratch/**)` must not slip through as "not Write" and
+  // land bare in `allowedTools`, which is what auto-approves it past door one.
+  return allow.filter((t) => !acting.includes(t) && !guarded.includes(toolHead(t)));
 }
 
 export function agentPosture(def: AgentDef): Posture {

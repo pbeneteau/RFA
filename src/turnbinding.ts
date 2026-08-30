@@ -74,7 +74,17 @@ export interface TurnBinding {
  * Both call it now.
  */
 export const provenanceFromTurn = (t: TurnBinding | null): WriteProvenance | null =>
-  t ? { requester_home: t.requesterHome ?? "local", room: t.room ?? null } : null;
+  t
+    ? {
+        requester_home: t.requesterHome ?? "local",
+        room: t.room ?? null,
+        // The other three of sect. 4 item 4's five fields, which sat RIGHT HERE
+        // on the binding while the provenance carried two (audit 2026-08-30).
+        run_id: t.runId,
+        conversation_id: t.conversationId ?? null,
+        lane: t.lane,
+      }
+    : null;
 
 export class TurnRegister {
   private live: TurnBinding[] = [];

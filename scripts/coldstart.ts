@@ -110,7 +110,11 @@ try {
   if (!out.started || !out.ready) throw new Error(`agent never became ready: ${JSON.stringify({ started: out.started, ready: out.ready })}\n${init.stderr.slice(-1500)}`);
   first = out.first_answer;
   if (!first || first.kind !== "response") throw new Error(`no answer: ${JSON.stringify(first)}`);
-  if (!/7\.2|lease/i.test(first.text)) throw new Error(`the answer does not cite the lease section: ${first.text.slice(0, 200)}`);
+  // The citation must name the SOURCE (the shipped spec file or its section
+  // number), never the question's own keyword: "lease" is in the question, so
+  // an answer that merely echoed the noun passed the old check without having
+  // read anything (audit 2026-08-30, rank 3).
+  if (!/RFA-0\.1|\b7\.2\b/i.test(first.text)) throw new Error(`the answer does not cite the spec (RFA-0.1 or section 7.2): ${first.text.slice(0, 200)}`);
   if (!out.human_key?.startsWith("hk_")) throw new Error("the human key was not shown once");
   verdict = `answered in ${first.elapsed_s}s${first.cost_usd != null ? `, $${first.cost_usd}` : ""}: ${first.text.slice(0, 120).replace(/\n/g, " ")}…`;
   // 4. The readers, against the live daemons.

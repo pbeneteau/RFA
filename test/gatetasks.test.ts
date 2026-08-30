@@ -214,3 +214,45 @@ test("an envelope check input is version 1, and the envelope itself is not mutat
   assert.equal("check_input_version" in msg!.envelope!, false, "the check input is a view, never the envelope itself");
   hub.close();
 });
+
+// ---------------------------------------------------------------- spec 5.1: the four task policies are all settable (audit 2026-08-30, rank 7)
+
+test("set_policy accepts max_rejections and max_attempts_default, and the caps they tune obey them", async () => {
+  const { hub, room, hostTok, workerTok } = setup();
+  // Until 2026-08-30 the loop held two of spec 5.1's four "all mutable via
+  // set_policy" policies: max_rejections had a live reader that could never be
+  // tuned, and max_attempts_default had no reader at all.
+  const res = (await hub.admin({
+    room, membership_token: hostTok, verb: "set_policy",
+    params: { policies: { max_rejections: 1, max_attempts_default: 2 } },
+  })) as { policies: { max_rejections?: number; max_attempts_default?: number } };
+  assert.equal(res.policies.max_rejections, 1);
+  assert.equal(res.policies.max_attempts_default, 2);
+
+  // max_attempts_default's reader: a task created WITHOUT max_attempts is
+  // STAMPED with the room policy (spec 10.2), so it carries the number it was
+  // born under.
+  const created = (await hub.task({ room, membership_token: hostTok, action: "create", title: "work", evidence_required: true })) as { id: string; max_attempts?: number };
+  assert.equal(created.max_attempts, 2, "a task born under max_attempts_default: 2 is stamped with it");
+
+  // max_rejections' reader: with the cap tuned to 1, the SECOND reject on one
+  // attempt is refused (spec 10.4), where the default cap of 3 would allow it.
+  const ev = { summary: "done", artifacts: ["x"] };
+  await hub.task({ room, membership_token: workerTok, action: "claim", id: created.id });
+  await hub.task({ room, membership_token: workerTok, action: "complete", id: created.id, evidence: ev });
+  await hub.task({ room, membership_token: hostTok, action: "verify", id: created.id, verdict: "reject", note: "no" });
+  await hub.task({ room, membership_token: workerTok, action: "complete", id: created.id, evidence: ev });
+  const err = await fails(() => hub.task({ room, membership_token: hostTok, action: "verify", id: created.id, verdict: "reject", note: "still no" }));
+  assert.match(err.message, /rejected 1 time\(s\) on attempt 1/, "the tuned cap of 1 refuses the second reject on this attempt; the default of 3 would have allowed it");
+  hub.close();
+});
+
+test("bounds hold: a max_rejections of 0 and a max_attempts_default of 0 are refused", async () => {
+  const { hub, room, hostTok } = setup();
+  for (const policies of [{ max_rejections: 0 }, { max_attempts_default: 0 }, { max_rejections: 101 }]) {
+    const err = await fails(() => hub.admin({ room, membership_token: hostTok, verb: "set_policy", params: { policies } }));
+    assert.match(err.message, /must be 1\.\.100/);
+  }
+  hub.close();
+});
+

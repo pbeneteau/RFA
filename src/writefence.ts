@@ -40,7 +40,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentDef } from "./agentdef.js";
-import { GUARDED_BUILTINS, type GuardedBuiltin } from "./toolclass.js";
+import { declaredOfClass, GUARDED_BUILTINS, toolHead, type GuardedBuiltin } from "./toolclass.js";
 import { ALLOWLIST_DENY_REASON, classifyDenial, ESTABLISHMENT_HOST, NO_APPROVER_DENY_REASON, type EgressPolicy } from "./egress.js";
 
 /**
@@ -65,13 +65,34 @@ const TARGET_FIELD: Record<GuardedBuiltin, string> = {
   NotebookEdit: "notebook_path",
 };
 
+/**
+ * Is this tool, or `tools.allow` entry, a guarded built-in? Matches on the HEAD
+ * (the substring before the first `(`), exactly as the classification table
+ * does (RFA-0.9 sect. 3.1: a specifier form is the same declaration).
+ *
+ * This was an exact string compare until 2026-08-30, and the mismatch was the
+ * defect: `fenceApplies` head-matched while this did not, so a pack declaring
+ * `Write(scratch/**)` - grammar the validator accepts - was FENCED by the
+ * coverage predicate while `guardedBuiltinsOf` returned []. Door one then had
+ * nothing to guard, the entry landed bare in `allowedTools` where it is
+ * auto-approved before `canUseTool` is consulted, and every fail-closed check
+ * built to notice (the boot deny probe, `shadowingFailures`, doctor's fence
+ * row) was handed an empty guarded set and found nothing to check. Measured
+ * before the fix: `allowedTools: ["Write(scratch/**)"]`, `guarded: []`.
+ */
 export function isGuardedBuiltin(tool: string): tool is GuardedBuiltin {
-  return (GUARDED_BUILTINS as readonly string[]).includes(tool);
+  return (GUARDED_BUILTINS as readonly string[]).includes(toolHead(tool));
 }
 
-/** The guarded built-ins THIS pack declares: its declared write surface, tool by tool. */
+/**
+ * The guarded built-ins THIS pack declares: its declared write surface, tool by
+ * tool. HEADS, deduplicated, through the classification table itself, so the
+ * fence and the class table cannot disagree about what is guarded - and so a
+ * specifier entry yields the NAME the SDK's callback will present and
+ * `TARGET_FIELD` is keyed on, never the entry verbatim.
+ */
 export function guardedBuiltinsOf(def: Pick<AgentDef, "tools">): GuardedBuiltin[] {
-  return (def.tools?.allow ?? []).filter(isGuardedBuiltin);
+  return declaredOfClass(def.tools?.allow, "guarded") as GuardedBuiltin[];
 }
 
 /**
@@ -118,7 +139,10 @@ export function shadowingFailures(input: {
   permissionMode?: string;
 }): string[] {
   const fails: string[] = [];
-  const bare = input.allowedTools.filter((t) => input.guarded.includes(t));
+  // Head-match, for the same reason `isGuardedBuiltin` does: a SCOPED entry
+  // (`Write(scratch/**)`) in `allowedTools` is a permission rule that auto-
+  // approves matching calls, which bypasses door one for exactly those paths.
+  const bare = input.allowedTools.filter((t) => input.guarded.includes(toolHead(t)));
   if (bare.length > 0) {
     fails.push(
       `${bare.join(", ")} ${bare.length === 1 ? "is" : "are"} listed bare in allowedTools: a bare entry auto-approves the whole tool ` +

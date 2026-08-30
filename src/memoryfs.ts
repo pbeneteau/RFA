@@ -56,6 +56,16 @@ export interface WriteProvenance {
   requester_home: string;
   /** The room the turn was serving. */
   room: string | null;
+  /**
+   * The remaining three of sect. 4 item 4's five required fields ("every file
+   * mutation MUST record run id, conversation, lane, and the hub-derived
+   * requester_home and room"). They sat on the TurnBinding at the only call
+   * site while the provenance carried two of five (audit 2026-08-30, rank 8).
+   * Null on records written before 2026-08-30 and on the e2e's synthetic turns.
+   */
+  run_id?: string | null;
+  conversation_id?: string | null;
+  lane?: string | null;
 }
 
 /** One recorded write: its provenance plus whether it is quarantined and when it was promoted. */
@@ -289,6 +299,10 @@ export class GatedMemory {
       if (meta?.read_only) throw new Error(`block ${path.basename(abs)} is read_only`);
     }
     fs.rmSync(abs, { recursive: true, force: true });
+    // The index entry goes with the file (directories take every child entry):
+    // a record describing a path that no longer exists makes provenanceIndex()
+    // lie to the operator and the consolidation lane.
+    this.dropRecords(abs);
     return `deleted ${p}`;
   }
 
@@ -297,7 +311,39 @@ export class GatedMemory {
     const b = this.resolve(to);
     fs.mkdirSync(path.dirname(b), { recursive: true });
     fs.renameSync(a, b);
+    // The provenance record MOVES with the file, quarantine flag included.
+    // Until 2026-08-30 (audit rank 8) it stayed keyed on the OLD path, so
+    // renaming a quarantined block dropped its record and compileBlocks()
+    // injected the renamed file into other turns' prompts - the exact read the
+    // quarantine exists to withhold. Rename is the consolidation lane's verb,
+    // but a lane that can silently lift a quarantine by renaming is not
+    // "defer, review, admit"; promotion stays the explicit promote() above.
+    this.moveRecords(a, b);
     return `renamed ${from} -> ${to}`;
+  }
+
+  /** Remove every index entry at or under this absolute path. */
+  private dropRecords(abs: string): void {
+    const rel = path.relative(this.root, abs);
+    const index = this.readProvenance();
+    const keys = Object.keys(index).filter((k) => k === rel || k.startsWith(rel + "/"));
+    if (keys.length === 0) return;
+    for (const k of keys) delete index[k];
+    this.writeProvenance(index);
+  }
+
+  /** Re-key every index entry at or under `fromAbs` onto `toAbs`, records intact. */
+  private moveRecords(fromAbs: string, toAbs: string): void {
+    const fromRel = path.relative(this.root, fromAbs);
+    const toRel = path.relative(this.root, toAbs);
+    const index = this.readProvenance();
+    const keys = Object.keys(index).filter((k) => k === fromRel || k.startsWith(fromRel + "/"));
+    if (keys.length === 0) return;
+    for (const k of keys) {
+      index[toRel + k.slice(fromRel.length)] = index[k];
+      delete index[k];
+    }
+    this.writeProvenance(index);
   }
 
   /** Letta XML rendering of core blocks, for the system prompt (spec 5.1). */

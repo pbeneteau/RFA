@@ -77,6 +77,18 @@ const policiesSchema = z
       .optional()
       .describe("Default joined_after: members read only what happened after their join. 'member' opts a shared-workspace room back into full history"),
     max_members: z.number().int().min(2).max(256).optional(),
+    // The numeric budgets of spec 5.1, admitted at create with set_policy's own
+    // bounds. Every one of these was silently STRIPPED at room_create until
+    // 2026-08-30 (audit rank 7): the strict parse drops unknown keys, so a
+    // creator passing a task policy lost it with no error. message_ttl_s stays
+    // out deliberately - it has no reader, and a schema key nothing reads is an
+    // inert setting.
+    member_rpm: z.number().int().min(1).max(600).nullable().optional(),
+    max_pending_requests: z.number().int().min(1).max(100).nullable().optional(),
+    max_claims_per_member: z.number().int().min(1).max(100).optional(),
+    task_actions_per_min: z.number().int().min(1).max(600).optional(),
+    max_rejections: z.number().int().min(1).max(100).optional(),
+    max_attempts_default: z.number().int().min(1).max(100).optional(),
     join_bearer_sha256: z
       .array(z.string().regex(/^[0-9a-f]{64}$/))
       .max(16)
@@ -540,7 +552,7 @@ export function createHubServer(hub: RoomHub): McpServer {
         "membership), quarantine (evict + refuse that identity's re-join), inject (speak as the supervisor: " +
         "params.text, optional params.mentions/kind/conversation_id/in_reply_to), cancel_task (target = task id), " +
         "approve/reject (target = approval request_id; approve requires a human-origin principal), set_policy " +
-        "(params.policies: mode/moderator/attention/max_members/member_rpm/max_pending_requests/join_bearer_sha256/history_visibility), " +
+        "(params.policies: mode/moderator/attention/max_members/member_rpm/max_pending_requests/join_bearer_sha256/history_visibility/max_claims_per_member/task_actions_per_min/max_rejections/max_attempts_default), " +
         "set_role (host only; params.role), grant_floor " +
         "(assign the floor; also allowed for the designated moderator). Targets are member refs unless noted.",
       inputSchema: advertised("room_admin", {

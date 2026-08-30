@@ -245,6 +245,66 @@ test("a write attributed to a non-local requester is withheld from OTHER turns, 
   }
 });
 
+test("a rename carries the quarantine with it, a delete takes the record with the file, and provenance holds all five fields", async () => {
+  const { GatedMemory } = await import("../src/memoryfs.js");
+  const { MemoryGate } = await import("../src/client.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "rfa-quarantine-mv-"));
+  try {
+    let serving: import("../src/memoryfs.js").WriteProvenance | null = {
+      requester_home: "acme", room: "r_1", run_id: "run_1", conversation_id: "conv_1", lane: "serve",
+    };
+    const mem = new GatedMemory(root, new MemoryGate(), "m_self", () => serving);
+    mem.create("/memories/blocks/theirs.md", "---\nlabel: theirs\n---\nwhat a guest asked us to remember");
+
+    // Sect. 4 item 4's five fields, not two: run id, conversation and lane sat
+    // on the TurnBinding while the record carried home and room alone (audit
+    // 2026-08-30, rank 8).
+    const rec = mem.provenanceIndex()["blocks/theirs.md"];
+    assert.equal(rec.run_id, "run_1");
+    assert.equal(rec.conversation_id, "conv_1");
+    assert.equal(rec.lane, "serve");
+    assert.equal(rec.quarantined, true);
+
+    // The escape this pins: rename a quarantined block and the record used to
+    // stay keyed on the OLD path, so compileBlocks() injected the renamed file
+    // into other turns' prompts - the exact read the quarantine withholds.
+    mem.rename("/memories/blocks/theirs.md", "/memories/blocks/renamed.md");
+    assert.doesNotMatch(
+      mem.compileBlocks(),
+      /what a guest asked us to remember/,
+      "a rename must not lift a quarantine; promotion is promote()'s alone",
+    );
+    const moved = mem.provenanceIndex();
+    assert.equal(moved["blocks/theirs.md"], undefined, "the old key is gone");
+    assert.equal(moved["blocks/renamed.md"].quarantined, true, "the record moved intact");
+    assert.equal(moved["blocks/renamed.md"].run_id, "run_1");
+
+    // A delete takes the record with the file: an index describing a path that
+    // no longer exists lies to the operator and the consolidation lane.
+    mem.delete("/memories/blocks/renamed.md");
+    assert.equal(mem.provenanceIndex()["blocks/renamed.md"], undefined);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("provenanceFromTurn maps ALL five required fields off the binding, not two", async () => {
+  // The mutation this exists for: dropping run_id/conversation_id/lane from the
+  // mapper failed nothing, because the sibling test constructs its provenance
+  // literal directly. The mapper is the only production constructor, so it gets
+  // its own pin (RFA-0.8 sect. 4 item 4).
+  const { provenanceFromTurn } = await import("../src/turnbinding.js");
+  const p = provenanceFromTurn({
+    runId: "run_9", leaseId: null, agent: "pm", lane: "serve", chain: null,
+    replyBy: null, conversationId: "conv_9", taskId: null, requesterHome: "acme", room: "r_2",
+  });
+  assert.deepEqual(p, { requester_home: "acme", room: "r_2", run_id: "run_9", conversation_id: "conv_9", lane: "serve" });
+  assert.equal(provenanceFromTurn(null), null);
+});
+
 // ---------------------------------------------------------------- the guest branch, on the store
 
 test("a guest is refused a `local/…` key, and a guest blocked by one sees a digest and never the path", async () => {

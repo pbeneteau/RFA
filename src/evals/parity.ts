@@ -47,6 +47,24 @@ export function loadFixtures(file: string): ParityFixture[] {
   return parsed as ParityFixture[];
 }
 
+/**
+ * Does this answer carry a citation - a source name in the prose, or a
+ * machine-readable `sources` key in a structured part?
+ *
+ * The parts check requires the QUOTED form `"sources"`, exactly as the eval
+ * trajectory assertion does (`citations_present`), and the quoting is the
+ * check: `JSON.stringify` escapes every quote inside the answer's own text to
+ * `\"`, so the unescaped form can only be a real JSON key or string boundary.
+ * The first version used `.includes("sources")` over the stringified parts,
+ * which the TEXT part satisfies whenever the prose contains the word
+ * "sources" - or "resources", which contains it - so the citation gate passed
+ * on answers that cited nothing, and fed `feedback(score: 1)` on them (audit
+ * 2026-08-30, rank 3).
+ */
+export function answerCites(text: string, parts: unknown): boolean {
+  return /knowledge\/|\.mdx?\b/.test(text) || /"sources"/.test(JSON.stringify(parts) ?? "");
+}
+
 export async function runParity(o: {
   me: RoomMember;
   subjectId: string;
@@ -76,7 +94,7 @@ export async function runParity(o: {
       const ms = Date.now() - t0;
       const text = a.text;
       const missing = f.must_mention.filter((m) => !m.split("|").some((alt) => norm(text).includes(norm(alt))));
-      const cited = /knowledge\/|\.mdx?\b/.test(text) || JSON.stringify(a.parts).includes("sources");
+      const cited = answerCites(text, a.parts);
       const ok = a.kind === "response" && missing.length === 0 && cited;
       const claimed = (a.parts.find((p) => p.type === "json")?.value as { run_id?: string } | undefined)?.run_id ?? null;
       // The subject's own record decides which run this was, never its word

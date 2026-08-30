@@ -72,6 +72,27 @@ test("the guarded built-ins are in the SDK base tool set and OUT of allowedTools
   assert.equal(p.allowedTools.includes("Write"), false);
 });
 
+test("a SPECIFIER declaration is the same declaration: Write(scratch/**) is guarded, out of allowedTools, and named by its head", () => {
+  // The defect this pins (audit 2026-08-30, rank 1): isGuardedBuiltin compared
+  // exact strings while fenceApplies head-matched, so this grammar - which the
+  // validator accepts and RFA-0.9 sect. 3.1 blesses - produced a pack the
+  // coverage predicate called FENCED while guardedBuiltinsOf returned []. The
+  // entry then sat bare in allowedTools, auto-approved before canUseTool, with
+  // door one off and every fail-closed check handed an empty guarded set.
+  const spec = writingPack([], "['Read', 'Write(scratch/**)', 'Edit(src/**)', 'Write']");
+  assert.deepEqual(guardedBuiltinsOf(spec), ["Write", "Edit"], "heads, deduplicated: Write(scratch/**) and Write are ONE declaration");
+  assert.equal(hasWriteSurface(spec), true);
+  assert.equal(isGuardedBuiltin("Write(scratch/**)"), true);
+  const p = agentPosture(spec);
+  assert.deepEqual(p.guarded, ["Write", "Edit"]);
+  assert.deepEqual(p.allowedTools, ["Read"], "no guarded-headed entry may land in allowedTools, specifier form included");
+  assert.deepEqual(p.builtins, ["Read", "Write", "Edit"], "the SDK base tool set takes NAMES, so specifier entries collapse to their head");
+  // and the startup assert sees a scoped entry as the shadow it is
+  const fails = shadowingFailures({ guarded: ["Write"], allowedTools: ["Write(scratch/**)"] });
+  assert.equal(fails.length, 1);
+  assert.match(fails[0], /Write\(scratch\/\*\*\).*bare in allowedTools/);
+});
+
 test("a guarded built-in the pack ALSO gates is both, and stays out of allowedTools for both reasons", () => {
   // The interaction door one must not get wrong: a pack that names Write in
   // `interrupt_on` has asked for a human card on every write. The fence narrows

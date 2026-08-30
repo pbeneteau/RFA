@@ -481,6 +481,14 @@ test("room_watch pushes events over the connection with replay, live disposition
   assert.equal(pushed[0].event.envelope.seq, pre.seq);
   assert.equal(pushed[1].event.envelope.body[0].text, "pushed live");
   assert.equal(pushed[1].member, joined.you.id);
+  // 9.6's MUST names the push plane too: both the watch REPLAY (pushed[0]) and
+  // the live delivery (pushed[1]) carry the hub-rendered boundary. This shipped
+  // without it until 2026-08-30 while the hub's own instructions string said
+  // every message event has it.
+  for (const p of pushed) {
+    assert.equal(typeof p.event.wrapped, "string", "a pushed message event carries wrapped");
+    assert.ok(p.event.wrapped.includes("<room-message from="), "and it is the boundary rendering, not a copy of the body");
+  }
 
   // Unsubscribe: no further pushes, delivery downgrades to queued.
   await call(dev, "room_watch", {
@@ -909,5 +917,22 @@ test("9.3: the reply-to-my-own-message clause is bounded by a 500-entry cap, and
   assert.equal((await deliveredToTalker()).includes("sid-reply-new"), true, "a reply to a RECENT message still matches, so the reply path itself is fine");
   await send(replier.you.membership_token, { kind: "response", in_reply_to: "sid-0000", to: [host.contract.you.id], body: [{ type: "text", text: "addressed" }], message_id: "sid-reply-addr" });
   assert.equal((await deliveredToTalker()).includes("sid-reply-addr"), true, "an ADDRESSED reply matches on `to` before sentIds is consulted, which is why a conforming client never meets this");
+  hub.close();
+});
+
+test("room_create carries the task policies THROUGH the strict schema instead of stripping them", async () => {
+  // The layer matters: the strict parse (advertised vs validated, wire 15)
+  // deletes unknown keys, so this test goes through the MCP tool call, not the
+  // store. A store-level version of it kept passing while the schema stripped
+  // every one of these at the wire (audit 2026-08-30, rank 7 - and the first
+  // draft of THIS test was that store-level version).
+  const hub = new RoomHub({ dataDir: null, sweepIntervalMs: 0 });
+  const pm = await connectAgent(hub, "pm-host");
+  const created = await call(pm, "room_create", {
+    topic: "budgeted", name: "pm-agent", card: pmCard,
+    policies: { max_attempts_default: 3, max_rejections: 2, max_claims_per_member: 1, task_actions_per_min: 5, member_rpm: 30 },
+  });
+  const t = await call(pm, "room_task", { room: created.room, membership_token: created.you.membership_token, action: "create", title: "t" });
+  assert.equal(t.max_attempts, 3, "the create-time policy survived the strict parse and reached a task born in the room");
   hub.close();
 });

@@ -78,7 +78,7 @@ test("Appendix F rows agree with the code they describe", () => {
       section: "10.3",
       hint: /Claim leases/,
       rowSays: /`max_attempts`, which the schema advertised/,
-      codeHas: /args\.max_attempts !== undefined \? \{ max_attempts: args\.max_attempts \}/.test(store),
+      codeHas: /args\.max_attempts !== undefined\s*\?\s*\{ max_attempts: args\.max_attempts \}/.test(store),
       because: "create honors the max_attempts argument",
     },
     {

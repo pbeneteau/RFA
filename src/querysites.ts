@@ -21,6 +21,14 @@
  * module that never imports the SDK but is handed its `query` by a caller - is
  * not findable that way at all, so seams are listed explicitly with the marker
  * that proves the seam is still there.
+ *
+ * A THIRD REACH EXISTS and the import anchor is blind to it: spawning the
+ * `claude` CLI as a child process is a model call over the same account, with
+ * the same connectors, and it carried none of sect. 6's declarations for as
+ * long as nothing scanned for it - the evals judge ran rubric-plus-untrusted-
+ * trajectory prompts from the HUB ROOT that way (audit 2026-08-30, rank 4). So
+ * the scan anchors on the spawn too: reach "spawn", detected by
+ * `spawnsClaudeCli` below.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -31,11 +39,13 @@ export interface QuerySite {
   /** What this lane is for, in the words its own file uses. */
   lane: string;
   /**
-   * How this module reaches the SDK. `import` is a direct
+   * How this module reaches the model. `import` is a direct
    * `import { query } from "@anthropic-ai/claude-agent-sdk"`; `injected` is a
-   * seam whose caller hands it one, which no import scan can find.
+   * seam whose caller hands it one, which no import scan can find; `spawn` is a
+   * child process running the `claude` CLI, which is the same account and the
+   * same connectors with none of the SDK's options unless the argv carries them.
    */
-  reach: "import" | "injected";
+  reach: "import" | "injected" | "spawn";
   /** What sect. 6.1 requires this site to declare, and the source token that proves it declares it. */
   declares: {
     /** The SDK's base tool set this lane passes. `tools: []` is the empty-surface form sect. 6.1 mandates. */
@@ -98,6 +108,17 @@ export const QUERY_SITES: readonly QuerySite[] = [
     },
     markers: ["export type ProbeQuery", "settings: { disableClaudeAiConnectors: true }", "canUseTool:"],
   },
+  {
+    module: "src/evals/judge.ts",
+    lane: "the binary judge (RFA-0.5 sect. 20.1): a rubric plus an untrusted trajectory, spawned through the claude CLI on a cross-tier model",
+    reach: "spawn",
+    declares: {
+      tools: '`--tools ""` - the CLI\'s empty-surface form: every built-in ABSENT, plus `--strict-mcp-config` with no config so no MCP server exists',
+      cwd: "a fresh empty temp directory per call (withIsolatedCwd), never the hub root this spawn inherited until 2026-08-30",
+      refusal: "the empty tool set: a verdict needs no tools, so there is nothing to refuse",
+    },
+    markers: ['"--tools", ""', '"--strict-mcp-config"', "disableClaudeAiConnectors: true", "withIsolatedCwd("],
+  },
 ];
 
 /** Directories the check walks. `test/` is excluded: a test may construct a fake `query` freely. */
@@ -159,15 +180,35 @@ function walk(dir: string, out: string[]): void {
 }
 
 /**
- * Every module under `src/` and `scripts/` that imports the SDK's `query` and is
- * NOT in the inventory above. Empty is the only acceptable answer.
+ * Does this source text spawn the `claude` CLI in PROMPT mode - a model call?
+ *
+ * The third reach: no import to anchor on, so the anchor is the process API
+ * with the literal binary name AND `-p`/`--print` leading the argv, because the
+ * binary name alone is not a model call: this repository legitimately runs
+ * `claude auth status` (preflight) and `claude --version` (connect), which
+ * spend no tokens and read no prompt, and the first draft of this detector
+ * flagged both. A dynamically assembled argv would evade the anchor; this scan
+ * is a control against drift, not an adversary, and a lane hiding its prompt
+ * flag behind a variable has left "drift" territory already.
+ */
+export function spawnsClaudeCli(source: string): boolean {
+  return /\b(?:spawn|spawnSync|execFile|execFileSync)\(\s*["']claude["']\s*,\s*\[\s*["'](?:-p|--print)["']/.test(stripComments(source));
+}
+
+/**
+ * Every module under `src/` and `scripts/` that reaches the model - by
+ * importing the SDK's `query` OR by spawning the `claude` CLI - and is NOT in
+ * the inventory above. Empty is the only acceptable answer.
  */
 export function unlistedQueryModules(root: string): string[] {
   const listed = new Set(QUERY_SITES.map((s) => s.module));
   const files: string[] = [];
   for (const d of SCANNED) walk(path.join(root, d), files);
   return files
-    .filter((f) => importsSdkQuery(fs.readFileSync(f, "utf8")))
+    .filter((f) => {
+      const source = fs.readFileSync(f, "utf8");
+      return importsSdkQuery(source) || spawnsClaudeCli(source);
+    })
     .map((f) => path.relative(root, f).split(path.sep).join("/"))
     .filter((rel) => !listed.has(rel))
     .sort();
@@ -193,6 +234,9 @@ export function siteDeclarationFailures(root: string): string[] {
     const source = fs.readFileSync(file, "utf8");
     if (site.reach === "import" && !importsSdkQuery(source)) {
       out.push(`${site.module} is listed as importing the SDK's query and does not; move it to reach "injected" or take it off the list`);
+    }
+    if (site.reach === "spawn" && !spawnsClaudeCli(source)) {
+      out.push(`${site.module} is listed as spawning the claude CLI and does not; take it off the list or fix the detector`);
     }
     for (const marker of site.markers) {
       if (!source.includes(marker)) out.push(`${site.module} no longer contains ${JSON.stringify(marker)}, a declaration RFA-0.9 sect. 6.1 requires of it`);

@@ -9,10 +9,16 @@ A communication protocol for AI agents: join a **room**, discover the other memb
 ## Sixty seconds
 
 ```bash
-npx agent-com
+npm install -g git+ssh://git@github.com/pbeneteau/agent-com.git
+rfa
 ```
 
-In an empty folder, that opens the onboarding: first a check of the machine (Node, the SQLite binding, git, a logged-in `claude` or `ANTHROPIC_API_KEY`, which other model CLIs are around), then six questions, one per screen with the reason beside it and a default in every field; then it mints the credentials, scaffolds a first agent that answers about the protocol from the spec shipped in the package, creates a room, starts the hub and the supervisor, waits for the agent to come up, asks it the first question and shows the cited answer. Measured, in a real terminal: 27.8 seconds from "start now" to an answered question. `rfa init --yes` takes every default with no screen; `--ask "…"` asks the first question without a terminal.
+<!-- Path 3 of RFA-0.7 sect. 6.3, deliberately: the package is not on the public
+     registry (publishing is decision 1 of sect. 10, unmade), so an `npx
+     agent-com` first line resolves for nobody. The spec says which line goes
+     here until that decision is made. -->
+
+In an empty folder, `rfa` opens the onboarding: first a check of the machine (Node, the SQLite binding, git, a logged-in `claude` or `ANTHROPIC_API_KEY`, which other model CLIs are around), then six questions, one per screen with the reason beside it and a default in every field; then it mints the credentials, scaffolds a first agent that answers about the protocol from the spec shipped in the package, creates a room, starts the hub and the supervisor, waits for the agent to come up, asks it the first question and shows the cited answer. Measured, in a real terminal: 27.8 seconds from "start now" to an answered question. `rfa init --yes` takes every default with no screen; `--ask "…"` asks the first question without a terminal.
 
 Then, in that folder, `rfa` alone opens the **dashboard**: what is running, the agents, the rooms, the cards waiting for you, a room's log followed live, the labelling sitting over the review queue (pass or fail, the gold source, cut a case, apply: the same rows `rfa evals label --apply` writes), and a room's task board (new, accept or reject evidence, cancel); single keys for the usual verbs (`u` up, `r` restart the agent, `m` its mode, `y` approve, `a` ask, `!` flag a wrong answer for the sitting); and `:` for the palette, which searches every command, shows the exact command line before running it, and asks in place for what the command needs. The long commands get learned there. Outside it, `rfa completion zsh --install` gives tab completion that knows this directory's agent and room names, an unknown command suggests the right one, and a missing argument on a terminal is a question rather than a usage error.
 

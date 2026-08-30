@@ -8,6 +8,7 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
+import { withIsolatedCwd } from "../consolidate.js";
 import type { TrajectoryMessage } from "./trajectory.js";
 
 const DAILY_CAP = 50;
@@ -82,8 +83,31 @@ export async function claudeJudge(
     .map((m) => `${m.role.toUpperCase()}: ${m.content || (m.tool_calls ? m.tool_calls.map((t) => `${t.function.name}(${t.function.arguments})`).join("; ") : "")}`)
     .join("\n");
   const prompt = `${rubric.text}\n\n<trajectory>\n${transcript.slice(0, 30_000)}\n</trajectory>`;
-  const stdout = await new Promise<string>((resolve, reject) => {
-    const p = spawn("claude", ["-p", "--model", judgeModel, "--output-format", "json"], { stdio: ["pipe", "pipe", "pipe"] });
+  const stdout = await withIsolatedCwd(async (cwd) => new Promise<string>((resolve, reject) => {
+    /**
+     * The judge is a MODEL CALL over untrusted room text, so it carries the
+     * declared-surface discipline of RFA-0.9 sect. 6 even though it reaches the
+     * model through the CLI rather than the SDK's query() (it is inventoried in
+     * `src/querysites.ts` under reach "spawn"):
+     *
+     *   --tools ""            the empty-surface form sect. 6.1 mandates: every
+     *                         built-in ABSENT, not present behind a permission
+     *                         layer. A verdict needs no tools.
+     *   --strict-mcp-config   with no --mcp-config: no MCP server exists.
+     *   --settings            the same disableClaudeAiConnectors the SDK lanes
+     *                         pass, because the operator's claude.ai connectors
+     *                         ride the login, not a settings file.
+     *   cwd                   a fresh empty temp directory, never the hub root,
+     *                         which is what this spawn inherited until the
+     *                         2026-08-30 audit (rank 4): a prompt-injected
+     *                         trajectory judging itself inside the directory
+     *                         that holds .rfa/secrets.json.
+     */
+    const p = spawn(
+      "claude",
+      ["-p", "--model", judgeModel, "--output-format", "json", "--tools", "", "--strict-mcp-config", "--settings", JSON.stringify({ disableClaudeAiConnectors: true })],
+      { stdio: ["pipe", "pipe", "pipe"], cwd },
+    );
     let out = "";
     let err = "";
     const timer = setTimeout(() => {
@@ -98,7 +122,7 @@ export async function claudeJudge(
     });
     p.stdin.write(prompt);
     p.stdin.end();
-  });
+  }));
   const outer = JSON.parse(stdout) as { result?: string };
   // Binary: the verdict is a word, not a number, so the model cannot hedge into
   // the middle of a scale that carried no information anyway.
