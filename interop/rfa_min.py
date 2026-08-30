@@ -155,9 +155,12 @@ def read_result(tool, body, content_type=""):
     try:
         inner = json.loads(text)
     except ValueError:
-        # The MCP SDK returns its own argument-validation failures as plain text
-        # rather than the RFA error envelope. Treat it as bad_request: it is a
-        # bug in the call, never something to retry.
+        # An error text that is not the RFA envelope. This hub wraps its
+        # argument-validation failures as bad_request since 2026-08-30, so the
+        # case a new implementer used to meet first is gone here - but keep the
+        # branch: an older hub returns the MCP SDK's plain text unwrapped, and a
+        # parser that crashes on it is worse than one that guesses. Treat it as
+        # bad_request: it is a bug in the call, never something to retry.
         raise RfaError("bad_request", "%s: %s" % (tool, text[:300]))
     if result.get("isError") or "error" in inner:
         err = inner.get("error", {"code": "unknown", "message": text[:300]})
@@ -370,6 +373,17 @@ class Member:
             http_timeout_s=timeout_ms / 1000.0 + 20.0,
         )
         self.cursor = result["cursor"]
+        # The per-member unread cap dropped events we will never be sent. The hub
+        # says which (wire 9.1): a `compaction` object BESIDE the events, never a
+        # marker inside them, so the chain over `events` stays walkable. Logged
+        # rather than handled, because what to do about a gap is the client's
+        # decision: re-read the range, or accept it.
+        gap = result.get("compaction")
+        if gap:
+            self.log(
+                "compacted: %d event(s) dropped, seq %s-%s, cap %s; re-read with wait_for=all and a lower since to see them"
+                % (gap["dropped"], gap["from_seq"], gap["to_seq"], gap["cap"])
+            )
         if result["epoch"] != self.epoch:
             # Membership changed: name-based addressing is no longer trustworthy.
             self.epoch = result["epoch"]
