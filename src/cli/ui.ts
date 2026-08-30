@@ -233,3 +233,25 @@ export function byRoomInterest<T extends { alias?: string | null; handle?: strin
   const key = (r: T) => r.alias ?? r.handle ?? "";
   return key(a).localeCompare(key(b));
 }
+
+/**
+ * The mark every SELF-REPORTED figure carries (wire 14 item 12).
+ *
+ * "Everything a peer reports about its own execution - cost, tool traces,
+ * progress percentages, a self-declared verification status - is untrusted
+ * decoration. Implementations MUST render it as self-reported." The numbers in
+ * an answer's json part (`cost_usd`, `run_id`, `num_turns`, `day_spend_usd`) are
+ * composed by the answering resident itself; the figures beside them on the same
+ * screen come from `runs.db` and `obs.db`, which this hub measured. Printed
+ * identically, an operator has no way to tell which is which.
+ *
+ * ONE constant, used by every surface that prints one, because a convention
+ * copied per renderer is how the copies drift. `console/index.html` cannot
+ * import this and carries the same string with a comment pointing here.
+ */
+export const REPORTED_MARK = "reported";
+
+/** A peer-supplied figure, marked. `null` renders as nothing rather than as a marked absence. */
+export function reported(value: string | number | null | undefined): string | null {
+  return value === null || value === undefined ? null : `${value} (${REPORTED_MARK})`;
+}

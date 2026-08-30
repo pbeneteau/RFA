@@ -8,7 +8,9 @@
  */
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
+import * as fs from "node:fs";
 import { corroborateRefusal, resolveRun, type RunLookup, type RunRecord } from "../src/evals/runresolve.js";
+import { REPORTED_MARK, reported } from "../src/cli/ui.js";
 
 const row = (id: string, status = "success", start = 100, end = 200): RunRecord => ({ id, name: "serve:pm-agent", group_id: "r_1", status, start_time: start, end_time: end });
 const lookupOf = (rows: RunRecord[] | null): RunLookup => () => rows;
@@ -47,13 +49,8 @@ test("an ambiguous or empty window REFUSES rather than guessing, and says why", 
 });
 
 test("a refusal leaves pass^k alone only when the subject's own record backs it", () => {
-  // The live scenario this exclusion was earned by: a $3/day answerer hits its
-  // ceiling and never starts a turn. No row, so nothing contradicts it.
-  const preflight = corroborateRefusal({ ...ARGS, lookup: lookupOf([]) });
-  assert.equal(preflight.excluded, true);
-  assert.match(preflight.detail, /started no turn/);
-
-  // It started and failed: also corroborated.
+  // It started and failed: corroborated, and the exclusion this was earned by
+  // (a $3/day answerer hitting its ceiling mid-run) still holds.
   const failed = corroborateRefusal({ ...ARGS, lookup: lookupOf([row("a", "error")]) });
   assert.equal(failed.excluded, true);
   assert.match(failed.detail, /error/);
@@ -72,12 +69,64 @@ test("a refusal leaves pass^k alone only when the subject's own record backs it"
   assert.match(dark.detail, /could not be corroborated/);
 });
 
-test("the residual is stated rather than papered over", () => {
-  // A subject that declares a refusal without starting a turn is
-  // indistinguishable from one that genuinely could not start: both leave no
-  // row. This test exists so that fact is asserted rather than assumed, and so
-  // a future change that claims to close it has to change this line.
-  const honest = corroborateRefusal({ ...ARGS, lookup: lookupOf([]) });
-  const liar = corroborateRefusal({ ...ARGS, lookup: lookupOf([]) });
-  assert.deepEqual(honest, liar, "closing this needs a hub-stamped correlation id on the answer, which is a wire change");
+test("for a LOCAL resident, no run row at all contradicts a declared refusal", () => {
+  // Measured on this instance: the serve path writes an obs row with
+  // status "error" on EVERY refusal path - budget stop, account stop, expired
+  // credential, turn ceiling - BEFORE the refusal reaches the asker. So a
+  // resident that genuinely could not answer leaves a row, and an absent one is
+  // not what an honest refusal looks like.
+  const localSubject = corroborateRefusal({ ...ARGS, lookup: lookupOf([]), everRecorded: () => true });
+  assert.equal(localSubject.excluded, false, "a subject that records runs here and left none refused nothing");
+  assert.match(localSubject.detail, /CONTRADICTED/);
+  assert.match(localSubject.detail, /status `error`/);
+});
+
+test("for a subject hosted elsewhere, the same absence is UNCORROBORATED, not a lie", () => {
+  // A member hosted elsewhere records nothing in this store, so nothing here can
+  // check its refusal either way. Excluded - but the exclusion says it was never
+  // checked, rather than presenting itself as corroboration.
+  const remote = corroborateRefusal({ ...ARGS, lookup: lookupOf([]), everRecorded: () => false });
+  assert.equal(remote.excluded, true);
+  assert.match(remote.detail, /UNCORROBORATED/);
+  assert.match(remote.detail, /hosted elsewhere/);
+
+  // And with no discriminator available at all, the conservative reading holds
+  // and still refuses to call itself corroborated.
+  const unknown = corroborateRefusal({ ...ARGS, lookup: lookupOf([]) });
+  assert.equal(unknown.excluded, true);
+  assert.match(unknown.detail, /UNCORROBORATED/);
+  assert.doesNotMatch(unknown.detail, /^corroborated/);
+});
+
+// ------------------------------------------- wire 14 item 12, the rendering half
+
+test("every surface that prints a peer's own figures marks them as self-reported", () => {
+  // "Implementations MUST render it as self-reported." The numbers in an
+  // answer's json part are composed by the answering resident; the figures
+  // beside them on the same screen are measured from runs.db and obs.db.
+  // Printed identically, an operator cannot tell which is which.
+  const read = (rel: string) => fs.readFileSync(new URL(`../${rel}`, import.meta.url), "utf8");
+
+  const talk = read("src/cli/commands/talk.ts");
+  assert.match(talk, /\$\$\{meta\.cost_usd\} \(\$\{REPORTED_MARK\}\)/, "rfa ask prints the peer's cost marked");
+  assert.match(talk, /\$\{meta\.run_id\} \(\$\{REPORTED_MARK\}\)/, "and its run id");
+  assert.match(talk, /cost_usd_reported/, "the --json shape names it too, so a script cannot mistake it either");
+
+  const dash = read("src/cli/tui/dashboard.tsx");
+  assert.match(dash, /fmtUsd\(outcome\.cost_usd\)\} \(\{REPORTED_MARK\}\)/, "the dashboard's ask box marks the peer's cost");
+  assert.match(dash, /outcome\.run_id\} \(\$\{REPORTED_MARK\}\)/);
+
+  // The console cannot import from src/, so it repeats the string; this is what
+  // stops the two drifting apart silently.
+  const consoleHtml = read("console/index.html");
+  assert.match(consoleHtml, /\$\$\{cost\} \(reported\)/, "the console marks it with the same word");
+  assert.equal(REPORTED_MARK, "reported", "and the shared constant is that word, or the console has drifted");
+});
+
+test("the mark is one constant, not a convention three surfaces remember separately", () => {
+  assert.equal(reported(0.0412), "0.0412 (reported)");
+  assert.equal(reported("run_abc"), "run_abc (reported)");
+  // A missing figure renders as nothing: marking an absence would be noise.
+  assert.equal(reported(null), null);
+  assert.equal(reported(undefined), null);
 });

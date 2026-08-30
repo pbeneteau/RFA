@@ -332,7 +332,21 @@ async function runLive(def: CaseDef, env: LiveEnv, obs: ObsStore | null, judged:
       // its state (wire 14 item 12; `src/evals/runresolve.ts`).
       if (answer.kind === "refuse") {
         const why = refusalOf(answer);
-        const verdict = corroborateRefusal({ agent: subjectRec.name, from, to, lookup });
+        const verdict = corroborateRefusal({
+          agent: subjectRec.name,
+          from,
+          to,
+          lookup,
+          everRecorded: obs
+            ? (agent) => {
+                try {
+                  return obs.recordsRunsFor(agent);
+                } catch {
+                  return null;
+                }
+              }
+            : undefined,
+        });
         if (verdict.excluded) {
           refused.push(why);
           comments.push(`trial ${i + 1}: REFUSED ${why} - ${verdict.detail}`);

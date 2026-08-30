@@ -26,9 +26,20 @@
  * would prove the wrong thing. A resident stamps one row per answered turn
  * (`serve:<pack>`), so within the window of one ask:
  *
- *   no row              the subject never started a turn. That is what a
- *                       pre-flight refusal looks like - budget, overload, busy -
- *                       so the refusal is corroborated and the trial is excluded
+ *   no row, and the subject records runs here
+ *                       ANOMALOUS. Measured on this instance: the serve path
+ *                       writes an obs row with `status: "error"` on EVERY
+ *                       refusal path - budget stop, account stop, expired
+ *                       credential, turn ceiling - BEFORE it returns the
+ *                       refusal to the asker (105 such rows against 944
+ *                       successes when this was checked). So a resident that
+ *                       genuinely could not answer leaves a row, and an absent
+ *                       one contradicts the claim. The trial COUNTS
+ *   no row, and the subject records NO runs here
+ *                       a member hosted elsewhere, which records nothing in
+ *                       this store. Nothing can corroborate it either way, so
+ *                       the trial is excluded and the exclusion says it is
+ *                       UNCORROBORATED rather than pretending it was checked
  *   row, not success    it started and failed. Corroborated, excluded
  *   row, success        it completed a turn and THEN declared a refusal. Its own
  *                       record contradicts its self-report, so the trial COUNTS
@@ -38,13 +49,12 @@
  *                       fail-closed direction `openRunWindows` takes for the
  *                       overlap metric
  *
- * The residual, stated rather than papered over: a subject that declares a
- * refusal without ever starting a turn is indistinguishable from one that
- * genuinely could not start, because both leave no row. Closing that needs a
- * hub-stamped correlation id on the answer event, which is a wire change. What
- * this module removes is the case where the subject's record CONTRADICTS its
- * claim, and it reports every exclusion so a run whose trials vanished is
- * visible to a person rather than silent.
+ * The residual that remains, narrowed to where it actually lives: a subject the
+ * harness cannot see the runs of - a member hosted elsewhere - can declare a
+ * refusal and nothing here can check it. That is a property of not hosting it,
+ * not a hole in this rule, and such a trial is marked uncorroborated so it is
+ * visible rather than silent. For a locally hosted resident, which is every
+ * subject on this instance, an absent row is now a contradiction.
  */
 
 /** One row of the store the harness writes to, narrowed to what resolution needs. */
@@ -108,13 +118,40 @@ export interface RefusalVerdict {
 }
 
 /** Does the subject's own record support the refusal it declared? See the header for the table. */
-export function corroborateRefusal(input: { agent: string; from: number; to: number; lookup: RunLookup }): RefusalVerdict {
+export function corroborateRefusal(input: {
+  agent: string;
+  from: number;
+  to: number;
+  lookup: RunLookup;
+  /**
+   * Does this subject record its runs in this store AT ALL? It separates a
+   * locally hosted resident, whose every refusal writes an error row, from a
+   * member hosted elsewhere, which writes nothing here. `null` or absent keeps
+   * the conservative reading: excluded, and marked uncorroborated.
+   */
+  everRecorded?: (agent: string) => boolean | null;
+}): RefusalVerdict {
   const rows = input.lookup({ agent: input.agent, from: input.from, to: input.to });
   if (rows === null) {
     return { excluded: false, detail: "the observability store could not be read, so the refusal could not be corroborated and the trial counts (wire 14 item 12)" };
   }
   if (rows.length === 0) {
-    return { excluded: true, detail: "corroborated: the subject started no turn in this window, which is what a pre-flight refusal looks like" };
+    const local = input.everRecorded?.(input.agent) ?? null;
+    if (local === true) {
+      return {
+        excluded: false,
+        detail:
+          "CONTRADICTED: this subject records its runs here, and every refusal path writes a run row with status `error` before the refusal is sent, " +
+          "so an absent row means no turn was refused - the trial counts (wire 14 item 12)",
+      };
+    }
+    return {
+      excluded: true,
+      detail:
+        local === false
+          ? "UNCORROBORATED: this subject records no runs in this store (a member hosted elsewhere), so nothing here can check the refusal either way"
+          : "UNCORROBORATED: the subject started no turn in this window and it is not known whether it records runs here at all",
+    };
   }
   const succeeded = rows.filter((r) => r.status === "success");
   if (succeeded.length === rows.length) {

@@ -15,7 +15,7 @@ import { CliError, numberFlag, type CliContext } from "../context.js";
 import { openHubCall } from "../hubaccess.js";
 import { askLine, pickOne } from "../prompts.js";
 import type { CommandDef } from "../router.js";
-import { fmtAge, fmtDuration } from "../ui.js";
+import { fmtAge, fmtDuration, REPORTED_MARK } from "../ui.js";
 import { requireRoom } from "./room.js";
 
 const clientInfo = () => ({ name: "rfa-cli", version: packageVersion() });
@@ -183,8 +183,11 @@ export const ask: CommandDef = {
       const convo = answer.envelope.conversation_id ?? conversationId ?? null;
       if (convo) recordLastAsk(h, rec.handle, { conversation: convo, capability, target: target.name });
       const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-      sp.stop({ ok: answer.kind === "response", text: answer.kind === "response" ? `${target.name} answered` : `${target.name} refused: ${answer.refusal?.reason ?? "?"}${answer.refusal?.detail ? ` (${answer.refusal.detail})` : ""}`, detail: `${elapsed}s${meta?.cost_usd != null ? ` · $${meta.cost_usd}` : ""}${meta?.run_id ? ` · ${meta.run_id}` : ""}` });
-      if (ctx.flags.json) ctx.ui.json({ room: rec.handle, conversation_id: convo, asked: target.name, capability, kind: answer.kind, refusal: answer.refusal ?? null, text: answer.text, elapsed_s: Number(elapsed), cost_usd: meta?.cost_usd ?? null, run_id: meta?.run_id ?? null });
+      sp.stop({ ok: answer.kind === "response", text: answer.kind === "response" ? `${target.name} answered` : `${target.name} refused: ${answer.refusal?.reason ?? "?"}${answer.refusal?.detail ? ` (${answer.refusal.detail})` : ""}`, detail: `${elapsed}s${meta?.cost_usd != null ? ` · $${meta.cost_usd} (${REPORTED_MARK})` : ""}${meta?.run_id ? ` · ${meta.run_id} (${REPORTED_MARK})` : ""}` });
+      // `elapsed` is the CLIENT's own clock and carries no mark; the cost and
+      // the run id come out of the answer's json part, which the answering
+      // resident composed for itself (wire 14 item 12).
+      if (ctx.flags.json) ctx.ui.json({ room: rec.handle, conversation_id: convo, asked: target.name, capability, kind: answer.kind, refusal: answer.refusal ?? null, text: answer.text, elapsed_s: Number(elapsed), cost_usd_reported: meta?.cost_usd ?? null, run_id_reported: meta?.run_id ?? null });
       else {
         ctx.ui.blank();
         process.stdout.write(answer.text + "\n");

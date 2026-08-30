@@ -232,6 +232,21 @@ export class ObsStore {
       .all(agent, from, to) as { id: string; name: string; group_id: string | null; status: string; start_time: number; end_time: number }[];
   }
 
+  /**
+   * Has this agent EVER recorded a run here? (wire 14 item 12,
+   * `src/evals/runresolve.ts`.)
+   *
+   * It separates a locally hosted resident - whose every refusal path writes a
+   * run row with `status: 'error'` before the refusal reaches the asker - from a
+   * member hosted elsewhere, which records nothing in this store. Without that
+   * distinction an absent row is ambiguous; with it, an absent row for a local
+   * resident contradicts a declared refusal.
+   */
+  recordsRunsFor(agent: string): boolean {
+    const row = this.db.prepare(`SELECT 1 FROM runs WHERE run_type = 'agent_span' AND name LIKE ('%:' || ?) LIMIT 1`).get(agent);
+    return row !== undefined;
+  }
+
   markReview(id: string, needs: boolean): void {
     this.db.prepare(`UPDATE runs SET needs_review = ? WHERE id = ?`).run(needs ? 1 : 0, id);
   }

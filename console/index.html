@@ -1208,8 +1208,13 @@ async function loadAgents() {
           cursor = res.cursor;
           const hit = res.events.find((e) => e.type === "message" && e.envelope.in_reply_to === send.message_id);
           if (hit) {
+            // wire 14 item 12: this number is composed by the ANSWERING agent,
+            // not measured here, so it is marked. The same mark as the CLI and
+            // the dashboard, which take it from REPORTED_MARK in src/cli/ui.ts;
+            // this file cannot import that, so the string is repeated with this
+            // comment pointing at it.
             const cost = (hit.envelope.body.find((p) => p.type === "json")?.value ?? {}).cost_usd;
-            askOut.textContent = hit.envelope.body.filter((p) => p.type === "text").map((p) => p.text).join("\n") + (cost != null ? `\n[$${cost}]` : "");
+            askOut.textContent = hit.envelope.body.filter((p) => p.type === "text").map((p) => p.text).join("\n") + (cost != null ? `\n[$${cost} (reported)]` : "");
             return;
           }
         }

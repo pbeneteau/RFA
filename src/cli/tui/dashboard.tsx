@@ -21,6 +21,7 @@ import { TextInput } from "@inkjs/ui";
 import { applySitting, flagForReview, reviewQueue, type ApplyResult, type Trace } from "../../evals/label.js";
 import type { HubDir, RoomRecord } from "../../hubdir.js";
 import type { RfaTask } from "../../model.js";
+import { REPORTED_MARK } from "../ui.js";
 import type { CandidateSet } from "../../engine.js";
 import type { CliContext } from "../context.js";
 import { supervisorCommand } from "../commands/agent.js";
@@ -1742,8 +1743,8 @@ export function AskBox(props: { ctx: CliContext; hub: HubDir; room: RoomRecord; 
               <Text bold> {outcome.target}</Text>
               <Text dimColor>
                 {" "}
-                {outcome.capability} · {fmtMs(outcome.elapsed_ms)} · {fmtUsd(outcome.cost_usd)}
-                {outcome.run_id ? ` · ${outcome.run_id}` : ""}
+                {outcome.capability} · {fmtMs(outcome.elapsed_ms)} · {fmtUsd(outcome.cost_usd)} ({REPORTED_MARK})
+                {outcome.run_id ? ` · ${outcome.run_id} (${REPORTED_MARK})` : ""}
                 {outcome.refusal ? ` · refused: ${outcome.refusal}` : ""}
               </Text>
             </Text>
