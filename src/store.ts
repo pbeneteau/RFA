@@ -601,6 +601,34 @@ export function refsMention(refs: Record<string, unknown>, memberId: string): bo
   return false;
 }
 
+/**
+ * 9.1's compaction marker is NOT implemented, and this is the reason rather than
+ * an oversight (recorded 2026-08-30 after an attempt was built and reverted).
+ *
+ * 9.1 says the events beyond the per-member unread cap are "compacted into a
+ * `system` summary marker". Delivering one in the event stream conflicts with
+ * three other statements this project has published:
+ *
+ *   9.6 (line 494)  "A verifier of received events now has TWO things to handle,
+ *                    not one": the `wrapped` stripping and the `content_hash` stamp
+ *   13              a verifier "needs NO field surgery in **two** cases and exactly two"
+ *   INTEROP.md      "differs from what you received in two ways, and only two"
+ *
+ * A synthesized marker is a THIRD, and nothing on the wire announces it. Measured
+ * on the reverted attempt: placing it first inside one listen result verifies,
+ * because `verifyChain` skips a LEADING unchained prefix - but a client that
+ * persists its cursor and listens again, which INTEROP sect. 4.1 tells peers to
+ * do, accumulates the marker MID-stream and gets DIVERGED with a false tamper
+ * report naming an innocent event. The hub would be serving conforming peers a
+ * slice its own published verifier calls tampered.
+ *
+ * So the marker needs either a fourth wire rule telling verifiers to expect it,
+ * or delivery outside the event array. Both are wire changes and belong to a
+ * protocol revision, not to this function. Until then the cap reports its
+ * overflow as the numeric `compacted` field below, which is honest about the
+ * count and silent about the content, and Appendix F carries the gap.
+ */
+
 export class RoomHub {
   readonly cfg: HubConfig;
   /** Who counts as a human here. One object for the wire join path and `POST /auth`, so a reload reaches both. */

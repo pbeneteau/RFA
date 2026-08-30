@@ -9,6 +9,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { refsMention, RoomHub } from "../src/store.js";
+import { verifyChain } from "../src/chain.js";
 import type { AgentCard, RfaTask } from "../src/model.js";
 
 const card = (name: string): AgentCard => ({
@@ -290,5 +291,49 @@ test("9.3: the owner of a released task is told, which the enumerated filter nev
     room: handle, membership_token: bystander.you.membership_token, since: 0, timeout_ms: 0, wait_for: "mentions",
   })) as { events: any[] };
   assert.equal(other.events.some((e) => e.event === "task_released"), false, "widening the rule must not make every system event ambient");
+  hub.close();
+});
+
+// ---------------------------------------------------------------- wire 9.1, the compaction marker
+
+test("9.1: the unread cap reports a count and adds NO event, because a marker would break the chain", async () => {
+  const hub = new RoomHub({ dataDir: null, sweepIntervalMs: 0, replayCap: 5 });
+  const host = hub.createRoom({ topic: "compaction", name: "creator", card: card("creator") });
+  const listener = hub.join({ room: host.room, join_secret: host.join_secret!, name: "listener", card: card("listener") });
+  const send = (i: number) =>
+    hub.send({
+      room: host.room, membership_token: host.contract.you.membership_token,
+      to: [listener.you.id], mentions: [listener.you.id], body: [{ type: "text", text: `m${i}` }], message_id: `msg-compact-${i}`,
+    });
+
+  // The NORMAL client shape, which is what settles this: INTEROP sect. 4.1 tells
+  // a peer to persist its cursor and listen again, so anything synthesized into
+  // one result ends up MID-stream in the accumulated one.
+  for (let i = 0; i < 3; i++) await send(i);
+  const first = (await hub.listen({ room: host.room, membership_token: listener.you.membership_token, since: 0, timeout_ms: 0, wait_for: "mentions" })) as { events: any[]; cursor: number };
+  for (let i = 3; i < 15; i++) await send(i);
+  const second = (await hub.listen({ room: host.room, membership_token: listener.you.membership_token, since: first.cursor, timeout_ms: 0, wait_for: "mentions" })) as { events: any[]; compacted: number };
+
+  assert.ok(second.compacted > 0, "the cap dropped events and says how many");
+  assert.equal(second.events.some((e: any) => e.type === "system" && e.event === "compacted"), false, "and adds NO synthesized event");
+
+  // Why not, pinned rather than asserted in prose: a marker was built and
+  // reverted on 2026-08-30 because the accumulated stream then DIVERGES, with a
+  // false tamper report naming an innocent event. 9.6, 13 and INTEROP all say a
+  // verifier handles exactly TWO deviations; a marker is a third, and adding one
+  // is a wire change.
+  const accumulated = [...first.events, ...second.events];
+  const verdict = verifyChain(accumulated);
+  // The cap leaves a genuine GAP, and one divergence across it is the honest
+  // report of that gap - a client whose cursor fell behind really is missing
+  // events. What the reverted marker added was a SECOND divergence and a false
+  // accusation naming an innocent event, plus an unchained event mid-stream.
+  assert.equal(verdict.divergences.length, 1, "exactly the gap, and nothing invented on top of it");
+  assert.match(verdict.divergences[0].suspect, /was altered|prev_hash was rewritten/);
+  assert.equal(
+    accumulated.filter((e: any, i: number) => i > 0 && e.prev_hash === undefined).length,
+    0,
+    "no unchained event sits mid-stream: that is what a synthesized marker would add, and what makes a verifier accuse an innocent event",
+  );
   hub.close();
 });
