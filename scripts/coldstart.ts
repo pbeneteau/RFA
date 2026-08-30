@@ -64,6 +64,38 @@ if (install.code !== 0) {
 const rfaBin = path.join(prefix, "bin", "rfa");
 console.log(`  ${dim(rfaBin)}`);
 
+/**
+ * 2b. THE SPAWNED ENTRY POINTS, checked in the installed package before anything
+ * boots (RFA-0.9 sect. 5.4, rung 8).
+ *
+ * `rfa init --agent spec-expert` provisions a pack with no `mcp_servers`, so the
+ * run below never spawns `dist/mcplaunch.js` - which means the step that most
+ * needs a published install was the one this gate did not reach. It is a
+ * DIFFERENT code path from the checkout's: here `entryFor` must resolve
+ * `dist/mcplaunch.js` and run it with no tsx anywhere, where in the repository it
+ * resolves `src/mcplaunch.ts` through the loader.
+ *
+ * Free to check and not worth a model call, so it runs here rather than being
+ * left to the one pack kind that would have exercised it.
+ */
+step("spawned entries resolve and run in the installed package");
+const installedPkg = path.join(prefix, "lib", "node_modules", "agent-com");
+for (const entry of ["mcplaunch", "resident", "supervisor"]) {
+  const built = path.join(installedPkg, "dist", `${entry}.js`);
+  if (!fs.existsSync(built)) {
+    console.error(red(`dist/${entry}.js is missing from the published package: the resident spawns it by name and would fail at runtime`));
+    process.exit(1);
+  }
+}
+// The launcher is the one with a contract worth asserting: it must REFUSE to run
+// a server with no policy, which is what stops an MCP child running unconfined.
+const unconfined = await run(process.execPath, [path.join(installedPkg, "dist", "mcplaunch.js"), "--", "/bin/echo", "hi"], { cwd: os.tmpdir(), timeoutMs: 60_000 });
+if (unconfined.code === 0 || !/never runs a server unconfined/.test(unconfined.stderr + unconfined.stdout)) {
+  console.error(red(`the installed mcp launcher did not refuse an unconfined server (exit ${unconfined.code}): ${(unconfined.stderr + unconfined.stdout).slice(0, 300)}`));
+  process.exit(1);
+}
+console.log(`  ${dim("dist/{mcplaunch,resident,supervisor}.js present; the launcher refuses an unconfined server")}`);
+
 // 3. An empty folder, one command, one answer.
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-coldstart-"));
 const port = await freePort();
