@@ -8,7 +8,7 @@
  */
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { RoomHub } from "../src/store.js";
+import { refsMention, RoomHub } from "../src/store.js";
 import type { AgentCard, RfaTask } from "../src/model.js";
 
 const card = (name: string): AgentCard => ({
@@ -232,5 +232,63 @@ test("create honors max_attempts, and the default stays 1", async () => {
   const capped = await fails(() => hub.task({ room: handle, membership_token: w2.you.membership_token, action: "claim", id: strict.id }));
   assert.equal(capped.code, "task_conflict");
   assert.match(capped.message, /must reopen it/, "the refusal says who can unstick it");
+  hub.close();
+});
+
+// ---------------------------------------------------------------- wire 9.3, the amended mentions filter
+
+test("9.3: a system event reaches a member referenced under ANY refs key, not an enumerated few", () => {
+  const me = "m_abc123";
+  // The three keys the enumerated form covered.
+  assert.equal(refsMention({ asker: me }, me), true);
+  assert.equal(refsMention({ member: me }, me), true);
+  assert.equal(refsMention({ askers: ["m_other", me] }, me), true);
+  // The three it named as in use and did NOT cover, each a live event.
+  assert.equal(refsMention({ task_id: "t_1", owner: me, asker: "m_other" }, me), true, "task_released and task_overdue name the owner here");
+  assert.equal(refsMention({ request_id: "r_1", requester: me }, me), true, "one of approval_expired's two branches names the requester here");
+  assert.equal(refsMention({ author: me }, me), true);
+  // The point of a general rule: a key nobody has invented yet.
+  assert.equal(refsMention({ some_future_key: me }, me), true);
+  assert.equal(refsMention({ future_list: ["m_x", me] }, me), true);
+  // And it stays a filter.
+  assert.equal(refsMention({ owner: "m_someone_else", reason: "offline" }, me), false);
+  assert.equal(refsMention({}, me), false);
+  assert.equal(refsMention({ count: 3, flag: true, nothing: null }, me), false);
+});
+
+test("9.3: the owner of a released task is told, which the enumerated filter never did", async () => {
+  let now = 1_000_000_000_000;
+  const { hub, handle, creator, join } = await room({ defaultLeaseS: 60, flapWindowS: 10, now: () => now });
+  const worker = join("worker");
+  const t = (await hub.task({ room: handle, membership_token: creator.membership_token, action: "create", title: "tell the owner it lost the claim" })) as RfaTask;
+  await hub.task({ room: handle, membership_token: worker.you.membership_token, action: "claim", id: t.id });
+
+  now += 71_000; // past the lease plus the flap window
+  hub.sweep();
+
+  // `task_released` carries {task_id, attempt, reason, owner, asker}. `asker` is
+  // the CREATOR, so the creator was always told; `owner` is the member whose
+  // claim was just taken away, and under the enumerated filter it was told
+  // nothing at all - the exact silent undeliverability 9.3's general rule names.
+  const mine = (await hub.listen({
+    room: handle, membership_token: worker.you.membership_token, since: 0, timeout_ms: 0, wait_for: "mentions",
+  })) as { events: any[] };
+  const released = mine.events.find((e) => e.type === "system" && e.event === "task_released");
+  assert.ok(released, "the member whose claim was released must hear about it under wait_for: mentions");
+  assert.equal(released.refs.owner, worker.you.id);
+  assert.equal(released.refs.reason, "offline");
+
+  // And the creator still gets it, under the key that always worked.
+  const theirs = (await hub.listen({
+    room: handle, membership_token: creator.membership_token, since: 0, timeout_ms: 0, wait_for: "mentions",
+  })) as { events: any[] };
+  assert.ok(theirs.events.some((e) => e.event === "task_released"), "no regression for the key the enumerated form did cover");
+
+  // Still a filter, not a firehose: an unrelated member sees no such event.
+  const bystander = join("bystander");
+  const other = (await hub.listen({
+    room: handle, membership_token: bystander.you.membership_token, since: 0, timeout_ms: 0, wait_for: "mentions",
+  })) as { events: any[] };
+  assert.equal(other.events.some((e) => e.event === "task_released"), false, "widening the rule must not make every system event ambient");
   hub.close();
 });

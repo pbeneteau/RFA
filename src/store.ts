@@ -565,6 +565,42 @@ const RESERVED_FIRST_TOKENS = new Set(["human", "console", "system", "hub", "rfa
 
 const firstToken = (name: string): string => name.split(/[ _.\-]/, 1)[0].toLowerCase();
 
+/**
+ * Does this system event's `refs` reference this member? (wire 9.3, the general
+ * rule amended in 0.1.8.)
+ *
+ * "Any member id under any key, at the top level or inside an array of member
+ * refs." The enumerated form this replaces tested `asker`, `askers` and `member`
+ * only, and 9.3 says in terms why an enumeration is the wrong shape: "the
+ * general rule is what an implementer builds so that a later system event does
+ * not silently become undeliverable". That is not hypothetical here. Three
+ * events were already undeliverable to the member who most needed them, and
+ * each was found by reading the refs literals rather than by a failing test:
+ *
+ *   task_released     refs.owner  - the member whose claim was just released was
+ *                                   not told; only the creator was, via `asker`
+ *   task_overdue      refs.owner  - the same member, the same silence
+ *   approval_expired  refs.requester - one of its two branches names the
+ *                                   requester under `requester` and the other
+ *                                   under `member`, so the SAME event reached a
+ *                                   member or did not depending on which path
+ *                                   emitted it
+ *
+ * Scope, stated because "any key" invites the question: only top-level values
+ * and the elements of top-level arrays are examined, which is exactly what 9.3
+ * describes. A `refs` value is compared for equality with the member id, so a
+ * free-text field (`name`, `title`, `reason`) can only match by holding that
+ * member's id verbatim. Over-delivery in that pathological case is the safe
+ * direction; the defect being fixed is silent UNDER-delivery.
+ */
+export function refsMention(refs: Record<string, unknown>, memberId: string): boolean {
+  for (const value of Object.values(refs)) {
+    if (value === memberId) return true;
+    if (Array.isArray(value) && value.includes(memberId)) return true;
+  }
+  return false;
+}
+
 export class RoomHub {
   readonly cfg: HubConfig;
   /** Who counts as a human here. One object for the wire join path and `POST /auth`, so a reload reaches both. */
@@ -3720,9 +3756,10 @@ export class RoomHub {
         }
         if (event.type === "system") {
           const refs = event.refs as Record<string, unknown>;
-          return refs.asker === member.id || refs.member === member.id ||
-            (Array.isArray(refs.askers) && refs.askers.includes(member.id)) ||
-            (typeof refs.message_id === "string" && member.sentIds.has(refs.message_id));
+          // 9.3's GENERAL rule, and a system event referencing a message_id the
+          // caller sent. See `refsMention` for why the enumerated form it
+          // replaces was not merely non-conformant but lossy.
+          return refsMention(refs, member.id) || (typeof refs.message_id === "string" && member.sentIds.has(refs.message_id));
         }
         if (event.type === "task") {
           const t = event.task;
