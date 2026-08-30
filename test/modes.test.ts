@@ -118,3 +118,32 @@ test("the scaffold writes a mode line for a tool user only, ask unless told othe
   const answerer = renderAgentMd({ name: "a", kind: "answerer", room: null });
   assert.ok(!/^mode:/m.test(answerer), "an answerer has nothing a mode would change");
 });
+
+test("a specifier-scoped acting tool is still ACTING: Bash(gh:*) under interrupt_on Bash cards, never auto-approves", () => {
+  // Found live 2026-08-30 on the first fenced pack a real org built: the
+  // interrupt key `Bash` did not claim the allow entry `Bash(gh:*)`, so
+  // actingTools was empty, the posture read-only, and the entry sat BARE in
+  // allowedTools - six gh/curl commands ran with zero approval cards. Same
+  // defect class as the guarded-builtin exact-match (audit rank 1), one
+  // predicate over.
+  const def = parseAgentMd(
+    [
+      "---",
+      "rfa_agent: 1",
+      "name: gher",
+      "description: d",
+      "tools:",
+      "  allow: ['Read', 'Bash(gh:*)']",
+      "  allow_subagents: false",
+      "interrupt_on:",
+      "  Bash: true",
+      "---",
+      "prompt",
+    ].join("\n"),
+  ).def;
+  const p = agentPosture(def);
+  assert.equal(p.mode, "ask", "an interruptible tool means the pack ACTS");
+  assert.deepEqual(p.acting, ["Bash(gh:*)"]);
+  assert.deepEqual(p.allowedTools, ["Read"], "the specifier entry must NOT sit bare in allowedTools");
+  assert.equal(p.onActing, "card");
+});

@@ -9,6 +9,7 @@
  * are watched by a lazy OBSERVER sidekick membership (`<name>-hitl`): cheap,
  * read-only, and it can never eat a question meant for the serve loop.
  */
+import { toolHead } from "./toolclass.js";
 import { ACTION_IDENTITY_EXT, EFFECT_CLASS_EXT, type EffectClass } from "./actionid.js";
 import type { AgentDef } from "./agentdef.js";
 import { RoomMember } from "./client.js";
@@ -51,6 +52,16 @@ export function interruptMatch(
           };
   const exact = entries.find(([p]) => p === toolName);
   if (exact) return resolve(exact[1] as never);
+  // HEAD match, exactly as the guarded-builtin chain matches (audit 2026-08-30
+  // rank 1, and this is the same defect one predicate over, found live the same
+  // day): `toolName` here is sometimes a tools.allow ENTRY (`Bash(gh:*)`), and
+  // an interrupt key `Bash` must claim it. Without this, the specifier form
+  // made actingTools() empty, the posture read-only, and the entry sat BARE in
+  // allowedTools - auto-approved, no card, door one never consulted. Measured
+  // on a real pack: interrupt_on {Bash: true} + allow ["Bash(gh:*)"] ran six
+  // gh/curl commands with zero approval cards.
+  const head = entries.find(([p]) => p === toolHead(toolName));
+  if (head) return resolve(head[1] as never);
   const glob = entries.find(([p]) => p.endsWith("*") && toolName.startsWith(p.slice(0, -1)));
   return glob ? resolve(glob[1] as never) : null;
 }

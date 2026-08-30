@@ -36,13 +36,14 @@ TSX = subprocess.check_output(["node", "-p", 'require.resolve("tsx",{paths:[proc
 COLS, ROWS = 120, 38
 
 
-def drive(target, script, keys, extra_args=(), tail=60, quiet=False):
+def drive(target, script, keys, extra_args=(), tail=60, quiet=False, env=None):
     argv = ["node", "--import", TSX, CLI, "--dir", target] + list(script) + list(extra_args)
     pid, fd = pty.fork()
     if pid == 0:
         os.environ["TERM"] = "xterm-256color"
         os.environ["COLUMNS"] = str(COLS)
         os.environ["LINES"] = str(ROWS)
+        os.environ.update(env or {})
         os.execvp(argv[0], argv)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
     out = b""
@@ -133,13 +134,25 @@ def smoke():
             failures.append("dashboard did not widen to the 160-column terminal")
         if not any(w <= 80 for w in borders[-12:]):
             failures.append("dashboard did not narrow to the 80-column terminal")
-        # the walkthrough: an answerer with every default, knowledge later, bound to the room
-        painted = drive(d, ["agent", "new"], [[1800, "helper"], [400, "<CR>"], [900, "<CR>"], [900, "j"], [300, "j"], [400, "<CR>"], [900, "<CR>"], [900, "<CR>"], [600, "<CR>"], [900, "<CR>"], [600, "<CR>"], [600, "<CR>"], [900, "<CR>"], [900, "<CR>"], [2500, "<CR>"]], quiet=True)
-        for want in ["Name the agent", "What kind of agent?", "What does it answer from?", "Which model?", "The capability it advertises", "Budgets", "Which room does it serve in?", "Create it?", "helper is ready"]:
+        # the walkthrough: the describe-first intake (a dummy key makes the screen
+        # deterministic on any machine; a BLANK submit spends nothing and falls
+        # through to the questions), then an answerer with every default,
+        # knowledge later, bound to the room
+        smoke_key = {"ANTHROPIC_API_KEY": "tui-smoke-dummy"}
+        painted = drive(d, ["agent", "new"], [[1800, "<CR>"], [700, "helper"], [400, "<CR>"], [900, "<CR>"], [900, "j"], [300, "j"], [400, "<CR>"], [900, "<CR>"], [900, "<CR>"], [600, "<CR>"], [900, "<CR>"], [600, "<CR>"], [600, "<CR>"], [900, "<CR>"], [900, "<CR>"], [2500, "<CR>"]], quiet=True, env=smoke_key)
+        for want in ["Describe the agent", "Name the agent", "What kind of agent?", "What does it answer from?", "Which model?", "The capability it advertises", "Budgets", "Which room does it serve in?", "Create it?", "agent.md", "helper is ready"]:
             if want not in painted:
                 failures.append(f"walkthrough never painted: {want!r}")
         if not os.path.exists(os.path.join(d, "agents", "helper", "agent.md")):
             failures.append("walkthrough did not write agents/helper/agent.md")
+        # F9 pinned: a bare NAME on a terminal enters the walkthrough with the
+        # name pre-filled instead of scaffolding silently with defaults
+        painted = drive(d, ["agent", "new", "helper2"], [[1800, "<CR>"], [700, "<CR>"], [900, "<C-c>"]], quiet=True, env=smoke_key)
+        for want in ["name: helper2", "Name the agent", "What kind of agent?"]:
+            if want not in painted:
+                failures.append(f"bare-name walkthrough never painted: {want!r}")
+        if os.path.exists(os.path.join(d, "agents", "helper2")):
+            failures.append("a bare name on a terminal scaffolded silently (F9 regressed)")
         # the edit walkthrough over the pack just made: the settings list, the model changed, applied
         painted = drive(d, ["agent", "edit", "helper"], [[1800, "j"], [400, "<CR>"], [900, "j"], [400, "<CR>"], [900, "<CR>"], [2500, "<CR>"]], quiet=True)
         for want in ["edit helper", "What do you want to change?", "Which model?", "1 pending", "apply 1 change", "haiku → sonnet", "helper edited"]:
@@ -165,7 +178,7 @@ def smoke():
         for f in failures:
             print(f"  - {f}")
         return 1
-    print("TUI SMOKE PASS: dashboard (7 tabs, help, palette, two resizes), the walkthroughs (an answerer end to end, then its model edited) and the onboarding (checks, defaults, provisioning, done screen) painted what they should")
+    print("TUI SMOKE PASS: dashboard (7 tabs, help, palette, two resizes), the walkthroughs (describe-first intake skipped onto an answerer end to end, a bare name pre-filling the questions instead of scaffolding, then the model edited) and the onboarding (checks, defaults, provisioning, done screen) painted what they should")
     return 0
 
 

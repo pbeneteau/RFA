@@ -1,10 +1,20 @@
 /**
- * The agent walkthrough (RFA-0.7 sect. 13.7): what `rfa agent new` opens on a
- * terminal when no name is given, and what `n` on the dashboard runs. One
- * question per screen with the reason beside it, every setting a pack has
- * (kind, what it reads or acts through, its mode, model, capability, budgets,
- * room), a review screen, then the same `scaffoldPack` the one-line command
- * uses. The flags of `rfa agent new` stay the headless form of every answer.
+ * The agent walkthrough (RFA-0.7 sect. 13.7, amended 2026-08-30): what
+ * `rfa agent new` opens on a terminal - bare, or with only a name, which used
+ * to scaffold silently with defaults (dogfood F9) - and what `n` on the
+ * dashboard runs.
+ *
+ * Describe-first: when a model credential exists, the first screen is one
+ * free-text question ("what should it do, from what, for whom"), a bounded
+ * model call (`src/cli/draftpack.ts`, in RFA-0.9 sect. 6's inventory) drafts
+ * the whole pack, and the wizard lands on the review with every question
+ * pre-answered - esc walks back into any screen to edit. Without a credential,
+ * or on a blank description, it is the same question-per-screen walkthrough as
+ * before. Nothing is written until the review's enter, through the same
+ * `scaffoldPack` the one-line command uses, and creation ends with an offered
+ * first ask instead of a silent success line when something is running to
+ * answer it. The flags of `rfa agent new` stay the headless form of every
+ * answer.
  *
  * The screens are exported: `rfa agent edit` asks the same questions over an
  * existing pack (agentedit.tsx), so a setting is asked the same way whether the
@@ -15,18 +25,19 @@ import * as path from "node:path";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Box, render, Text, useApp, useInput, useWindowSize } from "ink";
 import { daemonState } from "../../daemon.js";
-import type { HubDir } from "../../hubdir.js";
+import type { HubDir, RoomRecord } from "../../hubdir.js";
 import { isGitRemote } from "../../knowledge-sources.js";
 import { MODE_SUMMARY, MODES, type AgentMode } from "../../posture.js";
 import { addKnowledge } from "../agentmd.js";
 import { attachKnowledge } from "../attach.js";
 import { createRoomRecord } from "../commands/init.js";
 import type { CliContext } from "../context.js";
-import { nameProblem, PACK_KINDS, scaffoldPack, type PackKind, type ToolSpec } from "../scaffold.js";
-import { recordedRooms } from "./data.js";
+import { draftAvailable, draftPack, type PackDraft } from "../draftpack.js";
+import { knowledgeRelativeToPack, nameProblem, PACK_KINDS, renderAgentMd, scaffoldPack, type PackKind, type ToolSpec } from "../scaffold.js";
+import { askInRoom, recordedRooms, type AskOutcome } from "./data.js";
 import { Mark } from "./logo.js";
 import { Field, ToolServerFields } from "./onboarding.js";
-import { ACCENT, BAD, GOOD, WARN } from "./theme.js";
+import { ACCENT, BAD, fmtMs, fmtUsd, GOOD, MUTED, WARN } from "./theme.js";
 import { Choice, Keys, Panel, Spin } from "./widgets.js";
 
 export interface WizardResult {
@@ -34,8 +45,8 @@ export interface WizardResult {
   created: string | null;
 }
 
-export type Step = "name" | "kind" | "knowledge" | "server" | "mode" | "model" | "capability" | "budgets" | "room" | "review" | "create" | "done";
-const ORDER: Step[] = ["name", "kind", "knowledge", "server", "mode", "model", "capability", "budgets", "room", "review", "create", "done"];
+export type Step = "describe" | "name" | "kind" | "knowledge" | "server" | "mode" | "model" | "capability" | "budgets" | "room" | "review" | "create" | "ask" | "done";
+const ORDER: Step[] = ["describe", "name", "kind", "knowledge", "server", "mode", "model", "capability", "budgets", "room", "review", "create", "ask", "done"];
 
 export interface Draft {
   name: string;
@@ -48,10 +59,18 @@ export interface Draft {
   budgets: { per_task_usd: number; per_day_usd: number; max_turns: number };
   /** A recorded room's handle, a room to create, or none. */
   room: { handle: string; alias: string } | { create: { alias: string; topic: string } } | null;
+  /** The describe screen applies only when a model credential exists (checked once, before render). */
+  draftable: boolean;
+  /** A draft filled these answers in, so re-walking a screen must not reset them to kind defaults. */
+  drafted: boolean;
+  /** The drafted card description; null keeps the kind's sentence. */
+  description: string | null;
+  /** The drafted system prompt; null keeps the kind's template. */
+  prompt: string | null;
 }
 
 export function defaultDraft(): Draft {
-  return { name: "", kind: "answerer", knowledge: null, tool: null, mode: "ask", model: "haiku", offer: { id: "answer-question", description: "" }, budgets: { per_task_usd: 0.25, per_day_usd: 5, max_turns: 8 }, room: null };
+  return { name: "", kind: "answerer", knowledge: null, tool: null, mode: "ask", model: "haiku", offer: { id: "answer-question", description: "" }, budgets: { per_task_usd: 0.25, per_day_usd: 5, max_turns: 8 }, room: null, draftable: false, drafted: false, description: null, prompt: null };
 }
 
 /** The defaults that follow from the kind, applied when the kind is chosen. */
@@ -63,6 +82,7 @@ export function forKind(d: Draft, kind: PackKind): Draft {
 }
 
 export function applicableStep(step: Step, d: Draft): boolean {
+  if (step === "describe") return d.draftable;
   if (step === "knowledge") return d.kind === "answerer";
   if (step === "server" || step === "mode") return d.kind === "tool";
   return true;
@@ -71,10 +91,15 @@ export function applicableStep(step: Step, d: Draft): boolean {
 export function nextStep(from: Step, d: Draft, dir: 1 | -1 = 1): Step {
   let i = ORDER.indexOf(from) + dir;
   while (i > 0 && i < ORDER.length && !applicableStep(ORDER[i], d)) i += dir;
-  return ORDER[Math.max(0, Math.min(ORDER.length - 1, i))];
+  const step = ORDER[Math.max(0, Math.min(ORDER.length - 1, i))];
+  // The clamp can land on ORDER[0] ("describe"), which is not always applicable;
+  // an inapplicable landing stays where it was rather than showing a screen that
+  // does not exist for this draft.
+  return applicableStep(step, d) ? step : from;
 }
 
 export const WHY: Record<Step, { title: string; lines: string[] }> = {
+  describe: { title: "describe-first", lines: ["One model call drafts the whole pack: kind, name, tools, knowledge, budgets, capability, prompt. A few cents; the cost is shown on the review.", "Every question is then pre-answered and editable, and NOTHING is written until you approve the review.", "The draft is validated through the same schema as a hand-written pack: it is never trusted because a model wrote it.", "Blank skips straight to the questions. This screen only appears when a model credential exists."] },
   name: { title: "the name", lines: ["Lowercase, no spaces: it is the folder under agents/ and the name the room sees.", "Reserved first words (human, console, system, hub, rfa) are refused here rather than at join."] },
   kind: { title: "three kinds of pack", lines: ["An answerer reads markdown and answers with citations; it has no side effects.", "A tool user acts through an MCP server; every acting call pauses for a human unless you set its mode otherwise.", "A spec-expert answers about the RFA protocol from the spec shipped in this package; a demo, not a colleague."] },
   knowledge: { title: "what it answers from", lines: ["A folder is attached as a glob; nothing is copied.", "A git repository is cloned under the pack and tracked: provenance for free, fresh on every push, no credential at answer time.", "Later: fill agents/<name>/knowledge/ or run rfa knowledge add."] },
@@ -86,6 +111,7 @@ export const WHY: Record<Step, { title: string; lines: string[] }> = {
   room: { title: "where it serves", lines: ["Rooms are the isolation unit: everyone in a room sees everything in it.", "A pack bound to a room joins it with the operator bearer; no secret to paste.", "One capability per room keeps rfa ask unambiguous."] },
   review: { title: "what will be written", lines: ["agents/<name>/agent.md: the whole definition, validated through the supervisor's own schema before it is written.", "A running supervisor picks the pack up within 30 seconds."] },
   create: { title: "", lines: [] },
+  ask: { title: "first value", lines: ["The asker joins the room as you, finds the agent by capability, and waits for the answer.", "Answers carry citations, cost and a run id, every time.", "Blank skips; rfa ask does the same thing later, from anywhere in this folder."] },
   done: { title: "", lines: [] },
 };
 
@@ -129,19 +155,53 @@ export function WizardFrame(props: { heading: string; counter?: string; hubName:
 
 export type Screen = (label: string, body: React.ReactNode, footer?: [string, string][]) => React.JSX.Element;
 
-export function AgentWizard(props: { ctx: CliContext; hub: HubDir }): React.JSX.Element {
+export function AgentWizard(props: { ctx: CliContext; hub: HubDir; initialName?: string; draftable?: boolean }): React.JSX.Element {
   const { exit } = useApp();
   const h = props.hub;
-  const [step, setStep] = useState<Step>("name");
-  const [d, setD] = useState<Draft>(defaultDraft);
+  const draftable = Boolean(props.draftable);
+  const [step, setStep] = useState<Step>(draftable ? "describe" : "name");
+  const [d, setD] = useState<Draft>(() => ({ ...defaultDraft(), name: props.initialName ?? "", draftable }));
   const [lines, setLines] = useState<{ ok: boolean; text: string; detail?: string }[]>([]);
   const [failure, setFailure] = useState<string | null>(null);
-  const [created, setCreated] = useState<{ name: string; skill: string; room: string | null } | null>(null);
+  const [created, setCreated] = useState<{ name: string; skill: string; room: string | null; dir: string } | null>(null);
+  const [draftMeta, setDraftMeta] = useState<{ cost: number; model: string; reasoning: string; notes: string[] } | null>(null);
+  const [previewAt, setPreviewAt] = useState(0);
   const started = useRef(false);
   const rooms = useMemo(() => recordedRooms(h).filter((r) => r.alias !== "ops"), [h]);
+  const taken = useMemo(() => (fs.existsSync(h.paths.agents) ? fs.readdirSync(h.paths.agents, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name) : []), [h]);
+  const [askRoom, setAskRoom] = useState<RoomRecord | null>(null);
 
   const go = (dir: 1 | -1, draft = d) => setStep((s) => nextStep(s, draft, dir));
   const set = (patch: Partial<Draft>) => setD((x) => ({ ...x, ...patch }));
+
+  /** A draft landed: every question pre-answered, straight to the review (or to the one question a draft cannot answer, a tool user's server). */
+  const onDrafted = (p: PackDraft, cost: number, model: string) => {
+    const notes = [...p.notes];
+    let room = d.room;
+    if (!room && rooms[0]) {
+      room = { handle: rooms[0].handle, alias: rooms[0].alias };
+      notes.push(`bound to ${rooms[0].alias}, the first recorded room; the room screen changes it`);
+    }
+    if (p.kind === "tool") notes.push("a drafted tool user starts in ask mode: every acting call pauses for you (the mode screen changes it)");
+    setDraftMeta({ cost, model, reasoning: p.reasoning, notes });
+    const next: Draft = {
+      ...d,
+      drafted: true,
+      name: p.name,
+      kind: p.kind,
+      description: p.description,
+      prompt: p.prompt,
+      model: p.model,
+      offer: p.offer,
+      budgets: p.budgets,
+      knowledge: p.knowledge ? { type: "folder", value: p.knowledge } : null,
+      tool: null,
+      mode: "ask",
+      room,
+    };
+    setD(next);
+    setStep(p.kind === "tool" ? "server" : "review");
+  };
 
   useInput(
     (input, key) => {
@@ -149,7 +209,8 @@ export function AgentWizard(props: { ctx: CliContext; hub: HubDir }): React.JSX.
       if (step === "done" && (key.return || input === "q" || key.escape)) return exit({ code: 0, created: created?.name ?? null } satisfies WizardResult);
       if (step === "create" && failure && (key.return || input === "q" || key.escape)) return exit({ code: 1, created: null } satisfies WizardResult);
       if (step === "review" && key.return) return setStep("create");
-      if (key.escape && step !== "create" && step !== "done") return go(-1);
+      if (step === "review" && (input === "j" || input === "k")) return setPreviewAt((o) => Math.max(0, o + (input === "j" ? 3 : -3)));
+      if (key.escape && step !== "create" && step !== "ask" && step !== "done") return go(-1);
     },
     { isActive: true },
   );
@@ -177,6 +238,8 @@ export function AgentWizard(props: { ctx: CliContext; hub: HubDir }): React.JSX.
           mode: d.kind === "tool" ? d.mode : undefined,
           offer: d.offer,
           budgets: d.budgets,
+          description: d.description ?? undefined,
+          prompt: d.prompt ?? undefined,
         });
         say(true, `agents/${d.name}/agent.md`, `definition ${res.definitionHash.slice(7, 15)} · offers ${res.skillId}${roomHandle ? "" : " · not bound to a room yet"}`);
         if (d.knowledge?.type === "git" && d.knowledge.value) {
@@ -186,27 +249,38 @@ export function AgentWizard(props: { ctx: CliContext; hub: HubDir }): React.JSX.
         }
         const sup = daemonState(h.paths.supervisorPid);
         say(true, sup.alive ? "the supervisor picks it up within 30 seconds" : "nothing is running: rfa up starts it", sup.alive ? "rfa status shows it joining" : undefined);
-        setCreated({ name: d.name, skill: res.skillId, room: roomHandle });
-        setStep("done");
+        setCreated({ name: d.name, skill: res.skillId, room: roomHandle, dir: res.dir });
+        // First value instead of a silent success line: offer an ask when
+        // something is actually running to answer it; otherwise the done screen
+        // says what to start.
+        const rec = roomHandle ? (recordedRooms(h).find((r) => r.handle === roomHandle) ?? null) : null;
+        const askable = rec && sup.alive && (await props.ctx.healthz());
+        if (askable) setAskRoom(rec);
+        setStep(askable ? "ask" : "done");
       } catch (err) {
         setFailure((err as Error).message);
       }
     })();
   }, [step, d, h, props.ctx]);
 
-  const asked = ORDER.filter((s) => applicableStep(s, d) && !["create", "done"].includes(s));
+  const asked = ORDER.filter((s) => applicableStep(s, d) && !["describe", "create", "ask", "done"].includes(s));
   const screen: Screen = (label, body, footer) => (
-    <WizardFrame heading="new agent" counter={`${asked.indexOf(step) + 1}/${asked.length}`} hubName={h.manifest.name} label={label} why={WHY[step]} footer={footer}>
+    <WizardFrame heading="new agent" counter={asked.includes(step) ? `${asked.indexOf(step) + 1}/${asked.length}` : undefined} hubName={h.manifest.name} label={label} why={WHY[step]} footer={footer}>
       {body}
     </WizardFrame>
   );
 
   switch (step) {
+    case "describe":
+      return <DescribeScreen screen={screen} fixedName={props.initialName} taken={taken} onSkip={() => setStep("name")} onDrafted={onDrafted} />;
     case "name":
       return screen(
         "Name the agent",
         <Field key="name" value={d.name} placeholder="pm-agent" validate={(v) => nameProblem(v) ?? (fs.existsSync(path.join(h.paths.agents, v, "agent.md")) ? `agents/${v} already exists` : null)} onSubmit={(v) => {
-          const next = forKind({ ...d, name: v }, d.kind);
+          // A rename over a DRAFTED pack keeps the drafted answers; only the
+          // plain walkthrough re-derives the kind's defaults from the name.
+          const renamed = { ...d, name: v };
+          const next = d.drafted ? renamed : forKind(renamed, d.kind);
           setD(next);
           go(1, next);
         }} />,
@@ -218,7 +292,11 @@ export function AgentWizard(props: { ctx: CliContext; hub: HubDir }): React.JSX.
           initial={d.kind}
           options={PACK_KINDS.map((k) => ({ value: k, label: k === "tool" ? "a tool user" : k === "answerer" ? "an answerer" : "spec-expert", hint: k === "tool" ? "acts through an MCP server, behind your approval" : k === "answerer" ? "answers from markdown, with citations" : "answers about the RFA protocol; a demo" }))}
           onChoose={(v) => {
-            const next = forKind(d, v as PackKind);
+            // Re-confirming the same kind keeps every drafted or customized
+            // answer; a different kind resets to its defaults, drafted prompt
+            // and description included, because they were composed for the old one.
+            if (v === d.kind) return go(1);
+            const next: Draft = { ...forKind(d, v as PackKind), drafted: false, description: null, prompt: null };
             setD(next);
             go(1, next);
           }}
@@ -235,6 +313,9 @@ export function AgentWizard(props: { ctx: CliContext; hub: HubDir }): React.JSX.
         "The MCP server it acts through",
         <ToolServerFields initial={d.tool ?? undefined} onSubmit={(t) => {
           set({ tool: t });
+          // The server is the one question a draft cannot answer for a tool
+          // user; with the rest pre-answered, the review is next.
+          if (d.drafted) return setStep("review");
           go(1, { ...d, tool: t });
         }} />,
         [["enter", "next"], ["esc", "back"]],
@@ -278,30 +359,77 @@ export function AgentWizard(props: { ctx: CliContext; hub: HubDir }): React.JSX.
         set({ room });
         go(1, { ...d, room });
       }} />;
-    case "review":
-      return screen(
-        "Create it?",
-        <Box flexDirection="column">
-          {[
-            ["name", d.name],
-            ["kind", d.kind],
-            ...(d.kind === "answerer" ? [["knowledge", d.knowledge?.type === "later" || !d.knowledge ? "later" : `${d.knowledge.type}: ${d.knowledge.value}${d.knowledge.docs ? ` (${d.knowledge.docs})` : ""}`]] : []),
-            ...(d.kind === "tool" ? [["server", d.tool ? `${d.tool.server}${d.tool.builtin ? " (built in)" : ` = ${[d.tool.command, ...(d.tool.args ?? [])].join(" ")}`} · tool ${d.tool.tool}` : "-"], ["mode", d.mode]] : []),
-            ["model", d.model],
-            ["capability", `${d.offer.id}: ${d.offer.description}`],
-            ["budgets", `$${d.budgets.per_task_usd.toFixed(2)} per task · $${d.budgets.per_day_usd.toFixed(2)} per day · ${d.budgets.max_turns} turns`],
-            ["room", d.room ? ("create" in d.room ? `new: ${d.room.create.alias}` : d.room.alias) : "none yet (rfa agent bind later)"],
-          ].map(([k, v]) => (
-            <Box key={k}>
-              <Box width={12}>
-                <Text dimColor>{k}</Text>
+    case "review": {
+      // The COMPLETE proposed agent.md, rendered exactly as the create step
+      // will write it (a new room's handle does not exist yet, so its binding
+      // previews as the commented block). j/k scroll it; esc walks back into
+      // any pre-answered screen to edit.
+      let preview: string[];
+      try {
+        preview = renderAgentMd({
+          name: d.name,
+          kind: d.kind,
+          room: d.room && "handle" in d.room ? d.room.handle : null,
+          model: d.model,
+          knowledge: d.knowledge?.type === "folder" && d.knowledge.value ? knowledgeRelativeToPack(h, d.name, d.knowledge.value) : undefined,
+          tool: d.tool ?? undefined,
+          mode: d.kind === "tool" ? d.mode : undefined,
+          offer: d.offer,
+          budgets: d.budgets,
+          description: d.description ?? undefined,
+          prompt: d.prompt ?? undefined,
+        }).split("\n");
+      } catch (err) {
+        preview = [`the preview could not render: ${(err as Error).message}`];
+      }
+      const WINDOW = 16;
+      const at = Math.min(previewAt, Math.max(0, preview.length - WINDOW));
+      return (
+        <WizardFrame
+          heading="new agent"
+          counter={`${asked.indexOf("review") + 1}/${asked.length}`}
+          hubName={h.manifest.name}
+          label="Create it?"
+          why={{ title: `agents/${d.name}/agent.md · ${at + 1}–${Math.min(at + WINDOW, preview.length)} of ${preview.length}`, lines: preview.slice(at, at + WINDOW) }}
+          footer={[["enter", "create"], ["esc", "back to edit"], ["j/k", "the file"]]}
+        >
+          <Box flexDirection="column">
+            {draftMeta ? (
+              <Box flexDirection="column" marginBottom={1}>
+                <Text>
+                  <Text color={ACCENT}>drafted</Text>
+                  <Text dimColor> by {draftMeta.model} · {fmtUsd(draftMeta.cost)}{draftMeta.reasoning ? ` · ${draftMeta.reasoning}` : ""}</Text>
+                </Text>
+                {draftMeta.notes.map((n) => (
+                  <Text key={n} color={WARN} wrap="wrap">
+                    ! {n}
+                  </Text>
+                ))}
               </Box>
-              <Text wrap="wrap">{v}</Text>
-            </Box>
-          ))}
-        </Box>,
-        [["enter", "create"], ["esc", "back"]],
+            ) : null}
+            {[
+              ["name", d.name],
+              ["kind", d.kind],
+              ...(d.description ? [["description", d.description]] : []),
+              ...(d.kind === "answerer" ? [["knowledge", d.knowledge?.type === "later" || !d.knowledge ? "later" : `${d.knowledge.type}: ${d.knowledge.value}${d.knowledge.docs ? ` (${d.knowledge.docs})` : ""}`]] : []),
+              ...(d.kind === "tool" ? [["server", d.tool ? `${d.tool.server}${d.tool.builtin ? " (built in)" : ` = ${[d.tool.command, ...(d.tool.args ?? [])].join(" ")}`} · tool ${d.tool.tool}` : "-"], ["mode", d.mode]] : []),
+              ["model", d.model],
+              ["capability", `${d.offer.id}: ${d.offer.description}`],
+              ["budgets", `$${d.budgets.per_task_usd.toFixed(2)} per task · $${d.budgets.per_day_usd.toFixed(2)} per day · ${d.budgets.max_turns} turns`],
+              ["room", d.room ? ("create" in d.room ? `new: ${d.room.create.alias}` : d.room.alias) : "none yet (rfa agent bind later)"],
+              ["prompt", d.prompt ? `drafted from your description (${d.prompt.split("\n").length} lines, in the panel)` : "the kind's template"],
+            ].map(([k, v]) => (
+              <Box key={k}>
+                <Box width={12}>
+                  <Text dimColor>{k}</Text>
+                </Box>
+                <Text wrap="wrap">{v}</Text>
+              </Box>
+            ))}
+          </Box>
+        </WizardFrame>
       );
+    }
     case "create":
       return screen(
         failure ? "stopped" : "writing",
@@ -319,6 +447,9 @@ export function AgentWizard(props: { ctx: CliContext; hub: HubDir }): React.JSX.
         </Box>,
         failure ? [["enter", "leave"]] : [],
       );
+    case "ask":
+      if (!created || !askRoom) return screen("…", <Spin label="…" />, []);
+      return <AskScreen ctx={props.ctx} h={h} room={askRoom} agent={created.name} skill={created.skill} dir={created.dir} screen={screen} onDone={() => setStep("done")} />;
     case "done":
       return screen(
         `${created?.name} is ready`,
@@ -344,6 +475,178 @@ export function AgentWizard(props: { ctx: CliContext; hub: HubDir }): React.JSX.
         [["enter", "done"]],
       );
   }
+}
+
+// ---------------------------------------------------------------- describe-first
+
+/**
+ * The intake (RFA-0.7 sect. 13.7, amendment of 2026-08-30): one free-text
+ * question, one bounded model call, and the wizard's questions come back
+ * pre-answered. Blank skips to the plain walkthrough; so does a failed draft,
+ * loudly. The call site with its RFA-0.9 sect. 6 declarations is
+ * `src/cli/draftpack.ts`.
+ */
+export function DescribeScreen(props: { screen: Screen; fixedName?: string; taken: string[]; onSkip: () => void; onDrafted: (p: PackDraft, cost: number, model: string) => void }): React.JSX.Element {
+  const [phase, setPhase] = useState<"input" | "drafting" | "failed">("input");
+  const [error, setError] = useState<string | null>(null);
+  useInput(
+    (_, key) => {
+      if (key.return) props.onSkip();
+    },
+    { isActive: phase === "failed" },
+  );
+  if (phase === "drafting") return props.screen("Drafting the pack", <Spin label="one model call composes the whole proposal; the review shows what it cost" />, []);
+  if (phase === "failed") {
+    return props.screen(
+      "The draft failed",
+      <Box flexDirection="column">
+        <Text color={BAD} wrap="wrap">
+          ✖ {error}
+        </Text>
+        <Text dimColor wrap="wrap">
+          The walkthrough asks everything the draft would have filled in.
+        </Text>
+      </Box>,
+      [["enter", "answer the questions instead"]],
+    );
+  }
+  return props.screen(
+    "Describe the agent: what should it do, from what, for whom?",
+    <Box flexDirection="column">
+      {props.fixedName ? <Text dimColor>name: {props.fixedName}</Text> : null}
+      <Field
+        key="describe"
+        value=""
+        placeholder="answers billing questions from ./docs/handbook, for the support team"
+        allowEmpty
+        validate={() => null}
+        onSubmit={(v) => {
+          if (!v) return props.onSkip();
+          setPhase("drafting");
+          void draftPack({ description: v, fixedName: props.fixedName, taken: props.taken })
+            .then((r) => props.onDrafted(r.draft, r.cost_usd, r.model))
+            .catch((err) => {
+              setError((err as Error).message);
+              setPhase("failed");
+            });
+        }}
+      />
+    </Box>,
+    [["enter", "draft it"], ["blank enter", "just the questions"]],
+  );
+}
+
+/**
+ * Joined, honestly: the resident's own state/member.json names the room it
+ * serves and its heartbeat says it is alive now. Both are the running system's
+ * record, never the file the operator edited.
+ */
+async function waitForResident(dir: string, room: string, deadlineMs: number): Promise<boolean> {
+  const until = Date.now() + deadlineMs;
+  for (;;) {
+    try {
+      const m = JSON.parse(fs.readFileSync(path.join(dir, "state", "member.json"), "utf8")) as { room?: string };
+      const hb = Number(fs.readFileSync(path.join(dir, "state", "heartbeat"), "utf8"));
+      if (m.room === room && Date.now() - hb < 90_000) return true;
+    } catch {
+      /* not joined yet */
+    }
+    if (Date.now() >= until) return false;
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+}
+
+/** The offered first ask: creation ends at a working answer, not a folder. Blank skips. */
+function AskScreen(props: { ctx: CliContext; h: HubDir; room: RoomRecord; agent: string; skill: string; dir: string; screen: Screen; onDone: () => void }): React.JSX.Element {
+  const [phase, setPhase] = useState<"input" | "waiting" | "asking" | "answered" | "failed">("input");
+  const [question, setQuestion] = useState("");
+  const [outcome, setOutcome] = useState<AskOutcome | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const alias = props.room.alias ?? props.room.handle;
+  useInput(
+    (_, key) => {
+      if (key.return || key.escape) props.onDone();
+    },
+    { isActive: phase === "answered" || phase === "failed" },
+  );
+  const submit = (v: string) => {
+    if (!v) return props.onDone();
+    setQuestion(v);
+    setPhase("waiting");
+    void (async () => {
+      try {
+        if (!(await waitForResident(props.dir, props.room.handle, 90_000))) {
+          throw new Error(`${props.agent} has not joined after 90 seconds; rfa status says why. Ask later: rfa ask --capability ${props.skill} "…"`);
+        }
+        setPhase("asking");
+        let o: AskOutcome;
+        try {
+          o = await askInRoom(props.ctx, props.h, props.room, props.skill, v, { timeoutMs: 180_000 });
+        } catch (err) {
+          // member.json lands a beat before the card is on the roster the asker
+          // reads; one settle-and-retry covers the gap, anything else is real.
+          if (!/offers/.test((err as Error).message)) throw err;
+          await new Promise((r) => setTimeout(r, 4000));
+          o = await askInRoom(props.ctx, props.h, props.room, props.skill, v, { timeoutMs: 180_000 });
+        }
+        setOutcome(o);
+        setPhase("answered");
+      } catch (err) {
+        setError((err as Error).message);
+        setPhase("failed");
+      }
+    })();
+  };
+  if (phase === "input") {
+    return props.screen(
+      `${props.agent} is joining ${alias}. Ask it something?`,
+      <Field key="ask" value="" placeholder="blank to skip" allowEmpty validate={() => null} onSubmit={submit} />,
+      [["enter", "ask"], ["blank enter", "skip"]],
+    );
+  }
+  if (phase === "waiting" || phase === "asking") {
+    return props.screen(
+      "The first answer",
+      <Box flexDirection="column">
+        <Text dimColor wrap="wrap">
+          "{question}"
+        </Text>
+        <Box marginTop={1}>
+          <Spin label={phase === "waiting" ? `waiting for ${props.agent} to join ${alias} (the supervisor picks it up within 30s)` : `${props.agent} is answering`} />
+        </Box>
+      </Box>,
+      [],
+    );
+  }
+  if (phase === "failed") {
+    return props.screen(
+      "The ask did not land",
+      <Text color={BAD} wrap="wrap">
+        ✖ {error}
+      </Text>,
+      [["enter", "continue"]],
+    );
+  }
+  const o = outcome!;
+  const answerLines = o.text.split("\n");
+  return props.screen(
+    `${o.target} ${o.kind === "response" ? "answered" : "refused"}`,
+    <Box flexDirection="column">
+      <Text dimColor>
+        {fmtMs(o.elapsed_ms)} · {fmtUsd(o.cost_usd)}
+        {o.run_id ? ` · ${o.run_id}` : ""}
+      </Text>
+      <Box marginTop={1} flexDirection="column">
+        {answerLines.slice(0, 14).map((l, i) => (
+          <Text key={i} wrap="wrap">
+            {l}
+          </Text>
+        ))}
+        {answerLines.length > 14 ? <Text color={MUTED}>… the rest is in the room: rfa room tail {alias}</Text> : null}
+      </Box>
+    </Box>,
+    [["enter", "continue"]],
+  );
 }
 
 // ---------------------------------------------------------------- the screens, shared with rfa agent edit
@@ -484,8 +787,11 @@ export function Labeled(props: { label: string; children: React.ReactNode }): Re
   );
 }
 
-export async function runAgentWizard(ctx: CliContext, h: HubDir): Promise<number> {
-  const app = render(<AgentWizard ctx={ctx} hub={h} />, { exitOnCtrlC: false, patchConsole: true });
+export async function runAgentWizard(ctx: CliContext, h: HubDir, opts: { name?: string } = {}): Promise<number> {
+  // The credential check runs once, before render: the describe screen exists
+  // only when a draft is possible at all (no credential = the plain walkthrough).
+  const draftable = draftAvailable(ctx.env);
+  const app = render(<AgentWizard ctx={ctx} hub={h} initialName={opts.name} draftable={draftable} />, { exitOnCtrlC: false, patchConsole: true });
   const result = (await app.waitUntilExit()) as WizardResult | undefined;
   if (!result) return 2;
   if (result.created) ctx.ui.done(`agents/${result.created}/agent.md written`, `rfa agent show ${result.created}`);

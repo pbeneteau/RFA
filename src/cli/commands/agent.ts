@@ -34,19 +34,24 @@ function resolveRoom(h: HubDir, ref: string | undefined): RoomRecord | { handle:
   throw new CliError(2, `no room called ${ref}`, "rfa room ls; or pass a handle (r_…)");
 }
 
+/** The flags that configure the pack: any of them on the command line means the caller chose the headless form. */
+const NEW_CONFIG_FLAGS = ["kind", "room", "knowledge", "model", "server", "command", "builtin", "tool", "mode"] as const;
+
 export const agentNew: CommandDef = {
   path: ["agent", "new"],
-  summary: "Scaffold a pack, validated, bound to a room; alone on a terminal, the walkthrough",
-  usage: "<name> [--kind spec-expert|answerer|tool] [--room <alias|handle>] [--knowledge <dir>] [--model haiku|sonnet] [--server <name> --command <cmd> --tool <id> | --builtin linear [--tool <id>]] [--mode ask|plan|bypass] [--dry-run]",
-  why: "Everything the scaffold writes is something a hand-written pack got wrong at least once here: RFA_TOKEN in secrets, a skill on the card, budgets, allow_subagents: false, a room binding. It is validated through the supervisor's own schema, so it either loads or says why before the supervisor sees it. A tool user names the MCP server it brings; the runtime loads it from the pack's own declaration.",
+  summary: "Scaffold a pack, validated, bound to a room; on a terminal, the walkthrough (describe-first with a model credential)",
+  usage: "[<name>] [--kind spec-expert|answerer|tool] [--room <alias|handle>] [--knowledge <dir>] [--model haiku|sonnet] [--server <name> --command <cmd> --tool <id> | --builtin linear [--tool <id>]] [--mode ask|plan|bypass] [--dry-run]",
+  why: "Everything the scaffold writes is something a hand-written pack got wrong at least once here: RFA_TOKEN in secrets, a skill on the card, budgets, allow_subagents: false, a room binding. It is validated through the supervisor's own schema, so it either loads or says why before the supervisor sees it. A tool user names the MCP server it brings; the runtime loads it from the pack's own declaration. On a terminal a bare name walks the questions with the name filled in, and with a model credential the walkthrough opens on one free-text description that drafts the whole pack for review; headless scaffolding needs a configuration flag, --yes, or a pipe, because a name alone silently meaning every-default surprised the first real user (dogfood F9).",
   options: { kind: { type: "string" }, room: { type: "string" }, knowledge: { type: "string" }, model: { type: "string" }, server: { type: "string" }, command: { type: "string" }, builtin: { type: "string" }, tool: { type: "string" }, mode: { type: "string" }, "dry-run": { type: "boolean", default: false } },
-  examples: ["rfa agent new pm --kind answerer --knowledge ./docs --room product", "rfa agent new scribe --kind tool --builtin linear", "rfa agent new filer --kind tool --server filesystem --command 'npx -y @modelcontextprotocol/server-filesystem /tmp/scratch' --tool write_file"],
+  examples: ["rfa agent new", "rfa agent new pm --kind answerer --knowledge ./docs --room product", "rfa agent new scribe --kind tool --builtin linear", "rfa agent new filer --kind tool --server filesystem --command 'npx -y @modelcontextprotocol/server-filesystem /tmp/scratch' --tool write_file"],
   run: async (ctx, a) => {
     const h = ctx.hubdir();
-    if (!a.positionals[0] && ctx.interactive) {
-      // No name, a terminal: the walkthrough, every setting a pack has, one screen each.
+    const configured = Boolean(a.values["dry-run"]) || NEW_CONFIG_FLAGS.some((f) => a.values[f] !== undefined);
+    if (ctx.interactive && !configured) {
+      // A terminal with nothing configured: the walkthrough, a given name
+      // pre-filled (F9: a bare name used to scaffold silently with defaults).
       const { runAgentWizard } = await import("../tui/agentwizard.js");
-      return runAgentWizard(ctx, h);
+      return runAgentWizard(ctx, h, { name: a.positionals[0] });
     }
     const name = a.positionals[0] ?? (await askLine(ctx, "Name the new agent", "rfa agent new <name> [--kind …]", { placeholder: "pm-agent" }));
     const problem = nameProblem(name);
@@ -85,7 +90,11 @@ export const agentNew: CommandDef = {
     }
     try {
       const res = scaffoldPack(h, opts);
-      ctx.ui.done(`agents/${name}/agent.md`, `definition ${res.definitionHash.slice(7, 15)} · offers ${res.skillId}${room ? ` · room ${room.alias ?? room.handle}` : " · NOT bound to a room yet"}`);
+      // The success line names the model, the mode and the budgets it just
+      // chose - the three things that cost money and act (F9) - read back from
+      // the definition as written, never from this command's own defaults.
+      const chose = `${res.def.model ?? "inherit"}${kind === "tool" ? ` · mode ${effectiveMode(res.def)}` : ""} · $${(res.def.budgets?.per_task_usd ?? 0).toFixed(2)}/task $${(res.def.budgets?.per_day_usd ?? 0).toFixed(2)}/day`;
+      ctx.ui.done(`agents/${name}/agent.md`, `definition ${res.definitionHash.slice(7, 15)} · offers ${res.skillId} · ${chose}${room ? ` · room ${room.alias ?? room.handle}` : " · NOT bound to a room yet"}`);
       ctx.ui.note(res.reused ? `the folder already existed and was taken over${res.kept.length ? `; kept ${res.kept.length} file(s) of yours: ${res.kept.slice(0, 4).join(", ")}${res.kept.length > 4 ? ", …" : ""}` : ""}` : "the pack is a folder: agent.md, knowledge/, memory/, skills/, evals/");
       const sup = daemonState(h.paths.supervisorPid);
       const next: string[] = [];

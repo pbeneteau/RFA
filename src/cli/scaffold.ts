@@ -24,10 +24,11 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { parseAgentMd } from "../agentdef.js";
+import { parseAgentMd, type AgentDef } from "../agentdef.js";
 import type { HubDir } from "../hubdir.js";
 import type { AgentMode } from "../posture.js";
 import { packageFile } from "../pkg.js";
+import { yamlScalar } from "./agentmd.js";
 
 export type PackKind = "answerer" | "tool" | "spec-expert";
 export const PACK_KINDS: PackKind[] = ["spec-expert", "answerer", "tool"];
@@ -59,6 +60,10 @@ export interface ScaffoldOptions {
   offer?: { id: string; description: string };
   /** Ceilings; defaults per kind. */
   budgets?: { max_turns?: number; per_task_usd?: number; per_day_usd?: number };
+  /** The card's one-line description; default derived from the kind. */
+  description?: string;
+  /** The system prompt body (the describe-first draft's); default is the kind's template. */
+  prompt?: string;
 }
 
 export interface ToolSpec {
@@ -127,11 +132,12 @@ export function renderAgentMd(o: ScaffoldOptions): string {
   const { name, kind } = o;
   const skillId = o.offer?.id ?? (kind === "tool" ? `${name}-action` : kind === "spec-expert" ? "answer-protocol-question" : "answer-question");
   const description =
-    kind === "tool"
+    o.description ??
+    (kind === "tool"
       ? "Acts on requests in the room; every external write pauses for a human decision."
       : kind === "spec-expert"
         ? "Answers questions about the RFA protocol from the specification, citing the section."
-        : "Answers questions from its knowledge pack, citing the file and section it used.";
+        : "Answers questions from its knowledge pack, citing the file and section it used.");
   const model = o.model ?? (kind === "tool" ? "sonnet" : "haiku");
   const knowledge =
     kind === "answerer" && o.knowledge
@@ -180,7 +186,8 @@ interrupt_on:
   allow: [Read, Grep, Glob]   # reading knowledge; no side effects. Add mcp__rfa__ask for a voice
   allow_subagents: false`;
   const body =
-    kind === "tool"
+    o.prompt ??
+    (kind === "tool"
       ? `You are ${name}, acting on requests inside an RFA agent room.
 
 You have tools that change things outside this room. That is why every call to
@@ -210,11 +217,11 @@ ${ANSWERER_RULES}`
 Answer using ONLY the knowledge files listed below. Consult them with Read and
 Grep; never answer a factual question from general knowledge. Rules:
 
-${ANSWERER_RULES}`;
+${ANSWERER_RULES}`);
   return `---
 rfa_agent: 1
 name: ${name}
-description: ${description}
+description: ${yamlScalar(description)}
 model: ${model}   # haiku for retrieval and answers, sonnet when it has to compose
 ${kind === "tool" ? "effort: medium\n" : ""}${toolsBlock}
 ${knowledge}
@@ -222,7 +229,7 @@ offers:
   # What this agent advertises in the room. Discovery is by capability, so the
   # id is what an asker matches on: make it a verb, not a noun.
   - id: ${skillId}
-    description: ${o.offer?.description ?? (kind === "tool" ? `Performs the ${name} action after a human approves it.` : kind === "spec-expert" ? "Answers a question about the RFA protocol from the specification, citing the section." : `Answers a question from the ${name} knowledge pack, citing its source.`)}
+    description: ${yamlScalar(o.offer?.description ?? (kind === "tool" ? `Performs the ${name} action after a human approves it.` : kind === "spec-expert" ? "Answers a question about the RFA protocol from the specification, citing the section." : `Answers a question from the ${name} knowledge pack, citing its source.`))}
 memory:
   scope: pack
   gate: memory-gate   # peer content cannot become memory unexamined
@@ -250,6 +257,8 @@ export interface ScaffoldResult {
   dir: string;
   definitionHash: string;
   skillId: string;
+  /** The definition as written, so a caller can report the model, mode and budgets it just chose (F9: the success line named none of the three things that cost money and act). */
+  def: AgentDef;
   files: string[];
   /** Files already in a taken-over folder that the scaffold left alone. */
   kept: string[];
@@ -379,5 +388,5 @@ expect:
     must_mention: [${o.kind === "spec-expert" ? '"lease"' : '"something the correct answer must contain"'}]
 ${o.kind === "tool" ? "" : "  protocol: [citations_present]\n"}`,
   );
-  return { dir, definitionHash: parsed.definitionHash, skillId, files , kept, reused };
+  return { dir, definitionHash: parsed.definitionHash, skillId, def: parsed.def, files, kept, reused };
 }

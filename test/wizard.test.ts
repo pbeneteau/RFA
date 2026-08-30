@@ -37,6 +37,32 @@ test("the walkthrough asks what the kind needs: knowledge for an answerer, serve
   assert.equal(nextStep("review", answerer), "create");
 });
 
+test("describe-first exists only with a credential, and back from the first real question never lands on a screen that does not exist", () => {
+  const plain = forKind({ ...defaultDraft(), name: "pm" }, "answerer");
+  assert.ok(!applicableStep("describe", plain), "no credential: the walkthrough starts at the name, as it always did");
+  assert.equal(nextStep("name", plain, -1), "name", "esc on the first question stays put rather than landing on the inapplicable describe screen");
+  const draftable = { ...plain, draftable: true };
+  assert.ok(applicableStep("describe", draftable));
+  assert.equal(nextStep("name", draftable, -1), "describe", "with a credential, back from the name reaches the intake");
+  assert.equal(nextStep("describe", draftable), "name", "and a skipped intake walks into the same questions");
+});
+
+test("the scaffold takes the drafted description and prompt, quoted so hostile prose cannot break the YAML", () => {
+  const text = renderAgentMd({
+    name: "pm",
+    kind: "answerer",
+    room: null,
+    description: "Answers fee questions: plans, fees, who to ask.",
+    prompt: "You are pm, drafted from a description.\n\nCite every file you rely on.",
+  });
+  const parsed = parseAgentMd(text);
+  assert.equal(parsed.def.description, "Answers fee questions: plans, fees, who to ask.");
+  assert.match(parsed.prompt, /^You are pm, drafted from a description\./);
+  assert.match(parsed.prompt, /Cite every file/);
+  const plain = parseAgentMd(renderAgentMd({ name: "pm", kind: "answerer", room: null })).def;
+  assert.equal(plain.description, "Answers questions from its knowledge pack, citing the file and section it used.", "nothing given: the kind's sentence, unchanged");
+});
+
 test("the environment checks read a described machine: what blocks, what warns, what is merely noted", () => {
   const machine = (over: Partial<Probe>): Probe => ({
     env: {},

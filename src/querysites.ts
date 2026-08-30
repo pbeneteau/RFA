@@ -87,6 +87,17 @@ export const QUERY_SITES: readonly QuerySite[] = [
     markers: ["tools: []", "settings: { disableClaudeAiConnectors: true }", "withIsolatedCwd("],
   },
   {
+    module: "src/cli/draftpack.ts",
+    lane: "the agent wizard's describe-first draft: the operator's own description of a wanted agent, composed into a proposed pack that is schema-validated before the wizard shows it and written only on approval",
+    reach: "import",
+    declares: {
+      tools: "[] - the empty set. Drafting a pack needs no tools, so every built-in is ABSENT rather than merely denied (sect. 6.1)",
+      cwd: "a fresh empty directory per call (withIsolatedCwd, the consolidation lane's own helper), never the hub root and never a caller's choice",
+      refusal: "the empty tool set: there is nothing to refuse. The visible cost line sect. 6.1 asks for is the review screen's `drafted by <model> · $<cost>`",
+    },
+    markers: ["tools: []", "settings: { disableClaudeAiConnectors: true }", "withIsolatedCwd("],
+  },
+  {
     module: "scripts/egress-proof.ts",
     lane: "the live egress proof (sect. 10.2): sect. 4's obligations re-established against a real sandbox after every SDK bump",
     reach: "import",

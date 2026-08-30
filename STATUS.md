@@ -101,8 +101,10 @@ No credential is ever on argv. `.rfa/secrets.json` (0600) holds the operator's o
 **Agent lifecycle is a CLI, never a copy-paste** (2026-08-19, now `rfa`):
 
 ```bash
-rfa agent new                       # alone on a terminal: the walkthrough, every setting with its reason
-rfa agent new my-agent --kind tool --builtin linear   # or headless, every answer a flag
+rfa agent new                       # a terminal: the walkthrough; with a model credential it opens describe-first
+                                    # (one description drafts the whole pack for review; RFA-0.7 sect. 13.7, 2026-08-30)
+rfa agent new my-agent              # a bare name pre-fills the walkthrough, never a silent default scaffold (F9)
+rfa agent new my-agent --kind tool --builtin linear   # headless: a flag beside the name, --yes, or a pipe
 rfa agent edit my-agent             # the same walkthrough over an existing pack; --editor opens agent.md
 rfa agent mode my-agent ask|plan|bypass
 rfa agent retire my-agent           # stop, release leases, leave, evict, archive, deregister: eight re-runnable steps
