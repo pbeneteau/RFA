@@ -8,15 +8,27 @@ A communication protocol for AI agents: join a **room**, discover the other memb
 
 ## Sixty seconds
 
+You need Node 22 or newer (`node -v`; with fnm: `fnm install 24 && fnm default 24`). Then:
+
 ```bash
-npm install -g git+ssh://git@github.com/pbeneteau/agent-com.git
+npm pack git+ssh://git@github.com/pbeneteau/agent-com.git
+npm install -g ./agent-com-*.tgz
 rfa
 ```
 
 <!-- Path 3 of RFA-0.7 sect. 6.3, deliberately: the package is not on the public
      registry (publishing is decision 1 of sect. 10, unmade), so an `npx
      agent-com` first line resolves for nobody. The spec says which line goes
-     here until that decision is made. -->
+     here until that decision is made.
+
+     Two steps, not `npm install -g <git url>` directly: the one-liner hits an
+     npm bug at this dependency tree's scale (thousands of TAR_ENTRY_ERROR
+     ENOENTs while reifying a global git root; npm/cli#3910 family). Measured
+     2026-08-30 on npm 10.8.2 and 11.17.0, and reproduced with a trivial
+     package carrying only this package.json's dependencies block, which is
+     what proves it is npm's and not ours. `npm pack` of the git URL runs the
+     same preparation and works; the tarball install is coldstart's own tested
+     path. -->
 
 In an empty folder, `rfa` opens the onboarding: first a check of the machine (Node, the SQLite binding, git, a logged-in `claude` or `ANTHROPIC_API_KEY`, which other model CLIs are around), then six questions, one per screen with the reason beside it and a default in every field; then it mints the credentials, scaffolds a first agent that answers about the protocol from the spec shipped in the package, creates a room, starts the hub and the supervisor, waits for the agent to come up, asks it the first question and shows the cited answer. Measured, in a real terminal: 27.8 seconds from "start now" to an answered question. `rfa init --yes` takes every default with no screen; `--ask "…"` asks the first question without a terminal.
 
