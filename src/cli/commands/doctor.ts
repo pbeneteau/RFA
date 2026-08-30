@@ -639,6 +639,43 @@ export async function runChecks(ctx: CliContext, opts: { deep?: boolean } = {}):
     }
   }
 
+  // The watchdog invariants (RFA-0.5 sect. 20.6), read here as well as posted.
+  //
+  // The supervisor evaluates these on its ops timer and speaks them into `#ops`,
+  // and that path has a history: every alert 401'd for a day once `/mcp` required
+  // a transport credential, and nobody noticed because the residents were fine.
+  // `rfa doctor` reads the same rows through the same invariants, over a channel
+  // that cannot 401, so the operator has a direct check and not only a
+  // notification. It reports the count, never a sweep: judging a run dead on a
+  // clock is a decision for a human, which is why the engine's own reconciler
+  // refuses to make it.
+  if (fs.existsSync(h.paths.runsDb)) {
+    try {
+      const { Engine } = await import("../../engine.js");
+      const { watchdogAlerts, watchdogFailures, shippedInvariants } = await import("../../watchdog.js");
+      const engine = new Engine(h.paths.runsDb);
+      try {
+        const state = { runs: engine.runningRuns(), rosters: null };
+        for (const blind of watchdogFailures(state)) checks.push(warn("watchdog-blind", blind, "unship it or give this evaluator what it reads (src/watchdog.ts)"));
+        const firing = watchdogAlerts(state, Date.now());
+        // The line SAYS watchdog: the message is the invariant id, which tells an
+        // operator nothing about where the check came from. And the hint names a
+        // command that exists - the first draft of it named `rfa runs`, which does
+        // not, which is the same defect as an instrument that cannot report.
+        for (const al of firing) {
+          checks.push(fail(`watchdog-${al.message.split(":")[0]}`, `watchdog ${al.message}`, "rfa status shows what is running; rfa agent restart <agent> reconciles that pack's runs as it starts"));
+        }
+        if (firing.length === 0) {
+          checks.push(ok("watchdog", `no watchdog invariant firing over ${state.runs.length} running run(s) (${shippedInvariants().map((i) => i.id).join(", ")})`));
+        }
+      } finally {
+        engine.close();
+      }
+    } catch (err) {
+      checks.push(skip("watchdog", `runs.db unreadable: ${(err as Error).message}`));
+    }
+  }
+
   // Backups and logs.
   if (fs.existsSync(h.paths.backups)) {
     const dated = fs.readdirSync(h.paths.backups).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)).sort();

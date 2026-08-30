@@ -77,8 +77,17 @@ export interface ObsSummary {
 }
 
 export interface Alert {
-  kind: "error_pct" | "latency" | "feedback" | "credential";
+  kind: "error_pct" | "latency" | "feedback" | "credential" | "watchdog";
   message: string;
+  /**
+   * The supervisor's cooldown key, defaulting to `kind` where it is absent.
+   *
+   * The triad below has one alert per kind, so `kind` was the key. A watchdog
+   * invariant (spec 20.6, `src/watchdog.ts`) is one of several sharing a kind,
+   * and keying their 30-minute cooldown on `kind` would let whichever fired
+   * first silence the rest.
+   */
+  key?: string;
 }
 
 /** LangSmith's dotted_order segment: sortable start time + the run id. */
@@ -381,6 +390,36 @@ export class ObsStore {
       )
       .run(cutoff);
     return res.changes;
+  }
+}
+
+/**
+ * Which alerts are due, given what has already been sent.
+ *
+ * The rule is three lines and it lived inline in `src/supervisor.ts`, where
+ * nothing could test it: the supervisor is a script, not a module. It matters
+ * enough to be reachable - it decides what an operator hears - so it lives here,
+ * next to the alerts it gates.
+ *
+ * The key is the alert's own `key`, falling back to its kind. The triad has one
+ * alert per kind so the two were the same thing, and the watchdog invariants of
+ * spec 20.6 share a kind: keying them on it would let the first invariant to
+ * fire silence every other one for the whole cooldown.
+ */
+export class AlertCooldown {
+  private readonly lastSent = new Map<string, number>();
+  constructor(private readonly cooldownMs: number) {}
+
+  /** The subset of `alerts` due at `now`, marking each one sent. */
+  due(alerts: Alert[], now = Date.now()): Alert[] {
+    const out: Alert[] = [];
+    for (const a of alerts) {
+      const key = a.key ?? a.kind;
+      if (now - (this.lastSent.get(key) ?? -Infinity) < this.cooldownMs) continue;
+      this.lastSent.set(key, now);
+      out.push(a);
+    }
+    return out;
   }
 }
 

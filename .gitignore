@@ -36,3 +36,6 @@ AGENTS.md
 # that owns it. Machine state, never project source - the same reason no hub
 # directory's `.rfa/` is tracked.
 .codex/
+
+# npm pack output (coldstart and by-hand install checks leave these behind)
+*.tgz

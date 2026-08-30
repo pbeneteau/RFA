@@ -34,7 +34,9 @@ import { RoomMember } from "./client.js";
 import { Engine } from "./engine.js";
 import { minimalEnv } from "./env.js";
 import { ensureRuntime, HubDirError, requireHubDir, roomsStore, type HubDir } from "./hubdir.js";
-import { ObsStore, evaluateAlerts, formatReviewDigest } from "./obs.js";
+import { AlertCooldown, ObsStore, evaluateAlerts, formatReviewDigest } from "./obs.js";
+import type { Alert } from "./obs.js";
+import { shippedInvariants, watchdogAlerts, watchdogFailures } from "./watchdog.js";
 import { spawnEntry, stopTree } from "./proc.js";
 import { belongsTo, residentProcessesSync } from "./procscan.js";
 import { backupPlan, runBackup } from "./platform.js";
@@ -527,7 +529,7 @@ const OPS = {
 };
 
 let opsRoom: RoomMember | null = null;
-const alertLastSent = new Map<string, number>();
+const alertCooldown = new AlertCooldown(OPS.alertCooldownMs);
 
 /**
  * The supervisor is itself a member: it speaks alerts into the `ops` room.
@@ -587,23 +589,52 @@ async function opsMember(): Promise<RoomMember | null> {
   }
 }
 
+/**
+ * Alerts, cooled down, logged, and posted to `#ops`.
+ *
+ * The log line goes out BEFORE the post and does not depend on it: the ops room
+ * is a hub client and hub clients fail (every alert 401'd for a day once the
+ * transport credential became mandatory), so the log is the record and the room
+ * is the notification. The cooldown rule itself lives in `src/obs.ts` where a
+ * test can reach it.
+ */
+async function raise(alerts: Alert[]): Promise<void> {
+  for (const alert of alertCooldown.due(alerts)) {
+    log(`ALERT ${alert.kind}: ${alert.message}`);
+    const m = await opsMember();
+    await m?.send({ body: `ALERT ${alert.kind}: ${alert.message}`, kind: "status" }).catch((e) => log(`alert post failed: ${e.message}`));
+  }
+}
+
 async function alertPass(): Promise<void> {
   if (!fs.existsSync(OBS_DB)) return;
   const obs = new ObsStore(OBS_DB);
   try {
-    const summary = obs.summary(OPS.alertWindowMs);
-    const alerts = evaluateAlerts(summary);
-    const now = Date.now();
-    for (const alert of alerts) {
-      if (now - (alertLastSent.get(alert.kind) ?? 0) < OPS.alertCooldownMs) continue;
-      alertLastSent.set(alert.kind, now);
-      log(`ALERT ${alert.kind}: ${alert.message}`);
-      const m = await opsMember();
-      await m?.send({ body: `ALERT ${alert.kind}: ${alert.message}`, kind: "status" }).catch((e) => log(`alert post failed: ${e.message}`));
-    }
+    await raise(evaluateAlerts(obs.summary(OPS.alertWindowMs)));
   } finally {
     obs.close();
   }
+}
+
+/**
+ * The watchdog pass (spec 20.6): the replay-validated invariants of
+ * `src/watchdog.ts`, evaluated against the engine's own rows.
+ *
+ * It reads `runs.db`, which is the record of what HAPPENED, never a config file
+ * describing what was asked for. It runs on the ops timer rather than at any
+ * resident's start, and it carries no minimum-volume guard, because every
+ * invariant here is a STATE: one wedged run at zero traffic is complete evidence,
+ * and the volume guard that suits an error rate is the thing that kept a
+ * 100%-failing credential silent on a quiet hub.
+ *
+ * `rosters: null` is a fact about this process and not a stub. The hub owns the
+ * room store exclusively (RFA-0.7), so the supervisor may not open it, and the
+ * start-up check below says out loud that any shipped invariant needing rosters
+ * would never fire here. Today none does.
+ */
+async function watchdogPass(): Promise<void> {
+  if (!fs.existsSync(hubdir.paths.runsDb)) return;
+  await raise(watchdogAlerts({ runs: engine.runningRuns(), rosters: null }, Date.now()));
 }
 
 /**
@@ -753,6 +784,17 @@ if (account.pausedUntil() > 0) {
 await reconcile();
 writeStateFile();
 void opsMember();
+
+// Spec 20.6's watchdog, announced at start so the shipped set is visible in the
+// log rather than inferable from an alert that has not fired yet. `blind` names a
+// shipped invariant this process could never evaluate; it is empty today and the
+// check exists so it cannot become non-empty quietly.
+{
+  const shipped = shippedInvariants();
+  const blind = watchdogFailures({ runs: [], rosters: null });
+  log(`watchdog: ${shipped.length} replay-validated invariant(s) on the ops timer: ${shipped.map((i) => i.id).join(", ") || "none"}`);
+  for (const line of blind) log(`watchdog: BLIND: ${line}`);
+}
 const timer = setInterval(() => void reconcile(), POLICY.reconcileMs);
 const accountTimer = setInterval(() => {
   accountPass();
@@ -763,6 +805,7 @@ const accountTimer = setInterval(() => {
 accountTimer.unref?.();
 const opsTimer = setInterval(() => {
   void alertPass();
+  void watchdogPass();
   void digestPass();
   void nightlyPass();
 }, OPS.alertEveryMs);

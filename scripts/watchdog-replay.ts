@@ -13,21 +13,27 @@
  * harness or it is decoration, because the alternative is an engineer eyeballing a
  * log once and declaring the invariant sound.
  *
- * So this script is the gate, not the invariants. It reconstructs the state each
- * candidate reads at a series of past instants, reports every firing, marks the
- * ones that coincide with a recorded incident, and REFUSES to bless anything while
- * the corpus is shorter than 14 days. Today the corpus is about 3 days, so the
- * honest output is "not shippable yet, here is what they would have said".
+ * So this script is the gate, and `src/watchdog.ts` is the invariants. It
+ * reconstructs the state each one reads at a series of past instants, reports
+ * every firing, marks the ones that coincide with a recorded incident, and
+ * REFUSES to bless anything while the corpus is shorter than 14 days.
  *
- * Replaying without a stored history works because both candidates read state that
- * carries its own timestamps: an engine run knows when it started and ended, and a
- * roster event is a full snapshot of the room at its own seq.
+ * It also re-measures the `replay` verdict each invariant carries and exits
+ * non-zero when the measurement disagrees, because that field is what decides
+ * which invariants the supervisor evaluates in production. A recorded verdict
+ * nobody re-measures is a licence that cannot expire.
+ *
+ * Replaying without a stored history works because every invariant reads state
+ * that carries its own timestamps: an engine run knows when it started and ended,
+ * and a roster event is a full snapshot of the room at its own seq.
  */
 import Database from "better-sqlite3";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { RfaEvent } from "../src/model.js";
 import { HubDirError, requireHubDir } from "../src/hubdir.js";
+import { INVARIANTS, measureVerdict, shippedInvariants, verdictDrift } from "../src/watchdog.js";
+import type { Firing, ReplayVerdict, RoomRoster, WatchdogRun, WatchdogState } from "../src/watchdog.js";
 
 /**
  * THE CORPUS LIVES IN A HUB DIRECTORY, not in this checkout (RFA-0.7).
@@ -128,21 +134,30 @@ const corpusTo = Math.max(...allTs);
 const spanDays = (corpusTo - corpusFrom) / DAY;
 
 const runsDb = hubdir.paths.runsDb;
-type RunRow = { run_id: string; agent: string; status: string; started_at: string | null; ended_at: string | null };
-const runs: RunRow[] = fs.existsSync(runsDb)
+const runs: WatchdogRun[] = fs.existsSync(runsDb)
   ? (new Database(runsDb, { readonly: true })
       .prepare("SELECT run_id, agent, status, started_at, ended_at FROM runs")
-      .all() as RunRow[])
+      .all() as WatchdogRun[])
   : [];
 
-// ---------------------------------------------------------------- candidates
+// ---------------------------------------------------------------- the state
 
-type Firing = { at: number; detail: string };
-type Candidate = { id: string; what: string; shippable: boolean; note?: string; evaluate: (t: number) => Firing | null };
+/**
+ * THE INVARIANTS ARE NOT DEFINED HERE.
+ *
+ * They live in `src/watchdog.ts`, which is also what `src/supervisor.ts`
+ * evaluates in production. This script supplies the state and the verdict; an
+ * invariant validated as one copy and shipped as another validates nothing.
+ *
+ * What this file owns is the reconstruction: room rosters at a past instant, and
+ * the full `runs` table rather than the live `running` set, because evaluating at
+ * a past `t` means re-deriving which runs were running THEN from the timestamps
+ * each row carries.
+ */
 
 /** The last roster snapshot at or before `t`, per room: a full member list. */
-function rosterAt(t: number): { room: string; members: Record<string, unknown>[] }[] {
-  const out: { room: string; members: Record<string, unknown>[] }[] = [];
+function rosterAt(t: number): RoomRoster[] {
+  const out: RoomRoster[] = [];
   for (const [room, events] of rooms) {
     let latest: RfaEvent | undefined;
     for (const e of events) {
@@ -154,61 +169,7 @@ function rosterAt(t: number): { room: string; members: Record<string, unknown>[]
   return out;
 }
 
-const STUCK_AFTER_MS = 2 * HOUR; // must exceed a legitimate 30-minute approval wait
-
-const candidates: Candidate[] = [
-  {
-    id: "engine-run-stuck-running",
-    what: `an engine run has been 'running' for more than ${STUCK_AFTER_MS / HOUR}h`,
-    shippable: true,
-    note: "spec 20.6 REQUIRES this one: it is the only anomaly that was present in live state",
-    evaluate: (t) => {
-      const stuck = runs.filter((r) => {
-        if (!r.started_at) return false;
-        const started = Date.parse(r.started_at);
-        if (!Number.isFinite(started) || started > t) return false;
-        const ended = r.ended_at ? Date.parse(r.ended_at) : null;
-        const runningAtT = ended === null || ended > t;
-        return runningAtT && t - started > STUCK_AFTER_MS;
-      });
-      return stuck.length === 0 ? null : { at: t, detail: `${stuck.length} run(s): ${stuck.slice(0, 3).map((r) => `${r.run_id}/${r.agent}`).join(", ")}` };
-    },
-  },
-  {
-    id: "observers-present-but-lease-expired-NAIVE",
-    what: "any observer is present with an expired lease",
-    shippable: false,
-    note: "the form spec 20.6 predicts false-fires: an expired lease is NORMAL for up to the 24h prune window",
-    evaluate: (t) => {
-      const hits: string[] = [];
-      for (const { room, members } of rosterAt(t)) {
-        for (const m of members) {
-          const role = String(m.role ?? "");
-          const exp = m.lease_expires ? Date.parse(String(m.lease_expires)) : NaN;
-          if (role === "observer" && Number.isFinite(exp) && exp < t) hits.push(`${room}/${String(m.name)}`);
-        }
-      }
-      return hits.length === 0 ? null : { at: t, detail: `${hits.length}: ${hits.slice(0, 3).join(", ")}` };
-    },
-  },
-  {
-    id: "observers-expired-beyond-prune",
-    what: "an observer's lease expired more than 24h ago, so the prune should have taken it",
-    shippable: true,
-    note: "20.6's corrected form of the invariant above",
-    evaluate: (t) => {
-      const hits: string[] = [];
-      for (const { room, members } of rosterAt(t)) {
-        for (const m of members) {
-          const role = String(m.role ?? "");
-          const exp = m.lease_expires ? Date.parse(String(m.lease_expires)) : NaN;
-          if (role === "observer" && Number.isFinite(exp) && t - exp > DAY) hits.push(`${room}/${String(m.name)}`);
-        }
-      }
-      return hits.length === 0 ? null : { at: t, detail: `${hits.length}: ${hits.slice(0, 3).join(", ")}` };
-    },
-  },
-];
+const state: WatchdogState = { runs, rosters: rosterAt };
 
 // ---------------------------------------------------------------- the replay
 
@@ -217,29 +178,33 @@ console.log(`        ${new Date(corpusFrom).toISOString()} .. ${new Date(corpusT
 console.log(`        replaying in ${bucketHours}h buckets against ${INCIDENTS.length} recorded incident window(s)\n`);
 
 let anyBlocked = false;
-for (const c of candidates) {
+const measurements: { id: string; verdict: ReplayVerdict }[] = [];
+for (const inv of INVARIANTS) {
   const firings: Firing[] = [];
   for (let t = corpusFrom; t <= corpusTo; t += bucketHours * HOUR) {
-    const f = c.evaluate(t);
+    const f = inv.evaluate(state, t);
     if (f) firings.push(f);
   }
-  const inIncident = firings.filter((f) => incidentFor(c.id, f.at) !== null);
-  const outside = firings.filter((f) => incidentFor(c.id, f.at) === null);
-  const verdict = firings.length === 0 ? "SILENT" : outside.length === 0 ? "CLEAN" : "FALSE-FIRES";
-  console.log(`${verdict.padEnd(12)} ${c.id}`);
-  console.log(`             ${c.what}`);
-  if (c.note) console.log(`             note: ${c.note}`);
+  const inIncident = firings.filter((f) => incidentFor(inv.id, f.at) !== null);
+  const outside = firings.filter((f) => incidentFor(inv.id, f.at) === null);
+  const measured = measureVerdict(firings.length, outside.length);
+  measurements.push({ id: inv.id, verdict: measured });
+  console.log(`${measured.toUpperCase().padEnd(12)} ${inv.id}`);
+  console.log(`             ${inv.what}`);
+  console.log(`             recorded: ${inv.replay}${inv.replay === "clean" ? " (SHIPS)" : " (does not ship)"}`);
+  console.log(`             ${inv.why.replace(/\s+/g, " ")}`);
   console.log(`             ${firings.length} firing bucket(s): ${inIncident.length} inside a recorded incident, ${outside.length} outside`);
   if (firings.length > 0) {
     const first = firings[0];
     console.log(`             first: ${new Date(first.at).toISOString()} ${first.detail}`);
-    console.log(`                    incident: ${incidentFor(c.id, first.at) ?? "NONE THAT CLAIMS THIS INVARIANT"}`);
+    console.log(`                    incident: ${incidentFor(inv.id, first.at) ?? "NONE THAT CLAIMS THIS INVARIANT"}`);
   }
   if (outside.length > 0) {
     const o = outside[0];
     console.log(`             unexplained: ${new Date(o.at).toISOString()} ${o.detail}`);
   }
-  if (verdict === "FALSE-FIRES" && c.shippable) anyBlocked = true;
+  if (measured !== inv.replay) console.log(`             DISAGREES WITH src/watchdog.ts: recorded \`${inv.replay}\`, measured \`${measured}\``);
+  if (measured === "false-fires" && inv.replay === "clean") anyBlocked = true;
   console.log();
 }
 
@@ -250,7 +215,17 @@ if (spanDays < REQUIRED_SPAN_DAYS) {
   process.exit(0);
 }
 if (anyBlocked) {
-  console.log("NOT SHIPPABLE: a candidate marked shippable fired outside every recorded incident. Fix it or record the incident.");
+  console.log("NOT SHIPPABLE: a SHIPPED invariant fired outside every recorded incident. Unship it, fix it, or record the incident.");
   process.exit(1);
 }
-console.log("Corpus long enough and no shippable candidate false-fires.");
+// The recorded verdicts are re-measured, not trusted: `src/watchdog.ts` ships on
+// the strength of that field, so a field that has drifted from what the corpus
+// says is a shipped invariant holding a stale licence.
+const disagreed = verdictDrift(measurements);
+if (disagreed.length > 0) {
+  console.log("VERDICTS DRIFTED from src/watchdog.ts, which is what production evaluates:");
+  for (const d of disagreed) console.log(`  ${d}`);
+  console.log("Update the `replay` field and its `why` to what this corpus measures, or explain the difference.");
+  process.exit(1);
+}
+console.log(`Corpus long enough; every verdict matches src/watchdog.ts. Shipped: ${shippedInvariants().map((i) => i.id).join(", ")}`);

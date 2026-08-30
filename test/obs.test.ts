@@ -4,7 +4,7 @@ import { test } from "node:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ObsStore, dottedSegment, evaluateAlerts, formatReviewDigest } from "../src/obs.js";
+import { AlertCooldown, ObsStore, dottedSegment, evaluateAlerts, formatReviewDigest } from "../src/obs.js";
 
 function fresh() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rfa-obs-"));
@@ -248,4 +248,27 @@ test("the SQL classifier and isAuthError agree, so they cannot drift apart", asy
   }
   obs.close();
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("AlertCooldown: the first is due, the repeat is not, and the cooldown expires", () => {
+  const cd = new AlertCooldown(30 * 60_000);
+  const a = { kind: "error_pct" as const, message: "40% over 12 runs" };
+  assert.deepEqual(cd.due([a], 1_000), [a], "nothing sent yet, so it is due");
+  assert.deepEqual(cd.due([a], 1_000 + 29 * 60_000), [], "still inside the cooldown");
+  assert.deepEqual(cd.due([a], 1_000 + 31 * 60_000), [a], "past it, the operator hears it again");
+});
+
+test("AlertCooldown: one watchdog invariant firing never silences another", () => {
+  // Every watchdog alert shares the kind `watchdog` (spec 20.6, src/watchdog.ts).
+  // Keying the cooldown on kind, which is what the triad needed, would let the
+  // first invariant to speak mute the rest for the whole window.
+  const cd = new AlertCooldown(30 * 60_000);
+  const stuck = { kind: "watchdog" as const, key: "watchdog:engine-run-stuck-running", message: "1 run stuck" };
+  const other = { kind: "watchdog" as const, key: "watchdog:some-other-invariant", message: "something else" };
+  assert.deepEqual(cd.due([stuck], 0), [stuck]);
+  assert.deepEqual(
+    cd.due([stuck, other], 60_000).map((x) => x.key),
+    ["watchdog:some-other-invariant"],
+    "the second invariant is heard while the first is still cooling down",
+  );
 });

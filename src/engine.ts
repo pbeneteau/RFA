@@ -15,6 +15,7 @@ import { randomBytes } from "node:crypto";
 import { Cron } from "croner";
 import { pidAlive } from "./account.js";
 import { effectClassOf, mayRetryUnsettled } from "./actionid.js";
+import type { WatchdogRun } from "./watchdog.js";
 
 export type RunStatus = "pending" | "running" | "error" | "success" | "timeout" | "interrupted";
 export type ThreadStatus = "idle" | "busy" | "interrupted" | "error";
@@ -399,6 +400,29 @@ export class Engine {
       }
       return { runs: dead.map((r) => r.run_id), threads: [...new Set(dead.map((r) => r.thread_id))] };
     })();
+  }
+
+  /**
+   * Every run the engine currently records as `running`, for the watchdog.
+   *
+   * This is the READ that complements the two sweeps above, and it deliberately
+   * does not sweep. `reconcileDead` refuses to infer death from age, and it is
+   * right to: a long run is not a dead one. But that leaves a residue nothing
+   * settles - a run whose owner process is alive and wedged, and a NULL-owner row
+   * whose pack is never restarted - and the residue is exactly what spec 20.6's
+   * one required invariant is for. So the watchdog reads the same rows, applies
+   * the age test the sweeps decline to apply, and raises an operator alert
+   * instead of rewriting state. Judging a run dead on a clock is a decision for a
+   * human, and `src/watchdog.ts` says so at more length.
+   *
+   * `status = 'running'` IS the set of runs running at NOW, which is the only
+   * instant this can be asked about. `WatchdogState.runs` documents the contract
+   * the replay harness satisfies differently, over past instants.
+   */
+  runningRuns(): WatchdogRun[] {
+    return this.db
+      .prepare(`SELECT run_id, agent, status, started_at, ended_at FROM runs WHERE status = 'running'`)
+      .all() as WatchdogRun[];
   }
 
   reconcileOrphans(agent: string): { runs: string[]; threads: string[] } {
