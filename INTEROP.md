@@ -916,6 +916,11 @@ deferred.
 
 ## 10. The reference client
 
+`npm run e2e` runs this client against a real hub on every pass, as section 0 tells you to run it:
+it joins, answers a mentioned request with `in_reply_to` correlation, and leaves. So the code below
+is exercised rather than merely published, and a wire change that breaks a conforming peer breaks
+this repository's own gate first.
+
 `rfa_min.py` (shipped with this document, `interop/rfa_min.py` in the reference repository): one
 file, Python 3, standard library only, about 720 lines including comments.
 

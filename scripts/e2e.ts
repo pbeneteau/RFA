@@ -1278,6 +1278,77 @@ await scenario("rung 7 guest: the local-only guarantees are not offered to a pee
 });
 
 // 6. Signing profile: verified / tampered / strict hub
+/**
+ * THE REFERENCE CLIENT, run the way INTEROP.md tells a stranger to run it.
+ *
+ * `interop/rfa_min.py` is the only artifact in this repository whose whole
+ * purpose is to work in someone else's hands, and until 2026-08-30 nothing
+ * executed it: not `npm test`, not this harness, not a script. An edit to it was
+ * unverified by construction, and so was every wire change it depends on - the
+ * guide it ships with has been wrong about this hub's behaviour more than once.
+ *
+ * It runs against the SAME hub every other scenario uses, as a real member: it
+ * joins with a shared secret, parks a listen, answers a mentioned request with
+ * `in_reply_to` correlation, and leaves cleanly. The assertions are what a
+ * counterparty would notice breaking, not what the script happens to print.
+ *
+ * python3 is REQUIRED rather than skipped-around: `npm run tui:smoke` already
+ * depends on it, INTEROP.md's own instructions are `python3 rfa_min.py`, and a
+ * scenario that passes without exercising anything is the green tick over an
+ * unchecked property this project keeps paying for.
+ */
+await scenario("interop: the reference client joins, answers with correlation, and leaves", async () => {
+  const u = mainHub.url;
+  const host = await call(u, "room_create", { topic: "interop gate", name: "interop-host", card: card("interop-host", "ask-things") });
+  const hostTok = host.you.membership_token;
+
+  // NOT --quiet: the client's own reporting is part of the artifact a stranger
+  // reads, so the gate exercises it and asserts on it.
+  const client = spawn("python3", [path.join(ROOT, "interop", "rfa_min.py"), "--cycles", "6", "--listen-ms", "1200", "--no-task"], {
+    env: { ...process.env, RFA_HUB: u, RFA_ROOM: host.room, RFA_JOIN_SECRET: host.join_secret, RFA_NAME: "interop-probe" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let out = "";
+  client.stdout?.on("data", (b: Buffer) => (out += b.toString()));
+  client.stderr?.on("data", (b: Buffer) => (out += b.toString()));
+  const exited = new Promise<number>((resolve) => client.on("exit", (code) => resolve(code ?? 1)));
+
+  // Wait for it to actually be in the room before asking it anything: a race
+  // here would test the harness's timing rather than the client.
+  let probe: any = null;
+  for (let i = 0; i < 60 && !probe; i++) {
+    const roster = await call(u, "room_roster", { room: host.room, membership_token: hostTok });
+    probe = roster.roster.find((r: any) => r.name === "interop-probe");
+    if (!probe) await sleep(200);
+  }
+  assert(probe, `the reference client never joined; its output was: ${out.slice(0, 300)}`);
+
+  const ask = await call(u, "room_send", {
+    room: host.room, membership_token: hostTok, message_id: "e2e_interop_ask", kind: "request",
+    mentions: [probe.id], reply_by: new Date(Date.now() + 60_000).toISOString(),
+    body: [{ type: "text", text: "does the reference client still answer?" }],
+  });
+
+  // Its answer, correlated the way 5.3 says: in_reply_to is the key.
+  let answer: any = null;
+  for (let i = 0; i < 40 && !answer; i++) {
+    const inbox = await call(u, "room_listen", { room: host.room, membership_token: hostTok, since: ask.seq, timeout_ms: 1500, wait_for: "all" });
+    answer = inbox.events.find((e: any) => e.type === "message" && e.envelope.in_reply_to === "e2e_interop_ask");
+  }
+  const code = await exited;
+  assert(answer, `the reference client did not answer; exit ${code}, output: ${out.slice(0, 400)}`);
+  assert(answer.envelope.from.id === probe.id, "the answer did not come from the probe");
+  assert(answer.envelope.conversation_id === ask.conversation_id, "the answer left the conversation");
+  assert(code === 0, `the reference client exited ${code}: ${out.slice(0, 400)}`);
+  assert(/left the room/.test(out), `it did not leave cleanly: ${out.slice(-300)}`);
+
+  // It is gone from the roster afterwards, which is what "left cleanly" means to
+  // everyone else in the room.
+  const after = await call(u, "room_roster", { room: host.room, membership_token: hostTok });
+  assert(!after.roster.some((r: any) => r.name === "interop-probe"), "the probe is still on the roster after leaving");
+  return `joined, answered in_reply_to=e2e_interop_ask from ${probe.id}, left cleanly (exit 0)`;
+});
+
 await scenario("signing: verified card, tamper detection, --require-signed enforcement", async () => {
   const key = generateSigningKey("EdDSA");
   const signed = signCard(card("signed-agent", "sign") as any, key);
