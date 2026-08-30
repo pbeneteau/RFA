@@ -90,6 +90,50 @@ const DECLARED = z.enum(["ready", "busy", "away"]);
 
 type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
 
+/**
+ * The strict schema for each tool, by tool name, so `run` can enforce it (spec 15).
+ *
+ * WHY THIS EXISTS. Spec 15: "A hub MUST wrap its own argument-validation
+ * failures in this same shape rather than returning a bare string: an SDK that
+ * emits plain text on a schema violation is the first error class a new
+ * implementer meets, and `bad_request` is the code for it." The MCP SDK
+ * validates a tool's `inputSchema` BEFORE the handler runs and throws its own
+ * `Input validation error: Invalid arguments for tool room_listen: ...` - plain
+ * prose, no code, no RFA envelope - so `run`'s catch-all never saw it and a peer
+ * had nothing to branch on. Measured against a live hub for a missing argument,
+ * an out-of-range bound and a bad enum alike.
+ */
+const STRICT_SCHEMAS = new Map<string, z.ZodTypeAny>();
+
+/**
+ * Advertise a tool's schema EXACTLY as before while deferring its enforcement to
+ * `run`, which can answer in the RFA error shape.
+ *
+ * The SDK derives the published JSON Schema from the same object it validates
+ * with, so the two can only be separated by handing it an object that converts
+ * one way and validates another. This proxy is that object: everything reads
+ * through to the real zod schema, so `standardSchemaToJsonSchema` produces a
+ * BYTE-IDENTICAL `tools/list` entry (asserted in `test/hub.test.ts`), and only
+ * `~standard.validate` is replaced with a pass-through.
+ *
+ * Note that it must wrap the WHOLE object schema, not the individual fields: the
+ * SDK normalizes a raw shape into a fresh `z.object`, which rebuilds the fields
+ * and discards a per-field proxy. Measured both ways before this landed.
+ */
+function advertised<S extends z.ZodRawShape>(tool: string, shape: S): z.ZodObject<S> {
+  const strict = z.object(shape);
+  STRICT_SCHEMAS.set(tool, strict);
+  return new Proxy(strict, {
+    get(target, prop, recv) {
+      if (prop === "~standard") {
+        const std = Reflect.get(target, prop, recv) as unknown as Record<string, unknown>;
+        return { ...std, validate: (value: unknown) => ({ value }) };
+      }
+      return Reflect.get(target, prop, recv);
+    },
+  }) as z.ZodObject<S>;
+}
+
 function ok(result: unknown): ToolResult {
   return { content: [{ type: "text", text: JSON.stringify(result, null, 1) }] };
 }
@@ -134,6 +178,30 @@ async function run(
         if (member) span.setAttribute("rfa.member", member);
       }
       try {
+        /**
+         * ARGUMENT VALIDATION, here rather than at the SDK (spec 15). The SDK
+         * would answer a schema violation with plain prose and no code; this
+         * throws an `RfaError`, which `fail` renders in the same envelope every
+         * other refusal uses, so a peer branches on `bad_request` instead of
+         * matching on English.
+         *
+         * The parsed value is assigned BACK onto the object the handler closed
+         * over, and keys the schema strips are removed, so a handler sees
+         * exactly what the SDK used to hand it: coerced values, defaults
+         * applied, unknown keys gone.
+         */
+        const strict = STRICT_SCHEMAS.get(tool);
+        if (strict) {
+          const parsed = strict.safeParse(args);
+          if (!parsed.success) {
+            const issue = parsed.error.issues[0];
+            const where = issue.path.join(".");
+            throw new RfaError("bad_request", `${where ? `${where}: ` : ""}${issue.message}`.slice(0, 400));
+          }
+          const value = parsed.data as Record<string, unknown>;
+          for (const key of Object.keys(args)) if (!(key in value) && key !== "_meta") delete (args as Record<string, unknown>)[key];
+          Object.assign(args, value);
+        }
         const result = await fn();
         const seq = (result as { seq?: unknown } | null | undefined)?.seq;
         if (typeof seq === "number") span.setAttribute("rfa.seq", seq);
@@ -216,13 +284,13 @@ export function createHubServer(hub: RoomHub): McpServer {
       description:
         "Create a new RFA room and join it as host. Returns the room handle, the join_secret to share with invitees, " +
         "and your join contract (identity, membership_token, roster, cursor).",
-      inputSchema: {
+      inputSchema: advertised("room_create", {
         topic: z.string().min(1).max(200),
         name: NAME,
         card: cardSchema,
         policies: policiesSchema,
         human_key: z.string().optional().describe("Provisioned human-principal key; grants origin=human"),
-      },
+      }),
     },
     async (args) =>
       run(hub, "room_create", args, () => {
@@ -238,7 +306,7 @@ export function createHubServer(hub: RoomHub): McpServer {
       description:
         "Join an RFA room. Returns the join contract: your identity (you.id, you.name, membership_token), the full roster " +
         "with presence states and capability digests, recent history, and a cursor for room_listen. Process in that order.",
-      inputSchema: {
+      inputSchema: advertised("room_join", {
         room: z.string().describe("Room handle (r_*)"),
         join_secret: z
           .string()
@@ -255,7 +323,7 @@ export function createHubServer(hub: RoomHub): McpServer {
           .optional()
           .describe("Provisioned human-principal key (hub --human-key); grants origin=human"),
         history_limit: z.number().int().min(0).max(500).optional(),
-      },
+      }),
     },
     async (args) => run(hub, "room_join", args, () => hub.join(args)),
   );
@@ -265,7 +333,7 @@ export function createHubServer(hub: RoomHub): McpServer {
     {
       title: "Leave a room",
       description: "Leave the room. Your name is freed (rebind-guarded), your token is revoked.",
-      inputSchema: { room: z.string(), membership_token: TOKEN },
+      inputSchema: advertised("room_leave", { room: z.string(), membership_token: TOKEN }),
     },
     async (args) => run(hub, "room_leave", args, () => hub.leave(args)),
   );
@@ -280,7 +348,7 @@ export function createHubServer(hub: RoomHub): McpServer {
         "for questions; answer with kind=response and in_reply_to; decline with kind=refuse and a refusal reason " +
         "(busy = retry later, ineligible = re-route). mention the members whose attention you want. " +
         "Always generate a fresh unique message_id (retries with the same id are idempotent).",
-      inputSchema: {
+      inputSchema: advertised("room_send", {
         room: z.string(),
         membership_token: TOKEN,
         message_id: z.string().min(8).max(64),
@@ -326,7 +394,7 @@ export function createHubServer(hub: RoomHub): McpServer {
           .describe("Floor-controlled rooms: release the floor after this message (holder only)"),
         _meta: z.record(z.string(), z.unknown()).optional().describe("traceparent/tracestate/baggage pass through"),
         ext: z.record(z.string(), z.unknown()).optional(),
-      },
+      }),
     },
     async (args) => run(hub, "room_send", args, () => hub.send(args as Parameters<typeof hub.send>[0])),
   );
@@ -344,14 +412,14 @@ export function createHubServer(hub: RoomHub): McpServer {
         "your requests), 'all' (everything, including ambient chat and presence changes), 'conversation:{id}', " +
         "'from:{member}'. Replay honors the same filter: the returned cursor is the log tip, non-matching events are " +
         "counted in ambient_skipped, and you can re-read them any time with wait_for='all' and a lower since.",
-      inputSchema: {
+      inputSchema: advertised("room_listen", {
         room: z.string(),
         membership_token: TOKEN,
         since: z.number().int().min(0).describe("Last seen seq; the join contract's history.cursor to start"),
         timeout_ms: z.number().int().min(0).max(60_000).optional(),
         wait_for: z.string().optional(),
         presence: DECLARED.optional(),
-      },
+      }),
     },
     async (args) => run(hub, "room_listen", args, () => hub.listen(args)),
   );
@@ -363,7 +431,7 @@ export function createHubServer(hub: RoomHub): McpServer {
       description:
         "Full roster: every member with presence state, capability digest, and card summary, plus the room epoch. " +
         "Refresh this after any roster event before addressing members by name.",
-      inputSchema: { room: z.string(), membership_token: TOKEN },
+      inputSchema: advertised("room_roster", { room: z.string(), membership_token: TOKEN }),
     },
     async (args) => run(hub, "room_roster", args, () => hub.roster(args)),
   );
@@ -375,7 +443,7 @@ export function createHubServer(hub: RoomHub): McpServer {
       description:
         "Declare your state: ready (accepting requests), busy (working; add detail), away. You never declare offline; " +
         "the hub infers it when your lease expires. Also used to re-present your card (rotates your capability digest).",
-      inputSchema: {
+      inputSchema: advertised("room_presence", {
         room: z.string(),
         membership_token: TOKEN,
         state: DECLARED,
@@ -384,7 +452,7 @@ export function createHubServer(hub: RoomHub): McpServer {
         task: z.string().optional(),
         ttl_s: z.number().int().min(30).max(900).optional(),
         card: cardSchema.optional(),
-      },
+      }),
     },
     async (args) => run(hub, "room_presence", args, () => hub.presence(args)),
   );
@@ -396,12 +464,12 @@ export function createHubServer(hub: RoomHub): McpServer {
       description:
         "Fetch a member's full agent card by member ref or by capability digest. Cache by digest: identical digests mean " +
         "identical capabilities, no refetch needed.",
-      inputSchema: {
+      inputSchema: advertised("agent_describe", {
         room: z.string(),
         membership_token: TOKEN,
         member: MEMBER_REF.optional(),
         digest: z.string().optional(),
-      },
+      }),
     },
     async (args) => run(hub, "agent_describe", args, () => hub.describe(args)),
   );
@@ -423,7 +491,7 @@ export function createHubServer(hub: RoomHub): McpServer {
         "A claim whose keys intersect a live grant is REFUSED with task_conflict naming the blocking key, never queued, so back off and retry rather than waiting. " +
         "Intersection is on whole path segments: `local/a` conflicts with `local/a/notes` and not with `local/ab`. " +
         "Claiming again on a task you already own WIDENS your grant with the additional keys.",
-      inputSchema: {
+      inputSchema: advertised("room_task", {
         room: z.string(),
         membership_token: TOKEN,
         action: z.enum(["create", "get", "list", "claim", "release", "update", "complete", "verify", "cancel"]),
@@ -456,7 +524,7 @@ export function createHubServer(hub: RoomHub): McpServer {
         /** `update`: approve the reservation the hub offered after three refused widenings (spec 10.3 item 6). */
         approve_reservation: z.boolean().optional(),
         max_attempts: z.number().int().min(1).max(20).optional(),
-      },
+      }),
     },
     async (args) => run(hub, "room_task", args, () => hub.task(args as Parameters<typeof hub.task>[0])),
   );
@@ -475,7 +543,7 @@ export function createHubServer(hub: RoomHub): McpServer {
         "(params.policies: mode/moderator/attention/max_members/member_rpm/max_pending_requests/join_bearer_sha256/history_visibility), " +
         "set_role (host only; params.role), grant_floor " +
         "(assign the floor; also allowed for the designated moderator). Targets are member refs unless noted.",
-      inputSchema: {
+      inputSchema: advertised("room_admin", {
         room: z.string(),
         membership_token: TOKEN,
         verb: z.enum([
@@ -498,7 +566,7 @@ export function createHubServer(hub: RoomHub): McpServer {
           .record(z.string(), z.unknown())
           .optional()
           .describe("Verb-specific: inject {text, mentions?, kind?}, set_policy {policies}, set_role {role}"),
-      },
+      }),
     },
     async (args) => run(hub, "room_admin", args, () => hub.admin(args as Parameters<typeof hub.admin>[0])),
   );
@@ -514,13 +582,13 @@ export function createHubServer(hub: RoomHub): McpServer {
         "last cursor. Intended for SDK-level clients and resident agents; interactive hosts that do not surface " +
         "custom notifications should keep using room_listen. enabled=false unsubscribes. Watching alone does not " +
         "renew your presence lease in a quiet room; each delivered event does.",
-      inputSchema: {
+      inputSchema: advertised("room_watch", {
         room: z.string(),
         membership_token: TOKEN,
         since: z.number().int().min(0),
         wait_for: z.string().optional(),
         enabled: z.boolean().optional(),
-      },
+      }),
     },
     async (args) =>
       run(hub, "room_watch", args, () =>
@@ -543,7 +611,7 @@ export function createHubServer(hub: RoomHub): McpServer {
     {
       title: "End the room",
       description: "Host only. Ends the room: members are notified, further sends fail, reads keep working.",
-      inputSchema: { room: z.string(), membership_token: TOKEN, summary: z.string().max(2000).optional() },
+      inputSchema: advertised("room_end", { room: z.string(), membership_token: TOKEN, summary: z.string().max(2000).optional() }),
     },
     async (args) => run(hub, "room_end", args, () => hub.end(args)),
   );

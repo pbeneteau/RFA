@@ -295,13 +295,38 @@ export interface SendResult {
   replayed?: true;
 }
 
+/**
+ * The summary 9.1 requires when the per-member unread cap drops events, carried
+ * BESIDE the events rather than inside them.
+ *
+ * 9.1 asks for the dropped events to be "compacted into a `system` summary
+ * marker". A marker synthesized into `events` is a third thing a verifier must
+ * handle, where 9.6, sect. 13 and INTEROP.md all say there are exactly two, and
+ * a client that persists its cursor and listens again accumulates it mid-stream
+ * and gets a false tamper report. So the summary rides here, outside the array
+ * the hash chain covers: it carries everything the marker would have said, and
+ * a verifier walking `events` never meets it.
+ */
+export interface CompactionSummary {
+  /** How many matched events the cap dropped. Always equal to `ListenResult.compacted`. */
+  dropped: number;
+  /** The seq range that was dropped, inclusive: everything the caller will not receive. */
+  from_seq: number;
+  to_seq: number;
+  /** The cap that did it, so a client can tell a policy from a defect. */
+  cap: number;
+}
+
 export interface ListenResult {
   events: RfaEvent[];
   cursor: number;
   epoch: number;
   lease_expires: string;
   ambient_skipped: number;
+  /** How many events the per-member unread cap dropped. `compaction` says WHICH. */
   compacted: number;
+  /** Present only when `compacted > 0` (9.1). Absent is not zero: it means nothing was dropped. */
+  compaction?: CompactionSummary;
 }
 
 export interface JoinContract {

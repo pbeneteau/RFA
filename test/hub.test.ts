@@ -834,3 +834,42 @@ test("ambient_skipped counts what the filter dropped while parked, not just on r
   assert.equal(res.events.length, 1, "only the mention woke it");
   assert.ok(res.ambient_skipped >= 2, `the two ambient messages are counted (got ${res.ambient_skipped})`);
 });
+
+test("spec 15: an argument-validation failure comes back in the RFA envelope, not the SDK's prose", async () => {
+  const hub = new RoomHub({ dataDir: null, sweepIntervalMs: 0 });
+  const client = await connectAgent(hub, "validator");
+  const rfaError = async (name: string, args: Record<string, unknown>) => {
+    const r = (await client.callTool({ name, arguments: args })) as { isError?: boolean; content: { text: string }[] };
+    assert.equal(r.isError, true, `${name} should have refused`);
+    // The whole point: a peer branches on a CODE, not on English prose.
+    const body = JSON.parse(r.content[0].text) as { error?: { code?: string; message?: string } };
+    assert.ok(body.error, `${name} returned no RFA envelope: ${r.content[0].text.slice(0, 120)}`);
+    return body.error!;
+  };
+
+  // Every class an implementer meets first: a missing required argument, a
+  // violated bound, and a bad enum. All three used to return
+  // `Input validation error: Invalid arguments for tool ...` with no code.
+  assert.equal((await rfaError("room_listen", { room: "r_1", since: 0 })).code, "bad_request");
+  assert.equal((await rfaError("room_listen", { room: "r_1", membership_token: "t".repeat(20), since: 0, timeout_ms: 70_000 })).code, "bad_request");
+  assert.equal((await rfaError("room_presence", { room: "r_1", membership_token: "t".repeat(20), state: "offline" })).code, "bad_request");
+  const missing = await rfaError("room_listen", { room: "r_1", since: 0 });
+  assert.match(missing.message ?? "", /membership_token/, "and it still names the field, which is the useful half of the SDK's message");
+  hub.close();
+});
+
+test("spec 15: deferring validation did not change the schema the hub advertises", async () => {
+  // The advertised schema is what a peer builds against, so the fix must be
+  // invisible in `tools/list`. It is, because `advertised()` proxies the same
+  // zod object and replaces only `~standard.validate`.
+  const hub = new RoomHub({ dataDir: null, sweepIntervalMs: 0 });
+  const client = await connectAgent(hub, "lister");
+  const { tools } = (await client.listTools()) as { tools: { name: string; inputSchema: any }[] };
+  const listen = tools.find((t) => t.name === "room_listen")!;
+  assert.ok(listen.inputSchema.required.includes("membership_token"), "required survives");
+  assert.equal(listen.inputSchema.properties.timeout_ms.maximum, 60_000, "the bound survives, so a client still knows the cap");
+  assert.equal(listen.inputSchema.properties.membership_token.type, "string");
+  const presence = tools.find((t) => t.name === "room_presence")!;
+  assert.deepEqual(presence.inputSchema.properties.state.enum, ["ready", "busy", "away"], "the enum survives");
+  hub.close();
+});

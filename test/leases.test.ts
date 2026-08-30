@@ -317,6 +317,15 @@ test("9.1: the unread cap reports a count and adds NO event, because a marker wo
   assert.ok(second.compacted > 0, "the cap dropped events and says how many");
   assert.equal(second.events.some((e: any) => e.type === "system" && e.event === "compacted"), false, "and adds NO synthesized event");
 
+  // 9.1's summary, delivered BESIDE the events (the owner's option 2, 2026-08-30):
+  // everything an in-stream marker would have said, outside the array the hash
+  // chain covers, so a verifier walking `events` never meets it.
+  assert.ok(second.compaction, "a compaction must say WHICH events went, not only how many");
+  assert.equal(second.compaction!.dropped, second.compacted, "the two agree, always");
+  assert.ok(second.compaction!.from_seq <= second.compaction!.to_seq);
+  assert.equal(second.compaction!.cap, 5, "and it names the cap, so a client tells a policy from a defect");
+  assert.ok(second.compaction!.to_seq < second.events[0].seq, "the range ends before the oldest event actually delivered");
+
   // Why not, pinned rather than asserted in prose: a marker was built and
   // reverted on 2026-08-30 because the accumulated stream then DIVERGES, with a
   // false tamper report naming an innocent event. 9.6, 13 and INTEROP all say a
@@ -335,5 +344,10 @@ test("9.1: the unread cap reports a count and adds NO event, because a marker wo
     0,
     "no unchained event sits mid-stream: that is what a synthesized marker would add, and what makes a verifier accuse an innocent event",
   );
+
+  // Nothing dropped, nothing announced: absent is not zero.
+  const under = (await hub.listen({ room: host.room, membership_token: listener.you.membership_token, since: second.events.at(-1).seq - 2, timeout_ms: 0, wait_for: "mentions" })) as { compacted: number; compaction?: unknown };
+  assert.equal(under.compacted, 0);
+  assert.equal(under.compaction, undefined, "a compaction that did not happen must not be reported");
   hub.close();
 });

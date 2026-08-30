@@ -2810,6 +2810,7 @@ export class RoomHub {
 
     if (matched.length > 0 || timeoutMs === 0 || room.ended) {
       const compacted = Math.max(0, matched.length - this.cfg.replayCap);
+      const dropped = compacted > 0 ? matched.slice(0, compacted) : [];
       return {
         events: this.withWrapped(member, matched.slice(-this.cfg.replayCap)),
         cursor: room.seq,
@@ -2817,6 +2818,11 @@ export class RoomHub {
         lease_expires: iso(member.leaseExpires),
         ambient_skipped: scanned.length - matched.length,
         compacted,
+        // 9.1's summary, BESIDE the events rather than inside them. See the note
+        // above `RoomHub` for why an in-stream marker was built and reverted.
+        ...(compacted > 0
+          ? { compaction: { dropped: compacted, from_seq: dropped[0].seq, to_seq: dropped[dropped.length - 1].seq, cap: this.cfg.replayCap } }
+          : {}),
       };
     }
 
