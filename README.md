@@ -62,11 +62,13 @@ A hub directory can also host agents for a hub that runs elsewhere: `rfa init --
 |---|---|
 | [`STATUS.md`](STATUS.md) | **Current state, decisions in force, rung status, runbook (read first when resuming)** |
 | [`docs/LEDGER.md`](docs/LEDGER.md) | The findings ledger: the project's evidence record, appended directly as findings land. Completed-work narrative lives in [`docs/HISTORY.md`](docs/HISTORY.md) |
-| [`spec/RFA-0.1.md`](spec/RFA-0.1.md) | The wire protocol, **0.1.8 (draft)** (normative). Appendix F is the single implementation-status table: the spec leads the code in places and says so |
+| [`spec/RFA-0.1.md`](spec/RFA-0.1.md) | The wire protocol, **0.1.9 (draft)** (normative); 0.1.9 is the concurrency surface, transplanted from RFA-0.8 at its acceptance. Appendix F is the single implementation-status table: the spec leads the code in places and says so |
 | [`spec/RFA-0.4-platform.md`](spec/RFA-0.4-platform.md) | The v0.4 platform layer: agent packs, engine, memory, sandboxes, governance, evals, workbench. **Implemented** |
 | [`spec/RFA-0.5-platform.md`](spec/RFA-0.5-platform.md) | v0.5 amendments: exposure posture, the approval clock, reach, honest meters, knowledge, instruments. **Section 22 is the single merged build ladder for v0.5 and v0.6** |
 | [`spec/RFA-0.6-remote.md`](spec/RFA-0.6-remote.md) | v0.6: remote peers (admission records, transport auth, remote task mechanics, the interop artifact, containment, deployment) |
 | [`spec/RFA-0.7-cli.md`](spec/RFA-0.7-cli.md) | v0.7: the operator CLI and the hub directory. Accepted; being built rung by rung, with the rung status in STATUS |
+| [`spec/RFA-0.8-concurrency.md`](spec/RFA-0.8-concurrency.md) | v0.8: concurrency (the serial-loop invariant and parallel runs, the reservation budget ledger, the CoW-clone run workspace, the two-door write fence, `concurrency: N` and its gates, resource-keyed claims). Accepted; its section 2 wire half is protocol 0.1.9 |
+| [`spec/RFA-0.9-egress.md`](spec/RFA-0.9-egress.md) | v0.9: egress and the declared surface (the network posture wired to the OS sandbox, the built-in classification table and the widened fence coverage, the enforced `query()` inventory, the total tool surface, offer deprecation, and where the fence stops). Accepted; proved live by `npm run egress-proof` |
 | [`INTEROP.md`](INTEROP.md) | **Start here to connect a non-RFA agent.** Everything a stranger needs to join a room and do work, with `interop/rfa_min.py` as a dependency-free reference client. Verified by an engineer who had only this document and no repo access. `rfa docs interop --path` hands it out |
 | [`src/`](src/) | The hub (`main.ts`, an MCP server implementing the spec's `core` profile), the supervisor, the resident runner, the client SDK (`client.ts`), the hub directory (`hubdir.ts`), the CLI (`cli/`), the built-in MCP servers a pack can declare (`servers/`) |
 | [`console/index.html`](console/index.html) | Room console: live web view + supervisor controls, served by the hub at `/console` |
@@ -87,7 +89,11 @@ npm run demo              # the spec's worked example, in memory
 npm run evals             # = rfa evals run (about two dollars; one per day). Run it from a hub directory, or pass --dir:
                           #   npm run evals -- --dir ~/rfa/acme   (this repository is not an instance)
 npm run parity            # = rfa evals parity, twice after a brain or knowledge change; same --dir rule
+npm run fence-proof       # the two-door WRITE fence, proved against a real sandbox and a real model (RFA-0.8 sect. 9)
+npm run egress-proof      # what a pack may REACH, proved the same way (RFA-0.9 sect. 10.2)
 ```
+
+`fence-proof` and `egress-proof` are deliberately outside `npm test`: each needs a real OS sandbox, a real model and a real refusal, and nondeterminism in a trust anchor erodes it. Both are re-run after every SDK bump, because the behaviour they pin is version-fragile by design - the SDK's own type documentation contradicts itself about part of it, and a cache keyed on a version number is a changelog with extra steps.
 
 `npm run e2e` boots isolated hub processes (random ports, temp data dirs; your own hub directory is untouched), exercises both MCP eras over HTTP and stdio across its scenarios (unit suite, lockfile guard, dual-era serving, the spec section 17 core flow, tasks with a real claim race, signing incl. a strict `--require-signed` hub, moderation, push notifications, restart persistence, the CLI's init/up/status/down, an approval decided from the CLI), and writes `reports/latest.md` + `latest.json`. Exit code = number of failed scenarios.
 
@@ -135,7 +141,7 @@ In the terminal: `rfa room tail <alias> --follow`.
 - **The policy gate (spec 12.2)**: rules and command-tier checks over messages AND mutating task actions, most-severe-wins, fail-closed-to-hold, alerts and refusals audited as system events. `policies/gate.json` ships with three rules.
 - **Dual-era MCP serving (v2 SDK)**: the hub serves BOTH protocol eras on every transport: modern 2026-07-28 (`server/discover`, per-request `_meta`, `Mcp-Method`/`Mcp-Name` header routing, stateless HTTP) and legacy 2025-era (`initialize` handshake) on the same endpoint.
 
-**Protocol 0.1.8 changed the `core` and `tasks` profiles, and the reference hub does not yet meet its own amended profile.** That is stated rather than hidden: wire section 16.1 splits 0.1.8 into a half that binds now and a half gated on a named remote peer, and **Appendix F is the single per-requirement status table**; this README repeats none of its rows because a second copy is how they rot.
+**Protocol 0.1.8 changed the `core` and `tasks` profiles, and the reference hub does not yet meet its own amended profile** (the protocol is 0.1.9 now; 0.1.9 added the concurrency surface, and it is 0.1.8's profile change that this paragraph is about)**.** That is stated rather than hidden: wire section 16.1 splits 0.1.8 into a half that binds now and a half gated on a named remote peer, and **Appendix F is the single per-requirement status table**; this README repeats none of its rows because a second copy is how they rot.
 
 ## Security posture (spec section 14)
 
