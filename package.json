@@ -14,7 +14,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "prepare": "tsc",
+    "prepare": "node scripts/prepare.cjs",
     "prepublishOnly": "tsc",
     "dev": "tsx src/cli/main.ts",
     "start": "tsx src/main.ts",
