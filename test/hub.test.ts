@@ -873,3 +873,41 @@ test("spec 15: deferring validation did not change the schema the hub advertises
   assert.deepEqual(presence.inputSchema.properties.state.enum, ["ready", "busy", "away"], "the enum survives");
   hub.close();
 });
+
+test("9.3: the reply-to-my-own-message clause is bounded by a 500-entry cap, and that is a known miss", async () => {
+  /**
+   * 9.3's filter MUST match "message events that mention or address the caller
+   * **or reply to a message the caller sent**". The last clause is backed by
+   * `member.sentIds`, which src/store.ts caps at 500 with LRU eviction, so past
+   * 500 sends a reply to an older message of yours stops matching.
+   *
+   * This test PINS the current behaviour rather than asserting the MUST,
+   * because the fix is a tradeoff the owner has not taken: an unbounded set on a
+   * long-lived resident is exactly what the cap exists to prevent. If the cap is
+   * ever changed - raised, time-windowed, or removed - this test fails, which is
+   * the point: the decision should be made deliberately, not discovered.
+   */
+  const hub = new RoomHub({ dataDir: null, sweepIntervalMs: 0, rateMsgsPerMin: 100_000 });
+  const host = hub.createRoom({ topic: "sentids", name: "talker", card: pmCard });
+  const replier = hub.join({ room: host.room, join_secret: host.join_secret!, name: "replier", card: devCard });
+  const tok = host.contract.you.membership_token;
+  const send = (from: string, args: Record<string, unknown>) => hub.send({ room: host.room, membership_token: from, ...args } as never);
+
+  await send(tok, { body: [{ type: "text", text: "m0" }], message_id: "sid-0000" });
+  for (let i = 1; i <= 501; i++) await send(tok, { body: [{ type: "text", text: `m${i}` }], message_id: `sid-${String(i).padStart(4, "0")}` });
+  const cursor = ((await hub.listen({ room: host.room, membership_token: tok, since: 0, timeout_ms: 0, wait_for: "all" })) as { cursor: number }).cursor;
+  const deliveredToTalker = async () =>
+    ((await hub.listen({ room: host.room, membership_token: tok, since: cursor, timeout_ms: 0, wait_for: "mentions" })) as { events: any[] }).events.map((e) => e.envelope?.message_id);
+
+  // An UNADDRESSED reply to the caller's oldest message: the only case this
+  // clause is load-bearing for, and the one the cap loses.
+  await send(replier.you.membership_token, { kind: "response", in_reply_to: "sid-0000", body: [{ type: "text", text: "old" }], message_id: "sid-reply-old" });
+  assert.equal((await deliveredToTalker()).includes("sid-reply-old"), false, "KNOWN MISS: 9.3 says this MUST match; the 500-entry sentIds cap evicted the message id");
+
+  // Two controls, so the cap is shown to be the cause rather than the reply path.
+  await send(replier.you.membership_token, { kind: "response", in_reply_to: "sid-0501", body: [{ type: "text", text: "recent" }], message_id: "sid-reply-new" });
+  assert.equal((await deliveredToTalker()).includes("sid-reply-new"), true, "a reply to a RECENT message still matches, so the reply path itself is fine");
+  await send(replier.you.membership_token, { kind: "response", in_reply_to: "sid-0000", to: [host.contract.you.id], body: [{ type: "text", text: "addressed" }], message_id: "sid-reply-addr" });
+  assert.equal((await deliveredToTalker()).includes("sid-reply-addr"), true, "an ADDRESSED reply matches on `to` before sentIds is consulted, which is why a conforming client never meets this");
+  hub.close();
+});
