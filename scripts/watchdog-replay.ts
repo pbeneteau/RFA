@@ -1,8 +1,11 @@
 /**
  * Replay validation for watchdog invariants (spec 20.6).
  *
- *   npx tsx scripts/watchdog-replay.ts                 # replay every candidate, report
- *   npx tsx scripts/watchdog-replay.ts -- --hours 1    # bucket size (default 1h)
+ *   npx tsx scripts/watchdog-replay.ts --dir ~/rfa/acme        replay every candidate, report
+ *   npx tsx scripts/watchdog-replay.ts --dir ~/rfa/acme --hours 1   bucket size (default 1h)
+ *
+ * Run it from inside a hub directory, or name one with `--dir` / `RFA_DIR`: this
+ * repository carries no instance.
  *
  * 20.6 is a MUST NOT with teeth: an invariant may not ship until it has been
  * replayed against at least two weeks of room logs plus the observability store
@@ -24,8 +27,31 @@ import Database from "better-sqlite3";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { RfaEvent } from "../src/model.js";
+import { HubDirError, requireHubDir } from "../src/hubdir.js";
 
-const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
+/**
+ * THE CORPUS LIVES IN A HUB DIRECTORY, not in this checkout (RFA-0.7).
+ *
+ * This script read `<repo>/data/rooms` and `<repo>/data/runs.db` until
+ * 2026-08-31, which is the pre-0.7 layout: `agents/`, `data/` and `dogfood/`
+ * were removed from this repository on 2026-08-25 and the instance became a hub
+ * directory. So it had been exiting `no room logs to replay against` on the
+ * first line of work ever since, while STATUS carried "re-run it and ship what
+ * is still clean" as an actionable item. `test/hubdir.test.ts` greps `src/` for
+ * exactly this defect and did not walk `scripts/`; it does now.
+ */
+const hubdir = (() => {
+  try {
+    const i = process.argv.indexOf("--dir");
+    return requireHubDir({ dir: i >= 0 ? process.argv[i + 1] : undefined });
+  } catch (err) {
+    if (err instanceof HubDirError) {
+      console.error(`watchdog-replay: ${err.message}\n  ${err.hint}`);
+      process.exit(2);
+    }
+    throw err;
+  }
+})();
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
 const REQUIRED_SPAN_DAYS = 14; // spec 20.6
@@ -80,13 +106,13 @@ const incidentFor = (id: string, t: number): string | null =>
 
 // ---------------------------------------------------------------- the corpus
 
-const roomFiles = fs.existsSync(path.join(ROOT, "data", "rooms"))
-  ? fs.readdirSync(path.join(ROOT, "data", "rooms")).filter((f) => f.endsWith(".ndjson"))
+const roomFiles = fs.existsSync(hubdir.paths.roomLogs)
+  ? fs.readdirSync(hubdir.paths.roomLogs).filter((f) => f.endsWith(".ndjson"))
   : [];
 const rooms = new Map<string, RfaEvent[]>();
 for (const f of roomFiles) {
   const events = fs
-    .readFileSync(path.join(ROOT, "data", "rooms", f), "utf8")
+    .readFileSync(path.join(hubdir.paths.roomLogs, f), "utf8")
     .split("\n")
     .filter((l) => l.trim())
     .map((l) => JSON.parse(l) as RfaEvent);
@@ -101,7 +127,7 @@ const corpusFrom = Math.min(...allTs);
 const corpusTo = Math.max(...allTs);
 const spanDays = (corpusTo - corpusFrom) / DAY;
 
-const runsDb = path.join(ROOT, "data", "runs.db");
+const runsDb = hubdir.paths.runsDb;
 type RunRow = { run_id: string; agent: string; status: string; started_at: string | null; ended_at: string | null };
 const runs: RunRow[] = fs.existsSync(runsDb)
   ? (new Database(runsDb, { readonly: true })

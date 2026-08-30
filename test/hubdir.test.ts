@@ -146,29 +146,47 @@ test("JsonStore writes atomically at 0600, leaves no temp file, and update() rou
 });
 
 test("no source file outside hubdir.ts joins a path onto an instance directory name", () => {
-  const src = path.resolve(import.meta.dirname, "..", "src");
+  /**
+   * `scripts/` is walked too, since 2026-08-31, and it was not before.
+   * `scripts/watchdog-replay.ts` read `<repo>/data/rooms` and exited "no room
+   * logs to replay against" on its first line of work from the day `data/` was
+   * removed (2026-08-25) - while STATUS carried "re-run it and ship what is
+   * still clean" as an actionable item that could never have run.
+   * `scripts/repair-obs-cost.ts` had the same defect. A guard that walks only
+   * half the tree finds only half the defects.
+   */
+  const roots = [path.resolve(import.meta.dirname, "..", "src"), path.resolve(import.meta.dirname, "..", "scripts")];
   const offenders: string[] = [];
   const walk = (dir: string): void => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) walk(full);
       else if (entry.name.endsWith(".ts") && entry.name !== "hubdir.ts") {
-        const rel = path.relative(src, full);
+        const rel = path.relative(path.resolve(import.meta.dirname, ".."), full);
         fs.readFileSync(full, "utf8")
           .split("\n")
           .forEach((line, i) => {
             const flag = (why: string) => offenders.push(`${rel}:${i + 1}: ${why}: ${line.trim()}`);
             // The old shape: a repository root, then fixed instance names joined onto it.
-            if (/path\.(join|resolve)\(\s*ROOT\b/.test(line)) flag("joins onto a repository ROOT");
-            if (/import\.meta\.dirname[^)]*"\.\."\s*\)/.test(line) && entry.name !== "pkg.ts") flag("resolves the repository root");
+            // A script legitimately resolves its own checkout to spawn a sibling
+            // entry (fence-proof, e2e); what none of them may do is join an
+            // INSTANCE directory onto it, which the two rules below catch.
+            const isScript = full.startsWith(path.resolve(import.meta.dirname, "..", "scripts"));
+            if (!isScript && /path\.(join|resolve)\(\s*ROOT\b/.test(line)) flag("joins onto a repository ROOT");
+            if (!isScript && /import\.meta\.dirname[^)]*"\.\."\s*\)/.test(line) && entry.name !== "pkg.ts") flag("resolves the repository root");
+            if (isScript && /path\.(join|resolve)\(\s*ROOT\s*,\s*["'](data|agents|dogfood)["']/.test(line)) flag("joins an instance directory onto the checkout");
             // Two instance subpaths as consecutive literals is a hard-coded layout (`"data", "runs.db"`).
             if (/["'](agents|data)["'],\s*["']/.test(line)) flag("hard-codes an instance layout");
             // The pre-0.7 directories have no business anywhere but the migration.
-            if (/["'](dogfood|deploy)["']/.test(line) && entry.name !== "migrate.ts") flag("names a pre-0.7 directory");
+            // Scoped to src/: in a script `"deploy"` is a legitimate VALUE (an
+            // approval-ext fixture names a `deploy` action), and the script rule
+            // above already catches the real defect, which is joining an
+            // instance directory onto the checkout.
+            if (!isScript && /["'](dogfood|deploy)["']/.test(line) && entry.name !== "migrate.ts") flag("names a pre-0.7 directory");
           });
       }
     }
   };
-  walk(src);
+  for (const root of roots) walk(root);
   assert.deepEqual(offenders, [], "every instance path goes through src/hubdir.ts");
 });

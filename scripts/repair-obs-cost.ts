@@ -32,9 +32,25 @@
 import Database from "better-sqlite3";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { HubDirError, requireHubDir } from "../src/hubdir.js";
 
-const ROOT = path.resolve(import.meta.dirname ?? ".", "..");
-const DB = path.join(ROOT, "data", "obs.db");
+/**
+ * The obs store lives in a HUB DIRECTORY, never in this checkout (RFA-0.7): the
+ * repository's `data/` was removed on 2026-08-25. Run this from inside one, or
+ * name it with `--dir` / `RFA_DIR`.
+ */
+const DB = (() => {
+  try {
+    const i = process.argv.indexOf("--dir");
+    return requireHubDir({ dir: i >= 0 ? process.argv[i + 1] : undefined }).paths.obsDb;
+  } catch (err) {
+    if (err instanceof HubDirError) {
+      console.error(`repair-obs-cost: ${err.message}\n  ${err.hint}`);
+      process.exit(2);
+    }
+    throw err;
+  }
+})();
 const apply = process.argv.includes("--apply");
 const beforeArg = process.argv[process.argv.indexOf("--before") + 1];
 const before = process.argv.includes("--before") ? Date.parse(beforeArg) : Date.now();
