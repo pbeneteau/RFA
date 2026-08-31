@@ -205,10 +205,11 @@ test("a round returns questions when the model asks, coerced and capped; the fin
   assert.equal(r.questions[0].question, "Which sources?");
   assert.equal(r.cost_usd, 0.03, "the round's cost rides the result");
 
-  // final round: questions are ignored and the failure carries the cost
+  // final round: questions are ignored and the failure carries the FULL cost -
+  // the corrective retry runs once (same stub, same refusal), so two calls.
   await assert.rejects(
     draftRound({ description: "x", finalRound: true, llm: async () => ({ text: '{"questions":[{"question":"still asking"}]}', cost: 0.04 }) }),
-    (err: Error & { cost_usd?: number }) => /neither a pack nor a usable question/.test(err.message) && err.cost_usd === 0.04,
+    (err: Error & { cost_usd?: number }) => /neither a pack nor a usable question/.test(err.message) && Math.abs((err.cost_usd ?? 0) - 0.08) < 1e-9,
   );
 });
 
@@ -216,7 +217,8 @@ test("a failed draft still says what it cost (review 2026-08-31: the money is sp
   const { draftRound, DraftError } = await import("../src/cli/draftpack.js");
   await assert.rejects(
     draftRound({ description: "x", llm: async () => ({ text: "no json here at all", cost: 0.07 }) }),
-    (err: unknown) => err instanceof DraftError && err.cost_usd === 0.07,
+    (err: unknown) => err instanceof DraftError && Math.abs((err as DraftError).cost_usd - 0.14) < 1e-9,
+    "both attempts' spend is reported, the corrective retry included",
   );
 });
 
@@ -234,4 +236,41 @@ test("the answers transcript reaches the next round's prompt, and the pack ends 
   assert.match(seen, /Q: Which folder\?\nA: \.\/docs/, "the operator's answers are material for the next round");
   assert.ok(r.draft, "pack wins over questions when both come back");
   assert.equal(r.questions.length, 0);
+});
+
+test("the round survives the model's JSON flakes: fences, glued objects, trailing commas, one corrective retry (field failure 2026-08-31)", async () => {
+  const { draftRound, scanJsonObjects, DraftError } = await import("../src/cli/draftpack.js");
+
+  // the scanner: string-aware, multiple candidates, prose around them
+  const glued = 'Here you go:\n```json\n{"thoughts":"{not it}"}\n```\nand then {"questions":[{"question":"Which sources?"}]} trailing prose } }';
+  const objs = scanJsonObjects(glued);
+  assert.equal(objs.length, 2, "two balanced objects, braces inside strings and stray closers ignored");
+  const r0 = await draftRound({ description: "x", llm: async () => ({ text: glued, cost: 0.01 }) });
+  assert.equal(r0.questions[0]?.question, "Which sources?", "the candidate carrying a known key wins over the first object");
+
+  // a trailing comma inside the questions array - the exact field failure shape
+  const trailing = '{"questions":[{"question":"Which folder?"},]}';
+  const r1 = await draftRound({ description: "x", llm: async () => ({ text: trailing, cost: 0.01 }) });
+  assert.equal(r1.questions[0]?.question, "Which folder?", "the lenient pass strips trailing commas outside strings");
+
+  // hopeless first output -> ONE corrective retry, costs summed, second output used
+  let calls = 0;
+  const r2 = await draftRound({
+    description: "x",
+    llm: async (_s, user) => {
+      calls++;
+      if (calls === 1) return { text: "not json at all", cost: 0.01 };
+      assert.match(user, /could not be used/, "the corrective message names the failure");
+      return { text: '{"questions":[{"question":"Recovered?"}]}', cost: 0.02 };
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(r2.questions[0]?.question, "Recovered?");
+  assert.equal(r2.cost_usd, 0.03, "both calls' costs are carried, the flaked one included");
+
+  // two hopeless outputs -> DraftError with the FULL spend
+  await assert.rejects(
+    draftRound({ description: "x", llm: async () => ({ text: "still not json", cost: 0.01 }) }),
+    (err: unknown) => err instanceof DraftError && Math.abs(err.cost_usd - 0.02) < 1e-9,
+  );
 });

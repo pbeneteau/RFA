@@ -176,7 +176,8 @@ through, or which credential or host it must use - respond INSTEAD with follow-u
 
 {"questions": [{"question": "one short question", "why": "one line on why it matters", "placeholder": "an example answer"}]}
 
-One to three questions, each answerable in one short line. Ask ONLY what changes the pack's shape;
+One to three questions, each answerable in one short line. Output valid JSON only: newlines inside
+strings escaped as \\n, no trailing commas. Ask ONLY what changes the pack's shape;
 never ask about names, budgets or models (they have safe defaults), and never re-ask something the
 operator already answered. When you have enough - and ALWAYS when the message says "final round" -
 respond with the pack.`;
@@ -369,12 +370,98 @@ export function coerceQuestions(raw: unknown): DraftQuestion[] {
   return out;
 }
 
-/** The whole top-level JSON object (pack, questions, or both), or a DraftError carrying the cost. */
+/**
+ * Every balanced top-level {...} in the text, string- and escape-aware.
+ *
+ * The first version sliced first-\`{\` to last-\`}\`, which glues two objects
+ * (or an object plus trailing prose braces) into one invalid parse - measured
+ * in the field on the wizard's first real user: "Expected ',' or ']' after
+ * array element at position 845", $0.01 spent, the operator dumped to the
+ * manual walkthrough over a formatting flake.
+ */
+export function scanJsonObjects(text: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === "\\") escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') {
+      if (depth > 0) inString = true;
+      continue;
+    }
+    if (c === "{") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (c === "}") {
+      if (depth > 0 && --depth === 0 && start >= 0) {
+        out.push(text.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+  return out;
+}
+
+/** JSON.parse with one lenient pass: trailing commas stripped outside strings (a shape models emit). */
+function parseLenient(candidate: string): Record<string, unknown> | null {
+  try {
+    return JSON.parse(candidate) as Record<string, unknown>;
+  } catch {
+    /* try the lenient pass */
+  }
+  // Strip trailing commas before } or ] - but never inside strings, so walk.
+  let cleaned = "";
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < candidate.length; i++) {
+    const c = candidate[i];
+    if (inString) {
+      cleaned += c;
+      if (escaped) escaped = false;
+      else if (c === "\\") escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      cleaned += c;
+      continue;
+    }
+    if (c === ",") {
+      let j = i + 1;
+      while (j < candidate.length && /\s/.test(candidate[j])) j++;
+      if (candidate[j] === "}" || candidate[j] === "]") continue; // drop the trailing comma
+    }
+    cleaned += c;
+  }
+  try {
+    return JSON.parse(cleaned) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+/** The round's top-level object (pack, questions, or both): the first candidate that parses AND carries a known key wins. */
 function extractRound(text: string): Record<string, unknown> {
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start < 0 || end <= start) throw new Error(`no JSON object in llm output: ${text.slice(0, 120)}`);
-  return JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
+  const candidates = scanJsonObjects(text);
+  if (candidates.length === 0) throw new Error(`no JSON object in llm output: ${text.slice(0, 120)}`);
+  let firstParsed: Record<string, unknown> | null = null;
+  for (const c of candidates) {
+    const parsed = parseLenient(c);
+    if (!parsed) continue;
+    if (parsed.pack !== undefined || parsed.questions !== undefined) return parsed;
+    firstParsed ??= parsed;
+  }
+  if (firstParsed) return firstParsed;
+  throw new Error(`the llm output holds no parseable JSON object (${candidates.length} candidate(s) scanned): ${text.slice(0, 120)}`);
 }
 
 /**
@@ -401,20 +488,33 @@ export async function draftRound(input: RoundInput): Promise<RoundResult> {
   ]
     .filter((l): l is string => l !== null)
     .join("\n");
-  const r = await llm(DRAFT_SYSTEM, user, model);
-  try {
-    const parsed = extractRound(r.text);
-    if (parsed.pack !== undefined) {
-      const draft = coerceDraft(parsed.pack, { fixedName: input.fixedName, taken: new Set(input.taken ?? []), hubRoot: input.hubRoot });
-      return { draft, questions: [], cost_usd: r.cost, model };
+  let r = await llm(DRAFT_SYSTEM, user, model);
+  let cost = r.cost;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const parsed = extractRound(r.text);
+      if (parsed.pack !== undefined) {
+        const draft = coerceDraft(parsed.pack, { fixedName: input.fixedName, taken: new Set(input.taken ?? []), hubRoot: input.hubRoot });
+        return { draft, questions: [], cost_usd: cost, model };
+      }
+      const questions = input.finalRound ? [] : coerceQuestions(parsed.questions);
+      if (questions.length === 0) throw new Error("the draft returned neither a pack nor a usable question");
+      return { draft: null, questions, cost_usd: cost, model };
+    } catch (err) {
+      if (err instanceof DraftError) throw err;
+      // ONE corrective retry per round before dumping the operator to the
+      // manual walkthrough: a malformed-JSON flake is the model's, not theirs,
+      // and the field failure cost $0.01 - a retry is cheaper than re-typing
+      // the description. Coercion failures retry too: the corrective message
+      // names what was wrong, and the second output is parsed the same way.
+      if (attempt >= 2) throw new DraftError((err as Error).message, cost, model);
+      r = await llm(
+        DRAFT_SYSTEM,
+        `${user}\n\nYour previous response could not be used: ${(err as Error).message.slice(0, 200)}.\nRespond again with ONLY the JSON object - valid JSON, newlines inside strings escaped as \\n, no trailing commas, no prose.`,
+        model,
+      );
+      cost += r.cost;
     }
-    const questions = input.finalRound ? [] : coerceQuestions(parsed.questions);
-    if (questions.length === 0) throw new Error("the draft returned neither a pack nor a usable question");
-    return { draft: null, questions, cost_usd: r.cost, model };
-  } catch (err) {
-    // The money is spent whichever way this failed; the error says so.
-    if (err instanceof DraftError) throw err;
-    throw new DraftError((err as Error).message, r.cost, model);
   }
 }
 
