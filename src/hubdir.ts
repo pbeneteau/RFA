@@ -119,6 +119,36 @@ export const manifestSchema = z
       })
       .strict()
       .prefault({}),
+    /**
+     * Operator gateway processes the supervisor runs beside the residents
+     * (added 2026-08-31). A gateway is infrastructure a pack reaches as a
+     * `url`-form MCP server but the OPERATOR owns: the measured case is a
+     * read-only Postgres->MCP HTTP bridge, needed because the OS sandbox
+     * refuses raw TCP outright, so no pack process can speak to a database
+     * directly. Before this section the only options were a hand-rolled nohup
+     * (dies on reboot, nothing restarts it) or a launchd/systemd unit per
+     * gateway; the supervisor already restarts, drains and logs things, so it
+     * runs these too.
+     *
+     * `command` + `args` spawn through src/proc.ts (own process group, tree
+     * kill). `env_secrets` are NAMES resolved from `.rfa/secrets.json` at
+     * spawn, the same contract packs get - values never sit in this file.
+     * `cwd` is relative to the hub directory.
+     */
+    gateways: z
+      .record(
+        z.string().regex(/^[a-z0-9_-]+$/, "a gateway name: lowercase letters, digits, underscore, hyphen"),
+        z
+          .object({
+            command: z.string().min(1),
+            args: z.array(z.string()).default([]),
+            env: z.record(z.string(), z.string()).default({}),
+            env_secrets: z.array(z.string()).default([]),
+            cwd: z.string().optional(),
+          })
+          .strict(),
+      )
+      .default({}),
   })
   .strict();
 

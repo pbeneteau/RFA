@@ -37,7 +37,7 @@ import { ensureRuntime, HubDirError, requireHubDir, roomsStore, type HubDir } fr
 import { AlertCooldown, ObsStore, evaluateAlerts, formatReviewDigest } from "./obs.js";
 import type { Alert } from "./obs.js";
 import { shippedInvariants, watchdogAlerts, watchdogFailures } from "./watchdog.js";
-import { spawnEntry, stopTree } from "./proc.js";
+import { spawnEntry, spawnGroup, stopTree } from "./proc.js";
 import { belongsTo, residentProcessesSync } from "./procscan.js";
 import { backupPlan, runBackup } from "./platform.js";
 import { loadSecrets, pickSecrets, transportToken } from "./secrets.js";
@@ -148,7 +148,19 @@ function writeStateFile(): void {
     // `rfa status` and `rfa doctor` report what IS unsupervised and not what a
     // second scan guesses.
     JSON.stringify(
-      { ts: new Date().toISOString(), pid: process.pid, agents, invalid: Object.fromEntries(invalidPacks), account: account.snapshot() },
+      {
+        ts: new Date().toISOString(),
+        pid: process.pid,
+        agents,
+        gateways: Object.fromEntries(
+          [...gateways].map(([name, g]) => [
+            name,
+            { pid: g.proc?.pid ?? null, status: g.proc ? "running" : g.restarts.length > POLICY.maxRestarts ? "crash-looped" : "restarting", started_at: g.startedAt ? new Date(g.startedAt).toISOString() : null },
+          ]),
+        ),
+        invalid: Object.fromEntries(invalidPacks),
+        account: account.snapshot(),
+      },
       null,
       1,
     ),
@@ -497,6 +509,88 @@ try {
   log(`command channel unavailable: ${(err as Error).message}`);
 }
 
+// ---------------------------------------------------------------- operator gateways (manifest `gateways`, 2026-08-31)
+
+/**
+ * Infrastructure processes the operator declares in rfa.json and this
+ * supervisor runs beside the residents: the measured case is a read-only
+ * Postgres->MCP HTTP bridge, which exists because the OS sandbox refuses raw
+ * TCP outright, so no pack process can reach a database directly. Before this
+ * section the choices were a hand-rolled nohup (dies on reboot, nothing
+ * restarts it) or one launchd/systemd unit per gateway.
+ *
+ * Same lifecycle rules as residents where they transfer: own process group
+ * (spawnGroup) so a kill reaches the tree, the resident crash budget and
+ * backoff, logs under .rfa/logs/gateway-<name>.log, drained at shutdown, and
+ * published in the state file so `rfa status` reports what IS running rather
+ * than what this file asked for. env_secrets are NAMES from .rfa/secrets.json,
+ * the contract packs already have; a missing one is named at spawn and the
+ * gateway still starts, because a gateway may legitimately read its own env
+ * files (the measured one does).
+ */
+interface Gateway {
+  name: string;
+  def: { command: string; args: string[]; env: Record<string, string>; env_secrets: string[]; cwd?: string };
+  proc: ReturnType<typeof spawnGroup> | null;
+  startedAt: number;
+  restarts: { at: number }[];
+  backoffMs: number;
+  draining: boolean;
+}
+const gateways = new Map<string, Gateway>();
+for (const [name, def] of Object.entries(hubdir.manifest.gateways)) {
+  gateways.set(name, { name, def, proc: null, startedAt: 0, restarts: [], backoffMs: POLICY.backoffBaseMs, draining: false });
+}
+
+function gatewayLogFd(name: string): number {
+  const dir = path.join(hubdir.paths.runtime, "logs");
+  fs.mkdirSync(dir, { recursive: true });
+  return fs.openSync(path.join(dir, `gateway-${name}.log`), "a");
+}
+
+function startGateway(g: Gateway): void {
+  const fd = gatewayLogFd(g.name);
+  const picked = pickSecrets(loadSecrets(hubdir.paths.secrets), g.def.env_secrets);
+  if (picked.missing.length) log(`gateway ${g.name}: secret(s) not in .rfa/secrets.json: ${picked.missing.join(", ")} (starting anyway; the process may have its own source)`);
+  const proc = spawnGroup(g.def.command, g.def.args, {
+    cwd: g.def.cwd ? path.resolve(hubdir.root, g.def.cwd) : hubdir.root,
+    stdio: ["ignore", fd, fd],
+    env: { ...process.env, ...g.def.env, ...picked.env },
+  });
+  g.proc = proc;
+  g.startedAt = Date.now();
+  g.draining = false;
+  log(`gateway ${g.name} started (pid ${proc.pid}): ${g.def.command} ${g.def.args.join(" ")}`);
+  writeStateFile();
+  proc.on("error", (err) => {
+    log(`gateway ${g.name} could not spawn: ${err.message}`);
+  });
+  proc.on("exit", (code, signal) => {
+    fs.closeSync(fd);
+    const uptime = Date.now() - g.startedAt;
+    g.proc = null;
+    writeStateFile();
+    if (g.draining) {
+      log(`gateway ${g.name} stopped (uptime ${Math.round(uptime / 1000)}s)`);
+      return;
+    }
+    if (uptime >= POLICY.minUptimeMs) g.backoffMs = POLICY.backoffBaseMs;
+    g.restarts = g.restarts.filter((r) => Date.now() - r.at < POLICY.crashWindowMs);
+    g.restarts.push({ at: Date.now() });
+    if (g.restarts.length > POLICY.maxRestarts) {
+      log(`gateway ${g.name} is crash-looping (${g.restarts.length} restarts in window); giving up until rfa.json changes`);
+      return;
+    }
+    log(`gateway ${g.name} exited (code ${code}, signal ${signal}); restarting in ${g.backoffMs}ms`);
+    setTimeout(() => {
+      if (!g.proc && gateways.has(g.name)) startGateway(g);
+    }, g.backoffMs).unref?.();
+    g.backoffMs = Math.min(POLICY.backoffCapMs, g.backoffMs * 2);
+  });
+}
+
+for (const g of gateways.values()) startGateway(g);
+
 // ---------------------------------------------------------------- platform duties (v0.4.3): #ops alerts, retention, backup
 
 const HUB = process.env.RFA_HUB_URL ?? hubdir.hubUrl;
@@ -817,6 +911,13 @@ async function shutdown(sig: string): Promise<void> {
   clearInterval(opsTimer);
   clearInterval(accountTimer);
   await Promise.all([...children.values()].map((c) => drain(c)));
+  await Promise.all(
+    [...gateways.values()].map(async (g) => {
+      if (!g.proc) return;
+      g.draining = true;
+      await stopTree(g.proc);
+    }),
+  );
   account.close();
   engine.close();
   process.exit(0);

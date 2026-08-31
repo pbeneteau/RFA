@@ -190,3 +190,22 @@ test("no source file outside hubdir.ts joins a path onto an instance directory n
   for (const root of roots) walk(root);
   assert.deepEqual(offenders, [], "every instance path goes through src/hubdir.ts");
 });
+
+test("manifest gateways: the operator's infrastructure processes, validated and defaulted", async () => {
+  const { manifestSchema } = await import("../src/hubdir.js");
+  const base = { rfa: 1, name: "x", hub: { port: 8790 } };
+  // absent -> empty record, never undefined (the supervisor iterates it unconditionally)
+  assert.deepEqual(manifestSchema.parse(base).gateways, {});
+  // the measured case: a node process with env secrets by NAME
+  const m = manifestSchema.parse({
+    ...base,
+    gateways: { "db-gateway": { command: "node", args: ["gateways/db-gateway.mjs"], env_secrets: ["AURORA_RO_URL"], cwd: "gateways" } },
+  });
+  assert.equal(m.gateways["db-gateway"].command, "node");
+  assert.deepEqual(m.gateways["db-gateway"].env, {}, "env defaults to empty");
+  // a name outside the grammar is refused, same rule as mcp_servers names
+  assert.throws(() => manifestSchema.parse({ ...base, gateways: { "Bad Name": { command: "x" } } }));
+  // values never sit in the manifest: env is k=v strings the operator chose to
+  // write, env_secrets are NAMES - there is no field for a secret VALUE
+  assert.throws(() => manifestSchema.parse({ ...base, gateways: { g: { command: "x", secrets: { KEY: "value" } } } }), /unrecognized|strict/i);
+});

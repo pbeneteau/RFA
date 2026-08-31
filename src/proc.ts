@@ -54,6 +54,18 @@ export function spawnTsx(script: string, args: string[], opts: SpawnOptions = {}
  * which is success, not failure: it is the normal outcome of stopping a child
  * that had already exited.
  */
+/**
+ * An arbitrary command in its own process group, findable and killable as a
+ * tree (the same contract `spawnTsx`/`spawnEntry` give tsx entries). Added for
+ * operator GATEWAYS (manifest `gateways`, 2026-08-31): their command is the
+ * operator's, not a tsx entry of this package, so the existing spawners do not
+ * fit - but the orphan lesson they encode (a SIGKILL that cannot reach the
+ * group leaves the real process running) applies unchanged.
+ */
+export function spawnGroup(command: string, args: string[], opts: SpawnOptions = {}): ChildProcess {
+  return spawn(command, args, { ...opts, detached: true });
+}
+
 export function signalTree(proc: ChildProcess, signal: NodeJS.Signals): void {
   const pid = proc.pid;
   if (pid === undefined) return;

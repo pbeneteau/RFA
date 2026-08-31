@@ -188,6 +188,7 @@ interface SupervisorStateFile {
   ts?: string;
   pid?: number;
   agents?: Record<string, { pid: number | null; status: string; started_at: string | null; definition_hash: string; restarts_in_window: number }>;
+  gateways?: Record<string, { pid: number | null; status: string; started_at: string | null }>;
   account?: { cap?: number; in_flight?: number; parked?: number; paused_until?: string | null; pause_reason?: string | null };
 }
 
@@ -287,6 +288,9 @@ export async function collectStatus(ctx: CliContext): Promise<Record<string, unk
     },
     agents: packs,
     agents_invalid: invalid,
+    // From the supervisor's own state file - what IS running, never what
+    // rfa.json asked for (the standing configured-vs-in-force rule).
+    gateways: supFile?.gateways ?? {},
     rooms,
     rooms_source: roomsSource,
   };
@@ -339,6 +343,21 @@ export const status: CommandDef = {
       if (a.reach.length) ui.note(ui.caution(`${a.name} declares ${a.reach.join(", ")}: network I/O in the SDK's own process, which NEITHER door of the fence covers and no network posture describes (RFA-0.9 sect. 5.3)`));
     }
     for (const bad of (s.agents_invalid as { name: string; error: string }[]) ?? []) ui.note(`${bad.name}: agent.md does not parse, so nothing runs it (${bad.error}) · rfa agent validate ${bad.name}`);
+    const gws = Object.entries((s.gateways as Record<string, { pid: number | null; status: string; started_at: string | null }>) ?? {});
+    if (gws.length) {
+      ui.blank();
+      ui.line("gateways");
+      ui.table(
+        gws.map(([name, g]) => [
+          g.status === "running" ? ui.good("●") : ui.dim("○"),
+          name,
+          g.status,
+          g.pid ? `pid ${g.pid}` : "",
+          g.started_at ? ui.dim(`up ${fmtAge(Date.parse(g.started_at))}`) : "",
+          ui.dim(`rfa logs · .rfa/logs/gateway-${name}.log`),
+        ]),
+      );
+    }
     ui.blank();
     ui.line(`rooms${s.rooms_source === "file" ? ui.dim("   (from rooms.json; the hub is not answering or no human key)") : ""}`);
     const rooms = s.rooms as Record<string, unknown>[];
