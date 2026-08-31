@@ -37,7 +37,7 @@ import { ensureRuntime, HubDirError, requireHubDir, roomsStore, type HubDir } fr
 import { AlertCooldown, ObsStore, evaluateAlerts, formatReviewDigest } from "./obs.js";
 import type { Alert } from "./obs.js";
 import { shippedInvariants, watchdogAlerts, watchdogFailures } from "./watchdog.js";
-import { spawnEntry, spawnGroup, stopTree } from "./proc.js";
+import { entryFor, nodeArgsFor, spawnEntry, spawnGroup, stopTree } from "./proc.js";
 import { belongsTo, residentProcessesSync } from "./procscan.js";
 import { backupPlan, runBackup } from "./platform.js";
 import { loadSecrets, pickSecrets, transportToken } from "./secrets.js";
@@ -530,7 +530,7 @@ try {
  */
 interface Gateway {
   name: string;
-  def: { command: string; args: string[]; env: Record<string, string>; env_secrets: string[]; cwd?: string };
+  def: { command?: string; builtin?: string; args?: string[]; env: Record<string, string>; env_secrets: string[]; cwd?: string };
   proc: ReturnType<typeof spawnGroup> | null;
   startedAt: number;
   restarts: { at: number }[];
@@ -552,7 +552,11 @@ function startGateway(g: Gateway): void {
   const fd = gatewayLogFd(g.name);
   const picked = pickSecrets(loadSecrets(hubdir.paths.secrets), g.def.env_secrets);
   if (picked.missing.length) log(`gateway ${g.name}: secret(s) not in .rfa/secrets.json: ${picked.missing.join(", ")} (starting anyway; the process may have its own source)`);
-  const proc = spawnGroup(g.def.command, g.def.args, {
+  // A builtin gateway resolves inside THIS package exactly as a builtin MCP
+  // server does for the resident (entryFor handles checkout vs installed dist).
+  const entry = g.def.builtin ? entryFor(import.meta.url, path.join("gateways", g.def.builtin)) : null;
+  const [cmd, args] = entry ? [process.execPath, nodeArgsFor(entry)] : [g.def.command!, g.def.args ?? []];
+  const proc = spawnGroup(cmd, args, {
     cwd: g.def.cwd ? path.resolve(hubdir.root, g.def.cwd) : hubdir.root,
     stdio: ["ignore", fd, fd],
     env: { ...process.env, ...g.def.env, ...picked.env },
@@ -560,7 +564,7 @@ function startGateway(g: Gateway): void {
   g.proc = proc;
   g.startedAt = Date.now();
   g.draining = false;
-  log(`gateway ${g.name} started (pid ${proc.pid}): ${g.def.command} ${g.def.args.join(" ")}`);
+  log(`gateway ${g.name} started (pid ${proc.pid}): ${g.def.builtin ? `builtin ${g.def.builtin}` : `${g.def.command} ${(g.def.args ?? []).join(" ")}`}`);
   writeStateFile();
   proc.on("error", (err) => {
     log(`gateway ${g.name} could not spawn: ${err.message}`);

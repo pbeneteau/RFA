@@ -209,3 +209,16 @@ test("manifest gateways: the operator's infrastructure processes, validated and 
   // write, env_secrets are NAMES - there is no field for a secret VALUE
   assert.throws(() => manifestSchema.parse({ ...base, gateways: { g: { command: "x", secrets: { KEY: "value" } } } }), /unrecognized|strict/i);
 });
+
+test("manifest gateways: the builtin form ships in the package, values never in the file", async () => {
+  const { manifestSchema } = await import("../src/hubdir.js");
+  const base = { rfa: 1, name: "x", hub: { port: 8790 } };
+  const m = manifestSchema.parse({ ...base, gateways: { db: { builtin: "postgres-readonly", env_secrets: ["GW_DB_URL"] } } });
+  const g = m.gateways.db as { builtin?: string; env_secrets: string[] };
+  assert.equal(g.builtin, "postgres-readonly");
+  assert.deepEqual(g.env_secrets, ["GW_DB_URL"]);
+  // an unshipped builtin name is refused at parse, not at spawn
+  assert.throws(() => manifestSchema.parse({ ...base, gateways: { db: { builtin: "mysql" } } }));
+  // builtin and command are different shapes: mixing them is refused
+  assert.throws(() => manifestSchema.parse({ ...base, gateways: { db: { builtin: "postgres-readonly", command: "node" } } }));
+});

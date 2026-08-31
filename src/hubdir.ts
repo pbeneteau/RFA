@@ -138,15 +138,32 @@ export const manifestSchema = z
     gateways: z
       .record(
         z.string().regex(/^[a-z0-9_-]+$/, "a gateway name: lowercase letters, digits, underscore, hyphen"),
-        z
-          .object({
-            command: z.string().min(1),
-            args: z.array(z.string()).default([]),
-            env: z.record(z.string(), z.string()).default({}),
-            env_secrets: z.array(z.string()).default([]),
-            cwd: z.string().optional(),
-          })
-          .strict(),
+        z.union([
+          z
+            .object({
+              command: z.string().min(1),
+              args: z.array(z.string()).default([]),
+              env: z.record(z.string(), z.string()).default({}),
+              env_secrets: z.array(z.string()).default([]),
+              cwd: z.string().optional(),
+            })
+            .strict(),
+          z
+            .object({
+              /**
+               * A gateway this package ships (`src/gateways/`), the counterpart
+               * of `mcp_servers`' `builtin: linear`: infrastructure every org
+               * needs must not be a bespoke script in a hub directory. The
+               * first, `postgres-readonly`, exists because the OS sandbox
+               * refuses raw TCP, so a database is reachable only through an
+               * operator-run HTTP bridge (ledger 85, 86).
+               */
+              builtin: z.enum(["postgres-readonly"]),
+              env: z.record(z.string(), z.string()).default({}),
+              env_secrets: z.array(z.string()).default([]),
+            })
+            .strict(),
+        ]),
       )
       .default({}),
   })

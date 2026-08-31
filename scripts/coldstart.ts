@@ -80,7 +80,7 @@ console.log(`  ${dim(rfaBin)}`);
  */
 step("spawned entries resolve and run in the installed package");
 const installedPkg = path.join(prefix, "lib", "node_modules", "agent-com");
-for (const entry of ["mcplaunch", "resident", "supervisor"]) {
+for (const entry of ["mcplaunch", "resident", "supervisor", "gateways/postgres-readonly"]) {
   const built = path.join(installedPkg, "dist", `${entry}.js`);
   if (!fs.existsSync(built)) {
     console.error(red(`dist/${entry}.js is missing from the published package: the resident spawns it by name and would fail at runtime`));
