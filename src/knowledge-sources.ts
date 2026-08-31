@@ -88,6 +88,27 @@ export function skippedByExtension(root: string, matched: Iterable<string>): { e
   return [...counts.entries()].map(([ext, count]) => ({ ext, count })).sort((a, b) => b.count - a.count);
 }
 
+/**
+ * What a DIRECTORY attach would match with the default globs (`**\/*.md` +
+ * `**\/*.mdx`), before anything is written - the wizard's measured fact for a
+ * drafted knowledge folder. Same exclusion rules as the real matcher
+ * (node_modules, .git, dot-entries), same skip report as the attach's.
+ */
+export function previewDirAttach(root: string): { matched: number; skipped: { ext: string; count: number }[] } {
+  if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) return { matched: 0, skipped: [] };
+  const matched: string[] = [];
+  const walk = (dir: string) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (e.name.startsWith(".") || e.name === "node_modules") continue;
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (/\.mdx?$/.test(e.name)) matched.push(full);
+    }
+  };
+  walk(root);
+  return { matched: matched.length, skipped: skippedByExtension(root, matched) };
+}
+
 /** The clones under a pack's knowledge directory, with what git says about each. */
 export function packClones(pack: AgentPack): CloneInfo[] {
   const kdir = path.join(pack.dir, "knowledge");

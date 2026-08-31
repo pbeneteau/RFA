@@ -192,7 +192,7 @@ test("packs: new binds to the first room, validate checks what the supervisor wo
   const created = json<{ room: string; skill: string }>(n);
   const product = roomsStore(h).read().rooms.find((r) => r.alias === "product")!;
   assert.equal(created.room, product.handle, "bound to the first non-ops room by default");
-  assert.equal(created.skill, "answer-question");
+  assert.equal(created.skill, "answer-fees-question", "name-derived, never the generic colliding id (dogfood F16)");
   const reserved = await rfa(["agent", "new", "hub-helper"]);
   assert.equal(reserved.code, 2, "a reserved first token is refused at write time");
   assert.match(reserved.stderr, /reserved/);

@@ -20,7 +20,7 @@ test("the walkthrough asks what the kind needs: knowledge for an answerer, serve
   const answerer = forKind({ ...defaultDraft(), name: "pm" }, "answerer");
   assert.equal(nextStep("kind", answerer), "knowledge");
   assert.equal(nextStep("knowledge", answerer), "model", "no server, no mode");
-  assert.equal(answerer.offer.id, "answer-question");
+  assert.equal(answerer.offer.id, "answer-pm-question", "name-derived, never the generic colliding id (dogfood F16)");
   assert.equal(answerer.model, "haiku");
   const tool = forKind({ ...defaultDraft(), name: "scribe" }, "tool");
   assert.equal(nextStep("kind", tool), "server");

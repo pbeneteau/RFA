@@ -118,3 +118,22 @@ test("skippedByExtension: names what a directory attach left out, ignoring vendo
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("previewDirAttach: the wizard's measured fact matches the real matcher's rules", async () => {
+  const { previewDirAttach } = await import("../src/knowledge-sources.js");
+  const fs = await import("node:fs"); const os = await import("node:os"); const path = await import("node:path");
+  const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "rfa-preview-"));
+  try {
+    fs.mkdirSync(path.join(root, "node_modules", "dep"), { recursive: true });
+    fs.writeFileSync(path.join(root, "a.md"), "x");
+    fs.writeFileSync(path.join(root, "b.mdx"), "x");
+    fs.writeFileSync(path.join(root, "c.bru"), "x");
+    fs.writeFileSync(path.join(root, "node_modules", "dep", "README.md"), "x");
+    const p = previewDirAttach(root);
+    assert.equal(p.matched, 2, "md + mdx, vendored trees never counted");
+    assert.deepEqual(p.skipped, [{ ext: ".bru", count: 1 }]);
+    assert.deepEqual(previewDirAttach(path.join(root, "nope")), { matched: 0, skipped: [] }, "a missing dir measures as zero, never throws mid-render");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

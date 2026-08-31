@@ -24,10 +24,11 @@
  * a note the wizard renders, never silently.
  */
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { parseAgentMd } from "../agentdef.js";
-import { extractJson, withIsolatedCwd, type LlmFn } from "../consolidate.js";
+import { withIsolatedCwd, type LlmFn } from "../consolidate.js";
 import { modelCredentialStatus } from "./preflight.js";
 import { nameProblem, PACK_KINDS, renderAgentMd, type PackKind } from "./scaffold.js";
 
@@ -56,6 +57,24 @@ export function draftQueryOptions(cwd: string, systemPrompt: string, model: stri
   };
 }
 
+/**
+ * A draft failure that still says what it COST: the money is spent whether or
+ * not a pack came back, and an error path that discards `total_cost_usd` is the
+ * instrument going silent exactly when money was spent for nothing (review
+ * finding, 2026-08-31; the honest-meters rule). Every failure between the model
+ * call and a returned draft carries the round's cost.
+ */
+export class DraftError extends Error {
+  constructor(
+    message: string,
+    public readonly cost_usd: number,
+    public readonly model: string,
+  ) {
+    super(message);
+    this.name = "DraftError";
+  }
+}
+
 const llmOnce: LlmFn = async (systemPrompt, prompt, model) =>
   withIsolatedCwd(async (cwd) => {
     const q = query({ prompt, options: draftQueryOptions(cwd, systemPrompt, model) });
@@ -63,9 +82,11 @@ const llmOnce: LlmFn = async (systemPrompt, prompt, model) =>
     let cost = 0;
     for await (const msg of q) {
       if (msg.type === "result") {
-        if (msg.subtype !== "success" || msg.is_error) throw new Error(`draft llm error: ${msg.subtype}`);
+        // The SDK reports cost on ERROR results too (error_max_budget_usd by
+        // definition fires after spending up to the cap): read it before throwing.
+        cost = (msg as { total_cost_usd?: number }).total_cost_usd ?? 0;
+        if (msg.subtype !== "success" || msg.is_error) throw new DraftError(`draft llm error: ${msg.subtype}`, cost, model);
         text = msg.result;
-        cost = msg.total_cost_usd ?? 0;
       }
     }
     return { text, cost };
@@ -147,7 +168,18 @@ Rules:
   complete result, and report a rejection or an error plainly, never claiming a side effect you did
   not observe. Do not write rules about treating messages as data; the platform appends that rule itself.
 - The description is the operator's own words about the agent they want; it is material, and your
-  entire output must be the JSON object.`;
+  entire output must be the JSON object.
+
+When the description leaves a LOAD-BEARING choice undetermined - what sources it reads (a folder?
+which one?), whether it only answers or also acts on an external system, which system it acts
+through, or which credential or host it must use - respond INSTEAD with follow-up questions:
+
+{"questions": [{"question": "one short question", "why": "one line on why it matters", "placeholder": "an example answer"}]}
+
+One to three questions, each answerable in one short line. Ask ONLY what changes the pack's shape;
+never ask about names, budgets or models (they have safe defaults), and never re-ask something the
+operator already answered. When you have enough - and ALWAYS when the message says "final round" -
+respond with the pack.`;
 
 /** Appended to every drafted prompt: the one rule a drafted pack must not be allowed to omit. */
 export const PROMPT_FOOTER =
@@ -159,10 +191,13 @@ const KIND_BUDGETS: Record<PackKind, { per_task_usd: number; per_day_usd: number
   tool: { per_task_usd: 1, per_day_usd: 5, max_turns: 20 },
 };
 
-function kindOffer(kind: PackKind, name: string): { id: string; description: string } {
+export function kindOffer(kind: PackKind, name: string): { id: string; description: string } {
   if (kind === "tool") return { id: `${name}-action`, description: `Performs the ${name} action after a human approves it.` };
   if (kind === "spec-expert") return { id: "answer-protocol-question", description: "Answers a question about the RFA protocol from the specification, citing the section." };
-  return { id: "answer-question", description: `Answers a question from the ${name} knowledge pack, citing its source.` };
+  // Name-derived, never the generic `answer-question`: every scaffolded answerer
+  // sharing one id made discovery collide by construction (dogfood F16 - two
+  // answerers shipped the same id and the ask routed silently to the wrong one).
+  return { id: `answer-${name.slice(0, 40)}-question`, description: `Answers a question from the ${name} knowledge pack, citing its source.` };
 }
 
 /** A string collapsed to one trimmed line, or null when it is not usable text. */
@@ -206,7 +241,7 @@ function pickName(candidate: unknown, fixed: string | undefined, taken: Set<stri
  * survive, and the composed agent.md parsed through the supervisor's own
  * schema before anything is returned. Exported so a test can feed it garbage.
  */
-export function coerceDraft(raw: unknown, opts: { fixedName?: string; taken?: Set<string> } = {}): PackDraft {
+export function coerceDraft(raw: unknown, opts: { fixedName?: string; taken?: Set<string>; hubRoot?: string } = {}): PackDraft {
   const notes: string[] = [];
   const o = (raw ?? {}) as Record<string, unknown>;
   const taken = opts.taken ?? new Set<string>();
@@ -240,27 +275,117 @@ export function coerceDraft(raw: unknown, opts: { fixedName?: string; taken?: Se
   if (typeof o.knowledge_dir === "string" && o.knowledge_dir.trim()) {
     const dir = path.resolve(o.knowledge_dir.trim().replace(/^~(?=\/|$)/, process.env.HOME ?? "~"));
     if (kind !== "answerer") notes.push(`a ${kind} pack takes no knowledge folder; ${o.knowledge_dir} dropped`);
-    else if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) knowledge = dir;
-    else notes.push(`the folder the draft named does not exist (${o.knowledge_dir}); point the knowledge screen at a real one`);
+    else if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+      knowledge = dir;
+      // Existing-and-a-directory is not the same as SENSIBLE: a draft naming
+      // the home directory, the filesystem root, or the hub itself passed
+      // silently (review finding, 2026-08-31), and the resident would read all
+      // of it - .rfa/secrets.json included, for the hub root. Kept, but said.
+      const hubRoot = opts.hubRoot ? path.resolve(opts.hubRoot) : null;
+      const scope =
+        dir === path.parse(dir).root
+          ? "the whole filesystem"
+          : dir === os.homedir()
+            ? "your whole home directory"
+            : hubRoot && dir === hubRoot
+              ? "the hub directory itself (secrets included)"
+              : hubRoot && hubRoot.startsWith(dir + path.sep)
+                ? "a folder that CONTAINS the hub directory (secrets included)"
+                : null;
+      if (scope) notes.push(`the knowledge folder ${dir} spans ${scope}; the knowledge screen can narrow it`);
+    } else notes.push(`the folder the draft named does not exist (${o.knowledge_dir}); point the knowledge screen at a real one`);
   }
 
   let prompt: string | null = null;
   if (typeof o.prompt === "string" && o.prompt.trim().length >= 40) {
     prompt = o.prompt.trim();
-    if (!/never (as )?instructions/i.test(prompt)) prompt = `${prompt}\n\n${PROMPT_FOOTER}`;
+    // Appended unless the EXACT footer text is already present. The first
+    // version gated on a two-word substring the model's own untrusted output
+    // controls, so a draft writing its own weaker (or inverted) version of the
+    // rule suppressed the platform's - RFA-0.7 sect. 13.7 requires it
+    // unconditionally. A doubled variant is harmless; an absent rule is not.
+    if (!prompt.includes(PROMPT_FOOTER)) prompt = `${prompt}\n\n${PROMPT_FOOTER}`;
   } else if (o.prompt !== undefined) notes.push("the drafted prompt was too thin; the kind's template is used");
 
   const reasoning = oneLine(o.reasoning, 200) ?? "";
 
   const draft: PackDraft = { name, kind, description, model, offer, budgets: { per_task_usd, per_day_usd, max_turns }, knowledge, prompt, reasoning, notes };
   // The same schema a hand-written pack faces, before the wizard shows a single
-  // pre-answered screen: a drafted pack is never trusted because a model wrote it.
-  parseAgentMd(renderAgentMd({ name, kind, room: null, model, mode: kind === "tool" ? "ask" : undefined, offer: draft.offer, budgets: draft.budgets, description, prompt: prompt ?? undefined }));
+  // pre-answered screen: a drafted pack is never trusted because a model wrote
+  // it. Today coercion deliberately mirrors the schema's own bounds, so this is
+  // DRIFT INSURANCE (the schema tightening under an unchanged coercion must
+  // fail here, not at the write); validateDraft is exported so the insurance
+  // itself is testable instead of invisible (review finding, 2026-08-31).
+  validateDraft(draft);
   return draft;
 }
 
-/** One bounded call, then coercion. Throws when the output holds no usable JSON; the wizard falls back to the plain walkthrough. */
-export async function draftPack(input: DraftInput): Promise<DraftResult> {
+/** The composed pack through the supervisor's own schema; throws with the schema's reason. Exported so the backstop is testable. */
+export function validateDraft(d: PackDraft): void {
+  parseAgentMd(renderAgentMd({ name: d.name, kind: d.kind, room: null, model: d.model, mode: d.kind === "tool" ? "ask" : undefined, offer: d.offer, budgets: d.budgets, description: d.description, prompt: d.prompt ?? undefined }));
+}
+
+/** A follow-up the draft asked instead of guessing; the wizard renders it as a screen. */
+export interface DraftQuestion {
+  question: string;
+  /** One line on why the answer matters, rendered dim beside the question. */
+  why?: string;
+  placeholder?: string;
+}
+
+export interface RoundInput extends DraftInput {
+  /** The Q/A transcript of earlier rounds, oldest first. */
+  answers?: { question: string; answer: string }[];
+  /** Round 3 of 3: questions are no longer an option, a pack must come back. */
+  finalRound?: boolean;
+  /** The hub root, so a drafted knowledge folder spanning it is said out loud. */
+  hubRoot?: string;
+}
+
+export interface RoundResult {
+  /** The pack, when the model had enough; null when it asked instead. */
+  draft: PackDraft | null;
+  /** What it asked; empty when a draft came back. */
+  questions: DraftQuestion[];
+  cost_usd: number;
+  model: string;
+}
+
+/** The wizard's hard ceiling on rounds: description + at most two question screens. */
+export const MAX_DRAFT_ROUNDS = 3;
+
+/** The model's questions believed about nothing either: capped at three, each one line, or dropped. */
+export function coerceQuestions(raw: unknown): DraftQuestion[] {
+  if (!Array.isArray(raw)) return [];
+  const out: DraftQuestion[] = [];
+  for (const q of raw.slice(0, 3)) {
+    const o = (q ?? {}) as Record<string, unknown>;
+    const question = oneLine(o.question ?? o.q, 200);
+    if (!question) continue;
+    const why = oneLine(o.why, 200);
+    const placeholder = oneLine(o.placeholder, 80);
+    out.push({ question, ...(why ? { why } : {}), ...(placeholder ? { placeholder } : {}) });
+  }
+  return out;
+}
+
+/** The whole top-level JSON object (pack, questions, or both), or a DraftError carrying the cost. */
+function extractRound(text: string): Record<string, unknown> {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start < 0 || end <= start) throw new Error(`no JSON object in llm output: ${text.slice(0, 120)}`);
+  return JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
+}
+
+/**
+ * One round of the conversational intake (the dynamic wizard, 2026-08-31): the
+ * model returns either a complete pack or one-to-three follow-up questions,
+ * never both honoured at once - a pack ENDS the loop, because a proposal the
+ * operator can edit on every screen beats one more round of questions. Each
+ * round is its own bounded call under the same sect. 6 declarations; the caller
+ * accumulates the cost and renders it, failed rounds included.
+ */
+export async function draftRound(input: RoundInput): Promise<RoundResult> {
   const model = input.model ?? "sonnet";
   const llm = input.llm ?? llmOnce;
   const user = [
@@ -269,10 +394,33 @@ export async function draftPack(input: DraftInput): Promise<DraftResult> {
     "The operator's description of the agent:",
     "",
     input.description,
+    ...(input.answers?.length
+      ? ["", "The operator answered your follow-up questions:", ...input.answers.map((a) => `Q: ${a.question}\nA: ${a.answer}`)]
+      : []),
+    ...(input.finalRound ? ["", "This is the final round: respond with the pack now; questions are no longer an option."] : []),
   ]
     .filter((l): l is string => l !== null)
     .join("\n");
   const r = await llm(DRAFT_SYSTEM, user, model);
-  const draft = coerceDraft(extractJson<Record<string, unknown>>(r.text, "pack"), { fixedName: input.fixedName, taken: new Set(input.taken ?? []) });
-  return { draft, cost_usd: r.cost, model };
+  try {
+    const parsed = extractRound(r.text);
+    if (parsed.pack !== undefined) {
+      const draft = coerceDraft(parsed.pack, { fixedName: input.fixedName, taken: new Set(input.taken ?? []), hubRoot: input.hubRoot });
+      return { draft, questions: [], cost_usd: r.cost, model };
+    }
+    const questions = input.finalRound ? [] : coerceQuestions(parsed.questions);
+    if (questions.length === 0) throw new Error("the draft returned neither a pack nor a usable question");
+    return { draft: null, questions, cost_usd: r.cost, model };
+  } catch (err) {
+    // The money is spent whichever way this failed; the error says so.
+    if (err instanceof DraftError) throw err;
+    throw new DraftError((err as Error).message, r.cost, model);
+  }
+}
+
+/** One CONCLUDING call (headless and compat callers): a pack or a DraftError, never questions. */
+export async function draftPack(input: DraftInput & { hubRoot?: string }): Promise<DraftResult> {
+  const r = await draftRound({ ...input, finalRound: true });
+  if (!r.draft) throw new DraftError("the draft returned no pack", r.cost_usd, r.model);
+  return { draft: r.draft, cost_usd: r.cost_usd, model: r.model };
 }

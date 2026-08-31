@@ -75,6 +75,8 @@ export interface ToolSpec {
   tool: string;
   /** Secret NAMES the server needs; the supervisor injects their values. */
   envSecrets?: string[];
+  /** The server's own sandbox (RFA-0.9 sect. 5.4), when the walkthrough asked; a builtin brings its own. */
+  sandbox?: { network: "none" | "allowlist"; allowedDomains: string[]; allowWrite: string[] };
 }
 
 /** The servers this package ships, for `--builtin <name>` and the onboarding's first choice. */
@@ -130,7 +132,9 @@ const ANSWERER_RULES = `- Be concise and decisive. Cite the file you relied on b
 
 export function renderAgentMd(o: ScaffoldOptions): string {
   const { name, kind } = o;
-  const skillId = o.offer?.id ?? (kind === "tool" ? `${name}-action` : kind === "spec-expert" ? "answer-protocol-question" : "answer-question");
+  // Name-derived for an answerer, never the generic `answer-question`: a shared
+  // id made discovery collide by construction (dogfood F16).
+  const skillId = o.offer?.id ?? (kind === "tool" ? `${name}-action` : kind === "spec-expert" ? "answer-protocol-question" : `answer-${name.slice(0, 40)}-question`);
   const description =
     o.description ??
     (kind === "tool"
@@ -149,7 +153,7 @@ export function renderAgentMd(o: ScaffoldOptions): string {
       : `knowledge:
   # Globs are relative to this directory; out-of-pack paths work too.
   - "knowledge/**/*.md"`;
-  const serverSandbox = (o.tool?.builtin ? BUILTIN_SERVERS[o.tool.builtin]?.sandbox : undefined) ?? {
+  const serverSandbox = o.tool?.sandbox ?? (o.tool?.builtin ? BUILTIN_SERVERS[o.tool.builtin]?.sandbox : undefined) ?? {
     network: "allowlist" as const,
     // A hand-written server gets a placeholder the operator must edit: naming a
     // host they did not choose would be a policy this scaffold invented.
