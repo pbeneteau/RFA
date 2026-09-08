@@ -46,6 +46,11 @@ establishing the real ceiling needs a deliberately slow MCP server, which is a
 different spike. The default 25000ms poll in `src/client.ts` has 35 seconds of
 headroom against the largest value this client was proven to hold.
 
+**Where the row is published.** `INTEROP.md` sect. 4.7 is the counterparty-facing home of this
+table (RFA-0.6 sect. 6.1 item 6), and it carries the Codex row stamped `measured`, which that
+section now distinguishes from `operator report`. This directory holds the script and the reasoning;
+that document holds what a stranger reads.
+
 **What this does and does not say about the uncommitted row.** Sect. 12 item 6
 reports an OpenAI **Agents SDK** client session timing out after a few seconds.
 That is a different client from the Codex CLI, so this measurement does not

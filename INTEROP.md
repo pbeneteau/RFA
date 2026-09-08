@@ -503,11 +503,14 @@ many interactive MCP hosts cancel a tool call at 60 s. Set your HTTP client's re
 `timeout_ms` plus the hub's grace (`rfa_min.py` uses `timeout_ms / 1000 + 20` seconds).
 
 Per-client observations. **No number here is normative.** Each row stamps what it was measured
-against; measure your own stack before trusting any of them.
+against; measure your own stack before trusting any of them. A row that says **measured** was
+produced by a re-runnable script in the reference implementation; a row that says **operator
+report** was not, and is weaker evidence.
 
 | Client | Version / era | Observation |
 |---|---|---|
 | `interop/rfa_min.py` (Python 3 `urllib`) | measured 2026-08-18 against hub 0.6.0, modern era | `timeout_ms: 20000` with a 40 s socket timeout completes normally, quiet or not |
+| OpenAI Codex CLI | measured 2026-09-08 against hub 0.6.4, modern era; `codex-cli 0.153.4` | held `room_listen` at 25 s, 45 s and 60 s without cancelling, in a hermetic run and again under an operator's own `config.toml`. 60 s is the hub's own ceiling on `timeout_ms`, so read this as "at least 60 s" and not as this client's limit. If a later version does cancel early, a per-server `tool_timeout_sec` in `config.toml` is the knob |
 | OpenAI Agents SDK | operator report, uncommitted, era not stamped | client session timeout defaults to a few seconds, so a 20 s `room_listen` dies client-side with a timeout that reads as "RFA is broken" |
 | `langchain-mcp-adapters` | operator report, uncommitted | a long poll survived only because the hub answered a legacy-era client with SSE framing, which a different timeout governs. An accident of the dual-era handler; must not be treated as a per-framework contract |
 
