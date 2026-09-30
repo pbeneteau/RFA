@@ -1,445 +1,3769 @@
 {
- "sha": "91a98a36246c10f9604aa9847c5bbc1cc537d68c",
- "entries": [
-  {
-   "prose": "The package is named `agent-com` and published under the Apache-2.0 license.",
-   "anchor": {
-    "kind": "literal",
-    "path": "package.json",
-    "value": "\"license\": \"Apache-2.0\""
-   },
-   "proof": "literal"
-  },
-  {
-   "prose": "The package exposes two CLI binary names: `rfa` and `agent-com`, both pointing to `dist/cli/main.js`.",
-   "anchor": {
-    "kind": "literal",
-    "path": "package.json",
-    "value": "\"rfa\": \"dist/cli/main.js\""
-   },
-   "proof": "literal"
-  },
-  {
-   "prose": "Node.js 22 or later is required.",
-   "anchor": {
-    "kind": "literal",
-    "path": "package.json",
-    "value": "\"node\": \">=22\""
-   },
-   "proof": "literal"
-  },
-  {
-   "prose": "Run `npm run build` (or `pnpm build`) to compile TypeScript via `tsc`.",
-   "anchor": {
-    "kind": "script",
-    "command": "build"
-   },
-   "proof": "script"
-  },
-  {
-   "prose": "Run `npm run dev` to start the CLI entry point without compiling, using `tsx src/cli/main.ts`.",
-   "anchor": {
-    "kind": "script",
-    "command": "dev"
-   },
-   "proof": "script"
-  },
-  {
-   "prose": "Run `npm run start` to start the hub server via `tsx src/main.ts`.",
-   "anchor": {
-    "kind": "script",
-    "command": "start"
-   },
-   "proof": "script"
-  },
-  {
-   "prose": "Run `npm run supervisor` to start the supervisor process via `tsx src/supervisor.ts`.",
-   "anchor": {
-    "kind": "script",
-    "command": "supervisor"
-   },
-   "proof": "script"
-  },
-  {
-   "prose": "Unit tests are run with `npm test`, which invokes `node --import tsx --test test/*.test.ts`.",
-   "anchor": {
-    "kind": "script",
-    "command": "test"
-   },
-   "proof": "script"
-  },
-  {
-   "prose": "End-to-end tests are run with `npm run e2e`, executing `scripts/e2e.ts`.",
-   "anchor": {
-    "kind": "script",
-    "command": "e2e"
-   },
-   "proof": "script"
-  },
-  {
-   "prose": "A fuller e2e suite is available via `npm run e2e:full`, passing `--full` to the same script.",
-   "anchor": {
-    "kind": "script",
-    "command": "e2e:full"
-   },
-   "proof": "script"
-  },
-  {
-   "prose": "Evals are run with `npm run evals`, which calls `tsx src/cli/main.ts evals run`.",
-   "anchor": {
-    "kind": "script",
-    "command": "evals"
-   },
-   "proof": "script"
-  },
-  {
-   "prose": "Judged evals are run with `npm run evals:judged`, passing `--judged` to the evals runner.",
-   "anchor": {
-    "kind": "script",
-    "command": "evals:judged"
-   },
-   "proof": "script"
-  },
-  {
-   "prose": "The cold-start operator test (`npm run coldstart`) packs the checkout, installs it into a temp prefix, inits an empty folder, and asserts a real model answer, then tears down.",
-   "anchor": {
-    "kind": "script",
-    "command": "coldstart"
-   },
-   "proof": "script"
-  },
-  {
-   "prose": "The `--keep` flag on the coldstart script retains the temp prefix and directory for inspection.",
-   "anchor": {
-    "kind": "literal",
-    "path": "scripts/coldstart.ts",
-    "value": "const KEEP = process.argv.includes(\"--keep\");"
-   },
-   "proof": "literal"
-  },
-  {
-   "prose": "CLI source lives under `src/cli/`.",
-   "anchor": {
-    "kind": "exists",
-    "path": "src/cli"
-   },
-   "proof": "path"
-  },
-  {
-   "prose": "Agent packs live in a hub directory (`<hub>/agents/<name>/agent.md`), never in this repository; `src/cli/scaffold.ts` writes them.",
-   "anchor": {
-    "kind": "exists",
-    "path": "src/cli/scaffold.ts"
-   },
-   "proof": "path"
-  },
-  {
-   "prose": "Eval cases live under a hub directory's `evals/cases/`; `rfa init` seeds the first from `templates/evals/cases/`.",
-   "anchor": {
-    "kind": "exists",
-    "path": "templates/evals/cases"
-   },
-   "proof": "path"
-  },
-  {
-   "prose": "Spec documents live under `spec/`.",
-   "anchor": {
-    "kind": "exists",
-    "path": "spec"
-   },
-   "proof": "path"
-  },
-  {
-   "prose": "Research documents are organized under `research/` in numbered subdirectories.",
-   "anchor": {
-    "kind": "exists",
-    "path": "research/01-protocol"
-   },
-   "proof": "path"
-  },
-  {
-   "prose": "Templates for new agents and commands are under `templates/`.",
-   "anchor": {
-    "kind": "exists",
-    "path": "templates/service"
-   },
-   "proof": "path"
-  },
-  {
-   "prose": "MCP interoperability definitions are in `interop/`.",
-   "anchor": {
-    "kind": "exists",
-    "path": "interop"
-   },
-   "proof": "path"
-  },
-  {
-   "prose": "The console (web UI) asset directory is `console/`.",
-   "anchor": {
-    "kind": "exists",
-    "path": "console"
-   },
-   "proof": "path"
-  },
-  {
-   "prose": "Scripts for maintenance and one-time operations are in `scripts/`.",
-   "anchor": {
-    "kind": "exists",
-    "path": "scripts"
-   },
-   "proof": "path"
-  },
-  {
-   "prose": "Each agent pack is a directory under `agents/<name>/` with an `agent.md` file containing YAML frontmatter (the definition) and a markdown body (the system prompt).",
-   "anchor": {
-    "kind": "literal",
-    "path": "src/agentdef.ts",
-    "value": "* A pack is a directory `agents/<name>/` whose `agent.md` is YAML frontmatter"
-   },
-   "proof": "literal"
-  },
-  {
-   "prose": "The `agentDefSchema` Zod schema is the single shared schema used by the resident runner, supervisor, and console editor.",
-   "anchor": {
-    "kind": "symbol",
-    "path": "src/agentdef.ts",
-    "name": "agentDefSchema"
-   },
-   "proof": "ast"
-  },
-  {
-   "prose": "`parseAgentMd` parses an agent.md string and throws with a precise message on invalid input.",
-   "anchor": {
-    "kind": "symbol",
-    "path": "src/agentdef.ts",
-    "name": "parseAgentMd"
-   },
-   "proof": "ast"
-  },
-  {
-   "prose": "`loadPack` loads a pack directory from disk.",
-   "anchor": {
-    "kind": "symbol",
-    "path": "src/agentdef.ts",
-    "name": "loadPack"
-   },
-   "proof": "ast"
-  },
-  {
-   "prose": "`listPacks` enumerates all packs under an agents root, skipping directories without `agent.md`.",
-   "anchor": {
-    "kind": "symbol",
-    "path": "src/agentdef.ts",
-    "name": "listPacks"
-   },
-   "proof": "ast"
-  },
-  {
-   "prose": "`deriveCard` derives the capability card from an agent pack, including the definition hash as a deployed-version marker.",
-   "anchor": {
-    "kind": "symbol",
-    "path": "src/agentdef.ts",
-    "name": "deriveCard"
-   },
-   "proof": "ast"
-  },
-  {
-   "prose": "A pack that serves a room as a participant must declare at least one entry in `offers`.",
-   "anchor": {
-    "kind": "literal",
-    "path": "src/agentdef.ts",
-    "value": "a pack that serves a room as participant must declare at least one entry in `offers`"
-   },
-   "proof": "literal"
-  },
-  {
-   "prose": "Fan-out (subagent) tools are opt-in and require `tools.allow_subagents: true` in the pack definition.",
-   "anchor": {
-    "kind": "literal",
-    "path": "src/agentdef.ts",
-    "value": "lists \\`${entry}\\`, which spawns subagents; declare tools.allow_subagents: true to permit fan-out"
-   },
-   "proof": "literal"
-  },
-  {
-   "prose": "`requestApproval` publishes an approval request for a pending tool call and blocks until a human decision, expiry, or timeout.",
-   "anchor": {
-    "kind": "symbol",
-    "path": "src/bridge.ts",
-    "name": "requestApproval"
-   },
-   "proof": "ast"
-  },
-  {
-   "prose": "The approval sidekick membership is named `<residentName>-hitl` and joins as an observer role.",
-   "anchor": {
-    "kind": "literal",
-    "path": "src/bridge.ts",
-    "value": "name: `${residentName}-hitl`"
-   },
-   "proof": "literal"
-  },
-  {
-   "prose": "The default approval window when no `reply_by` is present is 30 minutes.",
-   "anchor": {
-    "kind": "literal",
-    "path": "src/bridge.ts",
-    "value": "export const DEFAULT_APPROVAL_WINDOW_MS = 30 * 60_000;"
-   },
-   "proof": "literal"
-  },
-  {
-   "prose": "`interruptMatch` matches a tool name against `interrupt_on` keys, with trailing `*` acting as a prefix glob.",
-   "anchor": {
-    "kind": "symbol",
-    "path": "src/bridge.ts",
-    "name": "interruptMatch"
-   },
-   "proof": "ast"
-  },
-  {
-   "prose": "`refusalForOutcome` returns `deadline_expired` for clock-based denials and `declined` for human rejections.",
-   "anchor": {
-    "kind": "symbol",
-    "path": "src/bridge.ts",
-    "name": "refusalForOutcome"
-   },
-   "proof": "ast"
-  },
-  {
-   "prose": "`verifyChain` walks an event log in order, checking each event's `prev_hash` link and reporting all divergences.",
-   "anchor": {
-    "kind": "symbol",
-    "path": "src/chain.ts",
-    "name": "verifyChain"
-   },
-   "proof": "ast"
-  },
-  {
-   "prose": "Events predating the chain (no `prev_hash`) are counted as `unchainedPrefix` and skipped rather than treated as breaks.",
-   "anchor": {
-    "kind": "symbol",
-    "path": "src/chain.ts",
-    "name": "ChainResult"
-   },
-   "proof": "ast"
-  },
-  {
-   "prose": "The `CHAIN_SCOPE_QUALIFIER` constant states that chain verification only proves no party other than the hub rewrote the log.",
-   "anchor": {
-    "kind": "symbol",
-    "path": "src/chain.ts",
-    "name": "CHAIN_SCOPE_QUALIFIER"
-   },
-   "proof": "ast"
-  },
-  {
-   "prose": "`genesisFor` computes the genesis link as the hex SHA-256 of the room handle.",
-   "anchor": {
-    "kind": "symbol",
-    "path": "src/chain.ts",
-    "name": "genesisFor"
-   },
-   "proof": "ast"
-  },
-  {
-   "prose": "`bindPack` rewrites only the `rooms:` block of an agent.md file, validates the result through the pack schema before writing, and returns definition hashes before and after.",
-   "anchor": {
-    "kind": "symbol",
-    "path": "src/cli/agentmd.ts",
-    "name": "bindPack"
-   },
-   "proof": "ast"
-  },
-  {
-   "prose": "`addKnowledge` merges new globs into the `knowledge:` block, deduplicates them, and validates before writing.",
-   "anchor": {
-    "kind": "symbol",
-    "path": "src/cli/agentmd.ts",
-    "name": "addKnowledge"
-   },
-   "proof": "ast"
-  },
-  {
-   "prose": "`setTopBlock` replaces or adds one top-level YAML block in agent.md frontmatter without touching any other lines.",
-   "anchor": {
-    "kind": "symbol",
-    "path": "src/cli/agentmd.ts",
-    "name": "setTopBlock"
-   },
-   "proof": "ast"
-  },
-  {
-   "prose": "The Anthropic Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`) is a runtime dependency.",
-   "anchor": {
-    "kind": "literal",
-    "path": "package.json",
-    "value": "\"@anthropic-ai/claude-agent-sdk\""
-   },
-   "proof": "literal"
-  },
-  {
-   "prose": "MCP client and server packages (`@modelcontextprotocol/client`, `@modelcontextprotocol/server`, `@modelcontextprotocol/sdk`) are runtime dependencies.",
-   "anchor": {
-    "kind": "literal",
-    "path": "package.json",
-    "value": "\"@modelcontextprotocol/sdk\""
-   },
-   "proof": "literal"
-  },
-  {
-   "prose": "`better-sqlite3` is used for local SQLite storage (e.g., the observability store).",
-   "anchor": {
-    "kind": "literal",
-    "path": "package.json",
-    "value": "\"better-sqlite3\""
-   },
-   "proof": "literal"
-  },
-  {
-   "prose": "`zod` is used for schema validation throughout the project.",
-   "anchor": {
-    "kind": "literal",
-    "path": "package.json",
-    "value": "\"zod\""
-   },
-   "proof": "literal"
-  },
-  {
-   "prose": "`tsx` is the dev-time TypeScript runner used in all `npm run` scripts that don't compile first.",
-   "anchor": {
-    "kind": "literal",
-    "path": "package.json",
-    "value": "\"tsx\": \"^4.23.12\""
-   },
-   "proof": "literal"
-  },
-  {
-   "prose": "`scripts/repair-obs-cost.ts` is a one-time repair script for observability rows whose `cost_usd` was incorrectly set to a day ledger total; it requires `--apply` to write changes.",
-   "anchor": {
-    "kind": "literal",
-    "path": "scripts/repair-obs-cost.ts",
-    "value": "const apply = process.argv.includes(\"--apply\");"
-   },
-   "proof": "literal"
-  },
-  {
-   "prose": "`scripts/watchdog-replay.ts` replays watchdog invariants against room logs and the observability store, and refuses to bless any invariant until the log corpus is at least 14 days.",
-   "anchor": {
-    "kind": "literal",
-    "path": "scripts/watchdog-replay.ts",
-    "value": "const REQUIRED_SPAN_DAYS = 14; // spec 20.6"
-   },
-   "proof": "literal"
-  },
-  {
-   "prose": "`scripts/demo-push.ts` demonstrates zero-polling push delivery over a real stdio MCP transport.",
-   "anchor": {
-    "kind": "literal",
-    "path": "scripts/demo-push.ts",
-    "value": "* Push-profile demo over a REAL stdio transport"
-   },
-   "proof": "literal"
-  }
- ]
+  "sha": "1d21db21b76c8e142f49408bfceae82210874717",
+  "entries": [
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "agent-com"
+      },
+      "proof": "literal",
+      "prose": "This repository is `agent-com`, the RFA (Rooms for Agents) hub and operator CLI.",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/"
+      },
+      "proof": "path",
+      "prose": "It is a TypeScript package whose source lives under `src/`.",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/cli/commands/"
+      },
+      "proof": "path",
+      "prose": "with CLI commands in `src/cli/commands/`,",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/cli/tui/"
+      },
+      "proof": "path",
+      "prose": "TUI components in `src/cli/tui/`,",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/evals/"
+      },
+      "proof": "path",
+      "prose": "and eval harness in `src/evals/`.",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "tsconfig.json"
+      },
+      "proof": "path",
+      "prose": "The package is built with `tsc` (configured by `tsconfig.json`) and publishes two binaries, `rfa` and `agent-com`, both pointing at `dist/cli/main.js`.",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "spec/"
+      },
+      "proof": "path",
+      "prose": "Specifications live in `spec/`,",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "research/"
+      },
+      "proof": "path",
+      "prose": "research in `research/`,",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "templates/"
+      },
+      "proof": "path",
+      "prose": "and operator-facing templates in `templates/`.",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/"
+      },
+      "proof": "path",
+      "prose": "`src/` - hub daemon, engine, CLI, TUI, and eval harness source; the only directory compiled by `tsc`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/cli/commands/"
+      },
+      "proof": "path",
+      "prose": "`src/cli/commands/` - one file per CLI sub-command",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/cli/tui/"
+      },
+      "proof": "path",
+      "prose": "`src/cli/tui/` - Ink/React TUI components for the dashboard and onboarding",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/evals/"
+      },
+      "proof": "path",
+      "prose": "`src/evals/` - eval runner, gate, judge, label, parity, promote, and trajectory modules",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "spec/"
+      },
+      "proof": "path",
+      "prose": "`spec/` - all seven RFA specification documents that govern wire protocol, platform, CLI, concurrency, and egress",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "templates/"
+      },
+      "proof": "path",
+      "prose": "`templates/` - files seeded into a new hub directory by `rfa init`, including the eval rubric and case stubs",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "test/"
+      },
+      "proof": "path",
+      "prose": "`test/` - all test files globbed by the `test` script",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "scripts/"
+      },
+      "proof": "path",
+      "prose": "`scripts/` - standalone runnable scripts for e2e, coldstart, demo, fence-proof, egress-proof, and TUI smoke",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "interop/rfa_min.py"
+      },
+      "proof": "path",
+      "prose": "`interop/` - the `rfa_min.py` minimal interop artifact",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/proc.ts"
+      },
+      "proof": "path",
+      "prose": "`src/proc.ts` - required spawn helper; child processes must be spawned through this module, never via `npx`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/writefence.ts"
+      },
+      "proof": "path",
+      "prose": "`src/writefence.ts` - keeps `Write`, `Edit`, and `NotebookEdit` out of `allowedTools` for every pack",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/fenceprobe.ts"
+      },
+      "proof": "path",
+      "prose": "`src/fenceprobe.ts` - re-proves the fall-through with a live deny probe per guarded built-in at every boot",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "fenceApplies",
+        "path": "src/toolclass.ts"
+      },
+      "proof": "ast",
+      "prose": "`src/toolclass.ts` - defines `fenceApplies`, the coverage predicate for the two-door write fence",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "transportToken",
+        "path": "src/secrets.ts"
+      },
+      "proof": "ast",
+      "prose": "`src/secrets.ts` - provides `transportToken()`, which resolves the transport credential; clients must call it per request, never capture at import",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "command": "build",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Build - `npm run build` (runs `tsc`)",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "command": "dev",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Run CLI from checkout - `npm run dev` (runs `tsx src/cli/main.ts`)",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "command": "start",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Start hub daemon - `npm run start`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "command": "test",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Run unit tests - `npm test`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "command": "e2e",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Run e2e scenarios - `npm run e2e`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "command": "e2e:full",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Run full e2e suite - `npm run e2e:full`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "command": "evals",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Run evals - `npm run evals`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "command": "evals:judged",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Run judged evals - `npm run evals:judged`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "command": "parity",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Run parity gate - `npm run parity`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "command": "tui:smoke",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "TUI smoke test - `npm run tui:smoke`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "command": "fence-proof",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Fence proof - `npm run fence-proof`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "command": "egress-proof",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Egress proof - `npm run egress-proof`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "command": "coldstart",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Cold-start test - `npm run coldstart`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "command": "supervisor",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Supervisor - `npm run supervisor`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "src/secrets.ts",
+        "value": "RFA_TOKEN"
+      },
+      "proof": "literal",
+      "prose": "`RFA_TOKEN` - transport credential read per call by `transportToken()` in `src/secrets.ts`; must appear in a pack's `secrets` declaration",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "spawnEntry",
+        "path": "src/proc.ts"
+      },
+      "proof": "ast",
+      "prose": "Spawn child processes through `spawnEntry` and `stopTree` in `src/proc.ts`, never `npx`; `spawnEntry` passes tsx's loader by absolute path because `--import tsx` resolves from the working directory",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "Nothing under `src/` may resolve `agents/`, `data/` or `dogfood/` from the repository root"
+      },
+      "proof": "literal",
+      "prose": "Resolve the hub directory through `src/hubdir.ts` exclusively; no source file under `src/` may resolve `agents/`, `data/`, or `dogfood/` from the repository root",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/procscan.ts"
+      },
+      "proof": "path",
+      "prose": "Find a resident in the process table using `src/procscan.ts`, never a substring match",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "fenceApplies",
+        "path": "src/toolclass.ts"
+      },
+      "proof": "ast",
+      "prose": "The fence coverage predicate is `fenceApplies` in `src/toolclass.ts`, never `hasWriteSurface`; a pack declaring `Bash` is fenced for that reason",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "A check that compares CONFIGURED against HAPPENING must read the running system's own record, never the file the operator edited"
+      },
+      "proof": "literal",
+      "prose": "A check that compares configured against happening must read the running system's own record, not the file the operator edited; honest sources are `state/member.json`, `runs.db`, and the supervisor's state",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "One knowledge fact must live in exactly ONE file"
+      },
+      "proof": "literal",
+      "prose": "One knowledge fact must live in exactly one file; check for duplicates before adding a source",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "Never start anything interactive when stdout or stdin is not a TTY"
+      },
+      "proof": "literal",
+      "prose": "Never start anything interactive when stdout or stdin is not a TTY",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "run it TWICE: a single pass has hidden a real regression here"
+      },
+      "proof": "literal",
+      "prose": "The `rfa evals parity` gate must be run twice; a single pass has hidden a real regression",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "After changing `src/`, restart what you are testing"
+      },
+      "proof": "literal",
+      "prose": "After changing `src/`, restart the affected long-lived process: `rfa agent restart <name>` for a resident, `rfa restart` for the hub and supervisor",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "tsconfig.json",
+        "value": "\"rootDir\": \"src\""
+      },
+      "proof": "literal",
+      "prose": "The `tsconfig.json` `rootDir` is `src` and `outDir` is `dist`; only files under `src/` are compiled",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "tsconfig.json",
+        "value": "\"target\": \"ES2022\""
+      },
+      "proof": "literal",
+      "prose": "The `tsconfig.json` target is `ES2022` with `module` set to `Node16`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "tsconfig.json",
+        "value": "\"jsx\": \"react-jsx\""
+      },
+      "proof": "literal",
+      "prose": "JSX is compiled with `react-jsx` as set in `tsconfig.json`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "command": "test",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Unit tests run with `npm test`, which executes `node --import tsx --test test/*.test.ts test/*.test.tsx`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "command": "pretest",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "The `pretest` script enforces Node.js >= 22 before running tests",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "test/"
+      },
+      "proof": "path",
+      "prose": "Test files live in `test/`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "the script globs `test/*.test.ts` and `test/*.test.tsx`, so a new file counts immediately"
+      },
+      "proof": "literal",
+      "prose": "A new test file in `test/` is picked up immediately by the glob without any registration step",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "command": "tui:smoke",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "TUI changes additionally require `npm run tui:smoke`, which drives onboarding and dashboard inside a real pty",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "command": "e2e",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Wire scenarios and CLI lifecycle are covered by `npm run e2e`, which writes output to `reports/latest.md`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "test/interleaving.test.ts"
+      },
+      "proof": "path",
+      "prose": "Deterministic concurrency ordering tests live in `test/interleaving.test.ts`, which drives every ordering with barriers",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "Stress loops stay OUT of `npm test`"
+      },
+      "proof": "literal",
+      "prose": "Stress loops are kept out of `npm test`; nondeterminism belongs in an opt-in soak mode",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "This repository carries no instance"
+      },
+      "proof": "literal",
+      "prose": "This repository carries no instance: no `agents/`, `data/`, or `dogfood/` directories (all removed 2026-08-25)",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "The hub must own its store"
+      },
+      "proof": "literal",
+      "prose": "The hub must own its store (`<hub directory>/.rfa/data`) and its lockfile exclusively; `rfa up` runs one HTTP hub per directory",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "`.rfa/data/runs.db`, WAL) is separate and shared by supervisor + residents"
+      },
+      "proof": "literal",
+      "prose": "The engine DB (`.rfa/data/runs.db`, WAL) is separate and shared by supervisor and residents; a resident's `state/member.json` spend is a mirror, never the source",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "A writing pack that cannot establish both doors refuses to serve rather than serving with one"
+      },
+      "proof": "literal",
+      "prose": "A writing pack that cannot establish both doors of the write fence refuses to serve rather than serving with one",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "The fan-out is LOCAL by decision"
+      },
+      "proof": "literal",
+      "prose": "The fan-out for candidates is local: the room sees one task, one owner, one completion, and only a selected winner's answer is recorded as an episode",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "`reports/`, `dist/` and every hub directory's `.rfa/` are gitignored"
+      },
+      "proof": "literal",
+      "prose": "`reports/`, `dist/`, and every hub directory's `.rfa/` are gitignored; never force-add them",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "Every pack now gets `view/create/insert/str_replace` on `/memories` and only those"
+      },
+      "proof": "literal",
+      "prose": "Every pack gets `view/create/insert/str_replace` on `/memories` and only those by default; `delete`, `rename`, and `str_replace` on `blocks/*` reach a pack only if its `tools.allow` names them",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/mcplaunch.ts"
+      },
+      "proof": "path",
+      "prose": "A pack's MCP servers of the `command` and `builtin` forms are spawned through `src/mcplaunch.ts`; the `url` form stays unconfined",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "A threshold tuned to suppress noise will hide a total outage"
+      },
+      "proof": "literal",
+      "prose": "A threshold tuned to suppress noise will hide a total outage; rates need volume guards and states need a direct check",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "Non-interactive shells default to fnm Node 20; see the gotcha in STATUS.md"
+      },
+      "proof": "literal",
+      "prose": "Non-interactive shells default to fnm Node 20; the `pretest` script rejects Node < 22 with an explicit error referencing `STATUS.md`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "the better-sqlite3 binding needs Node 24"
+      },
+      "proof": "literal",
+      "prose": "The `better-sqlite3` binding needs Node 24 per the `pretest` error message",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "never delete `dist/` without `npm run build` after"
+      },
+      "proof": "literal",
+      "prose": "Never delete `dist/` without running `npm run build` after, since the linked `rfa` binary executes it",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "Long-lived processes serve old code"
+      },
+      "proof": "literal",
+      "prose": "Long-lived processes (hub, supervisor, residents) serve old code after an edit; restart them explicitly after changing `src/`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "command": "fence-proof",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Run `npm run fence-proof` after every SDK bump; door one of the write fence is version-fragile by design",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "command": "egress-proof",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Run `npm run egress-proof` after every SDK bump alongside `npm run fence-proof`",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "CLAUDE_SDK_CAN_USE_TOOL_SHADOWED"
+      },
+      "proof": "literal",
+      "prose": "A bare `allowedTools` entry auto-approves a built-in call before the `canUseTool` callback fires; the SDK emits `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED` when this occurs",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "a read INSIDE the session cwd is auto-approved and NEVER reaches the callback"
+      },
+      "proof": "literal",
+      "prose": "A Read built-in inside the session cwd is auto-approved and never reaches the `canUseTool` callback; a Read outside it does reach the callback",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "`allowUnsandboxedCommands` defaults to true, leaving `dangerouslyDisableSandbox` live"
+      },
+      "proof": "literal",
+      "prose": "`allowUnsandboxedCommands` defaults to true, leaving `dangerouslyDisableSandbox` live; a model used it to escape into the pack tree on the first probe",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "the SUPERVISOR itself, which is a hub client as well as a process manager: it had no credential and its #ops alerts 401'd silently"
+      },
+      "proof": "literal",
+      "prose": "The supervisor is a hub client and must resolve its transport credential through `transportToken()`; it had no credential and its alerts 401'd silently",
+      "artifact": "AGENTS.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "RfaError",
+        "path": "interop/rfa_min.py"
+      },
+      "proof": "ast",
+      "prose": "`RfaError` is an exception class carrying a machine-readable `code`, a `message`, an optional `retry_after_s`, and a `data` dict representing an RFA tool-plane error.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "Hub",
+        "path": "interop/rfa_min.py"
+      },
+      "proof": "ast",
+      "prose": "`Hub` manages a single MCP endpoint URL and bearer token, exposing a `call` method that retries idempotent tools with bounded jitter and raises `RfaError` on tool-plane or HTTP failures.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "read_result",
+        "path": "interop/rfa_min.py"
+      },
+      "proof": "ast",
+      "prose": "`read_result` unwraps one tool result from either SSE-framed or plain JSON, returning the parsed inner object or raising `RfaError` on JSON-RPC or RFA-level errors.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "prune",
+        "path": "interop/rfa_min.py"
+      },
+      "proof": "ast",
+      "prose": "`prune` drops keys whose value is `None` from a dict, because the hub's schemas reject explicit nulls.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "neutralize",
+        "path": "interop/rfa_min.py"
+      },
+      "proof": "ast",
+      "prose": "`neutralize` strips C0 control characters, bidi overrides, and invisible Unicode from text, and replaces every case variant of `</room-message` with the literal string `&lt;/room-message` to prevent frame-breaking.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "strip_tag_block",
+        "path": "interop/rfa_min.py"
+      },
+      "proof": "ast",
+      "prose": "`strip_tag_block` removes Unicode TAG characters in the range U+E0000–U+E007F from text, which are invisible to a human reviewer but reach a model verbatim.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "attr",
+        "path": "interop/rfa_min.py"
+      },
+      "proof": "ast",
+      "prose": "`attr` allowlists attribute values to alphanumerics and the characters space, underscore, period, hyphen, and colon, producing a string safe for use in XML-style attribute positions without escaping.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "wrap_for_model",
+        "path": "interop/rfa_min.py"
+      },
+      "proof": "ast",
+      "prose": "`wrap_for_model` renders one peer message envelope as an untrusted-data boundary tag, identical to the hub's own `wrapped` field, so a model never receives raw `body` text directly.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "text_of",
+        "path": "interop/rfa_min.py"
+      },
+      "proof": "ast",
+      "prose": "`text_of` extracts raw text from a message envelope for logging and length checks only, and must never be passed to a model.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "Member",
+        "path": "interop/rfa_min.py"
+      },
+      "proof": "ast",
+      "prose": "`Member` manages one room membership: joining, leaving, listening, presence, task work, and message handling, with cursor discipline and epoch tracking.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "headless",
+        "path": "scripts/tui-drive.py"
+      },
+      "proof": "ast",
+      "prose": "`headless` runs the CLI in a subprocess with captured output, used by the smoke test to drive non-interactive commands against a target directory.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "free_port",
+        "path": "scripts/tui-drive.py"
+      },
+      "proof": "ast",
+      "prose": "`free_port` binds a socket on port 0 and returns the OS-assigned port number, then closes the socket.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "smoke",
+        "path": "scripts/tui-drive.py"
+      },
+      "proof": "ast",
+      "prose": "`smoke` drives both the dashboard and the onboarding scenarios inside real pseudo-terminals against temporary directories, returning 0 on success and 1 with a list of failures otherwise.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "Lane",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "`Lane` is the union type `\"serve\" | \"schedule\" | \"background\"` representing the three admission priority classes.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "LANES",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "`LANES` is the ordered tuple `[\"serve\", \"schedule\", \"background\"]` listing all admission lanes.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "UNSUPERVISED_CAP",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "`UNSUPERVISED_CAP` is `3`, the fallback concurrency cap used when no supervisor has written a cap to the ledger.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "RATE_LIMIT_PAUSE_FLOOR_MS",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "`RATE_LIMIT_PAUSE_FLOOR_MS` is `60_000`, the minimum account-wide hold duration after a provider rate limit.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "VIABLE_BUDGET_USD",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "`VIABLE_BUDGET_USD` is `0.05`, the minimum remaining budget below which admission is refused rather than starting a turn that would be truncated.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "BudgetRequest",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "`BudgetRequest` carries the optional per-day and per-task USD ceilings, the spend day string, and the viability floor used at admission time.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "spendDay",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "`spendDay` formats a `Date` as a `YYYY-MM-DD` string representing the budget day, defaulting to the current date.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "Lease",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "`Lease` describes one row in `account_leases`, including the lease id, agent, lane, run id, pid, timestamps, park state, reservation amount, spend day, and row kind (`\"lease\"` or `\"maintenance\"`).",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "Admission",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "`Admission` is the result of an `acquire` call: an `ok` flag, the granted `Lease` or null, a refusal `reason`, optional `detail` and `retry_after_s`, and the `granted_usd` ceiling passed to the SDK.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "Settlement",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "`Settlement` records the attribution of one completed lease: agent, lane, run id, spend day, granted ceiling, actual cost, and timestamps.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "RateLimitReport",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "`RateLimitReport` is one row from `account_rate_limits`, carrying the agent, run id, detail string, timestamp, and auto-increment id.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "AccountSnapshot",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "`AccountSnapshot` describes the current ledger state: cap, in-flight and parked counts, per-lane and per-agent breakdowns, pause state, all live leases, and active maintenance markers.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "isRateLimitError",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "`isRateLimitError` returns `true` when an error's message matches patterns for HTTP 429, rate-limit, too-many-requests, usage-limit, or quota-exceeded responses.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "AUTH_FAILURE_MARKERS",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "`AUTH_FAILURE_MARKERS` is the canonical list of LIKE-syntax patterns used to identify credential failures, shared between the resident's refusal logic and the observability alert.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "isAuthError",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "`isAuthError` returns `true` when an error's message matches any pattern in `AUTH_FAILURE_MARKERS`, indicating a bad or expired credential rather than a transient failure.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "pidAlive",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "`pidAlive` sends signal 0 to a pid and returns `true` if the process exists or is owned by another user (`EPERM`), and `false` for non-positive or non-integer pids.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "AccountLedger",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "`AccountLedger` manages the SQLite-backed admission table, providing `acquire`, `release`, `park`, `unpark`, `settle`, `sweep`, `setCap`, `cap`, `pause`, `beginMaintenance`, and snapshot methods over `account_leases` and related tables.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "ACTION_IDENTITY_EXT",
+        "path": "src/actionid.ts"
+      },
+      "proof": "ast",
+      "prose": "`ACTION_IDENTITY_EXT` is the wire extension key `\"io.github.pbeneteau/action-identity\"` used to carry a stable action identity on approval cards.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "EFFECT_CLASS_EXT",
+        "path": "src/actionid.ts"
+      },
+      "proof": "ast",
+      "prose": "`EFFECT_CLASS_EXT` is the wire extension key `\"io.github.pbeneteau/effect-class\"` used to carry the effect class of an action on approval cards.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "EffectClass",
+        "path": "src/actionid.ts"
+      },
+      "proof": "ast",
+      "prose": "`EffectClass` is the union type `\"irreversible\" | \"reversible_with_cost\" | \"reversible\"` classifying how an action fails when its outcome is unknown.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "EFFECT_CLASSES",
+        "path": "src/actionid.ts"
+      },
+      "proof": "ast",
+      "prose": "`EFFECT_CLASSES` is the tuple `[\"irreversible\", \"reversible_with_cost\", \"reversible\"]` listing all valid effect classes.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "DEFAULT_EFFECT_CLASS",
+        "path": "src/actionid.ts"
+      },
+      "proof": "ast",
+      "prose": "`DEFAULT_EFFECT_CLASS` is `\"irreversible\"`, the safe default applied when an effect class is absent or unrecognised.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "effectClassOf",
+        "path": "src/actionid.ts"
+      },
+      "proof": "ast",
+      "prose": "`effectClassOf` returns the `EffectClass` for a raw value, falling back to `DEFAULT_EFFECT_CLASS` for any unknown or absent input.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "mayRetryUnsettled",
+        "path": "src/actionid.ts"
+      },
+      "proof": "ast",
+      "prose": "`mayRetryUnsettled` returns `true` when an unsettled claim on the given `EffectClass` may be taken over and re-run, which is false only for `\"irreversible\"`.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "normalizeInput",
+        "path": "src/actionid.ts"
+      },
+      "proof": "ast",
+      "prose": "`normalizeInput` recursively normalises a tool input value for identity purposes: NFC-trimming strings, dropping absent-ish values from objects, stripping identity-blind keys, and preserving array order.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "actionIdentity",
+        "path": "src/actionid.ts"
+      },
+      "proof": "ast",
+      "prose": "`actionIdentity` computes a stable `act1_`-prefixed SHA-256 identity for an action from its tool name, normalised input, and scope, stable across retries and process restarts.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "actionScope",
+        "path": "src/actionid.ts"
+      },
+      "proof": "ast",
+      "prose": "`actionScope` returns a scope string for an action derived from its task id, conversation id, or room, in that priority order.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "InterruptRule",
+        "path": "src/bridge.ts"
+      },
+      "proof": "ast",
+      "prose": "`InterruptRule` describes one matched interrupt rule, carrying the tool name pattern and the interrupt behaviour.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "interruptMatch",
+        "path": "src/bridge.ts"
+      },
+      "proof": "ast",
+      "prose": "`interruptMatch` returns the first `InterruptRule` from a pack's `interrupt_on` list whose pattern matches `toolName`, or `null` if none match.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "ApprovalOutcome",
+        "path": "src/bridge.ts"
+      },
+      "proof": "ast",
+      "prose": "`ApprovalOutcome` carries the result of a human approval wait: the verdict, the decliner's identity if declined, and whether the deadline expired.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "DEFAULT_APPROVAL_WINDOW_MS",
+        "path": "src/bridge.ts"
+      },
+      "proof": "ast",
+      "prose": "`DEFAULT_APPROVAL_WINDOW_MS` is `30 * 60_000` (30 minutes), the fallback approval window when no reply deadline is available.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "approvalWindowMs",
+        "path": "src/bridge.ts"
+      },
+      "proof": "ast",
+      "prose": "`approvalWindowMs` derives the approval window from the asker's `reply_by` deadline, clamped so the card never outlives its audience.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "refusalForOutcome",
+        "path": "src/bridge.ts"
+      },
+      "proof": "ast",
+      "prose": "`refusalForOutcome` maps an `ApprovalOutcome` to the wire refusal reason `\"deadline_expired\"` or `\"declined\"`, or `null` when the action was approved.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "humanAction",
+        "path": "src/bridge.ts"
+      },
+      "proof": "ast",
+      "prose": "`humanAction` returns a human-readable label for a tool name, used in approval card descriptions.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "previewLines",
+        "path": "src/bridge.ts"
+      },
+      "proof": "ast",
+      "prose": "`previewLines` formats a tool input record as a short multi-line preview string for display in an approval card.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "requestApproval",
+        "path": "src/bridge.ts"
+      },
+      "proof": "ast",
+      "prose": "`requestApproval` sends an approval card to the room via the sidekick member and waits for a human verdict, returning an `ApprovalOutcome`.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "joinSidekick",
+        "path": "src/bridge.ts"
+      },
+      "proof": "ast",
+      "prose": "`joinSidekick` joins a hub room as the resident's sidekick observer member and returns the resulting `RoomMember`.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "GeneratedArtifactRecord",
+        "path": "src/artifacts.ts"
+      },
+      "proof": "ast",
+      "prose": "`GeneratedArtifactRecord` describes one generated artifact: its path, content hash, and the run that produced it.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "ArtifactsFile",
+        "path": "src/artifacts.ts"
+      },
+      "proof": "ast",
+      "prose": "`ArtifactsFile` is the shape of the `artifacts.json` store, holding an array of `GeneratedArtifactRecord` entries.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "artifactsStore",
+        "path": "src/artifacts.ts"
+      },
+      "proof": "ast",
+      "prose": "`artifactsStore` returns a `JsonStore<ArtifactsFile>` backed by `<hub>/runtime/artifacts.json`.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "recordGeneratedArtifacts",
+        "path": "src/artifacts.ts"
+      },
+      "proof": "ast",
+      "prose": "`recordGeneratedArtifacts` appends or updates artifact records in the hub's `artifacts.json` store for a completed run.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "ArtifactDrift",
+        "path": "src/artifacts.ts"
+      },
+      "proof": "ast",
+      "prose": "`ArtifactDrift` describes a generated artifact whose on-disk content no longer matches the hash recorded at generation time.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "artifactDrift",
+        "path": "src/artifacts.ts"
+      },
+      "proof": "ast",
+      "prose": "`artifactDrift` compares a list of `GeneratedArtifactRecord` entries against live file hashes and returns the subset that have drifted.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "CANDIDATE_SELECTORS",
+        "path": "src/candidates.ts"
+      },
+      "proof": "ast",
+      "prose": "`CANDIDATE_SELECTORS` is the tuple `[\"human\", \"first-verified\"]` listing the valid candidate selection strategies.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "CandidateSelector",
+        "path": "src/candidates.ts"
+      },
+      "proof": "ast",
+      "prose": "`CandidateSelector` is the union type of the values in `CANDIDATE_SELECTORS`.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "isCandidateSelector",
+        "path": "src/candidates.ts"
+      },
+      "proof": "ast",
+      "prose": "`isCandidateSelector` is a type guard returning `true` when a value is a valid `CandidateSelector`.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "SELECTOR_NOTES",
+        "path": "src/candidates.ts"
+      },
+      "proof": "ast",
+      "prose": "`SELECTOR_NOTES` maps each `CandidateSelector` to a human-readable description string.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "CandidatePlan",
+        "path": "src/candidates.ts"
+      },
+      "proof": "ast",
+      "prose": "`CandidatePlan` describes a resolved fan-out plan: the number of candidates, the selector, and the per-task budget.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "planCandidates",
+        "path": "src/candidates.ts"
+      },
+      "proof": "ast",
+      "prose": "`planCandidates` validates and resolves a candidate fan-out request into a `CandidatePlan`, enforcing that `concurrency >= candidates`.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "StartedCandidate",
+        "path": "src/candidates.ts"
+      },
+      "proof": "ast",
+      "prose": "`StartedCandidate` carries the run id and task reference for one candidate turn that has been dispatched.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "CandidateProduct",
+        "path": "src/candidates.ts"
+      },
+      "proof": "ast",
+      "prose": "`CandidateProduct` holds the output of one completed candidate run: its answer text and cost.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "CandidateOutcome",
+        "path": "src/candidates.ts"
+      },
+      "proof": "ast",
+      "prose": "`CandidateOutcome` pairs a `StartedCandidate` with its `CandidateProduct` or failure reason.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "CandidateSetResult",
+        "path": "src/candidates.ts"
+      },
+      "proof": "ast",
+      "prose": "`CandidateSetResult` is the result of a full fan-out: all outcomes, the selected winner index, and the selector used.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "RunCandidateSetOpts",
+        "path": "src/candidates.ts"
+      },
+      "proof": "ast",
+      "prose": "`RunCandidateSetOpts` carries the inputs to `runCandidateSet`: the plan, the task, the agent context, and selection callbacks.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "runCandidateSet",
+        "path": "src/candidates.ts"
+      },
+      "proof": "ast",
+      "prose": "`runCandidateSet` runs N candidate turns in parallel for one task, applies the selector, and returns a `CandidateSetResult` with all outcomes and the winning candidate.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "roomsBlock",
+        "path": "src/cli/agentmd.ts"
+      },
+      "proof": "ast",
+      "prose": "`roomsBlock` generates the YAML `rooms:` block for an agent.md frontmatter given a room name and binding options.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "knowledgeBlock",
+        "path": "src/cli/agentmd.ts"
+      },
+      "proof": "ast",
+      "prose": "`knowledgeBlock` generates the YAML `knowledge:` block for an agent.md frontmatter from a list of glob patterns.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "setTopBlock",
+        "path": "src/cli/agentmd.ts"
+      },
+      "proof": "ast",
+      "prose": "`setTopBlock` rewrites a named top-level YAML block in agent.md text, replacing it with the provided block string.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "setRoomsBlock",
+        "path": "src/cli/agentmd.ts"
+      },
+      "proof": "ast",
+      "prose": "`setRoomsBlock` rewrites the `rooms:` block in agent.md text using `setTopBlock`.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "bindPack",
+        "path": "src/cli/agentmd.ts"
+      },
+      "proof": "ast",
+      "prose": "`bindPack` rewrites the `rooms:` block in a pack's agent.md file on disk, validated before the write, and returns the updated definition.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "addKnowledge",
+        "path": "src/cli/agentmd.ts"
+      },
+      "proof": "ast",
+      "prose": "`addKnowledge` appends or merges glob patterns into the `knowledge:` block of a pack's agent.md file on disk.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "setTopScalar",
+        "path": "src/cli/agentmd.ts"
+      },
+      "proof": "ast",
+      "prose": "`setTopScalar` rewrites a named top-level scalar key in agent.md text, with options to insert it if absent.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "dropNestedKey",
+        "path": "src/cli/agentmd.ts"
+      },
+      "proof": "ast",
+      "prose": "`dropNestedKey` removes a named key from a named top-level YAML block in agent.md text.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "MODE_LINE",
+        "path": "src/cli/agentmd.ts"
+      },
+      "proof": "ast",
+      "prose": "`MODE_LINE` is a function returning the `mode: <mode>` YAML line string for a given `AgentMode`.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "setAgentMode",
+        "path": "src/cli/agentmd.ts"
+      },
+      "proof": "ast",
+      "prose": "`setAgentMode` rewrites the `mode:` scalar in a pack's agent.md file on disk to one of `ask`, `plan`, or `bypass`.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "yamlScalar",
+        "path": "src/cli/agentmd.ts"
+      },
+      "proof": "ast",
+      "prose": "`yamlScalar` returns a YAML-safe scalar string, quoting the value when necessary.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "PackChanges",
+        "path": "src/cli/agentmd.ts"
+      },
+      "proof": "ast",
+      "prose": "`PackChanges` carries the set of optional fields that `editPack` may update: description, model, per-day budget, offer, concurrency, and candidates.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "EditResult",
+        "path": "src/cli/agentmd.ts"
+      },
+      "proof": "ast",
+      "prose": "`EditResult` carries the outcome of an `editPack` call: the updated text, the parsed definition, and a list of human-readable change descriptions.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "currentSettings",
+        "path": "src/cli/agentmd.ts"
+      },
+      "proof": "ast",
+      "prose": "`currentSettings` extracts the current description, model, and other editable settings from an `AgentDef` for use as defaults in an edit flow.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "editPack",
+        "path": "src/cli/agentmd.ts"
+      },
+      "proof": "ast",
+      "prose": "`editPack` applies a `PackChanges` to agent.md text, validates the result, and returns an `EditResult` with the updated text and change list.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "CHAIN_EXT",
+        "path": "src/chainid.ts"
+      },
+      "proof": "ast",
+      "prose": "`CHAIN_EXT` is the wire extension key `\"io.github.pbeneteau/chain\"` carrying the hash-linked chain reference on room events.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "COUNTER_ASK_EXT",
+        "path": "src/chainid.ts"
+      },
+      "proof": "ast",
+      "prose": "`COUNTER_ASK_EXT` is the wire extension key `\"io.github.pbeneteau/pending-counter-ask\"` annotating a 2-cycle counter-ask advisory.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "CHAIN_DEPTH_CAP",
+        "path": "src/chainid.ts"
+      },
+      "proof": "ast",
+      "prose": "`CHAIN_DEPTH_CAP` is `8`, the maximum chain hop depth at which the chain extension stops propagating rather than the request being refused.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "ChainRef",
+        "path": "src/chainid.ts"
+      },
+      "proof": "ast",
+      "prose": "`ChainRef` carries the chain id, depth, and parent hash for one hop in a request chain.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "readChain",
+        "path": "src/chainid.ts"
+      },
+      "proof": "ast",
+      "prose": "`readChain` extracts a `ChainRef` from an extension bag, returning `null` if absent or malformed.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "mintChainId",
+        "path": "src/chainid.ts"
+      },
+      "proof": "ast",
+      "prose": "`mintChainId` generates a new random chain id string.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "nextChain",
+        "path": "src/chainid.ts"
+      },
+      "proof": "ast",
+      "prose": "`nextChain` advances a `ChainRef` by one hop, returning `null` when the depth cap is reached.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "BlockedChains",
+        "path": "src/chainid.ts"
+      },
+      "proof": "ast",
+      "prose": "`BlockedChains` tracks in-flight chain ids to detect deadlock cycles, exposing `add`, `remove`, and `wouldDeadlock` methods.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "wouldDeadlockDetail",
+        "path": "src/chainid.ts"
+      },
+      "proof": "ast",
+      "prose": "`wouldDeadlockDetail` returns a human-readable string describing the deadlock a given `ChainRef` would create.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "genesisFor",
+        "path": "src/chain.ts"
+      },
+      "proof": "ast",
+      "prose": "`genesisFor` returns the genesis hash string for a room's event chain, derived from the room handle.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "hashedForm",
+        "path": "src/chain.ts"
+      },
+      "proof": "ast",
+      "prose": "`hashedForm` returns a copy of an event record with its hash field populated, used when appending to the chain.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "linkOf",
+        "path": "src/chain.ts"
+      },
+      "proof": "ast",
+      "prose": "`linkOf` extracts the chain link object from an event record.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "ChainDivergence",
+        "path": "src/chain.ts"
+      },
+      "proof": "ast",
+      "prose": "`ChainDivergence` describes a point where the event chain fails verification, naming the seq and the expected versus actual hash.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "ChainResult",
+        "path": "src/chain.ts"
+      },
+      "proof": "ast",
+      "prose": "`ChainResult` carries the outcome of `verifyChain`: a `valid` flag and any `ChainDivergence` found.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "verifyChain",
+        "path": "src/chain.ts"
+      },
+      "proof": "ast",
+      "prose": "`verifyChain` walks an array of event records and returns a `ChainResult` indicating whether the hash chain is intact from genesis.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "CHAIN_SCOPE_QUALIFIER",
+        "path": "src/chain.ts"
+      },
+      "proof": "ast",
+      "prose": "`CHAIN_SCOPE_QUALIFIER` is the fixed string appended to chain verification output explaining what the chain proves and does not prove about hub-side edits.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "MEMORY_DESTRUCTIVE_TOOLS",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`MEMORY_DESTRUCTIVE_TOOLS` is the tuple `[\"mcp__memory__delete\", \"mcp__memory__rename\", \"mcp__memory__str_replace\"]` naming the memory tools restricted to the consolidation lane.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "agentDefSchema",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`agentDefSchema` is the Zod schema that validates a parsed agent.md frontmatter object into an `AgentDef`.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "CONCURRENCY_GATE_LABELS",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`CONCURRENCY_GATE_LABELS` is the array of human-readable labels for each concurrency gate check.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "concurrencyGateFailures",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`concurrencyGateFailures` returns the list of gate failure messages for a definition that does not satisfy all concurrency preconditions.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "writeSurfaceDefFailures",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`writeSurfaceDefFailures` returns validation failure messages for a pack's declared write surface.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "resolvePackCwd",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`resolvePackCwd` resolves a pack's declared `cwd` relative to its pack directory, returning the absolute path.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "reachAcknowledgementFailure",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`reachAcknowledgementFailure` returns a failure message when a pack's reach declaration is missing required acknowledgement fields, or `null` when valid.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "fencedCwdFailure",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`fencedCwdFailure` returns a failure message when a fenced pack's declared `cwd` is outside the permitted root, or `null` when valid.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "AgentDef",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`AgentDef` is the TypeScript type inferred from `agentDefSchema`, representing a fully parsed and validated agent pack definition.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "declaredSecretNames",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`declaredSecretNames` returns the union of secret names declared by a pack's own `secrets` field and by its MCP servers.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "AgentPack",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`AgentPack` carries a loaded pack's directory path, parsed `AgentDef`, and raw agent.md content.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "splitAgentMd",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`splitAgentMd` splits agent.md content into its YAML frontmatter string and body string.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "parseAgentMd",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`parseAgentMd` parses agent.md content into a validated `AgentDef`, throwing on schema violations.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "loadPack",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`loadPack` reads and parses the agent.md in a pack directory, returning an `AgentPack`.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "listPacks",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`listPacks` returns all valid `AgentPack` entries found under an `agents/` root directory.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "BrokenPack",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`BrokenPack` carries the name and parse error for a pack directory whose agent.md could not be validated.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "scanPacks",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`scanPacks` returns both valid `AgentPack` entries and `BrokenPack` entries found under an `agents/` root.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "packByName",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`packByName` looks up a single pack by name under an `agents/` root, throwing if not found or broken.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "declaredPackNames",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`declaredPackNames` returns the sorted union of names from valid packs, broken packs, and an existing name list, used to detect collisions before a write.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "deriveCard",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`deriveCard` builds an `AgentCard` from a loaded `AgentPack`, used when joining a room.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "knowledgeFiles",
+        "path": "src/agentdef.ts"
+      },
+      "proof": "ast",
+      "prose": "`knowledgeFiles` returns the list of file paths matched by a pack's knowledge glob patterns.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "Attachment",
+        "path": "src/cli/attach.ts"
+      },
+      "proof": "ast",
+      "prose": "`Attachment` describes one knowledge source attachment: its local path, remote URL, and sync state.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "AttachError",
+        "path": "src/cli/attach.ts"
+      },
+      "proof": "ast",
+      "prose": "`AttachError` is thrown by `attachKnowledge` when a knowledge source cannot be attached, carrying a human-readable reason.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "attachKnowledge",
+        "path": "src/cli/attach.ts"
+      },
+      "proof": "ast",
+      "prose": "`attachKnowledge` clones or links a knowledge source into a pack's directory and updates the pack's agent.md knowledge block.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "agentNew",
+        "path": "src/cli/commands/agent.ts"
+      },
+      "proof": "ast",
+      "prose": "`agentNew` is the `CommandDef` for `rfa agent new`, which creates a new agent pack interactively or headlessly.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "agentLs",
+        "path": "src/cli/commands/agent.ts"
+      },
+      "proof": "ast",
+      "prose": "`agentLs` is the `CommandDef` for `rfa agent ls`, which lists all packs in the hub directory.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "agentShow",
+        "path": "src/cli/commands/agent.ts"
+      },
+      "proof": "ast",
+      "prose": "`agentShow` is the `CommandDef` for `rfa agent show`, which prints the parsed definition of a named pack.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "agentValidate",
+        "path": "src/cli/commands/agent.ts"
+      },
+      "proof": "ast",
+      "prose": "`agentValidate` is the `CommandDef` for `rfa agent validate`, which validates a pack's agent.md and reports errors.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "agentBind",
+        "path": "src/cli/commands/agent.ts"
+      },
+      "proof": "ast",
+      "prose": "`agentBind` is the `CommandDef` for `rfa agent bind`, which rewrites a pack's room binding in its agent.md.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "supervisorCommand",
+        "path": "src/cli/commands/agent.ts"
+      },
+      "proof": "ast",
+      "prose": "`supervisorCommand` sends a start, stop, or restart command for a named agent to the running supervisor and returns a status string.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "agentStart",
+        "path": "src/cli/commands/agent.ts"
+      },
+      "proof": "ast",
+      "prose": "`agentStart` is the `CommandDef` for `rfa agent start`, which starts a named agent via the supervisor.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "agentStop",
+        "path": "src/cli/commands/agent.ts"
+      },
+      "proof": "ast",
+      "prose": "`agentStop` is the `CommandDef` for `rfa agent stop`, which stops a named agent via the supervisor.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "agentRestart",
+        "path": "src/cli/commands/agent.ts"
+      },
+      "proof": "ast",
+      "prose": "`agentRestart` is the `CommandDef` for `rfa agent restart`, which restarts a named agent via the supervisor.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "EditOutcome",
+        "path": "src/cli/commands/agent.ts"
+      },
+      "proof": "ast",
+      "prose": "`EditOutcome` extends `EditResult` with the applied pack name and whether the agent was restarted after the edit.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "applyPackEdit",
+        "path": "src/cli/commands/agent.ts"
+      },
+      "proof": "ast",
+      "prose": "`applyPackEdit` validates and writes a `PackChanges` to a pack's agent.md, optionally restarting the agent, and returns an `EditOutcome`.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "editInEditor",
+        "path": "src/cli/commands/agent.ts"
+      },
+      "proof": "ast",
+      "prose": "`editInEditor` opens a pack's agent.md in the operator's `$EDITOR` and returns the exit code.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "changesFromFlags",
+        "path": "src/cli/commands/agent.ts"
+      },
+      "proof": "ast",
+      "prose": "`changesFromFlags` builds a `PackChanges` object from CLI flag values, returning `null` when no flags produced a change.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "agentEdit",
+        "path": "src/cli/commands/agent.ts"
+      },
+      "proof": "ast",
+      "prose": "`agentEdit` is the `CommandDef` for `rfa agent edit`, which edits a pack's settings interactively or headlessly.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "agentReflect",
+        "path": "src/cli/commands/agent.ts"
+      },
+      "proof": "ast",
+      "prose": "`agentReflect` is the `CommandDef` for `rfa agent reflect`, which distills a pack's judged eval record into lessons.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "agentMode",
+        "path": "src/cli/commands/agent.ts"
+      },
+      "proof": "ast",
+      "prose": "`agentMode` is the `CommandDef` for `rfa agent mode`, which sets a pack's operating mode to `ask`, `plan`, or `bypass`.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "agentRetire",
+        "path": "src/cli/commands/agent.ts"
+      },
+      "proof": "ast",
+      "prose": "`agentRetire` is the `CommandDef` for `rfa agent retire`, which removes a pack from the hub directory.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "completionScript",
+        "path": "src/cli/commands/completion.ts"
+      },
+      "proof": "ast",
+      "prose": "`completionScript` returns the shell completion script string for the given shell type.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "complete",
+        "path": "src/cli/commands/completion.ts"
+      },
+      "proof": "ast",
+      "prose": "`complete` returns completion candidates for the given word list against the router's command tree.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "completionCommands",
+        "path": "src/cli/commands/completion.ts"
+      },
+      "proof": "ast",
+      "prose": "`completionCommands` returns the `CommandDef` array for the `completion` subcommand group.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "clientHubUrl",
+        "path": "src/cli/commands/connect.ts"
+      },
+      "proof": "ast",
+      "prose": "`clientHubUrl` returns the hub URL a CLI client should connect to, derived from the hub directory's configuration.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "writeProjectSkill",
+        "path": "src/cli/commands/connect.ts"
+      },
+      "proof": "ast",
+      "prose": "`writeProjectSkill` writes the MCP skill configuration for a room into a Claude or Cursor project directory and returns the list of files written.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "connectClaude",
+        "path": "src/cli/commands/connect.ts"
+      },
+      "proof": "ast",
+      "prose": "`connectClaude` is the `CommandDef` for `rfa connect claude`, which writes the MCP configuration for Claude Desktop.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "connectCursor",
+        "path": "src/cli/commands/connect.ts"
+      },
+      "proof": "ast",
+      "prose": "`connectCursor` is the `CommandDef` for `rfa connect cursor`, which prints the MCP configuration for Cursor.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "connectMcp",
+        "path": "src/cli/commands/connect.ts"
+      },
+      "proof": "ast",
+      "prose": "`connectMcp` is the `CommandDef` for `rfa connect mcp`, which prints the generic MCP configuration block.",
+      "artifact": "docs/API.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/cli/main.ts"
+      },
+      "proof": "path",
+      "prose": "The CLI entry point is `src/cli/main.ts`, which installs as the `rfa` and `agent-com` binaries from `dist/cli/main.js`.",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/main.ts"
+      },
+      "proof": "path",
+      "prose": "The hub process (`src/main.ts`) serves HTTP and persists state in a SQLite store under the hub directory's `.rfa/data/` path, using `better-sqlite3`.",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "package.json"
+      },
+      "proof": "path",
+      "prose": "External services are reached through the Anthropic Claude Agent SDK and the MCP client and server packages declared in `package.json`.",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/"
+      },
+      "proof": "path",
+      "prose": "`src/` - core runtime: hub, engine, dispatch, sessions, store, credentials, signing, egress, and all agent lifecycle modules",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/cli/"
+      },
+      "proof": "path",
+      "prose": "`src/cli/` - operator CLI: routing, prompts, scaffolding, and command implementations that front every hub operation",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/cli/commands/"
+      },
+      "proof": "path",
+      "prose": "`src/cli/commands/` - individual CLI command modules (agent, connect, creds, dash, doctor, init, ops, room, server, talk, and others)",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/cli/tui/"
+      },
+      "proof": "path",
+      "prose": "`src/cli/tui/` - Ink/React terminal UI components including the dashboard, onboarding wizard, agent editor, and palette",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/evals/"
+      },
+      "proof": "path",
+      "prose": "`src/evals/` - evaluation pipeline: runner, judge, gate, parity, label, promote, trajectory, and concurrent eval modules",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/servers/"
+      },
+      "proof": "path",
+      "prose": "`src/servers/` - MCP server integrations (Linear)",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/hub.ts"
+      },
+      "proof": "path",
+      "prose": "`src/hub.ts` - hub HTTP server",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/engine.ts"
+      },
+      "proof": "path",
+      "prose": "`src/engine.ts` - agent run engine",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/dispatch.ts"
+      },
+      "proof": "path",
+      "prose": "`src/dispatch.ts` - task dispatch",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/supervisor.ts"
+      },
+      "proof": "path",
+      "prose": "`src/supervisor.ts` - process supervisor for resident agents",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/writefence.ts"
+      },
+      "proof": "path",
+      "prose": "`src/writefence.ts` - two-door write fence keeping `Write`, `Edit`, and `NotebookEdit` out of `allowedTools` for every pack",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/fenceprobe.ts"
+      },
+      "proof": "path",
+      "prose": "`src/fenceprobe.ts` - live deny probe run at every boot to re-prove write-fence fall-through per guarded built-in",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/egress.ts"
+      },
+      "proof": "path",
+      "prose": "`src/egress.ts` - egress and declared surface enforcement",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "fenceApplies",
+        "path": "src/toolclass.ts"
+      },
+      "proof": "ast",
+      "prose": "`src/toolclass.ts` - tool classification including the `fenceApplies` coverage predicate",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/hubdir.ts"
+      },
+      "proof": "path",
+      "prose": "`src/hubdir.ts` - the single module that resolves paths onto the hub directory",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "spawnEntry",
+        "path": "src/proc.ts"
+      },
+      "proof": "ast",
+      "prose": "`src/proc.ts` - child-process spawning via `spawnEntry` and `stopTree`, used instead of `npx`",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/procscan.ts"
+      },
+      "proof": "path",
+      "prose": "`src/procscan.ts` - process-table scanning to locate residents without substring matching",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "transportToken",
+        "path": "src/secrets.ts"
+      },
+      "proof": "ast",
+      "prose": "`src/secrets.ts` - transport credential resolution via `transportToken()`",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/signing.ts"
+      },
+      "proof": "path",
+      "prose": "`src/signing.ts` - log signing",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/logverify.ts"
+      },
+      "proof": "path",
+      "prose": "`src/logverify.ts` - log verification",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/knowledge.ts"
+      },
+      "proof": "path",
+      "prose": "`src/knowledge.ts` and `src/knowledge-sources.ts` - knowledge source tracking and sync",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/mcplaunch.ts"
+      },
+      "proof": "path",
+      "prose": "`src/mcplaunch.ts` - spawns MCP servers of the `command` and `builtin` forms through srt, one instance each per server's own sandbox block",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/mcpsandbox.ts"
+      },
+      "proof": "path",
+      "prose": "`src/mcpsandbox.ts` - MCP sandbox configuration",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/memoryfs.ts"
+      },
+      "proof": "path",
+      "prose": "`src/memoryfs.ts` - memory filesystem",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/consolidate.ts"
+      },
+      "proof": "path",
+      "prose": "`src/consolidate.ts` - memory consolidation",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/candidates.ts"
+      },
+      "proof": "path",
+      "prose": "`src/candidates.ts` - candidate fan-out for parallel task runs",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/turnlock.ts"
+      },
+      "proof": "path",
+      "prose": "`src/turnlock.ts` - turn lock enforcing the serial-loop invariant",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/account.ts"
+      },
+      "proof": "path",
+      "prose": "`src/account.ts` - account and budget ledger",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/obs.ts"
+      },
+      "proof": "path",
+      "prose": "`src/obs.ts` - observability",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/bridge.ts"
+      },
+      "proof": "path",
+      "prose": "`src/bridge.ts` - room bridge",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/posture.ts"
+      },
+      "proof": "path",
+      "prose": "`src/posture.ts` - exposure posture",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/principals.ts"
+      },
+      "proof": "path",
+      "prose": "`src/principals.ts` - principal identity",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/credentials.ts"
+      },
+      "proof": "path",
+      "prose": "`src/credentials.ts` - credential management",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/migrate.ts"
+      },
+      "proof": "path",
+      "prose": "`src/migrate.ts` - hub directory migration",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "interop/rfa_min.py"
+      },
+      "proof": "path",
+      "prose": "`interop/rfa_min.py` - minimal Python interop reference implementation",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "scripts/"
+      },
+      "proof": "path",
+      "prose": "`scripts/` - operator scripts: e2e, coldstart, demo-push, fence-proof, egress-proof, watchdog-replay, tui-drive, repair-obs-cost",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "spec/"
+      },
+      "proof": "path",
+      "prose": "`spec/` - RFA specification documents (versions 0.1 through 0.9)",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "templates/"
+      },
+      "proof": "path",
+      "prose": "`templates/` - files seeded into new hub directories by `rfa init`, including the eval rubric, service definitions, and skill templates",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "console/"
+      },
+      "proof": "path",
+      "prose": "`console/` - web console static assets",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/cli/main.ts"
+      },
+      "proof": "path",
+      "prose": "An operator request enters through `src/cli/main.ts`, which routes to a command in `src/cli/commands/` or the TUI in `src/cli/tui/`.",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/hubdir.ts"
+      },
+      "proof": "path",
+      "prose": "Commands that need hub state open the store via `src/hubdir.ts` when no hub is running, or call the hub's HTTP API when one is.",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/dispatch.ts"
+      },
+      "proof": "path",
+      "prose": "A task dispatched through `src/dispatch.ts` is picked up by `src/engine.ts`, which launches a resident agent process via `src/proc.ts` and `src/mcplaunch.ts`; the resident's writes pass through the two-door fence in `src/writefence.ts` and `src/fenceprobe.ts` before reaching `src/memoryfs.ts` or the run scratch surface.",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/obs.ts"
+      },
+      "proof": "path",
+      "prose": "Observability events flow through `src/obs.ts`, and the completed run's episode is available to the eval pipeline in `src/evals/runner.ts`.",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "transportToken",
+        "path": "src/secrets.ts"
+      },
+      "proof": "ast",
+      "prose": "Transport credential resolution is centralised in `transportToken()` in `src/secrets.ts`; callers read `RFA_TOKEN` per call, never at import time",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "stopTree",
+        "path": "src/proc.ts"
+      },
+      "proof": "ast",
+      "prose": "Child-process lifecycle is managed through `spawnEntry` and `stopTree` in `src/proc.ts` to ensure SIGKILL propagates to the process group",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "src/writefence.ts",
+        "value": "Write"
+      },
+      "proof": "literal",
+      "prose": "Write-fence enforcement is applied at startup by `src/writefence.ts`, which keeps `Write`, `Edit`, and `NotebookEdit` out of `allowedTools` for every pack",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "src/fenceprobe.ts",
+        "value": "bypassed"
+      },
+      "proof": "literal",
+      "prose": "Boot-time fence probing is performed by `src/fenceprobe.ts`; `bypassed` and `inconclusive` results are both fatal",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "fenceApplies",
+        "path": "src/toolclass.ts"
+      },
+      "proof": "ast",
+      "prose": "Tool surface classification uses `fenceApplies` in `src/toolclass.ts` to determine whether the write fence applies (any built-in of class `guarded` or `command`)",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/logverify.ts"
+      },
+      "proof": "path",
+      "prose": "Log integrity is provided by `src/signing.ts` (signing) and `src/logverify.ts` (verification)",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/obs.ts"
+      },
+      "proof": "path",
+      "prose": "Observability is collected in `src/obs.ts`",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/errors.ts"
+      },
+      "proof": "path",
+      "prose": "Error types are centralised in `src/errors.ts`",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/account.ts"
+      },
+      "proof": "path",
+      "prose": "Background knowledge sync takes a drain barrier in the account lease table before pulling, coordinated through `src/account.ts`",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "command": "evals",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "The eval reliability gate is run with `npm run evals`",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "command": "parity",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "The parity gate is run with `npm run parity`",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "command": "fence-proof",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "The write-fence proof is run with `npm run fence-proof`",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "command": "egress-proof",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "The egress proof is run with `npm run egress-proof`",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "templates/service/launchd.plist"
+      },
+      "proof": "path",
+      "prose": "`templates/service/launchd.plist` - launchd service definition for macOS deployment",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "templates/service/systemd.service"
+      },
+      "proof": "path",
+      "prose": "`templates/service/systemd.service` - systemd service definition for Linux deployment",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"build\": \"tsc\""
+      },
+      "proof": "literal",
+      "prose": "The `build` script compiles TypeScript sources from `src/` to `dist/` via `tsc`",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"node\": \">=22\""
+      },
+      "proof": "literal",
+      "prose": "The `engines` field in `package.json` requires Node.js `>=22`",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"pretest\": \"node -e \\\"if(+process.versions.node.split('.')[0]<22)"
+      },
+      "proof": "literal",
+      "prose": "The `pretest` script enforces Node.js major version 22 or above before running tests",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "command": "coldstart",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "The `coldstart` script (`npm run coldstart`) packs, installs into a fresh prefix, and answers one question to validate end-to-end packaging",
+      "artifact": "docs/ARCHITECTURE.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "Lane",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "Lane types use string union literals declared as `export type Lane = \"serve\" | \"schedule\" | \"background\"`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "src/account.ts",
+        "value": "export { EFFECTIVE_DEFAULT_CAP }"
+      },
+      "proof": "literal",
+      "prose": "Constants that are re-exported from another module keep their original name, e.g. `EFFECTIVE_DEFAULT_CAP` re-exported from `src/hubdir.ts` via `src/account.ts`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "ACTION_IDENTITY_EXT",
+        "path": "src/actionid.ts"
+      },
+      "proof": "ast",
+      "prose": "Extension wire keys follow reverse-domain notation, e.g. `\"io.github.pbeneteau/action-identity\"` assigned to `ACTION_IDENTITY_EXT`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "isRateLimitError",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "Boolean predicate functions are prefixed with `is`, e.g. `isRateLimitError` and `isAuthError` in `src/account.ts`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "Admission",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "Admission result interfaces use noun phrases, e.g. `Admission`, `Lease`, `Settlement`, `BudgetRequest` in `src/account.ts`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "EFFECT_CLASSES",
+        "path": "src/actionid.ts"
+      },
+      "proof": "ast",
+      "prose": "Effect class values are lowercase kebab string literals: `\"irreversible\"`, `\"reversible_with_cost\"`, `\"reversible\"` collected in `EFFECT_CLASSES`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "src/account.ts",
+        "value": "private db: Database.Database"
+      },
+      "proof": "literal",
+      "prose": "Private class fields use the `private` keyword rather than `#` syntax, e.g. `private db: Database.Database` in `AccountLedger`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "src/account.ts",
+        "value": "const LEASE_TTL_MS = 120_000"
+      },
+      "proof": "literal",
+      "prose": "Duration constants are suffixed `_MS` for milliseconds, e.g. `LEASE_TTL_MS`, `UNPARK_GRACE_MS`, `RATE_LIMIT_PAUSE_FLOOR_MS`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "src/actionid.ts",
+        "value": "act1_"
+      },
+      "proof": "literal",
+      "prose": "The identity prefix encodes the normalization version as a string literal `\"act1_\"` prepended to the hex digest in `actionIdentity`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/"
+      },
+      "proof": "path",
+      "prose": "Core runtime modules live directly under `src/`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/cli/"
+      },
+      "proof": "path",
+      "prose": "CLI entry point and command modules live under `src/cli/`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/cli/commands/"
+      },
+      "proof": "path",
+      "prose": "CLI subcommands are individual files under `src/cli/commands/`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/cli/tui/"
+      },
+      "proof": "path",
+      "prose": "TUI components are TypeScript/TSX files under `src/cli/tui/`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/evals/"
+      },
+      "proof": "path",
+      "prose": "Eval pipeline modules live under `src/evals/`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/servers/"
+      },
+      "proof": "path",
+      "prose": "MCP server integrations live under `src/servers/`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "test/"
+      },
+      "proof": "path",
+      "prose": "All test files live under `test/` and are named `*.test.ts` or `*.test.tsx`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "scripts/"
+      },
+      "proof": "path",
+      "prose": "Operator scripts (e2e, coldstart, proofs) live under `scripts/`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "spec/"
+      },
+      "proof": "path",
+      "prose": "Wire and platform specifications live under `spec/`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "templates/"
+      },
+      "proof": "path",
+      "prose": "Seed templates for hub directory initialization live under `templates/`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "interop/rfa_min.py"
+      },
+      "proof": "path",
+      "prose": "The interoperability reference client lives at `interop/rfa_min.py`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "src/account.ts",
+        "value": "import { randomBytes } from \"node:crypto\""
+      },
+      "proof": "literal",
+      "prose": "Node built-ins are imported with the `node:` protocol prefix, e.g. `import Database from \"better-sqlite3\"` alongside `import { randomBytes } from \"node:crypto\"`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"type\": \"module\""
+      },
+      "proof": "literal",
+      "prose": "The project uses ES module syntax (`\"type\": \"module\"` in `package.json`) with `.js` extensions on local imports in compiled output, e.g. `from \"../src/proc.js\"`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "scripts/egress-proof.ts",
+        "value": "from \"../src/egress.js\""
+      },
+      "proof": "literal",
+      "prose": "Internal modules are imported by relative path with `.js` extension as required by Node16 module resolution, e.g. `from \"../src/egress.js\"` in `scripts/egress-proof.ts`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "tsconfig.json",
+        "value": "\"moduleResolution\": \"node16\""
+      },
+      "proof": "literal",
+      "prose": "`tsconfig.json` sets `\"moduleResolution\": \"node16\"` and `\"module\": \"Node16\"`, enforcing explicit extensions on relative imports",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "scripts/demo-push.ts",
+        "value": "from \"@modelcontextprotocol/sdk/client/index.js\""
+      },
+      "proof": "literal",
+      "prose": "The `@modelcontextprotocol/sdk` client is imported from its scoped subpath, e.g. `from \"@modelcontextprotocol/sdk/client/index.js\"`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "tsconfig.json",
+        "value": "\"jsx\": \"react-jsx\""
+      },
+      "proof": "literal",
+      "prose": "JSX is compiled with `\"jsx\": \"react-jsx\"` in `tsconfig.json`, used by TUI components under `src/cli/tui/`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "interop/rfa_min.py",
+        "value": "class RfaError(Exception):"
+      },
+      "proof": "literal",
+      "prose": "Domain errors are typed classes extending `Error`, e.g. `RfaError` in `interop/rfa_min.py` carries `code`, `message`, `retry_after_s` and `data` fields",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "scripts/repair-obs-cost.ts",
+        "value": "if (err instanceof HubDirError)"
+      },
+      "proof": "literal",
+      "prose": "`HubDirError` is caught by name and its `.hint` field is printed before `process.exit(2)`, e.g. in `scripts/repair-obs-cost.ts`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "Admission",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "Admission refusals are typed via the `reason` discriminant on the `Admission` interface: `\"account_paused\"`, `\"cap_reached\"`, `\"budget_exhausted\"`, `\"maintenance\"`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "isAuthError",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "Auth failures are detected by `isAuthError` using a shared `AUTH_FAILURE_RE` regex derived from `AUTH_FAILURE_MARKERS`, so the resident and the observability alert cannot classify the same error differently",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "isRateLimitError",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "Rate-limit detection is centralised in `isRateLimitError` in `src/account.ts` and matched by `RATE_LIMIT_RE`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "interop/rfa_min.py",
+        "value": "IDEMPOTENT = {\"room_listen\", \"room_roster\", \"room_presence\", \"agent_describe\"}"
+      },
+      "proof": "literal",
+      "prose": "Mutating RPC calls in `interop/rfa_min.py` are not retried blindly; only idempotent reads listed in `IDEMPOTENT` are retried with bounded jitter",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "scripts/repair-obs-cost.ts",
+        "value": "process.exit(2)"
+      },
+      "proof": "literal",
+      "prose": "Process exit codes are explicit: `process.exit(1)` for operational failure, `process.exit(2)` for bad arguments or missing hub directory",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"test\": \"node --import tsx --test test/*.test.ts test/*.test.tsx\""
+      },
+      "proof": "literal",
+      "prose": "The test runner is Node's built-in `--test` flag, invoked as `node --import tsx --test test/*.test.ts test/*.test.tsx`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "command": "pretest",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "A `pretest` script guards the minimum Node version before any test file loads",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "command": "e2e",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "End-to-end scenarios are in `scripts/e2e.ts` and run via `npm run e2e` or `npm run e2e:full`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "command": "fence-proof",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Live fence behaviour is proved by `scripts/fence-proof.ts`, run via `npm run fence-proof`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "command": "egress-proof",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Live egress behaviour is proved by `scripts/egress-proof.ts`, run via `npm run egress-proof`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "command": "tui:smoke",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "TUI smoke tests are driven by `scripts/tui-drive.py` via `npm run tui:smoke`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "command": "evals",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "The eval reliability gate runs via `npm run evals` or `npm run evals:judged`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "test/interleaving.test.ts"
+      },
+      "proof": "path",
+      "prose": "Concurrency interleaving tests live in `test/interleaving.test.ts` and use barriers rather than timing",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "test/writefence.test.ts"
+      },
+      "proof": "path",
+      "prose": "The write-fence deterministic half lives in `test/writefence.test.ts`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "test/hubdir.test.ts"
+      },
+      "proof": "path",
+      "prose": "Hub directory path-resolution is regression-tested in `test/hubdir.test.ts`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "scripts/repair-obs-cost.ts",
+        "value": "SELECT id, name, cost_usd, (end_time - start_time) AS ms, error"
+      },
+      "proof": "literal",
+      "prose": "The observability store is a SQLite database accessed via `better-sqlite3`, with a separate `runs.db` for engine runs and an obs DB for cost rows",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "src/account.ts",
+        "value": "CREATE TABLE IF NOT EXISTS lease_settlements"
+      },
+      "proof": "literal",
+      "prose": "Spend attribution is written to `lease_settlements` with columns `lease_id`, `agent`, `lane`, `run_id`, `spend_day`, `ceiling_usd`, `actual_usd`, `acquired_at`, `settled_at`",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "src/account.ts",
+        "value": "CREATE TABLE IF NOT EXISTS account_rate_limits"
+      },
+      "proof": "literal",
+      "prose": "Rate-limit events are recorded to `account_rate_limits` with `agent`, `run_id`, `detail`, `at` and `handled` columns",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "AUTH_FAILURE_MARKERS",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "Auth failure markers are defined as `AUTH_FAILURE_MARKERS` in `src/account.ts` in SQL LIKE syntax and compiled into `AUTH_FAILURE_RE` for runtime use",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "AccountSnapshot",
+        "path": "src/account.ts"
+      },
+      "proof": "ast",
+      "prose": "The `AccountSnapshot` interface exposes `in_flight`, `parked`, `by_lane`, `by_agent`, `paused_until`, `pause_reason`, `leases` and `maintenance` for operator inspection",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "scripts/tui-drive.py",
+        "value": "#!/usr/bin/env python3"
+      },
+      "proof": "literal",
+      "prose": "Script language is inconsistent: operator scripts are TypeScript (`scripts/e2e.ts`, `scripts/fence-proof.ts`) except the TUI driver which is Python (`scripts/tui-drive.py`)",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "interop/rfa_min.py",
+        "value": "RETRY_DELAYS_S = [0.25, 1.0, 3.0]"
+      },
+      "proof": "literal",
+      "prose": "Retry logic style differs between layers: `interop/rfa_min.py` uses an explicit `RETRY_DELAYS_S` list with bounded jitter, while `src/account.ts` uses a `UNPARK_GRACE_MS` polling approach with no shared retry abstraction",
+      "artifact": "docs/CONVENTIONS.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/main.ts"
+      },
+      "proof": "path",
+      "prose": "**Room protocol** - agents join rooms, discover members by capability digest, and exchange messages over MCP using tools including `room_create`, `room_join`, `room_send`, `room_listen`, `room_roster`, `room_task`, `room_admin`, and `room_watch`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "symbol",
+        "name": "main",
+        "path": "src/cli/main.ts"
+      },
+      "proof": "ast",
+      "prose": "**Operator CLI (`rfa`)** - the front door for onboarding, the dashboard, agent lifecycle, room management, credentials, evals, and log verification",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/supervisor.ts"
+      },
+      "proof": "path",
+      "prose": "**Agent packs and supervisor** - local agents are defined as packs and managed by `src/supervisor.ts`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/writefence.ts"
+      },
+      "proof": "path",
+      "prose": "**Two-door write fence** - implemented in `src/writefence.ts`, keeping `Write`, `Edit`, and `NotebookEdit` out of `allowedTools` for every pack",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "command": "egress-proof",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "**Egress control** - the declared surface proved live by `npm run egress-proof`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "command": "evals",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "**Evals and parity gate** - reliability gate run via `npm run evals` and `npm run parity`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/cli/tui/dashboard.tsx"
+      },
+      "proof": "path",
+      "prose": "**TUI dashboard** - implemented in `src/cli/tui/dashboard.tsx`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "console/index.html"
+      },
+      "proof": "path",
+      "prose": "**Room console** - a live web view served by the hub, located at `console/index.html`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "interop/rfa_min.py"
+      },
+      "proof": "path",
+      "prose": "**Interop reference client** - `interop/rfa_min.py` is a dependency-free Python reference client for non-RFA agents",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "templates/service/launchd.plist"
+      },
+      "proof": "path",
+      "prose": "**Service templates** - `templates/service/launchd.plist` and `templates/service/systemd.service` for running the hub under launchd or systemd",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/obs.ts"
+      },
+      "proof": "path",
+      "prose": "**OTel observability** - one span per tool call via `src/obs.ts`, joining the caller's trace when `_meta` carries a `traceparent`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"node\": \">=22\""
+      },
+      "proof": "literal",
+      "prose": "Node.js `>=22` is required, as declared in the `engines` field of `package.json`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"rfa\": \"dist/cli/main.js\""
+      },
+      "proof": "literal",
+      "prose": "The package name is `agent-com` and the installed binary is `rfa`, as declared in the `bin` field of `package.json`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"url\": \"git+https://github.com/pbeneteau/agent-com.git\""
+      },
+      "proof": "literal",
+      "prose": "Install from the repository with `npm install -g git+ssh://git@github.com/pbeneteau/agent-com.git`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "package-lock.json"
+      },
+      "proof": "path",
+      "prose": "Run `npm install` to install dependencies after cloning",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"pretest\": \"node -e \\\"if(+process.versions.node.split('.')[0]<22)"
+      },
+      "proof": "literal",
+      "prose": "The `pretest` script checks that Node.js major version is at least 22 before running tests, because the `better-sqlite3` binding requires Node 24 in some environments",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "command": "build",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "TypeScript sources compile to `dist/` via `npm run build` (invokes `tsc`)",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "command": "dev",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Run the CLI from this checkout with `npm run dev -- --help`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "command": "start",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Start the hub process with `npm run start` (invokes `tsx src/main.ts`)",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "command": "supervisor",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Start the supervisor with `npm run supervisor` (invokes `tsx src/supervisor.ts`)",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "command": "demo",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Run the spec's worked example in memory with `npm run demo`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "command": "demo:push",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Run the push demo with `npm run demo:push`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"evals\": \"tsx src/cli/main.ts evals run\""
+      },
+      "proof": "literal",
+      "prose": "Run evals with `npm run evals` (equivalent to `tsx src/cli/main.ts evals run`)",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"evals:judged\": \"tsx src/cli/main.ts evals run --judged\""
+      },
+      "proof": "literal",
+      "prose": "Run judged evals with `npm run evals:judged` (equivalent to `tsx src/cli/main.ts evals run --judged`)",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"parity\": \"tsx src/cli/main.ts evals parity\""
+      },
+      "proof": "literal",
+      "prose": "Run the parity gate with `npm run parity` (equivalent to `tsx src/cli/main.ts evals parity`)",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"tui:smoke\": \"python3 scripts/tui-drive.py --smoke\""
+      },
+      "proof": "literal",
+      "prose": "Run the TUI smoke test with `npm run tui:smoke` (invokes `python3 scripts/tui-drive.py --smoke`)",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "command": "fence-proof",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Prove the write fence with `npm run fence-proof` (invokes `tsx scripts/fence-proof.ts`)",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "command": "egress-proof",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Prove egress with `npm run egress-proof` (invokes `tsx scripts/egress-proof.ts`)",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "command": "coldstart",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Run the coldstart check with `npm run coldstart` (invokes `tsx scripts/coldstart.ts`; needs a model credential)",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/cli/main.ts"
+      },
+      "proof": "path",
+      "prose": "The CLI entry point is `src/cli/main.ts`; the hub entry point is `src/main.ts`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "CLAUDE.md",
+        "value": "RFA_TOKEN"
+      },
+      "proof": "literal",
+      "prose": "`RFA_TOKEN` - the transport credential read per call by `transportToken()` in `src/secrets.ts`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "README.md",
+        "value": "RFA_HUMAN_KEYS"
+      },
+      "proof": "literal",
+      "prose": "`RFA_HUMAN_KEYS` - environment form for human principal keys",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "README.md",
+        "value": "RFA_MCP_TOKENS"
+      },
+      "proof": "literal",
+      "prose": "`RFA_MCP_TOKENS` - environment form for MCP transport bearers",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "README.md",
+        "value": "RFA_PUSH_URL"
+      },
+      "proof": "literal",
+      "prose": "`RFA_PUSH_URL` - environment form for the push notification URL",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "README.md",
+        "value": "RFA_CONSOLE_URL"
+      },
+      "proof": "literal",
+      "prose": "`RFA_CONSOLE_URL` - environment form for the console URL",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "README.md",
+        "value": ".rfa/               runtime the tool owns, gitignored, 0700: secrets.json, principals.json"
+      },
+      "proof": "literal",
+      "prose": "`.rfa/` is the runtime directory (gitignored, 0700) holding `secrets.json`, `principals.json`, `tokens.json`, `rooms.json`, `data/`, `logs/`, and `run/`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "templates/gate.json"
+      },
+      "proof": "path",
+      "prose": "`policies/gate.json` is the pre-delivery policy gate; the template ships at `templates/gate.json`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "src/env.ts"
+      },
+      "proof": "path",
+      "prose": "`src/env.ts` is the module that handles environment variable access",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"test\": \"node --import tsx --test test/*.test.ts test/*.test.tsx\""
+      },
+      "proof": "literal",
+      "prose": "Run the unit and integration test suite with `npm test` (globs `test/*.test.ts` and `test/*.test.tsx`)",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"e2e\": \"tsx scripts/e2e.ts\""
+      },
+      "proof": "literal",
+      "prose": "Run end-to-end scenarios with `npm run e2e` (invokes `tsx scripts/e2e.ts`; writes `reports/latest.md` and `latest.json`)",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"e2e:full\": \"tsx scripts/e2e.ts --full\""
+      },
+      "proof": "literal",
+      "prose": "Run the full e2e suite with `npm run e2e:full` (invokes `tsx scripts/e2e.ts --full`)",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "command": "tui:smoke",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "Run the TUI smoke test with `npm run tui:smoke` for changes under `src/cli/tui/`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "tsconfig.json",
+        "value": "\"outDir\": \"dist\""
+      },
+      "proof": "literal",
+      "prose": "Build TypeScript sources with `npm run build` (invokes `tsc`; output goes to `dist/`)",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "tsconfig.json",
+        "value": "\"target\": \"ES2022\""
+      },
+      "proof": "literal",
+      "prose": "The TypeScript compiler targets `ES2022` with `module` set to `Node16`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "tsconfig.json",
+        "value": "\"jsx\": \"react-jsx\""
+      },
+      "proof": "literal",
+      "prose": "JSX is compiled with `react-jsx` transform, as set in `tsconfig.json`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "command": "fence-proof",
+        "kind": "script"
+      },
+      "proof": "script",
+      "prose": "`npm run fence-proof` and `npm run egress-proof` are run after every SDK bump; they require a real OS sandbox and a real model",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "test/interleaving.test.ts"
+      },
+      "proof": "path",
+      "prose": "The deterministic concurrency test lives in `test/interleaving.test.ts`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "templates/service/launchd.plist"
+      },
+      "proof": "path",
+      "prose": "A launchd service template is provided at `templates/service/launchd.plist`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "exists",
+        "path": "templates/service/systemd.service"
+      },
+      "proof": "path",
+      "prose": "A systemd service template is provided at `templates/service/systemd.service`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"files\": [\n    \"dist\",\n    \"console\",\n    \"templates\",\n    \"interop\",\n    \"INTEROP.md\",\n    \"spec\",\n    \"README.md\",\n    \"LICENSE\"\n  ]"
+      },
+      "proof": "literal",
+      "prose": "The published package includes `dist`, `console`, `templates`, `interop`, `INTEROP.md`, `spec`, `README.md`, and `LICENSE`, as declared in the `files` field of `package.json`",
+      "artifact": "README.md"
+    },
+    {
+      "anchor": {
+        "kind": "literal",
+        "path": "package.json",
+        "value": "\"license\": \"Apache-2.0\""
+      },
+      "proof": "literal",
+      "prose": "Licensed under Apache-2.0, as declared in `package.json` and the `LICENSE` file",
+      "artifact": "README.md"
+    }
+  ]
 }

@@ -1,5 +1,7 @@
 # agent-com · RFA (Rooms for Agents)
 
+## Overview
+
 A communication protocol for AI agents: join a **room**, discover the other members (name, presence state, typed capabilities), and talk in real time - with the same discovery ergonomics as MCP tools. And a self-hosted hub that runs it: one room, agents from more than one place, one hash-chained log you can verify, one human who can stop it.
 
 **Who it is for.** Any organization that wants to self-host this, not a single person's laptop tool. A room holds two classes of member: **local** agents, which are packs the hub operator runs and supervises, and **remote** agents hosted elsewhere, possibly by another organization or on another framework, which can claim and complete work from their side with tools the hub never sees. The local half runs today; the remote half is specified in `spec/RFA-0.6-remote.md` and deliberately gated on a real counterparty rather than built speculatively.
@@ -187,4 +189,98 @@ Still not implemented: TLS termination (front it with a proxy), OAuth tiers, per
 
 ## License
 
-Apache-2.0 (spec and code). See [LICENSE](LICENSE).
+- Licensed under Apache-2.0, as declared in `package.json` and the `LICENSE` file
+
+## Key Features
+
+- **Room protocol** - agents join rooms, discover members by capability digest, and exchange messages over MCP using tools including `room_create`, `room_join`, `room_send`, `room_listen`, `room_roster`, `room_task`, `room_admin`, and `room_watch`
+- **Operator CLI (`rfa`)** - the front door for onboarding, the dashboard, agent lifecycle, room management, credentials, evals, and log verification
+- **Agent packs and supervisor** - local agents are defined as packs and managed by `src/supervisor.ts`
+- **Two-door write fence** - implemented in `src/writefence.ts`, keeping `Write`, `Edit`, and `NotebookEdit` out of `allowedTools` for every pack
+- **Egress control** - the declared surface proved live by `npm run egress-proof`
+- **Evals and parity gate** - reliability gate run via `npm run evals` and `npm run parity`
+- **TUI dashboard** - implemented in `src/cli/tui/dashboard.tsx`
+- **Room console** - a live web view served by the hub, located at `console/index.html`
+- **Interop reference client** - `interop/rfa_min.py` is a dependency-free Python reference client for non-RFA agents
+- **Service templates** - `templates/service/launchd.plist` and `templates/service/systemd.service` for running the hub under launchd or systemd
+- **OTel observability** - one span per tool call via `src/obs.ts`, joining the caller's trace when `_meta` carries a `traceparent`
+
+## Getting Started
+
+Prerequisites and installation, quoted from the manifests:
+
+- Node.js `>=22` is required, as declared in the `engines` field of `package.json`
+- The package name is `agent-com` and the installed binary is `rfa`, as declared in the `bin` field of `package.json`
+- Install from the repository with `npm install -g git+ssh://git@github.com/pbeneteau/agent-com.git`
+- Run `npm install` to install dependencies after cloning
+- The `pretest` script checks that Node.js major version is at least 22 before running tests, because the `better-sqlite3` binding requires Node 24 in some environments
+- TypeScript sources compile to `dist/` via `npm run build` (invokes `tsc`)
+
+## Usage
+
+- Run the CLI from this checkout with `npm run dev -- --help`
+- Start the hub process with `npm run start` (invokes `tsx src/main.ts`)
+- Start the supervisor with `npm run supervisor` (invokes `tsx src/supervisor.ts`)
+- Run the spec's worked example in memory with `npm run demo`
+- Run the push demo with `npm run demo:push`
+- Run evals with `npm run evals` (equivalent to `tsx src/cli/main.ts evals run`)
+- Run judged evals with `npm run evals:judged` (equivalent to `tsx src/cli/main.ts evals run --judged`)
+- Run the parity gate with `npm run parity` (equivalent to `tsx src/cli/main.ts evals parity`)
+- Run the TUI smoke test with `npm run tui:smoke` (invokes `python3 scripts/tui-drive.py --smoke`)
+- Prove the write fence with `npm run fence-proof` (invokes `tsx scripts/fence-proof.ts`)
+- Prove egress with `npm run egress-proof` (invokes `tsx scripts/egress-proof.ts`)
+- Run the coldstart check with `npm run coldstart` (invokes `tsx scripts/coldstart.ts`; needs a model credential)
+- The CLI entry point is `src/cli/main.ts`; the hub entry point is `src/main.ts`
+
+## Configuration
+
+- `RFA_TOKEN` - the transport credential read per call by `transportToken()` in `src/secrets.ts`
+- `RFA_HUMAN_KEYS` - environment form for human principal keys
+- `RFA_MCP_TOKENS` - environment form for MCP transport bearers
+- `RFA_PUSH_URL` - environment form for the push notification URL
+- `RFA_CONSOLE_URL` - environment form for the console URL
+- `.rfa/` is the runtime directory (gitignored, 0700) holding `secrets.json`, `principals.json`, `tokens.json`, `rooms.json`, `data/`, `logs/`, and `run/`
+- `policies/gate.json` is the pre-delivery policy gate; the template ships at `templates/gate.json`
+- `src/env.ts` is the module that handles environment variable access
+
+## Project Structure
+
+```
+console/
+docs/
+interop/
+research/
+scripts/
+spec/
+src/
+templates/
+test/
+CLAUDE.md
+INTEROP.md
+LICENSE
+README.md
+STATUS.md
+package-lock.json
+package.json
+tsconfig.json
+```
+
+## Development
+
+Local development commands, quoted from the manifests:
+
+- Run the unit and integration test suite with `npm test` (globs `test/*.test.ts` and `test/*.test.tsx`)
+- Run end-to-end scenarios with `npm run e2e` (invokes `tsx scripts/e2e.ts`; writes `reports/latest.md` and `latest.json`)
+- Run the full e2e suite with `npm run e2e:full` (invokes `tsx scripts/e2e.ts --full`)
+- Run the TUI smoke test with `npm run tui:smoke` for changes under `src/cli/tui/`
+- Build TypeScript sources with `npm run build` (invokes `tsc`; output goes to `dist/`)
+- The TypeScript compiler targets `ES2022` with `module` set to `Node16`
+- JSX is compiled with `react-jsx` transform, as set in `tsconfig.json`
+- `npm run fence-proof` and `npm run egress-proof` are run after every SDK bump; they require a real OS sandbox and a real model
+- The deterministic concurrency test lives in `test/interleaving.test.ts`
+
+## Deployment
+
+- A launchd service template is provided at `templates/service/launchd.plist`
+- A systemd service template is provided at `templates/service/systemd.service`
+- The published package includes `dist`, `console`, `templates`, `interop`, `INTEROP.md`, `spec`, `README.md`, and `LICENSE`, as declared in the `files` field of `package.json`
